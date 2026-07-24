@@ -331,7 +331,6 @@ const Scout = {
     this.state.cvFiles = cvFiles;
     this.latestScan = latest?.scan || null;
     this.applyWorkspaceConfig(this.state.data.workspaceConfig, { render: false });
-    this.setupCategoryUi();
     const h = this.state.data.scanHealth;
     const status = document.getElementById('scan-status');
     if (status) {
@@ -342,7 +341,8 @@ const Scout = {
       status.tabIndex = h?.lastRunAt ? 0 : -1;
       status.setAttribute('role', h?.lastRunAt ? 'button' : 'status');
     }
-    this.categoryIds().forEach((category) => this.renderCategory(category));
+    this.renderJobs();
+    this.renderShortlist();
     this.renderPipeline();
     this.renderAll();
     this.queueStrongMatches();
@@ -663,7 +663,8 @@ const Scout = {
 
   setCommuteFilter(key, value) {
     this.state.commute[key] = value;
-    this.categoryIds().forEach((category) => this.renderCategory(category));
+    this.renderJobs();
+    this.renderShortlist();
     this.renderAll();
   },
 
@@ -676,33 +677,9 @@ const Scout = {
       if (typeof commute.includeUnknown === 'boolean') this.state.commute.includeUnknown = commute.includeUnknown;
     }
     if (!this.state.data || !render) return;
-    this.categoryIds().forEach((category) => this.renderCategory(category));
+    this.renderJobs();
+    this.renderShortlist();
     this.renderAll();
-  },
-
-  setupCategoryUi() {
-    const nav = document.querySelector('header nav');
-    const main = document.querySelector('main');
-    const pipelineButton = nav?.querySelector('button[data-tab="pipeline"]');
-    const pipelineSection = document.getElementById('tab-pipeline');
-    if (!nav || !main || !pipelineButton || !pipelineSection) return;
-    nav.querySelectorAll('button[data-category="true"]').forEach((element) => element.remove());
-    main.querySelectorAll('section[data-category="true"]').forEach((element) => element.remove());
-    for (const category of this.categories()) {
-      const button = document.createElement('button');
-      button.dataset.tab = category.id;
-      button.dataset.category = 'true';
-      button.textContent = category.label;
-      button.addEventListener('click', () => this.showTab(category.id));
-      nav.insertBefore(button, pipelineButton);
-      const section = document.createElement('section');
-      section.id = `tab-${category.id}`;
-      section.dataset.category = 'true';
-      section.classList.add('hidden');
-      main.insertBefore(section, pipelineSection);
-    }
-    if (!this.categoryIds().includes(this.state.tab)) this.state.tab = this.categoryIds()[0] || 'pipeline';
-    this.showTab(this.state.tab);
   },
 
   triageCardHtml(e) {
@@ -790,51 +767,6 @@ const Scout = {
   },
 
   removeFromShortlist(id) { this.post('/api/status', { id, status: 'ignore' }).then((r) => { if (r && r.ok) this.showUndo(id); }); },
-
-  renderCategory(category) {
-    if (!this.state.data) return;
-    const target = document.getElementById(`tab-${category}`);
-    if (!target) return;
-    const policy = this.triagePolicy();
-    const entries = this.filteredEntries(category);
-    const ids = new Set(entries.map((e) => e.id));
-    const action = entries.filter((e) => e.status === 'new' && typeof e.score === 'number' && e.score >= policy.actionScore)
-      .sort((a, b) => b.score - a.score);
-    const unlock = entries.filter((e) => e.status === 'new' && typeof e.score === 'number' && e.score >= policy.checkScore && e.score < policy.actionScore
-      && (e.tags || []).some((tag) => tag.includes('Check')))
-      .sort((a, b) => b.score - a.score);
-    const claimed = new Set([...action.map((e) => e.id), ...unlock.map((e) => e.id)]);
-    const followups = (this.state.data.triage.followups || [])
-      .filter((f) => ids.has(f.entry.id) && !claimed.has(f.entry.id));
-    followups.forEach((f) => claimed.add(f.entry.id));
-    const remaining = entries.filter((e) => !claimed.has(e.id));
-    const remainingNew = remaining.filter((e) => e.status === 'new');
-    const watch = remaining.filter((e) => e.status === 'watch');
-    const active = remaining.filter((e) => ['outreach', 'applied', 'interviewing'].includes(e.status));
-    const closed = remaining.filter((e) => ['accepted', 'rejected', 'ignore'].includes(e.status));
-    const sec = (title, items, cls = '') => items.length
-      ? `<div class="label">${title}</div>` + items.map((e) => this.cardHtml(e, cls)).join('')
-      : '';
-    const fu = followups.length
-      ? '<div class="label">Follow-ups due</div>' + followups.map((f) =>
-          `<div class="card" data-id="${this.esc(f.entry.id)}" role="button" tabindex="0">
-             <div class="top"><b>${this.esc(f.entry.company)}</b>
-             <span class="chip">${f.due[0].kind === 'nudge' ? 'nudge due' : 'close-out due'}</span></div>
-             <div class="meta">since ${this.esc(f.due[0].since)}</div>
-             <div class="detail"></div></div>`).join('')
-      : '';
-    const label = this.categoryLabel(category);
-    target.innerHTML =
-      this.filterBar()
-      + `<div class="label">${this.esc(label)} lane (${entries.length})</div>`
-      + (sec('Action today', action, 'action') || (entries.length ? '<p>Nothing new over the bar in this lane.</p>' : this.latestScanCard() || '<p>No scan result is available yet.</p>'))
-      + sec('One check from unlocking', unlock)
-      + fu
-      + sec('Remaining new', remainingNew)
-      + sec('Watch', watch)
-      + sec('Active', active)
-      + sec('Closed', closed);
-  },
 
   renderPipeline() {
     if (!this.state.data) return;

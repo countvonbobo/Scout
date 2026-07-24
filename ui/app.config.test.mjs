@@ -147,22 +147,6 @@ test('interview prep is a manual, separate conversation with escaped saved-pack 
   assert.doesNotMatch(source, /openInterviewPrep[\s\S]{0,200}sendChat\(/);
 });
 
-test('rendered category lanes escape configured labels', () => {
-  const { scout, context } = loadScout();
-  const target = { innerHTML: '' };
-  context.document.getElementById = () => target;
-  scout.state.data = {
-    categories: [{ id: 'priority', label: '<img src=x onerror=alert(1)>' }],
-    opportunities: [],
-    triage: { followups: [] },
-  };
-  scout.workspaceConfig = { triage: { actionScore: 70, checkScore: 55 } };
-  scout.filterBar = () => '';
-  scout.renderCategory('priority');
-  assert.match(target.innerHTML, /&lt;img src=x onerror=alert\(1\)&gt; lane/);
-  assert.doesNotMatch(target.innerHTML, /<img/);
-});
-
 test('index.html defines static Jobs and Shortlist tabs, not category lanes', () => {
   const html = fs.readFileSync(new URL('./index.html', import.meta.url), 'utf8');
   assert.match(html, /data-tab="jobs"/);
@@ -248,4 +232,24 @@ test('removeFromShortlist dismisses to ignore with undo', () => {
   scout.removeFromShortlist('b');
   const normalized = calls.map(([path, payload]) => [path, JSON.parse(JSON.stringify(payload))]);
   assert.deepEqual(normalized[0], ['/api/status', { id: 'b', status: 'ignore' }]);
+});
+
+test('dynamic category lane machinery is gone', () => {
+  const source = fs.readFileSync(new URL('./app.js', import.meta.url), 'utf8');
+  assert.doesNotMatch(source, /renderCategory/);
+  assert.doesNotMatch(source, /setupCategoryUi/);
+});
+
+test('commute filter refresh re-renders jobs and shortlist', () => {
+  const { scout, context } = loadScout();
+  const { doc } = withJobsDom();
+  context.document = doc;
+  let jobs = 0; let shortlist = 0;
+  scout.renderJobs = () => { jobs += 1; };
+  scout.renderShortlist = () => { shortlist += 1; };
+  scout.renderAll = () => {};
+  scout.state.data = { opportunities: [] };
+  scout.setCommuteFilter('mode', 'car');
+  assert.equal(jobs, 1);
+  assert.equal(shortlist, 1);
 });
