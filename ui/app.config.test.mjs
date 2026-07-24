@@ -162,3 +162,14 @@ test('rendered category lanes escape configured labels', () => {
   assert.match(target.innerHTML, /&lt;img src=x onerror=alert\(1\)&gt; lane/);
   assert.doesNotMatch(target.innerHTML, /<img/);
 });
+
+test('index.html defines static Jobs and Shortlist tabs, not category lanes', () => {
+  const html = fs.readFileSync(new URL('./index.html', import.meta.url), 'utf8');
+  assert.match(html, /data-tab="jobs"/);
+  assert.match(html, /data-tab="shortlist"/);
+  assert.match(html, /id="tab-jobs"/);
+  assert.match(html, /id="tab-shortlist"/);
+  assert.doesNotMatch(html, /data-tab="startup"/);
+  assert.doesNotMatch(html, /data-tab="established"/);
+  assert.doesNotMatch(html, /data-category="true"/);
+});

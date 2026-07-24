@@ -192,7 +192,7 @@ const Scout = {
     data: null,
     sort: { key: 'score', dir: -1 },
     filter: '',
-    tab: 'startup',
+    tab: 'jobs',
     commute: { mode: 'either', maxMinutes: '180', includeUnknown: true },
   },
   cvState: { path: null, slug: null, opportunityId: null, content: null, dirty: false },

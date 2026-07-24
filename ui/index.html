@@ -850,6 +850,17 @@
       .chat-companion .scout-bubble { max-width:calc(100vw - 100px); }
       .scout-arrival-character { width:88px; height:88px; }
     }
+    .cat-tag { font-size:11px; font-weight:600; padding:2px 9px; border-radius:20px; display:inline-block; }
+    .tab-badge { background:#7fd1ff; color:#04222e; border-radius:20px; padding:0 7px; font-size:11px; font-weight:700; margin-left:2px; }
+    .tab-badge.hidden { display:none; }
+    .triage-actions { display:flex; gap:10px; margin-top:12px; padding-top:12px; border-top:1px solid var(--border,#2c313a); }
+    .triage-actions .act { flex:1; }
+    .triage-no { color:#c98b8b; }
+    .triage-yes { background:#1f7a4d; color:#fff; }
+    .inbox-empty { color:var(--muted,#8b93a0); }
+    #undo-toast { position:fixed; left:50%; bottom:24px; transform:translateX(-50%); background:#2a2420; border:1px solid #4a3a2a; color:#d7c3a8; border-radius:10px; padding:11px 14px; display:flex; gap:14px; align-items:center; z-index:50; }
+    #undo-toast.hidden { display:none; }
+    #undo-toast button { background:none; border:none; color:#f0a982; font-weight:600; cursor:pointer; }
   </style>
 </head>
 <body>
@@ -859,8 +870,8 @@
   <header>
     <b>Scout</b>
     <nav>
-      <button data-tab="startup" data-category="true" class="active">Priority</button>
-      <button data-tab="established" data-category="true">Explore</button>
+      <button data-tab="jobs" class="active">Jobs <span id="jobs-count" class="tab-badge hidden"></span></button>
+      <button data-tab="shortlist">Shortlist</button>
       <button data-tab="pipeline">Pipeline</button>
       <button data-tab="all">All</button>
       <button data-tab="reports">Reports</button>
@@ -872,8 +883,8 @@
     <button id="scan-now" class="act" type="button">Scan now</button>
   </header>
   <main>
-    <section id="tab-startup" data-category="true"></section>
-    <section id="tab-established" data-category="true" class="hidden"></section>
+    <section id="tab-jobs"></section>
+    <section id="tab-shortlist" class="hidden"></section>
     <section id="tab-pipeline" class="hidden"></section>
     <section id="tab-all" class="hidden"></section>
     <section id="tab-reports" class="hidden"></section>
@@ -917,6 +928,7 @@
     </div>
   </div>
   <div id="scout-arrival" class="scout-arrival hidden"></div>
+  <div id="undo-toast" class="hidden" role="status" aria-live="polite"></div>
   <script src="/reportView.js?v=__SCOUT_UI_BUILD__"></script>
   <script src="/app.js?v=__SCOUT_UI_BUILD__"></script>
   <script type="module" src="/setup.js?v=__SCOUT_UI_BUILD__"></script>
