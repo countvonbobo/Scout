@@ -55,10 +55,10 @@ function mergeAcknowledged(current, entries) {
   return [...new Set([...(current || []), ...(entries || []).map((entry) => entry.id).filter(Boolean)])];
 }
 const CATEGORY_PALETTE = [
-  { bg: '#5b8def', fg: '#ffffff' }, { bg: '#e0794b', fg: '#ffffff' },
-  { bg: '#3bb59a', fg: '#04231c' }, { bg: '#9d7be0', fg: '#ffffff' },
-  { bg: '#d1495b', fg: '#ffffff' }, { bg: '#4c9f70', fg: '#ffffff' },
-  { bg: '#c9a227', fg: '#241f04' }, { bg: '#5c7a99', fg: '#ffffff' },
+  { bg: '#4a73c3', fg: '#ffffff' }, { bg: '#b05f3b', fg: '#ffffff' },
+  { bg: '#3bb59a', fg: '#04231c' }, { bg: '#8266ba', fg: '#ffffff' },
+  { bg: '#ca4658', fg: '#ffffff' }, { bg: '#3e825c', fg: '#ffffff' },
+  { bg: '#c9a227', fg: '#241f04' }, { bg: '#5a7896', fg: '#ffffff' },
 ];
 function categoryColor(categoryId, categoryIds) {
   const index = Array.isArray(categoryIds) ? categoryIds.indexOf(categoryId) : -1;

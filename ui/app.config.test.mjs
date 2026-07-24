@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import vm from 'node:vm';
 import { test } from 'node:test';
+import { CATEGORY_PALETTE } from './lib/categoryColor.mjs';
 
 function loadScout() {
   const context = {
@@ -67,7 +68,7 @@ test('tagHtml renders an escaped, colour-styled category tag', () => {
   const html = scout.tagHtml({ id: 'x', category: 'startup' });
   assert.match(html, /class="cat-tag"/);
   assert.match(html, /Priority/);
-  assert.match(html, /background:#5b8def/);
+  assert.match(html, /background:#4a73c3/);
 });
 
 test('tagHtml escapes a hostile category label', () => {
@@ -240,6 +241,13 @@ test('removeFromShortlist dismisses to ignore with undo', () => {
   scout.removeFromShortlist('b');
   const normalized = calls.map(([path, payload]) => [path, JSON.parse(JSON.stringify(payload))]);
   assert.deepEqual(normalized[0], ['/api/status', { id: 'b', status: 'ignore' }]);
+});
+
+test('app.js inlined CATEGORY_PALETTE stays in sync with the canonical ui/lib/categoryColor.mjs copy', () => {
+  const source = fs.readFileSync(new URL('./app.js', import.meta.url), 'utf8');
+  for (const { bg, fg } of CATEGORY_PALETTE) {
+    assert.match(source, new RegExp(`bg: '${bg}', fg: '${fg}'`), `app.js is missing inlined entry ${bg}/${fg}`);
+  }
 });
 
 test('dynamic category lane machinery is gone', () => {

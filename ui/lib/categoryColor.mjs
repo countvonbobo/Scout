@@ -2,14 +2,14 @@
 // per-category lane headings. Canonical copy — the classic ui/app.js inlines a
 // matching categoryColor() so a pre-update browser can still boot.
 export const CATEGORY_PALETTE = [
-  { bg: '#5b8def', fg: '#ffffff' }, // blue
-  { bg: '#e0794b', fg: '#ffffff' }, // orange
+  { bg: '#4a73c3', fg: '#ffffff' }, // blue
+  { bg: '#b05f3b', fg: '#ffffff' }, // orange
   { bg: '#3bb59a', fg: '#04231c' }, // teal
-  { bg: '#9d7be0', fg: '#ffffff' }, // purple
-  { bg: '#d1495b', fg: '#ffffff' }, // rose
-  { bg: '#4c9f70', fg: '#ffffff' }, // green
+  { bg: '#8266ba', fg: '#ffffff' }, // purple
+  { bg: '#ca4658', fg: '#ffffff' }, // rose
+  { bg: '#3e825c', fg: '#ffffff' }, // green
   { bg: '#c9a227', fg: '#241f04' }, // amber
-  { bg: '#5c7a99', fg: '#ffffff' }, // slate
+  { bg: '#5a7896', fg: '#ffffff' }, // slate
 ];
 
 export function categoryColor(categoryId, categoryIds) {

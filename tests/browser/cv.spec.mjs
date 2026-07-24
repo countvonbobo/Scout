@@ -61,8 +61,8 @@ test('CV creation is available from the library and opportunity card', async ({ 
   await expect(page.locator('#cv-options-overlay')).toBeHidden();
   await expect(continueFromLibrary).toBeFocused();
 
-  await page.getByRole('button', { name: 'Priority' }).click();
-  const card = page.locator('#tab-startup .card[data-id="new-systems-product-2026-07"]');
+  await page.getByRole('button', { name: 'Jobs' }).click();
+  const card = page.locator('#tab-jobs .card[data-id="new-systems-product-2026-07"]');
   await card.click();
   await expect(card.getByRole('button', { name: 'create custom CV' })).toBeVisible();
 });
