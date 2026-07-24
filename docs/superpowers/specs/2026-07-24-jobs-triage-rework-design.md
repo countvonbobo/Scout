@@ -107,12 +107,7 @@ Navigation becomes: `Jobs · Shortlist · Pipeline · All · Reports · CV`.
 - This is the "said yes, not applied yet" staging area between triage and the
   Pipeline.
 
-### A5. Keyboard shortcuts (stretch, optional)
-
-`Y` / `N` triage the top (or focused) inbox card, `U` undoes the last dismiss.
-Included only if it does not complicate the core implementation.
-
-### A6. Testing
+### A5. Testing
 
 - Unit: `categoryColor()` mapping (stable, wraps, distinct); inbox filtering
   (only `new`); each status transition and the undo reversal.
