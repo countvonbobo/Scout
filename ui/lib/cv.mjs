@@ -109,7 +109,7 @@ function finishRender(root, descriptor, temp, now = () => new Date().toISOString
 }
 
 function compileArgs(root, descriptor, temp) {
-  return ['compile', '--root', '.', relative(root, descriptor.typst), relative(root, temp)];
+  return ['compile', '--root', '.', '--format', 'pdf', relative(root, descriptor.typst), relative(root, temp)];
 }
 
 async function runTypst(command, args, { cwd, timeoutMs, spawnImpl }) {

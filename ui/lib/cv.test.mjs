@@ -70,7 +70,8 @@ test('renders with the resolved managed Typst executable', () => {
     });
     assert.equal(result.ok, true);
     assert.equal(invocation.command, 'C:/app/.scout-runtime/typst.exe');
-    assert.deepEqual(invocation.args.slice(0, 4), ['compile', '--root', '.', 'applications/example/cv.typ']);
+    assert.deepEqual(invocation.args.slice(0, 6), ['compile', '--root', '.', '--format', 'pdf', 'applications/example/cv.typ']);
+    assert.match(invocation.args.at(-1), /\.tmp$/);
     assert.equal(cvRenderState(root, { target: 'application', slug: 'example' }).current, true);
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
