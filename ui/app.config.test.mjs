@@ -220,3 +220,32 @@ test('triage actions post the right status transitions', () => {
   assert.deepEqual(normalized[1], ['/api/status', { id: 'b', status: 'ignore' }]);
   assert.deepEqual(normalized[2], ['/api/status', { id: 'b', status: 'new' }]);
 });
+
+test('renderShortlist lists only shortlisted jobs with a remove action', () => {
+  const { scout, context } = loadScout();
+  const { doc } = withJobsDom();
+  context.document = doc;
+  scout.filterBar = () => '';
+  scout.state.data = {
+    categories: [{ id: 'startup', label: 'Priority' }],
+    opportunities: [
+      { id: 'a', company: 'A', role: 'Eng', status: 'new', score: 60, category: 'startup' },
+      { id: 'b', company: 'B', role: 'Eng', status: 'shortlist', score: 90, category: 'startup' },
+    ],
+  };
+  scout.renderShortlist();
+  const html = doc.getElementById('tab-shortlist').innerHTML;
+  assert.match(html, /data-id="b"/);
+  assert.match(html, /data-action="remove-shortlist"/);
+  assert.doesNotMatch(html, /data-id="a"/);
+});
+
+test('removeFromShortlist dismisses to ignore with undo', () => {
+  const { scout } = loadScout();
+  const calls = [];
+  scout.post = (p, payload) => { calls.push([p, payload]); return Promise.resolve({ ok: true }); };
+  scout.showUndo = () => {};
+  scout.removeFromShortlist('b');
+  const normalized = calls.map(([path, payload]) => [path, JSON.parse(JSON.stringify(payload))]);
+  assert.deepEqual(normalized[0], ['/api/status', { id: 'b', status: 'ignore' }]);
+});

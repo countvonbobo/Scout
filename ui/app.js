@@ -760,7 +760,36 @@ const Scout = {
     document.getElementById('undo-toast')?.classList.add('hidden');
   },
 
-  renderShortlist() {},
+  shortlistCardHtml(e) {
+    const score = typeof e.score === 'number' ? e.score : '-';
+    return `<div class="card" data-id="${this.esc(e.id)}" role="button" tabindex="0">
+      <div class="chiprow">${this.tagHtml(e)}<span class="score ${this.fitClass(e.score)}">${this.esc(score)}</span></div>
+      <div class="top"><b>${this.esc(e.company)} - ${this.esc(e.role)}</b></div>
+      <div class="meta">${this.metaLine(e)}</div>
+      <div class="detail"></div>
+      <div class="triage-actions">
+        <button class="act triage-no" data-action="remove-shortlist" data-id="${this.esc(e.id)}">Remove</button>
+        <button class="act bridge" data-action="choose-cv-options" data-id="${this.esc(e.id)}">Create tailored CV</button>
+      </div>
+    </div>`;
+  },
+
+  renderShortlist() {
+    if (!this.state.data) return;
+    const target = document.getElementById('tab-shortlist');
+    if (!target) return;
+    const entries = this.filteredEntries('all')
+      .filter((e) => e.status === 'shortlist')
+      .sort((a, b) => (typeof b.score === 'number' ? b.score : -1) - (typeof a.score === 'number' ? a.score : -1));
+    const list = entries.length
+      ? entries.map((e) => this.shortlistCardHtml(e)).join('')
+      : '<p class="inbox-empty">Nothing shortlisted yet. Tap "Yes" on a job to add it here.</p>';
+    target.innerHTML = this.filterBar()
+      + `<div class="label">Shortlist (${entries.length})</div>`
+      + list;
+  },
+
+  removeFromShortlist(id) { this.post('/api/status', { id, status: 'ignore' }).then((r) => { if (r && r.ok) this.showUndo(id); }); },
 
   renderCategory(category) {
     if (!this.state.data) return;
@@ -2363,6 +2392,7 @@ const Scout = {
       case 'triage-yes': return this.triageYes(id);
       case 'triage-no': return this.triageNo(id);
       case 'undo-dismiss': return this.undoDismiss(id);
+      case 'remove-shortlist': return this.removeFromShortlist(id);
       default: return undefined;
     }
   },
