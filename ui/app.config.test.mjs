@@ -70,6 +70,14 @@ test('tagHtml renders an escaped, colour-styled category tag', () => {
   assert.match(html, /background:#5b8def/);
 });
 
+test('tagHtml escapes a hostile category label', () => {
+  const { scout } = loadScout();
+  scout.state.data = { categories: [{ id: 'startup', label: '<img src=x onerror=alert(1)>' }] };
+  const html = scout.tagHtml({ id: 'x', category: 'startup' });
+  assert.match(html, /&lt;img src=x onerror=alert\(1\)&gt;/);
+  assert.doesNotMatch(html, /<img/);
+});
+
 test('tabForEntry routes by status', () => {
   const { scout } = loadScout();
   assert.equal(scout.tabForEntry({ status: 'new' }), 'jobs');
