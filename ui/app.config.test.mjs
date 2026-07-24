@@ -61,6 +61,22 @@ test('master CV preview explains how to obtain a rendered PDF', () => {
   assert.doesNotMatch(source, /master CV is source material only and has no PDF preview/i);
 });
 
+test('tagHtml renders an escaped, colour-styled category tag', () => {
+  const { scout } = loadScout();
+  scout.state.data = { categories: [{ id: 'startup', label: 'Priority' }, { id: 'established', label: 'Explore' }] };
+  const html = scout.tagHtml({ id: 'x', category: 'startup' });
+  assert.match(html, /class="cat-tag"/);
+  assert.match(html, /Priority/);
+  assert.match(html, /background:#5b8def/);
+});
+
+test('tabForEntry routes by status', () => {
+  const { scout } = loadScout();
+  assert.equal(scout.tabForEntry({ status: 'new' }), 'jobs');
+  assert.equal(scout.tabForEntry({ status: 'shortlist' }), 'shortlist');
+  assert.equal(scout.tabForEntry({ status: 'applied' }), 'pipeline');
+});
+
 test('company history keeps real correspondence separate from role-specific Scout chats', () => {
   const html = fs.readFileSync(new URL('./index.html', import.meta.url), 'utf8');
   const source = fs.readFileSync(new URL('./app.js', import.meta.url), 'utf8');

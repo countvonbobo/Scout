@@ -54,6 +54,17 @@ function discoveryStorageKey(identity = 'default') {
 function mergeAcknowledged(current, entries) {
   return [...new Set([...(current || []), ...(entries || []).map((entry) => entry.id).filter(Boolean)])];
 }
+const CATEGORY_PALETTE = [
+  { bg: '#5b8def', fg: '#ffffff' }, { bg: '#e0794b', fg: '#ffffff' },
+  { bg: '#3bb59a', fg: '#04231c' }, { bg: '#9d7be0', fg: '#ffffff' },
+  { bg: '#d1495b', fg: '#ffffff' }, { bg: '#4c9f70', fg: '#ffffff' },
+  { bg: '#c9a227', fg: '#241f04' }, { bg: '#5c7a99', fg: '#ffffff' },
+];
+function categoryColor(categoryId, categoryIds) {
+  const index = Array.isArray(categoryIds) ? categoryIds.indexOf(categoryId) : -1;
+  const position = index >= 0 ? index : 0;
+  return CATEGORY_PALETTE[position % CATEGORY_PALETTE.length];
+}
 function codexTaskUrl(sessionId) {
   const value = String(sessionId || '').trim();
   if (!/^[A-Za-z0-9-]+$/.test(value)) return null;
@@ -585,7 +596,7 @@ const Scout = {
     this.acknowledgeDiscoveries();
     document.getElementById('scout-arrival').classList.add('hidden');
     if (!first) return;
-    this.showTab(this.categoryOf(first));
+    this.showTab(this.tabForEntry(first));
     requestAnimationFrame(() => {
       const card = this.cardById(first.id);
       if (card) { this.expandCard(first.id, card); card.scrollIntoView({ behavior: 'smooth', block: 'center' }); }
@@ -602,6 +613,17 @@ const Scout = {
     if (current) bits.push(`current: ${current}`);
     const checked = e.lastChecked ? ` - checked ${this.esc(e.lastChecked)}` : '';
     return this.esc(bits.join(' - ')) + checked;
+  },
+
+  tagHtml(e) {
+    const id = this.categoryOf(e);
+    const color = categoryColor(id, this.categoryIds());
+    return `<span class="cat-tag" style="background:${color.bg};color:${color.fg}">${this.esc(this.categoryLabel(id))}</span>`;
+  },
+  tabForEntry(e) {
+    if (e.status === 'new') return 'jobs';
+    if (e.status === 'shortlist') return 'shortlist';
+    return 'pipeline';
   },
 
   cardHtml(e, cls = '') {
@@ -834,7 +856,7 @@ const Scout = {
         const bv = b[key] ?? (key === 'score' ? -1 : '');
         return av < bv ? dir : av > bv ? -dir : 0;
       });
-      return rows.map((e) => `<tr data-action="open-entry" data-tab="${this.esc(this.categoryOf(e))}" data-id="${this.esc(e.id)}" role="button" tabindex="0" style="cursor:pointer">
+      return rows.map((e) => `<tr data-action="open-entry" data-tab="${this.esc(this.tabForEntry(e))}" data-id="${this.esc(e.id)}" role="button" tabindex="0" style="cursor:pointer">
         <td><b>${typeof e.score === 'number' ? e.score : '-'}</b></td>
         <td>${this.esc(e.company)}</td><td>${this.esc(e.role)}</td>
         <td>${this.esc(this.categoryOf(e))}</td>
