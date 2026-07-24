@@ -705,6 +705,63 @@ const Scout = {
     this.showTab(this.state.tab);
   },
 
+  triageCardHtml(e) {
+    const score = typeof e.score === 'number' ? e.score : '-';
+    return `<div class="card triage-card" data-id="${this.esc(e.id)}" role="button" tabindex="0">
+      <div class="chiprow">${this.tagHtml(e)}<span class="score ${this.fitClass(e.score)}">${this.esc(score)}</span></div>
+      <div class="top"><b>${this.esc(e.company)} - ${this.esc(e.role)}</b></div>
+      <div class="meta">${this.metaLine(e)}</div>
+      <div class="detail"></div>
+      <div class="triage-actions">
+        <button class="act triage-no" data-action="triage-no" data-id="${this.esc(e.id)}">No</button>
+        <button class="act triage-yes" data-action="triage-yes" data-id="${this.esc(e.id)}">Yes, shortlist</button>
+      </div>
+    </div>`;
+  },
+
+  renderJobs() {
+    if (!this.state.data) return;
+    const target = document.getElementById('tab-jobs');
+    if (!target) return;
+    const entries = this.filteredEntries('all')
+      .filter((e) => e.status === 'new')
+      .sort((a, b) => (typeof b.score === 'number' ? b.score : -1) - (typeof a.score === 'number' ? a.score : -1));
+    const list = entries.length
+      ? entries.map((e) => this.triageCardHtml(e)).join('')
+      : (this.latestScanCard() || '<p class="inbox-empty">All caught up - nothing new to review.</p>');
+    target.innerHTML = this.filterBar()
+      + `<div class="label">${entries.length} new job${entries.length === 1 ? '' : 's'} to review</div>`
+      + list;
+    this.updateJobsBadge(entries.length);
+  },
+
+  updateJobsBadge(count) {
+    const badge = document.getElementById('jobs-count');
+    if (!badge) return;
+    badge.textContent = count ? String(count) : '';
+    badge.classList.toggle('hidden', !count);
+  },
+
+  triageYes(id) { this.post('/api/status', { id, status: 'shortlist' }); },
+  triageNo(id) { this.post('/api/status', { id, status: 'ignore' }).then((r) => { if (r && r.ok) this.showUndo(id); }); },
+  undoDismiss(id) { this.post('/api/status', { id, status: 'new' }).then(() => this.hideUndo()); },
+
+  showUndo(id) {
+    const toast = document.getElementById('undo-toast');
+    if (!toast) return;
+    toast.innerHTML = `<span>${this.esc(this.company(id))} dismissed</span>`
+      + `<button data-action="undo-dismiss" data-id="${this.esc(id)}">Undo</button>`;
+    toast.classList.remove('hidden');
+    window.clearTimeout?.(this.undoTimer);
+    this.undoTimer = window.setTimeout?.(() => this.hideUndo(), 6000);
+  },
+  hideUndo() {
+    window.clearTimeout?.(this.undoTimer);
+    document.getElementById('undo-toast')?.classList.add('hidden');
+  },
+
+  renderShortlist() {},
+
   renderCategory(category) {
     if (!this.state.data) return;
     const target = document.getElementById(`tab-${category}`);
@@ -2252,9 +2309,10 @@ const Scout = {
   showTab(tab) {
     this.state.tab = tab;
     document.querySelectorAll('nav button').forEach((b) => b.classList.toggle('active', b.dataset.tab === tab));
-    [...this.categoryIds(), 'pipeline', 'all', 'reports', 'cv'].forEach((t) =>
+    ['jobs', 'shortlist', 'pipeline', 'all', 'reports', 'cv'].forEach((t) =>
       document.getElementById(`tab-${t}`)?.classList.toggle('hidden', t !== tab));
-    if (this.categoryIds().includes(tab)) this.renderCategory(tab);
+    if (tab === 'jobs') this.renderJobs();
+    if (tab === 'shortlist') this.renderShortlist();
     if (tab === 'pipeline') this.renderPipeline();
     if (tab === 'reports') this.renderReports();
     if (tab === 'cv') this.renderCv();
@@ -2302,6 +2360,9 @@ const Scout = {
       case 'send-chat': return this.sendChat();
       case 'stop-chat': return this.stopChat();
       case 'pick-engine': return this.pickEngine(engine);
+      case 'triage-yes': return this.triageYes(id);
+      case 'triage-no': return this.triageNo(id);
+      case 'undo-dismiss': return this.undoDismiss(id);
       default: return undefined;
     }
   },

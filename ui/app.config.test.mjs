@@ -173,3 +173,50 @@ test('index.html defines static Jobs and Shortlist tabs, not category lanes', ()
   assert.doesNotMatch(html, /data-tab="established"/);
   assert.doesNotMatch(html, /data-category="true"/);
 });
+
+function withJobsDom() {
+  const sections = {};
+  const make = () => ({ innerHTML: '', classList: { toggle() {}, add() {}, remove() {} } });
+  const doc = {
+    getElementById: (id) => (sections[id] ||= make()),
+    querySelectorAll: () => [],
+  };
+  return { doc, sections };
+}
+
+test('renderJobs lists only new jobs, highest score first, with tags and actions', () => {
+  const { scout, context } = loadScout();
+  const { doc } = withJobsDom();
+  context.document = doc;
+  scout.filterBar = () => '';
+  scout.latestScanCard = () => '';
+  scout.state.data = {
+    categories: [{ id: 'startup', label: 'Priority' }],
+    opportunities: [
+      { id: 'a', company: 'A', role: 'Eng', status: 'new', score: 60, category: 'startup' },
+      { id: 'b', company: 'B', role: 'Eng', status: 'new', score: 90, category: 'startup' },
+      { id: 'c', company: 'C', role: 'Eng', status: 'shortlist', score: 99, category: 'startup' },
+    ],
+  };
+  scout.renderJobs();
+  const html = doc.getElementById('tab-jobs').innerHTML;
+  assert.match(html, /data-action="triage-yes"/);
+  assert.match(html, /data-action="triage-no"/);
+  assert.ok(html.indexOf('data-id="b"') < html.indexOf('data-id="a"')); // 90 before 60
+  assert.doesNotMatch(html, /data-id="c"/); // shortlisted excluded
+});
+
+test('triage actions post the right status transitions', () => {
+  const { scout } = loadScout();
+  const calls = [];
+  scout.post = (path, payload) => { calls.push([path, payload]); return Promise.resolve({ ok: true }); };
+  scout.showUndo = () => {};
+  scout.hideUndo = () => {};
+  scout.triageYes('a');
+  scout.triageNo('b');
+  scout.undoDismiss('b');
+  const normalized = calls.map(([path, payload]) => [path, JSON.parse(JSON.stringify(payload))]);
+  assert.deepEqual(normalized[0], ['/api/status', { id: 'a', status: 'shortlist' }]);
+  assert.deepEqual(normalized[1], ['/api/status', { id: 'b', status: 'ignore' }]);
+  assert.deepEqual(normalized[2], ['/api/status', { id: 'b', status: 'new' }]);
+});
