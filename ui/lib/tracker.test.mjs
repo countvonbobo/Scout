@@ -35,6 +35,13 @@ test('setStatus validates and does not mutate input', () => {
   assert.throws(() => setStatus(fixture(), 'a-1', 'bogus'), /invalid status/i);
 });
 
+test('setStatus accepts the shortlist status', () => {
+  const data = { opportunities: [{ id: 'acme-eng-2026-07', status: 'new' }] };
+  const next = setStatus(data, 'acme-eng-2026-07', 'shortlist');
+  assert.equal(next.opportunities[0].status, 'shortlist');
+  assert.equal(data.opportunities[0].status, 'new'); // input not mutated
+});
+
 test('addNote appends a dated line and preserves existing notes', () => {
   const out = addNote(fixture(), 'a-1', 'called them', '2026-07-09');
   assert.equal(findEntry(out, 'a-1').notes, 'seed note\n[2026-07-09] called them');
@@ -69,7 +76,7 @@ test('editContact replaces by index and rejects bad index', () => {
 });
 
 test('constants expose the allowed values', () => {
-  assert.deepEqual(STATUSES, ['new','watch','outreach','applied','interviewing','accepted','rejected','ignore']);
+  assert.deepEqual(STATUSES, ['new','shortlist','watch','outreach','applied','interviewing','accepted','rejected','ignore']);
   assert.deepEqual(LOG_EVENTS, ['outreach-sent','replied','nudged','meeting','closed']);
 });
 

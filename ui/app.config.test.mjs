@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import vm from 'node:vm';
 import { test } from 'node:test';
+import { CATEGORY_PALETTE } from './lib/categoryColor.mjs';
 
 function loadScout() {
   const context = {
@@ -59,6 +60,30 @@ test('master CV preview explains how to obtain a rendered PDF', () => {
   assert.match(source, /save \+ render reference PDF/i);
   assert.match(source, /No master reference PDF yet\. Save and render to create it\./i);
   assert.doesNotMatch(source, /master CV is source material only and has no PDF preview/i);
+});
+
+test('tagHtml renders an escaped, colour-styled category tag', () => {
+  const { scout } = loadScout();
+  scout.state.data = { categories: [{ id: 'startup', label: 'Priority' }, { id: 'established', label: 'Explore' }] };
+  const html = scout.tagHtml({ id: 'x', category: 'startup' });
+  assert.match(html, /class="cat-tag"/);
+  assert.match(html, /Priority/);
+  assert.match(html, /background:#4a73c3/);
+});
+
+test('tagHtml escapes a hostile category label', () => {
+  const { scout } = loadScout();
+  scout.state.data = { categories: [{ id: 'startup', label: '<img src=x onerror=alert(1)>' }] };
+  const html = scout.tagHtml({ id: 'x', category: 'startup' });
+  assert.match(html, /&lt;img src=x onerror=alert\(1\)&gt;/);
+  assert.doesNotMatch(html, /<img/);
+});
+
+test('tabForEntry routes by status', () => {
+  const { scout } = loadScout();
+  assert.equal(scout.tabForEntry({ status: 'new' }), 'jobs');
+  assert.equal(scout.tabForEntry({ status: 'shortlist' }), 'shortlist');
+  assert.equal(scout.tabForEntry({ status: 'applied' }), 'pipeline');
 });
 
 test('company history keeps real correspondence separate from role-specific Scout chats', () => {
@@ -131,18 +156,116 @@ test('interview prep is a manual, separate conversation with escaped saved-pack 
   assert.doesNotMatch(source, /openInterviewPrep[\s\S]{0,200}sendChat\(/);
 });
 
-test('rendered category lanes escape configured labels', () => {
-  const { scout, context } = loadScout();
-  const target = { innerHTML: '' };
-  context.document.getElementById = () => target;
-  scout.state.data = {
-    categories: [{ id: 'priority', label: '<img src=x onerror=alert(1)>' }],
-    opportunities: [],
-    triage: { followups: [] },
+test('index.html defines static Jobs and Shortlist tabs, not category lanes', () => {
+  const html = fs.readFileSync(new URL('./index.html', import.meta.url), 'utf8');
+  assert.match(html, /data-tab="jobs"/);
+  assert.match(html, /data-tab="shortlist"/);
+  assert.match(html, /id="tab-jobs"/);
+  assert.match(html, /id="tab-shortlist"/);
+  assert.doesNotMatch(html, /data-tab="startup"/);
+  assert.doesNotMatch(html, /data-tab="established"/);
+  assert.doesNotMatch(html, /data-category="true"/);
+});
+
+function withJobsDom() {
+  const sections = {};
+  const make = () => ({ innerHTML: '', classList: { toggle() {}, add() {}, remove() {} } });
+  const doc = {
+    getElementById: (id) => (sections[id] ||= make()),
+    querySelectorAll: () => [],
   };
-  scout.workspaceConfig = { triage: { actionScore: 70, checkScore: 55 } };
+  return { doc, sections };
+}
+
+test('renderJobs lists only new jobs, highest score first, with tags and actions', () => {
+  const { scout, context } = loadScout();
+  const { doc } = withJobsDom();
+  context.document = doc;
   scout.filterBar = () => '';
-  scout.renderCategory('priority');
-  assert.match(target.innerHTML, /&lt;img src=x onerror=alert\(1\)&gt; lane/);
-  assert.doesNotMatch(target.innerHTML, /<img/);
+  scout.latestScanCard = () => '';
+  scout.state.data = {
+    categories: [{ id: 'startup', label: 'Priority' }],
+    opportunities: [
+      { id: 'a', company: 'A', role: 'Eng', status: 'new', score: 60, category: 'startup' },
+      { id: 'b', company: 'B', role: 'Eng', status: 'new', score: 90, category: 'startup' },
+      { id: 'c', company: 'C', role: 'Eng', status: 'shortlist', score: 99, category: 'startup' },
+    ],
+  };
+  scout.renderJobs();
+  const html = doc.getElementById('tab-jobs').innerHTML;
+  assert.match(html, /data-action="triage-yes"/);
+  assert.match(html, /data-action="triage-no"/);
+  assert.ok(html.indexOf('data-id="b"') < html.indexOf('data-id="a"')); // 90 before 60
+  assert.doesNotMatch(html, /data-id="c"/); // shortlisted excluded
+});
+
+test('triage actions post the right status transitions', () => {
+  const { scout } = loadScout();
+  const calls = [];
+  scout.post = (path, payload) => { calls.push([path, payload]); return Promise.resolve({ ok: true }); };
+  scout.showUndo = () => {};
+  scout.hideUndo = () => {};
+  scout.triageYes('a');
+  scout.triageNo('b');
+  scout.undoDismiss('b');
+  const normalized = calls.map(([path, payload]) => [path, JSON.parse(JSON.stringify(payload))]);
+  assert.deepEqual(normalized[0], ['/api/status', { id: 'a', status: 'shortlist' }]);
+  assert.deepEqual(normalized[1], ['/api/status', { id: 'b', status: 'ignore' }]);
+  assert.deepEqual(normalized[2], ['/api/status', { id: 'b', status: 'new' }]);
+});
+
+test('renderShortlist lists only shortlisted jobs with a remove action', () => {
+  const { scout, context } = loadScout();
+  const { doc } = withJobsDom();
+  context.document = doc;
+  scout.filterBar = () => '';
+  scout.state.data = {
+    categories: [{ id: 'startup', label: 'Priority' }],
+    opportunities: [
+      { id: 'a', company: 'A', role: 'Eng', status: 'new', score: 60, category: 'startup' },
+      { id: 'b', company: 'B', role: 'Eng', status: 'shortlist', score: 90, category: 'startup' },
+    ],
+  };
+  scout.renderShortlist();
+  const html = doc.getElementById('tab-shortlist').innerHTML;
+  assert.match(html, /data-id="b"/);
+  assert.match(html, /data-action="remove-shortlist"/);
+  assert.doesNotMatch(html, /data-id="a"/);
+});
+
+test('removeFromShortlist dismisses to ignore with undo', () => {
+  const { scout } = loadScout();
+  const calls = [];
+  scout.post = (p, payload) => { calls.push([p, payload]); return Promise.resolve({ ok: true }); };
+  scout.showUndo = () => {};
+  scout.removeFromShortlist('b');
+  const normalized = calls.map(([path, payload]) => [path, JSON.parse(JSON.stringify(payload))]);
+  assert.deepEqual(normalized[0], ['/api/status', { id: 'b', status: 'ignore' }]);
+});
+
+test('app.js inlined CATEGORY_PALETTE stays in sync with the canonical ui/lib/categoryColor.mjs copy', () => {
+  const source = fs.readFileSync(new URL('./app.js', import.meta.url), 'utf8');
+  for (const { bg, fg } of CATEGORY_PALETTE) {
+    assert.match(source, new RegExp(`bg: '${bg}', fg: '${fg}'`), `app.js is missing inlined entry ${bg}/${fg}`);
+  }
+});
+
+test('dynamic category lane machinery is gone', () => {
+  const source = fs.readFileSync(new URL('./app.js', import.meta.url), 'utf8');
+  assert.doesNotMatch(source, /renderCategory/);
+  assert.doesNotMatch(source, /setupCategoryUi/);
+});
+
+test('commute filter refresh re-renders jobs and shortlist', () => {
+  const { scout, context } = loadScout();
+  const { doc } = withJobsDom();
+  context.document = doc;
+  let jobs = 0; let shortlist = 0;
+  scout.renderJobs = () => { jobs += 1; };
+  scout.renderShortlist = () => { shortlist += 1; };
+  scout.renderAll = () => {};
+  scout.state.data = { opportunities: [] };
+  scout.setCommuteFilter('mode', 'car');
+  assert.equal(jobs, 1);
+  assert.equal(shortlist, 1);
 });
