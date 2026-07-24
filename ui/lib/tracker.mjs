@@ -1,7 +1,7 @@
 // Pure tracker domain: read helpers, single-field mutators, and a serializer that
 // preserves one-entry-per-line formatting. No I/O here — the server does file access.
 
-export const STATUSES = ['new', 'watch', 'outreach', 'applied', 'interviewing', 'accepted', 'rejected', 'ignore'];
+export const STATUSES = ['new', 'shortlist', 'watch', 'outreach', 'applied', 'interviewing', 'accepted', 'rejected', 'ignore'];
 export const LOG_EVENTS = ['outreach-sent', 'replied', 'nudged', 'meeting', 'closed'];
 export const INTERVIEW_STAGE_PATTERN = /\b(interview|technical|screen|call|system design|onsite|assessment)\b/i;
 export const JOB_CATEGORIES = ['startup', 'established'];

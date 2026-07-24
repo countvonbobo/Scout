@@ -500,6 +500,33 @@ test('a slow setup provider probe does not delay unrelated API requests', { conc
   }
 });
 
+test('POST /api/status accepts the shortlist status and persists it', async () => {
+  seedWorkspace(APP_ROOT, testWorkspace);
+  const trackerFile = path.join(testWorkspace, 'data', 'opportunities.json');
+  const id = 'shortlist-test-2026-07';
+  const original = {
+    updated: '2026-07-24',
+    opportunities: [{
+      id, company: 'Shortlist Test', role: 'Engineer', status: 'new', score: 75,
+      category: 'startup', notes: '', contacts: [], log: [],
+    }],
+  };
+  fs.writeFileSync(trackerFile, `${JSON.stringify(original, null, 2)}\n`);
+  const before = JSON.parse((await request({ path: '/api/opportunities' })).text);
+
+  const host = `127.0.0.1:${port}`;
+  const response = await request({
+    method: 'POST', path: '/api/status',
+    headers: { host, origin: `http://${host}`, 'content-type': 'application/json' },
+    body: JSON.stringify({ id, status: 'shortlist', trackerRevision: before.trackerRevision }),
+  });
+  assert.equal(response.status, 200);
+  assert.equal(JSON.parse(response.text).ok, true);
+
+  const saved = JSON.parse(fs.readFileSync(trackerFile, 'utf8')).opportunities[0];
+  assert.equal(saved.status, 'shortlist');
+});
+
 test('a UI mutation racing scan completion preserves every tracked user field', { concurrency: false }, async () => {
   seedWorkspace(APP_ROOT, testWorkspace);
   const trackerFile = path.join(testWorkspace, 'data', 'opportunities.json');
