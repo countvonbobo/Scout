@@ -36,3 +36,16 @@ export function resolveArtifact(existingSlugs, opportunity, slugOfCompany, oppor
   }
   return { slug: preferred, legacy: false, ambiguous: false };
 }
+
+// The client decides, via a prompt, whether an existing legacy company folder is
+// reused or a fresh per-role folder is started. That answer reaches the write path
+// as a requested slug, so it is never trusted verbatim: only a slug this resolver
+// would itself produce for this opportunity - the per-role slug, or the legacy
+// folder it resolved to - is honoured. Anything else falls back to the resolution.
+export function chooseArtifactSlug(existingSlugs, opportunity, slugOfCompany, opportunities = [], requested = '') {
+  const resolved = resolveArtifact(existingSlugs, opportunity, slugOfCompany, opportunities);
+  const fresh = artifactSlugFor(opportunity);
+  const wanted = String(requested || '').trim();
+  if (wanted && (wanted === resolved.slug || wanted === fresh)) return wanted;
+  return resolved.slug;
+}

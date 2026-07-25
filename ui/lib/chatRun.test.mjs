@@ -27,7 +27,7 @@ test('happy path: streams events, captures session, text, files, usage', async (
   assert.equal(r.ok, true);
   assert.equal(r.text, 'echo: hello world');
   assert.equal(r.sessionId, 'fake-sess-1');
-  assert.deepEqual(r.filesTouched, ['applications/acme/cv.typ']);
+  assert.deepEqual(r.filesTouched, ['applications/acme-role-2026-07/cv.typ']);
   assert.equal(r.usage.costUsd, 0.01);
   assert.ok(events.some((e) => e.kind === 'delta'));
   assert.ok(events.some((e) => e.kind === 'tool'));

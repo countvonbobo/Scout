@@ -104,6 +104,64 @@ test('chat prefills honour per-CV option query parameters', async () => {
   assert.match(body.prefills.cv, /xyz=false and humanize=true/);
 });
 
+// Bug #55: the browser's confirm() answer must reach the write path, and the
+// server must not take an arbitrary slug from the query on trust.
+async function prefillsFor(root, query = '') {
+  const routes = routeFixture(root);
+  const response = new MockResponse();
+  routes['GET /api/chat'](
+    new EventEmitter(), response, '',
+    new URL(`http://127.0.0.1/api/chat?id=${ID}${query}`),
+  );
+  await response.finished;
+  return JSON.parse(response.text()).prefills;
+}
+
+test('the CV write path is keyed by the opportunity, so a legacy company folder is never written over by default', async () => {
+  const root = tmpRoot();
+  // A legacy company folder exists on disk and is shared by two tracked roles.
+  fs.mkdirSync(path.join(root, 'applications', 'acme'), { recursive: true });
+  fs.writeFileSync(path.join(root, 'applications', 'acme', 'cv.typ'), 'other role\n');
+  const routes = {};
+  registerChatRoutes({
+    routes,
+    repoRoot: root,
+    readTracker: () => ({ opportunities: [ENTRY, { id: 'acme-other-2026-07', company: 'Acme', role: 'Other' }] }),
+    providerStatusFn: () => ({ installed: true, authenticated: true, executable: 'provider', env: process.env }),
+  });
+  const response = new MockResponse();
+  // "Start fresh": the client passes this opportunity's own slug.
+  routes['GET /api/chat'](
+    new EventEmitter(), response, '',
+    new URL(`http://127.0.0.1/api/chat?id=${ID}&artifact=${ID}`),
+  );
+  await response.finished;
+  const prefills = JSON.parse(response.text()).prefills;
+  assert.match(prefills.cv, new RegExp(`applications/${ID}/cv\\.typ`));
+  assert.match(prefills.cv, new RegExp(`applications/${ID}/cv-evidence\\.json`));
+  assert.doesNotMatch(prefills.cv, /applications\/acme\//);
+  // The other role's file was never a write target and is untouched.
+  assert.equal(fs.readFileSync(path.join(root, 'applications', 'acme', 'cv.typ'), 'utf8'), 'other role\n');
+});
+
+test('an explicitly reused legacy folder is honoured, but an arbitrary requested slug is rejected', async () => {
+  const root = tmpRoot();
+  fs.mkdirSync(path.join(root, 'applications', 'acme'), { recursive: true });
+  fs.writeFileSync(path.join(root, 'applications', 'acme', 'cv.typ'), 'legacy\n');
+  // "Open it as-is": the legacy slug is one this server's own resolver produces.
+  const reused = await prefillsFor(root, '&artifact=acme');
+  assert.match(reused.cv, /applications\/acme\/cv\.typ/);
+  // An attacker-supplied slug is not a slug the resolver would produce, so it is
+  // discarded and the server's own resolution is used instead.
+  const forged = await prefillsFor(root, '&artifact=someone-elses-folder');
+  assert.doesNotMatch(forged.cv, /someone-elses-folder/);
+  assert.match(forged.cv, /applications\/acme\/cv\.typ/);
+  // With no legacy folder on disk at all, resolution is the per-role folder.
+  const clean = await prefillsFor(tmpRoot(), '&artifact=../../etc/passwd');
+  assert.match(clean.cv, new RegExp(`applications/${ID}/cv\\.typ`));
+  assert.doesNotMatch(clean.cv, /passwd/);
+});
+
 test('interview prep GET uses a separate transcript and returns the saved pack without running a provider', async () => {
   const root = tmpRoot();
   const job = emptyChat('claude');
@@ -272,7 +330,7 @@ test('handoff route summarises the old session, starts the other engine, and per
     assert.ok(saved.messages.some((m) => m.role === 'system' && m.text.includes(`echo: ${HANDOFF_SUMMARY_PROMPT}`)));
     assert.ok(saved.messages.some((m) => m.role === 'user' && m.text.includes('taking over an in-progress task')));
     assert.ok(saved.messages.some((m) => m.role === 'assistant' && m.text.includes('taking over an in-progress task')));
-    assert.deepEqual(saved.filesTouched, ['applications/acme/cv.typ']);
+    assert.deepEqual(saved.filesTouched, ['applications/acme-role-2026-07/cv.typ']);
   } finally {
     ENGINES.claude = oldClaude;
     ENGINES.codex = oldCodex;
@@ -406,7 +464,7 @@ test('a failed send preserves emitted session and file metadata for retry', { co
 
 test('a CV writing turn triggers installed-app quality validation when evidence exists', { concurrency: false }, async () => {
   const root = tmpRoot();
-  const app = path.join(root, 'applications', 'acme');
+  const app = path.join(root, 'applications', 'acme-role-2026-07');
   fs.mkdirSync(app, { recursive: true });
   fs.writeFileSync(path.join(app, 'cv.typ'), '#show: cv.with(name: "Example")\n');
   fs.writeFileSync(path.join(app, 'cv-evidence.json'), '{"schemaVersion":1}\n');
@@ -418,10 +476,10 @@ test('a CV writing turn triggers installed-app quality validation when evidence 
       runCvQualityFn: (repoRoot, slug, options) => qualityCalls.push({ repoRoot, slug, options }),
     });
     await callRoute(routes['POST /api/chat/send'], JSON.stringify({ id: ID, engine: 'claude', text: 'hello' }));
-    assert.deepEqual(qualityCalls, [{ repoRoot: root, slug: 'acme', options: { locale: 'en-GB' } }]);
+    assert.deepEqual(qualityCalls, [{ repoRoot: root, slug: 'acme-role-2026-07', options: { locale: 'en-GB' } }]);
     const saved = loadChat(root, ID);
-    assert.ok(saved.filesTouched.includes('applications/acme/cv-quality.json'));
-    assert.ok(saved.filesTouched.includes('applications/acme/cv.pdf'));
+    assert.ok(saved.filesTouched.includes('applications/acme-role-2026-07/cv-quality.json'));
+    assert.ok(saved.filesTouched.includes('applications/acme-role-2026-07/cv.pdf'));
   } finally {
     ENGINES.claude = oldClaude;
   }

@@ -1,3 +1,5 @@
+import { artifactSlugFor } from './cvArtifacts.mjs';
+
 export function slugOf(company) {
   return String(company || '').toLowerCase()
     .replace(/&/g, ' and ')
@@ -6,7 +8,11 @@ export function slugOf(company) {
 }
 
 export function buildPrefills(entry, options = {}) {
-  const slug = slugOf(entry.company);
+  // Keyed by the tracked opportunity, not the company, so two roles at one
+  // employer never write over each other. The caller resolves and validates the
+  // slug (including a deliberately reused legacy company folder); the fallback
+  // here is the per-role slug, never the company slug.
+  const slug = String(options.artifactSlug || '').trim() || artifactSlugFor(entry);
   const cvPath = `applications/${slug}/cv.typ`;
   const evidencePath = `applications/${slug}/cv-evidence.json`;
   const style = [options.locale, options.tone].filter(Boolean).join(', ') || 'the locale and tone in workspace.json';
