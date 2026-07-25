@@ -61,3 +61,20 @@ test('established settings and backup use separate dismissible views', () => {
   assert.match(html, /\.settings-hub\s*\{[^}]*grid-template-columns:repeat\(2/s);
   assert.match(html, /@media \(max-width: 650px\)[\s\S]*\.settings-hub \{ grid-template-columns:1fr/);
 });
+
+test('report date navigation stays a vertical sidebar on desktop', () => {
+  const html = fs.readFileSync(new URL('./index.html', import.meta.url), 'utf8');
+  const rule = html.match(/\.report-list \.dates \{[^}]*\}/);
+  assert.ok(rule, 'expected a .report-list .dates rule');
+  assert.match(rule[0], /flex-direction:\s*column/);
+  assert.match(rule[0], /min-width:\s*0/);
+  assert.match(rule[0], /flex:\s*0 0 220px/);
+});
+
+test('CV create panel keeps its primary action on screen', () => {
+  const html = fs.readFileSync(new URL('./index.html', import.meta.url), 'utf8');
+  const rule = html.match(/\.cv-create[^{]*\{[^}]*\}/);
+  assert.ok(rule, 'expected a .cv-create rule');
+  assert.match(html, /\.cv-create select \{[^}]*max-width/);
+  assert.match(html, /\.cv-create label \{[^}]*min-width:\s*0/);
+});

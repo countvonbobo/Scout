@@ -85,7 +85,7 @@ The CV library also renders the approved master Markdown as a clearly labelled r
 From a source checkout, rerun the same review with:
 
 ```powershell
-node tools/scout.mjs cv quality <company-slug> --workspace "$HOME\Documents\Scout Workspace"
+node tools/scout.mjs cv quality <application-slug> --workspace "$HOME\Documents\Scout Workspace"
 ```
 
 ## 5. Add sources
@@ -105,13 +105,13 @@ Use `claude` instead if selected. Review the dated report and tracker changes. C
 
 If the supervised primary scan keeps zero roles, Scout automatically performs one broader discovery pass. It widens source queries, not your approved gates: salary, hard exclusions, location/commute, mandatory evidence and scoring remain in force. The completed result stays visible as “reviewed / kept”; **Review this scan** shows concise reasons for every discarded candidate without adding weak roles to the tracker.
 
-New opportunities land in the **Jobs** tab, highest score first, each carrying a colour tag for its search category. Choose **Yes, shortlist** to move a role to the **Shortlist** tab, or **No** to dismiss it; dismissing shows a brief **Undo** toast that restores the role to Jobs. Tap a card to expand its full detail, including the original advert. From the **Shortlist** tab, **Remove** dismisses a role the same way (with undo), and **Create tailored CV** starts the CV options flow above; marking a shortlisted role as applied moves it to the **Pipeline** tab. Dismissed and applied roles remain visible in the **All** tab and are never re-surfaced by a later scan.
+New opportunities land in the **Jobs** tab, highest score first, each carrying a colour tag for its search category. Choose **Yes, shortlist** to move a role to the **Shortlist** tab, or **No** to dismiss it; dismissing shows a brief **Undo** toast that restores the role to Jobs. Tap a card to expand its full detail, including the original advert. From the **Shortlist** tab, **Remove** dismisses a role the same way (with undo), and **Review CV options** starts the same CV options flow described above; marking a shortlisted role as applied moves it to the **Pipeline** tab. Dismissed and applied roles remain visible in the **All** tab and are never re-surfaced by a later scan.
 
 The **All** tab is a searchable table. On a phone, swipe the labelled table region horizontally to reach commute, stage, status and last-checked columns; filtering keeps the text cursor and in-progress keyboard composition in place.
 
 ## 7. Enable daily scans (optional)
 
-During setup, choose the local daily time and enable the schedule after the first healthy scan. Return to **Settings → First scan** to change or disable it later. The command-line equivalent is:
+During setup, choose the local daily time and enable the schedule after the first healthy scan. Return to **Settings → First scan** to change or disable it later — an existing schedule's time, days and model stay editable even after a later run is unhealthy, stale or skipped. The command-line equivalent is:
 
 ```powershell
 & $ScoutNode $ScoutCli schedule install --time 07:30 --provider codex

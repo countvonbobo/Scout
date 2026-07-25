@@ -59,3 +59,20 @@ Coverage was degraded; this is not evidence that no suitable roles exist.
   assert.match(html, /None\./);
   assert.match(html, /source unavailable/);
 });
+
+test('nested markdown headings render as headings, not raw text', () => {
+  const html = render(['# Daily report', '', '## Discarded', '', '### Closest reviewed roles not kept', '', 'Body text.'].join('\n'));
+  assert.match(html, /<h4>Closest reviewed roles not kept<\/h4>/);
+  assert.doesNotMatch(html, /###/);
+});
+
+test('headings deeper than the HTML heading range clamp instead of leaking raw markers', () => {
+  const html = render([
+    '# Daily report', '', '## Discarded', '',
+    '###### Six', '', '####### Seven', '', '######## Eight',
+  ].join('\n'));
+  assert.match(html, /<h6>Six<\/h6>/);
+  assert.match(html, /<h6>Seven<\/h6>/);
+  assert.match(html, /<h6>Eight<\/h6>/);
+  assert.doesNotMatch(html, /#/);
+});

@@ -292,7 +292,7 @@ export function requestAccess(req, url, settings = loadDeviceSettings()) {
     || url.pathname.startsWith('/api/sync/')
     || url.pathname.startsWith('/api/workspace/')
     || url.pathname.startsWith('/api/remote-access/')
-    || ['POST /api/restart', 'POST /api/setup/proposal', 'POST /api/setup/activate', 'POST /api/setup/recovery', 'DELETE /api/setup/proposal'].includes(`${req.method} ${url.pathname}`);
+    || ['POST /api/restart', 'POST /api/setup/proposal', 'POST /api/setup/activate', 'POST /api/setup/recovery'].includes(`${req.method} ${url.pathname}`);
   if (mutatingApi && requiresJson) {
     const mediaType = String(req.headers['content-type'] || '').split(';', 1)[0].trim().toLowerCase();
     if (mediaType !== 'application/json') {
@@ -1182,8 +1182,11 @@ routes['POST /api/schedule'] = (req, res, body) => {
     const model = assertSafeModel(b.model);
     let result;
     if (b.action === 'install') {
-      const health = readScanHealth();
-      if (!health.lastRunAt || !health.healthy) return replyJson(res, 409, { error: 'complete a healthy supervised scan before enabling daily scans' });
+      const configured = (config.schedule?.jobs || []).some((job) => job.id === id);
+      if (!configured) {
+        const health = readScanHealth();
+        if (!health.lastRunAt || !health.healthy) return replyJson(res, 409, { error: 'complete a healthy supervised scan before enabling daily scans' });
+      }
       if (b.days !== undefined && b.days !== null && !Array.isArray(b.days)) {
         return replyJson(res, 400, { error: 'days must be an array of whole numbers from 0 (Sunday) to 6 (Saturday)' });
       }

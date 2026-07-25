@@ -9,6 +9,8 @@ import { buildCodexArgs, parseCodexLine } from './chatCodex.mjs';
 import { runTurn } from './chatRun.mjs';
 import { buildPrefills, HANDOFF_SUMMARY_PROMPT, handoffOpening, slugOf } from './chatPrompts.mjs';
 import { runCvQuality } from './cvQuality.mjs';
+import { artifactSlugFor, chooseArtifactSlug } from './cvArtifacts.mjs';
+import { listCvFiles } from './cv.mjs';
 import { readUsage } from './usage.mjs';
 import { detectedModels, isSafeModelId, providerModels } from './providerModels.mjs';
 import { loadWorkspaceConfig, modelForProvider } from './workspace.mjs';
@@ -130,11 +132,28 @@ export function registerChatRoutes({
     return fs.readFileSync(file, 'utf8').slice(0, maximum);
   }
 
+  // The folder the agent must write into. The browser prompts the user when an
+  // existing legacy company folder could be reused, and passes their answer back
+  // as `requested`; chooseArtifactSlug only honours it if it matches a slug this
+  // server would itself resolve for this opportunity, so an arbitrary path from a
+  // request body can never redirect a write.
+  function artifactSlugForEntry(entry, requested = '') {
+    let existing = [];
+    try { existing = listCvFiles(repoRoot).applications || []; } catch { existing = []; }
+    let opportunities = [];
+    try { opportunities = readTracker().opportunities || []; } catch { opportunities = []; }
+    return chooseArtifactSlug(existing, entry, slugOf, opportunities, requested);
+  }
+
+  // After a turn, review whichever of this opportunity's own folders the agent
+  // actually touched - the per-role folder, or a legacy company folder the user
+  // explicitly chose to reuse. Never any other role's folder.
   function refreshCvQuality(entry, filesTouched = []) {
     if (!entry || entry.id === ONBOARDING_CHAT_ID) return [];
-    const slug = slugOf(entry.company);
-    const prefix = `applications/${slug}/`;
-    if (!(filesTouched || []).some((file) => String(file).startsWith(prefix))) return [];
+    const touched = (filesTouched || []).map((file) => String(file));
+    const candidates = [artifactSlugFor(entry), slugOf(entry.company)].filter(Boolean);
+    const slug = candidates.find((value) => touched.some((file) => file.startsWith(`applications/${value}/`)));
+    if (!slug) return [];
     const source = path.join(repoRoot, 'applications', slug, 'cv.typ');
     const evidence = path.join(repoRoot, 'applications', slug, 'cv-evidence.json');
     if (!fs.existsSync(source) || !fs.existsSync(evidence)) return [];
@@ -187,7 +206,12 @@ export function registerChatRoutes({
         ? { ask: onboardingPrefill(config), review: 'Review the currently staged onboarding changes. Summarise each proposed change, flag any unsupported claims or missing evidence, and do not activate anything.', approve: 'I have reviewed the staged onboarding changes. Validate them once more, show me the exact files that will be activated, and ask for final confirmation before activation.' }
         : purpose === 'interview-prep'
           ? interviewPrepPrefills(entry)
-          : buildPrefills(entry, { locale: config.locale, tone: config.profile?.tone, cvOptions }),
+          : buildPrefills(entry, {
+            locale: config.locale,
+            tone: config.profile?.tone,
+            cvOptions,
+            artifactSlug: artifactSlugForEntry(entry, url.searchParams.get('artifact') || ''),
+          }),
       busy: running.has(id),
     });
   };

@@ -28,7 +28,7 @@ process.stdin.on('end', () => {
     message: {
       content: [
         { type: 'text', text: `echo: ${prompt}` },
-        { type: 'tool_use', name: 'Edit', input: { file_path: 'applications/acme/cv.typ' } },
+        { type: 'tool_use', name: 'Edit', input: { file_path: 'applications/acme-role-2026-07/cv.typ' } },
       ],
     },
   }));

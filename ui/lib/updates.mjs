@@ -56,7 +56,7 @@ export async function checkForUpdate(currentVersion, fetchFn = globalThis.fetch,
 export function parseChecksums(text) {
   const entries = new Map();
   for (const line of String(text || '').split(/\r?\n/)) {
-    const match = line.match(/^([a-fA-F0-9]{64})\s+\*?([^/\\]+)$/);
+    const match = line.trim().match(/^([a-fA-F0-9]{64})\s+\*?(?:\.\/)?([^/\\]+)$/);
     if (match) entries.set(match[2], match[1].toLowerCase());
   }
   return entries;

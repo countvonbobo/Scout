@@ -986,6 +986,8 @@ const Setup = {
     const health = this.status?.scanHealth || {};
     const schedule = this.status?.schedule || {};
     const healthy = Boolean(health.lastRunAt && health.healthy);
+    const configuredJobs = (this.status?.config?.schedule?.jobs || []).some((job) => job.enabled !== false);
+    const hasHistory = Boolean(health.lastRunAt) || configuredJobs;
     const provider = this.status?.config?.ai?.provider;
     const primaryId = `${provider}-primary`;
     const primaryRun = (schedule.runs || []).find((run) => run.id === primaryId);
@@ -1005,17 +1007,17 @@ const Setup = {
       <label class="setup-field">Days<select data-schedule-preset>${DAY_PRESETS.map(([value, label]) => `<option value="${value}" ${preset === value ? 'selected' : ''}>${label}</option>`).join('')}</select></label>
       <fieldset class="setup-schedule-days" data-schedule-days ${preset === 'custom' ? '' : 'hidden'}><legend>Days this job runs</legend>${DAY_LABELS.map((label, day) => `<label><input type="checkbox" data-schedule-day="${day}" ${days.includes(day) ? 'checked' : ''}> ${label}</label>`).join('')}</fieldset>
       <label class="setup-field">Scan model <span>Optional; used for this scan job. Blank uses the provider default</span><input data-schedule-model type="text" value="${this.escape(run?.model || '')}" placeholder="Provider default" pattern="[A-Za-z0-9._:\\-]+"></label>
-      <p><button class="act" data-schedule-enable="${this.escape(id)}" data-provider="${this.escape(name)}" data-mode="${this.escape(mode)}" type="button" ${healthy ? '' : 'disabled'}>${run?.configured ? 'Save scan settings' : `Enable ${name} ${mode === 'primary' ? 'scan' : 'verification pass'}`}</button>${run?.configured ? ` <button class="act" data-schedule-disable="${this.escape(id)}" type="button">Disable</button>` : ''}</p>
+      <p><button class="act" data-schedule-enable="${this.escape(id)}" data-provider="${this.escape(name)}" data-mode="${this.escape(mode)}" type="button" ${(healthy || run?.configured) ? '' : 'disabled'}>${run?.configured ? 'Save scan settings' : `Enable ${name} ${mode === 'primary' ? 'scan' : 'verification pass'}`}</button>${run?.configured ? ` <button class="act" data-schedule-disable="${this.escape(id)}" type="button">Disable</button>` : ''}</p>
       ${run?.configured ? `<p class="meta">Currently runs: ${this.escape(run.daysLabel || 'Every day')} at ${this.escape(run.time || defaultTime)}.</p>` : ''}
     </div>`;
     };
     this.el('setup-body').innerHTML = `
       <div class="setup-conversation"><div class="setup-scout"><span class="setup-scout-frame" role="img" aria-label="Scout is ready to search"></span></div><div class="scout-bubble tail-left">
-      <h2>${healthy ? 'Your first scan is ready to review' : 'Run your first search with me'}</h2>
+      <h2>${hasHistory ? 'Your first scan is ready to review' : 'Run your first search with me'}</h2>
       <p>I search using your approved role families and search lanes, then apply your locations, exclusions, compensation preferences and evidence-based scoring. I do not use unrelated AI conversations.</p>
-      <div class="setup-callout"><strong>${healthy ? 'Supervised scan completed' : 'Supervised first scan'}</strong><p>${healthy ? `Last run: ${this.escape(formatLocalDateTime(health.lastRunAt, this.status?.config?.locale))}.` : 'A full source check can take several minutes and no application will be sent.'}</p>${outcome ? `<p><strong>${this.escape(outcome.headline)}</strong>${outcome.breakdown.length ? ` — ${this.escape(outcome.breakdown.join(', '))}` : ''}. Zero keepers can be a valid strict result.</p><p><a href="#reports" data-report-date="${this.escape(String(health.lastRunAt).slice(0, 10))}">Review the dated scan report</a></p>` : ''}</div>
+      <div class="setup-callout"><strong>${hasHistory ? 'Supervised scan completed' : 'Supervised first scan'}</strong><p>${healthy ? `Last run: ${this.escape(formatLocalDateTime(health.lastRunAt, this.status?.config?.locale))}.` : 'A full source check can take several minutes and no application will be sent.'}</p>${outcome ? `<p><strong>${this.escape(outcome.headline)}</strong>${outcome.breakdown.length ? ` — ${this.escape(outcome.breakdown.join(', '))}` : ''}. Zero keepers can be a valid strict result.</p><p><a href="#reports" data-report-date="${this.escape(String(health.lastRunAt).slice(0, 10))}">Review the dated scan report</a></p>` : ''}</div>
       ${this.operationPanelHtml('scan')}
-      <p><button id="setup-run-scan" class="act primary" type="button" ${scanning ? 'disabled' : ''}>${scanning ? 'Scan running…' : healthy ? 'Scan now' : 'Run first scan now'}</button></p>
+      <p><button id="setup-run-scan" class="act primary" type="button" ${scanning ? 'disabled' : ''}>${scanning ? 'Scan running…' : hasHistory ? 'Scan now' : 'Run first scan now'}</button></p>
       <div class="setup-callout"><strong>Daily scan schedule</strong><p>Each provider job is independent. First-run setup only offers your selected provider.</p>
       ${scheduleRow(primaryId, provider, 'primary', primaryRun, '07:30')}
       ${this.view === 'section' && other && !showSecond ? '<p><button id="setup-add-verification" class="act" type="button">Add verification pass</button></p>' : ''}

@@ -95,8 +95,8 @@ export function setCategory(data, id, category) {
 export function setCommute(data, id, commute, today) {
   return withEntry(data, id, (e) => {
     e.commute = {
-      originPostcode: String(commute?.originPostcode || e.commute?.originPostcode || '').trim(),
-      destination: String(commute?.destination || e.location || '').trim(),
+      originPostcode: String(commute?.originPostcode ?? e.commute?.originPostcode ?? '').trim(),
+      destination: String(commute?.destination ?? e.location ?? '').trim(),
       carMinutes: cleanMinutes(commute?.carMinutes, 'car'),
       publicTransportMinutes: cleanMinutes(commute?.publicTransportMinutes ?? commute?.trainMinutes, 'public transport'),
       checked: validDateOrNull(commute?.checked) || today,

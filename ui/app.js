@@ -65,6 +65,39 @@ function categoryColor(categoryId, categoryIds) {
   const position = index >= 0 ? index : 0;
   return CATEGORY_PALETTE[position % CATEGORY_PALETTE.length];
 }
+// Tailored CV artifacts are keyed by the tracked opportunity so two roles at one
+// company never share a directory. Legacy company-slug directories stay exactly
+// where they are: they are reused in place and flagged, never moved or deleted.
+// Inlined verbatim (behaviourally) from ui/lib/cvArtifacts.mjs — this is a classic
+// script and cannot use `import`.
+const CV_SLUG = /^[a-z0-9-]+$/;
+function cvSlugify(value) {
+  return String(value || '').toLowerCase().replace(/&/g, ' and ')
+    .replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
+}
+function artifactSlugFor(opportunity) {
+  const id = String(opportunity?.id || '');
+  if (CV_SLUG.test(id)) return id;
+  return [cvSlugify(opportunity?.company), cvSlugify(opportunity?.role)].filter(Boolean).join('-');
+}
+function resolveArtifact(existingSlugs, opportunity, slugOfCompany, opportunities = []) {
+  const slugs = new Set(existingSlugs || []);
+  const preferred = artifactSlugFor(opportunity);
+  if (slugs.has(preferred)) return { slug: preferred, legacy: false, ambiguous: false };
+  const legacy = slugOfCompany(opportunity?.company);
+  if (legacy && slugs.has(legacy)) {
+    const sharing = (opportunities || []).filter((o) => slugOfCompany(o.company) === legacy).length;
+    return { slug: legacy, legacy: true, ambiguous: sharing > 1 };
+  }
+  return { slug: preferred, legacy: false, ambiguous: false };
+}
+function chooseArtifactSlug(existingSlugs, opportunity, slugOfCompany, opportunities = [], requested = '') {
+  const resolved = resolveArtifact(existingSlugs, opportunity, slugOfCompany, opportunities);
+  const fresh = artifactSlugFor(opportunity);
+  const wanted = String(requested || '').trim();
+  if (wanted && (wanted === resolved.slug || wanted === fresh)) return wanted;
+  return resolved.slug;
+}
 function codexTaskUrl(sessionId) {
   const value = String(sessionId || '').trim();
   if (!/^[A-Za-z0-9-]+$/.test(value)) return null;
@@ -746,7 +779,7 @@ const Scout = {
       <div class="detail"></div>
       <div class="triage-actions">
         <button class="act triage-no" data-action="remove-shortlist" data-id="${this.esc(e.id)}">Remove</button>
-        <button class="act bridge" data-action="choose-cv-options" data-id="${this.esc(e.id)}">Create tailored CV</button>
+        <button class="act bridge" data-action="choose-cv-options" data-id="${this.esc(e.id)}">Review CV options</button>
       </div>
     </div>`;
   },
@@ -1029,7 +1062,7 @@ const Scout = {
       ? `<ol class="stage-list">${stages.map((s, i) =>
           `<li>${this.esc(s.completed ? '[x]' : '[ ]')} ${this.esc(s.name)}${s.date ? ' - ' + this.esc(s.date) : ''}${!s.completed ? ` <button class="act" data-action="complete-stage" data-id="${this.esc(e.id)}" data-index="${i}">complete</button>` : ''}</li>`).join('')}</ol>`
       : '<div class="meta">no application stages yet</div>';
-    const slug = this.slugOf(e.company);
+    const slug = this.resolveArtifactFor(e).slug;
     const cvFiles = this.state.cvFiles || { applications: [], outreach: [] };
     const hasCv = (cvFiles.applications || []).includes(slug);
     const hasOutreach = (cvFiles.outreach || []).includes(slug);
@@ -1122,6 +1155,16 @@ const Scout = {
       .replace(/&/g, ' and ')
       .replace(/[^a-z0-9]+/g, '-')
       .replace(/^-+|-+$/g, '');
+  },
+
+  artifactSlugFor(entry) { return artifactSlugFor(entry); },
+  resolveArtifactFor(entry) {
+    return resolveArtifact(
+      this.state.cvFiles?.applications || [],
+      entry,
+      (company) => this.slugOf(company),
+      this.state.data?.opportunities || [],
+    );
   },
 
   localToday() {
@@ -1297,8 +1340,9 @@ const Scout = {
     this.openCv(`applications/${slug}/outreach.md`, null);
   },
 
-  chooseCvOptions(id) {
+  chooseCvOptions(id, artifactSlug = null) {
     this.cvOptionsOpportunityId = id;
+    this.cvOptionsArtifactSlug = artifactSlug || null;
     document.getElementById('cv-option-xyz').checked = true;
     document.getElementById('cv-option-humanize').checked = true;
     document.getElementById('cv-options-overlay').classList.remove('hidden');
@@ -1306,6 +1350,7 @@ const Scout = {
 
   closeCvOptions() {
     this.cvOptionsOpportunityId = null;
+    this.cvOptionsArtifactSlug = null;
     document.getElementById('cv-options-overlay').classList.add('hidden');
   },
 
@@ -1316,8 +1361,9 @@ const Scout = {
       xyz: document.getElementById('cv-option-xyz').checked,
       humanize: document.getElementById('cv-option-humanize').checked,
     };
+    const artifactSlug = this.cvOptionsArtifactSlug;
     this.closeCvOptions();
-    this.openChat(id, 'cv', cvOptions);
+    this.openChat(id, 'cv', cvOptions, 'job', artifactSlug);
   },
 
   async renderCv() {
@@ -1331,7 +1377,7 @@ const Scout = {
       const opportunityId = matches.length === 1 ? matches[0].id : null;
       const label = matches.length === 1
         ? `${matches[0].company} — ${matches[0].role}`
-        : matches.length > 1 ? `${matches[0].company} — ${matches.length} tracked roles` : entry.slug;
+        : matches.length > 1 ? `${matches[0].company} — ${matches.length} tracked roles (shared folder — created before per-role CVs)` : entry.slug;
       const pdfState = entry.pdfCurrent ? 'PDF ready' : entry.pdfStale ? 'PDF stale' : 'PDF missing';
       const states = [pdfState, entry.quality ? 'quality recorded' : 'legacy', matches.length ? null : 'unmatched']
         .filter(Boolean).map((value) => `<span class="chip">${this.esc(value)}</span>`).join('');
@@ -1343,9 +1389,9 @@ const Scout = {
     const opportunityOptions = opportunities.map((entry) =>
       `<option value="${this.esc(entry.id)}">${this.esc(entry.company)} — ${this.esc(entry.role)}</option>`).join('');
     el.innerHTML = `
-      <div class="cv-library-head"><div><h2>CV library</h2><div class="meta">Existing sources remain available even before a PDF or quality review exists.</div></div><button class="act bridge" data-action="toggle-cv-create">Create tailored CV</button></div>
-      <div id="cv-create-panel" class="cv-create-panel hidden">
-        ${opportunityOptions ? `<label>Tracked opportunity<select id="cv-create-opportunity">${opportunityOptions}</select></label><button class="act primary" data-action="start-cv-create">Continue</button>` : '<div class="meta">Add a tracked opportunity before creating a tailored CV.</div>'}
+      <div class="cv-library-head"><div><h2>CV library</h2><div class="meta">Existing sources remain available even before a PDF or quality review exists.</div></div><button class="act bridge" data-action="toggle-cv-create">Review CV options</button></div>
+      <div id="cv-create-panel" class="cv-create-panel hidden cv-create">
+        ${opportunityOptions ? `<label>Tracked opportunity<select id="cv-create-opportunity">${opportunityOptions}</select></label><button class="act primary" data-action="start-cv-create">Start tailored CV</button>` : '<div class="meta">Add a tracked opportunity before creating a tailored CV.</div>'}
       </div>
       <div class="cv-layout">
         <aside class="cv-sidebar">
@@ -1354,10 +1400,11 @@ const Scout = {
           <div class="label">applications</div>${appBtns}
         </aside>
         <section class="cv-editor-panel">
-          <div class="label"><span id="cv-editing">select a file</span> <span id="cv-dirty" style="color:var(--warn)"></span></div>
+          <div class="label"><span id="cv-editing">select a file</span> <span id="cv-dirty" style="color:var(--warn)"></span> <span id="cv-status" class="meta"></span></div>
           <textarea id="cv-text" class="cv-source" data-input-action="cv-dirty"></textarea>
            <div class="controls" style="flex-wrap:wrap;margin-top:6px">
-             <button id="cv-save-render" class="act" data-action="save-cv">save + render</button>
+             <button id="cv-save" class="act" data-action="save-cv">save changes</button>
+             <button id="cv-render" class="act" data-action="render-cv">render PDF</button>
              <button id="cv-download" class="act" data-action="download-cv" disabled>download PDF</button>
            </div>
            <div id="cv-quality" class="cv-quality"><div class="meta">Select a tailored CV to see its quality review.</div></div>
@@ -1407,7 +1454,8 @@ const Scout = {
   },
 
   opportunitiesForSlug(slug) {
-    return (this.state.data?.opportunities || []).filter((entry) => this.slugOf(entry.company) === slug);
+    return (this.state.data?.opportunities || []).filter((entry) =>
+      this.artifactSlugFor(entry) === slug || this.slugOf(entry.company) === slug);
   },
 
   toggleCvCreate() {
@@ -1417,10 +1465,30 @@ const Scout = {
   startCvCreate() {
     const id = document.getElementById('cv-create-opportunity')?.value;
     if (!id) return;
+    return this.reviewCvOptions(id);
+  },
+
+  // The single place that resolves an opportunity's CV folder and, where an
+  // existing folder could be reused, asks the user. Every entry point (the CV
+  // library picker and the Shortlist card) routes through here, so no path can
+  // reach generation without the collision prompt. The answer is carried into
+  // generation as the artifact slug, so "start fresh" really does write to a new
+  // per-role folder and the existing folder is never overwritten.
+  reviewCvOptions(id) {
     const entry = (this.state.data?.opportunities || []).find((item) => item.id === id);
-    const slug = this.slugOf(entry?.company);
-    if ((this.state.cvFiles?.applications || []).includes(slug)) return this.seeCv(slug, id);
-    this.chooseCvOptions(id);
+    if (!entry) return;
+    const resolved = this.resolveArtifactFor(entry);
+    const exists = (this.state.cvFiles?.applications || []).includes(resolved.slug);
+    // Not legacy, or legacy but the only tracked role at that employer: the folder
+    // can only be this role's own CV, so open it without a confusing prompt.
+    if (exists && (!resolved.legacy || !resolved.ambiguous)) return this.seeCv(resolved.slug, id);
+    if (exists) {
+      if (!confirm('Scout has an existing CV folder shared with another role at this company, created before per-role CV folders. Open it as-is? Choose Cancel to start a new CV in its own folder for this role - the existing folder is left untouched.')) {
+        return this.chooseCvOptions(id, this.artifactSlugFor(entry));
+      }
+      return this.seeCv(resolved.slug, id);
+    }
+    this.chooseCvOptions(id, resolved.slug);
   },
 
   async refreshCvFilesIfTouched(filesTouched = []) {
@@ -1440,6 +1508,7 @@ const Scout = {
     document.getElementById('cv-text').value = content;
     document.getElementById('cv-editing').textContent = `editing: ${pathRel}`;
     document.getElementById('cv-dirty').textContent = '';
+    this.setCvStatus(''); // a save/render status belongs to the file it came from
     document.querySelectorAll('[data-cv-path]').forEach((b) =>
       b.classList.toggle('active', b.dataset.cvPath === pathRel));
     this.updateCvControls();
@@ -1463,10 +1532,7 @@ const Scout = {
   },
 
   updateCvControls() {
-    const master = Boolean(this.cvState.path && !this.cvState.slug);
     const current = this.currentCvRenderState().current === true;
-    const save = document.getElementById('cv-save-render');
-    if (save) save.textContent = master ? 'save + render reference PDF' : 'save + render tailored PDF';
     for (const id of ['cv-download', 'cv-fullscreen', 'cv-open-pdf']) {
       const button = document.getElementById(id); if (button) button.disabled = !current;
     }
@@ -1480,15 +1546,34 @@ const Scout = {
     else preview.innerHTML = `<div class="cv-preview-status">${state.stale ? 'This PDF is stale because the source changed. Save and render again.' : this.cvState.slug ? 'No tailored PDF yet. Save and render to create it.' : 'No master reference PDF yet. Save and render to create it.'}</div>`;
   },
 
+  setCvStatus(text) {
+    const status = document.getElementById('cv-status');
+    if (status) status.textContent = text;
+  },
+
   async saveCv() {
     if (!this.cvState.path) return alert('Open a file first.');
     const content = document.getElementById('cv-text').value;
+    this.setCvStatus('Saving…');
     const save = await this.post('/api/cv/save', { path: this.cvState.path, content });
-    if (!(save && save.ok)) return;
+    if (!(save && save.ok)) return this.setCvStatus('Save failed. Your changes are still in the editor.');
     this.cvState.dirty = false;
     this.cvState.content = content;
-    document.getElementById('cv-dirty').textContent = '';
-    await this.renderCvPreview();
+    const dirty = document.getElementById('cv-dirty');
+    if (dirty) dirty.textContent = '';
+    this.setCvStatus('Saved. The PDF is out of date until you render it.');
+  },
+
+  async renderCvOnly() {
+    if (!this.cvState.path) return alert('Open a file first.');
+    if (this.cvState.dirty) return this.setCvStatus('Save your changes first — rendering uses the last saved source.');
+    this.setCvStatus('Rendering PDF…');
+    try {
+      await this.renderCvPreview();
+      this.setCvStatus('PDF rendered from the saved source.');
+    } catch (error) {
+      this.setCvStatus(`Saved source is intact. PDF render failed: ${error?.message || String(error)}`);
+    }
   },
 
   async renderCvPreview() {
@@ -1507,6 +1592,7 @@ const Scout = {
       await this.watchCvRender(body.operation.id);
     } catch (e) {
       preview.innerHTML = `<div class="cv-preview-error">Preview could not load: ${this.esc(e.message)}</div>`;
+      throw e;
     }
   },
 
@@ -1588,7 +1674,7 @@ const Scout = {
 
   reviewEvidenceForMaster() {
     if (!this.cvState.opportunityId) return alert('Open this CV from its opportunity card first.');
-    this.openChat(this.cvState.opportunityId, 'reuseEvidence');
+    this.openChat(this.cvState.opportunityId, 'reuseEvidence', null, 'job', this.cvState.slug || null);
   },
 
   pdfUrl({ download = false } = {}) {
@@ -1655,7 +1741,7 @@ const Scout = {
 
   // --- Embedded chat drawer ---
 
-  async openChat(id, prefillKey = 'ask', cvOptions = null, purpose = 'job') {
+  async openChat(id, prefillKey = 'ask', cvOptions = null, purpose = 'job', artifactSlug = null) {
     this.closeCompanyHistory();
     const previous = this.chat;
     if (previous && previous.streaming) {
@@ -1673,7 +1759,11 @@ const Scout = {
       ? `&xyz=${cvOptions.xyz ? '1' : '0'}&humanize=${cvOptions.humanize ? '1' : '0'}`
       : '';
     const purposeQuery = purpose === 'job' ? '' : `&purpose=${encodeURIComponent(purpose)}`;
-    try { r = await this.api(`/api/chat?id=${encodeURIComponent(id)}${purposeQuery}${optionQuery}`); }
+    // The user's answer to the existing-folder prompt (and the folder an already
+    // open CV lives in). The server re-resolves and only honours a slug it would
+    // produce for this opportunity itself.
+    const artifactQuery = artifactSlug ? `&artifact=${encodeURIComponent(artifactSlug)}` : '';
+    try { r = await this.api(`/api/chat?id=${encodeURIComponent(id)}${purposeQuery}${optionQuery}${artifactQuery}`); }
     catch (e) {
       if (openSeq === this.chatOpenSeq) alert(`Could not open chat: ${e.message}`);
       return;
@@ -1956,7 +2046,9 @@ const Scout = {
 
   cvLinkHtml() {
     if (this.chat?.id === 'setup-onboarding') return '';
-    const slug = this.slugOf(this.company(this.chat.id));
+    const entry = (this.state.data?.opportunities || []).find((item) => item.id === this.chat.id);
+    if (!entry) return '';
+    const slug = this.resolveArtifactFor(entry).slug;
     return (this.chat.data.filesTouched || []).includes(`applications/${slug}/cv.typ`)
       ? `<div class="chat-msg system"><a href="#" data-action="see-cv" data-slug="${this.esc(slug)}" data-id="${this.esc(this.chat.id)}">view rendered CV</a></div>`
       : '';
@@ -2190,7 +2282,7 @@ const Scout = {
     if (!this.cvState.opportunityId) {
       return alert('Open this CV from its opportunity card so Scout knows which job chat it belongs to.');
     }
-    this.openChat(this.cvState.opportunityId, 'tweak');
+    this.openChat(this.cvState.opportunityId, 'tweak', null, 'job', this.cvState.slug || null);
   },
 
   async handoffChat() {
@@ -2272,6 +2364,7 @@ const Scout = {
     document.querySelectorAll('nav button').forEach((b) => b.classList.toggle('active', b.dataset.tab === tab));
     ['jobs', 'shortlist', 'pipeline', 'all', 'reports', 'cv'].forEach((t) =>
       document.getElementById(`tab-${t}`)?.classList.toggle('hidden', t !== tab));
+    window.scrollTo?.(0, 0);
     if (tab === 'jobs') this.renderJobs();
     if (tab === 'shortlist') this.renderShortlist();
     if (tab === 'pipeline') this.renderPipeline();
@@ -2296,7 +2389,7 @@ const Scout = {
       case 'mark-accepted': return this.markAccepted(id);
       case 'mark-rejected': return this.rejectOpportunity(id);
       case 'see-cv': return this.seeCv(slug, id || null);
-      case 'choose-cv-options': return this.chooseCvOptions(id);
+      case 'choose-cv-options': return this.reviewCvOptions(id);
       case 'see-cover-letter': return this.seeCoverLetter(slug);
       case 'open-chat': return this.openChat(id, prefill);
       case 'open-company-history': return this.openCompanyHistory(id);
@@ -2308,6 +2401,7 @@ const Scout = {
       case 'toggle-cv-create': return this.toggleCvCreate();
       case 'start-cv-create': return this.startCvCreate();
       case 'save-cv': return this.saveCv();
+      case 'render-cv': return this.renderCvOnly();
       case 'download-cv': return this.downloadCv();
       case 'open-chat-for-cv': return this.openChatForCv();
       case 'fullscreen-cv': return this.fullscreenCv();
