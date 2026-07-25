@@ -6,6 +6,7 @@ import { workspacePaths } from './workspace.mjs';
 import {
   advertMateriallyChanged, jobIdentity, mergeSourceReferences, sameUnderlyingJob, sourceReferencesOf,
 } from './jobIdentity.mjs';
+import { isVerifiable } from './statusGroups.mjs';
 
 const EMPTY_DISCARDED = Object.freeze({ hard_exclusion: 0, mandatory_unmet: 0, below_threshold: 0, provider_discarded: 0 });
 const REVIEW_REASON_LIMIT = 3;
@@ -118,7 +119,7 @@ export function verificationCandidates(candidates, tracker, today, policy = {}) 
   const recentUrls = new Set();
   for (const entry of tracker?.opportunities || []) {
     const recent = entry.lastChecked === today || entry.firstSeen === today;
-    const worthVerifying = recent && (entry.status === 'new' || entry.status === 'watch')
+    const worthVerifying = recent && isVerifiable(entry.status)
       && (typeof entry.score !== 'number' || entry.score >= checkScore - 10);
     if (!worthVerifying) continue;
     for (const url of entry.sources || []) if (url) recentUrls.add(String(url));

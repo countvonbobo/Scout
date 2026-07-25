@@ -11,12 +11,12 @@ function lastOf(log, event) {
   return null;
 }
 
-const CLOSED_STATUSES = new Set(['accepted', 'rejected', 'ignore']);
+import { isClosed, isTriage } from './statusGroups.mjs';
 
 export function followUpsDue(entry, today, policy = {}) {
   const closeoutDays = Number(policy.closeoutDays ?? 10);
   const nudgeDays = Number(policy.nudgeDays ?? 8);
-  if (CLOSED_STATUSES.has(entry.status)) return [];
+  if (isClosed(entry.status)) return [];
   const log = [...(entry.log || [])].sort((x, y) => (x.date < y.date ? -1 : x.date > y.date ? 1 : 0));
   const lastReplied = lastOf(log, 'replied');
   const lastClosed = lastOf(log, 'closed');
@@ -47,8 +47,8 @@ export function triage(data, today, policy = {}) {
     const eligibility = e.eligibility?.status;
     const actionEligible = !eligibility || eligibility === 'eligible';
     const checkEligible = !eligibility || eligibility === 'check';
-    if (e.status === 'new' && actionEligible && typeof s === 'number' && s >= actionScore) action.push(e);
-    else if (e.status === 'new' && typeof s === 'number' && s >= checkScore && s < actionScore
+    if (isTriage(e.status) && actionEligible && typeof s === 'number' && s >= actionScore) action.push(e);
+    else if (isTriage(e.status) && typeof s === 'number' && s >= checkScore && s < actionScore
       && checkEligible && (eligibility === 'check' || (e.tags || []).some((t) => t.includes('Check')))) unlock.push(e);
     else other.push(e);
   }
