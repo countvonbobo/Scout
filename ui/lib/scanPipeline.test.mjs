@@ -307,10 +307,10 @@ test('a verification pass re-examines only what the primary scan decided today',
     { candidateId: 'candidate-004', url: 'https://x.test/old', sources: ['https://x.test/old'] },
   ];
   const tracker = { opportunities: [
-    { id: 'a', status: 'new', score: 82, lastChecked: '2026-07-22', sources: ['https://x.test/kept'] },
+    { id: 'a', status: 'shortlist', score: 82, lastChecked: '2026-07-22', sources: ['https://x.test/kept'] },
     { id: 'b', status: 'watch', score: 47, lastChecked: '2026-07-22', sources: ['https://x.test/near'] },
-    { id: 'c', status: 'new', score: 12, lastChecked: '2026-07-22', sources: ['https://x.test/unrelated'] },
-    { id: 'd', status: 'new', score: 90, lastChecked: '2026-07-01', sources: ['https://x.test/old'] },
+    { id: 'c', status: 'shortlist', score: 12, lastChecked: '2026-07-22', sources: ['https://x.test/unrelated'] },
+    { id: 'd', status: 'shortlist', score: 90, lastChecked: '2026-07-01', sources: ['https://x.test/old'] },
   ] };
   const result = verificationCandidates(candidates, tracker, '2026-07-22', { checkScore: 55 });
   assert.equal(result.verified, true);

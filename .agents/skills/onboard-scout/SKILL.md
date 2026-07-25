@@ -13,6 +13,6 @@ Keep the workspace private, preserve evidence, and never send applications or ou
 4. Draft proposed `workspace.json`, `profile/context.md`, `profile/calibration.md`, `cv/master-cv.md`, and search-lane changes under `.scout/onboarding/`. Preserve existing files during retuning.
 5. Show a concise summary of every proposed change and pause for explicit approval.
 6. After approval, back up affected files under `.scout/backups/`, apply the staged files, and run `node tools/scout.mjs doctor --workspace <path>` again.
-7. For retuning, append dated evidence to `profile/calibration.md`; do not rewrite earlier precedents. Keep tracker and application history intact.
+7. For retuning, append dated evidence to `profile/calibration.md`; do not rewrite earlier precedents. Keep tracker and application history intact (including `new`, `shortlist`, active and closed states).
 
 Reject invented qualifications, undisclosed salary assumptions, guessed contact details, automatic sending, or moving personal files into the public application repository.

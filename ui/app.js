@@ -656,6 +656,7 @@ const Scout = {
   tabForEntry(e) {
     if (e.status === 'new') return 'jobs';
     if (e.status === 'shortlist') return 'shortlist';
+    if (e.status === 'ignore') return 'all';
     return 'pipeline';
   },
 
@@ -755,6 +756,7 @@ const Scout = {
   triageYes(id) { this.post('/api/status', { id, status: 'shortlist' }); },
   triageNo(id) { this.post('/api/status', { id, status: 'ignore' }).then((r) => { if (r && r.ok) this.showUndo(id); }); },
   undoDismiss(id) { this.post('/api/status', { id, status: 'new' }).then(() => this.hideUndo()); },
+  restoreEntry(id) { this.post('/api/status', { id, status: 'new' }); },
 
   showUndo(id) {
     const toast = document.getElementById('undo-toast');
@@ -837,7 +839,7 @@ const Scout = {
     </div>`;
     el.innerHTML = `
       <div class="metrics">
-        ${metric('new', p.summary.new ?? (p.new || []).length)}
+        ${metric('shortlist', p.summary.shortlist ?? (p.shortlist || []).length)}
         ${metric('watch', p.summary.watch ?? (p.watch || []).length)}
         ${metric('active', p.summary.active)}
         ${metric('closed / ignored', p.summary.recentlyClosed)}
@@ -852,7 +854,7 @@ const Scout = {
       </div>
       ${flags}
       <div class="split">
-        ${list('New', p.new || [])}
+        ${list('Shortlist', p.shortlist || [])}
         ${list('Watch', p.watch || [])}
         ${list('Active', p.active)}
         ${list('Closed / ignored', p.recentlyClosed)}
@@ -914,7 +916,7 @@ const Scout = {
         <td>${this.esc(this.commuteMinutes(e, 'car') ?? '-')}</td>
         <td>${this.esc(this.commuteMinutes(e, 'public') ?? '-')}</td>
         <td>${this.esc(this.currentStage(e) || '-')}</td>
-        <td>${this.esc(e.status)}</td><td>${this.esc(e.lastChecked || 'never')}</td></tr>`).join('');
+        <td>${this.esc(e.status)}${e.status === 'ignore' ? ` <button class="act min" data-action="restore" data-id="${this.esc(e.id)}">Restore</button>` : ''}</td><td>${this.esc(e.lastChecked || 'never')}</td></tr>`).join('');
     };
     document.getElementById('tab-all').innerHTML =
       `${this.filterBar()}
@@ -1378,7 +1380,7 @@ const Scout = {
       const label = matches.length === 1
         ? `${matches[0].company} — ${matches[0].role}`
         : matches.length > 1 ? `${matches[0].company} — ${matches.length} tracked roles (shared folder — created before per-role CVs)` : entry.slug;
-      const pdfState = entry.pdfCurrent ? 'PDF ready' : entry.pdfStale ? 'PDF stale' : 'PDF missing';
+      const pdfState = entry.restored ? 'Needs re-rendering after restore' : entry.pdfCurrent ? 'PDF ready' : entry.pdfStale ? 'PDF stale' : 'PDF missing';
       const states = [pdfState, entry.quality ? 'quality recorded' : 'legacy', matches.length ? null : 'unmatched']
         .filter(Boolean).map((value) => `<span class="chip">${this.esc(value)}</span>`).join('');
       return `<button class="act cv-entry" data-action="open-cv" data-cv-path="${this.esc(cvPath)}" data-slug="${this.esc(entry.slug)}" data-opportunity-id="${this.esc(opportunityId || '')}"><span class="cv-entry-label">${this.esc(label)}</span><span class="cv-entry-state">${states}</span></button>`;
@@ -2419,6 +2421,7 @@ const Scout = {
       case 'triage-no': return this.triageNo(id);
       case 'undo-dismiss': return this.undoDismiss(id);
       case 'remove-shortlist': return this.removeFromShortlist(id);
+      case 'restore': return this.restoreEntry(id);
       default: return undefined;
     }
   },

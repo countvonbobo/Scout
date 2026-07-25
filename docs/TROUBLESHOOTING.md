@@ -60,6 +60,13 @@ Select the master or tailored source and use its **save changes** and **render P
 
 Scout refuses to start a scan when the approved profile, calibration or master CV is incomplete. If Setup reports an empty activated master CV and offers the validated recovery control, use it there; Scout backs up the current file and restores only the hash-checked reviewed staging copy. If the control is unavailable, preserve the workspace and inspect the reported mismatch.
 
+If your restored PDFs show as needing re-rendering, verify your `.gitignore` tracks the render manifest. Workspaces created before Scout `0.1.0-beta.21` will self-heal their ignore rules on the next start. If you are editing `.gitignore` manually, replace the bare `.scout/` line with these two lines to ensure your render state survives a backup:
+
+```gitignore
+.scout/*
+!.scout/cv-renders.json
+```
+
 ## A tracker change conflicts with a scan
 
 Scout briefly waits when a scan is finishing, then refreshes and retries a stale tracker change once. If the scan is still running, Scout reports that it did not overwrite the tracker. Wait for the scan to finish and repeat the change; do not edit `data/opportunities.json` or remove `.scout-scan.lock` while a live scan is active.

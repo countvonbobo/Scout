@@ -70,6 +70,7 @@ test('triage collects follow-ups across entries', () => {
 test('triage action and unlock contain only untouched new opportunities', () => {
   const data = { opportunities: [
     entry({ id: 'new-action', status: 'new', score: 80 }),
+    entry({ id: 'shortlist', status: 'shortlist', score: 80 }),
     entry({ id: 'rejected', status: 'rejected', score: 90 }),
     entry({ id: 'applied', status: 'applied', score: 85 }),
     entry({ id: 'watch', status: 'watch', score: 75 }),
@@ -79,7 +80,7 @@ test('triage action and unlock contain only untouched new opportunities', () => 
   const out = triage(data, '2026-07-10');
   assert.deepEqual(out.action.map((e) => e.id), ['new-action']);
   assert.deepEqual(out.unlock.map((e) => e.id), ['new-unlock']);
-  assert.deepEqual(out.other.map((e) => e.id).sort(), ['applied', 'rejected', 'watch', 'watch-unlock']);
+  assert.deepEqual(out.other.map((e) => e.id).sort(), ['applied', 'rejected', 'shortlist', 'watch', 'watch-unlock']);
 });
 
 test('mandatory eligibility gates override stale or provider-supplied scores', () => {

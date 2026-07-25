@@ -241,6 +241,18 @@ export function syncManagedInstructions(appRoot, workspaceRoot) {
     fs.mkdirSync(workspaceRoot, { recursive: true });
     fs.appendFileSync(ignore, `${ignoreText && !ignoreText.endsWith('\n') ? '\n' : ''}data/chats/\n`, 'utf8');
   }
+  const currentIgnore = fs.existsSync(ignore) ? fs.readFileSync(ignore, 'utf8') : '';
+  const lines = currentIgnore.split(/\r?\n/);
+  const scoutIndex = lines.indexOf('.scout/');
+  if (scoutIndex !== -1) {
+    // Note: applications/**/*.pdf remains ignored because PDFs are large and regenerable,
+    // while the manifest (cv-renders.json) persists their state across restores.
+    const eol = currentIgnore.includes('\r\n') ? '\r\n' : '\n';
+    lines.splice(scoutIndex, 1, '.scout/*', '!.scout/cv-renders.json');
+    // Atomic: this file decides what leaves the machine in a backup, so a torn
+    // write here is a privacy and data-loss risk, not just a corrupt config.
+    atomicWriteFile(ignore, lines.join(eol));
+  }
   // A source checkout can still act as its own legacy workspace. Its managed
   // files are already present and may be protected by the host sandbox.
   if (path.resolve(appRoot) === path.resolve(workspaceRoot)) return;

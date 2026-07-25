@@ -93,6 +93,23 @@ test('serializeTracker writes one entry object per line and round-trips', () => 
   assert.deepEqual(JSON.parse(text), data, 'round-trips to identical data');
 });
 
+test('serializeTracker with no updated key returns valid JSON with a real date string', () => {
+  const data = { opportunities: fixture().opportunities };
+  const text = serializeTracker(data);
+  const parsed = JSON.parse(text);
+  assert.match(parsed.updated, /^\d{4}-\d{2}-\d{2}/, 'should have a valid date string');
+  assert.deepEqual(parsed.opportunities, data.opportunities);
+});
+
+test('serializeTracker output parses for every status in STATUSES', () => {
+  for (const status of STATUSES) {
+    const data = { updated: '2026-07-25', opportunities: [{ ...fixture().opportunities[0], status }] };
+    const text = serializeTracker(data);
+    const parsed = JSON.parse(text);
+    assert.equal(parsed.opportunities[0].status, status);
+  }
+});
+
 test('markApplied adds an application block and Applied stage idempotently', () => {
   const once = markApplied(fixture(), 'a-1', '2026-07-10', 'Submitted via site');
   const entry = findEntry(once, 'a-1');

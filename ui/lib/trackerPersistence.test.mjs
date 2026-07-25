@@ -61,3 +61,29 @@ test('UI tracker lock waits for and then shares the scan coordination lock', asy
   assert.equal(second.token, 'second');
   assert.deepEqual(releaseTrackerMutationLock(root, second.token), { ok: true, released: true });
 });
+
+test('mutateTrackerSnapshot refuses to write unparseable content and leaves the existing file byte-identical', () => {
+  const { file } = fixture();
+  const initialBytes = fs.readFileSync(file);
+  assert.throws(
+    () => mutateTrackerSnapshot(file, (data) => data, () => '{ bad json', {}),
+    SyntaxError
+  );
+  assert.deepEqual(fs.readFileSync(file), initialBytes);
+});
+
+test('end-to-end regression: mutating a tracker with missing updated field preserves data', () => {
+  const { file } = fixture();
+  // Write a tracker with missing updated field but valid JSON (as the agent-driven scan might produce)
+  const validButMissingUpdated = `{ "opportunities": [{ "id": "incident-test", "company": "Missing Updated", "role": "Role", "status": "new" }] }`;
+  atomicReplaceTracker(file, validButMissingUpdated);
+  
+  mutateTrackerSnapshot(file, (data) => {
+    data.opportunities[0].status = 'ignore';
+    return data;
+  }, serializeTracker);
+  
+  const finalState = readTrackerSnapshot(file);
+  assert.equal(finalState.data.opportunities[0].status, 'ignore');
+  assert.equal(finalState.data.opportunities[0].id, 'incident-test');
+});

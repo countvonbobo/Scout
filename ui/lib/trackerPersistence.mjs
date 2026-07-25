@@ -17,7 +17,14 @@ export function trackerRevision(content) {
 
 export function readTrackerSnapshot(file) {
   const content = fs.readFileSync(file, 'utf8');
-  return { data: JSON.parse(content), revision: trackerRevision(content) };
+  try {
+    return { data: JSON.parse(content), revision: trackerRevision(content) };
+  } catch (error) {
+    if (error instanceof SyntaxError) {
+      error.message = `The tracker file is corrupted but your data is likely intact. A backup is available in the workspace backup repository. Error: ${error.message}`;
+    }
+    throw error;
+  }
 }
 
 export function atomicReplaceTracker(file, content) {
@@ -49,6 +56,7 @@ export function mutateTrackerSnapshot(file, mutate, serialize, { expectedRevisio
   }
   const next = mutate(current.data);
   const content = serialize(next);
+  JSON.parse(content);
   atomicReplaceTracker(file, content);
   return { data: next, revision: trackerRevision(content) };
 }

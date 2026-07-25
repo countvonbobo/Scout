@@ -99,3 +99,31 @@ test('managed workspace upgrades keep chat transcripts out of Git without replac
   assert.match(value, /^custom-private-file$/m);
   assert.match(value, /^data\/chats\/$/m);
 });
+
+import { spawnSync } from 'node:child_process';
+test('syncManagedInstructions migrates .scout/ to track cv-renders.json while ignoring the rest of .scout', () => {
+  const appRoot = temp();
+  const workspace = temp();
+  fs.writeFileSync(path.join(workspace, '.gitignore'), '.env\n.scout/\n');
+  syncManagedInstructions(appRoot, workspace);
+  const value = fs.readFileSync(path.join(workspace, '.gitignore'), 'utf8');
+  assert.match(value, /^\.scout\/\*$/m);
+  assert.match(value, /^!\.scout\/cv-renders\.json$/m);
+  
+  // Verify idempotency
+  syncManagedInstructions(appRoot, workspace);
+  const value2 = fs.readFileSync(path.join(workspace, '.gitignore'), 'utf8');
+  assert.equal(value, value2);
+  
+  // Real behavior test: check-ignore
+  spawnSync('git', ['init'], { cwd: workspace, encoding: 'utf8', windowsHide: true });
+  fs.mkdirSync(path.join(workspace, '.scout'));
+  fs.writeFileSync(path.join(workspace, '.scout', 'cv-renders.json'), '{}');
+  fs.writeFileSync(path.join(workspace, '.scout', 'junk'), '');
+  
+  const ignoreJunk = spawnSync('git', ['check-ignore', '.scout/junk'], { cwd: workspace, encoding: 'utf8', windowsHide: true });
+  assert.equal(ignoreJunk.status, 0); // 0 means ignored
+  
+  const ignoreRenders = spawnSync('git', ['check-ignore', '.scout/cv-renders.json'], { cwd: workspace, encoding: 'utf8', windowsHide: true });
+  assert.equal(ignoreRenders.status, 1); // 1 means NOT ignored
+});
