@@ -204,9 +204,10 @@ export function markRejected(data, id, today, note = '') {
 }
 
 export function serializeTracker(data) {
+  const updated = data.updated || new Date().toISOString().split('T')[0];
   const entries = data.opportunities.map((o) => '    ' + JSON.stringify(o));
   return '{\n'
-    + `  "updated": ${JSON.stringify(data.updated)},\n`
+    + `  "updated": ${JSON.stringify(updated)},\n`
     + '  "opportunities": [\n'
     + entries.join(',\n') + '\n'
     + '  ]\n'
