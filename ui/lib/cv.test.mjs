@@ -5,7 +5,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import { EventEmitter } from 'node:events';
 import { PassThrough } from 'node:stream';
-import { cvRenderState, listCvFiles, masterMarkdownToTypst, renderCv, renderCvTarget, safeCvPath } from './cv.mjs';
+import { cvPdfPath, cvRenderState, listCvFiles, masterMarkdownToTypst, renderCv, renderCvTarget, safeCvPath } from './cv.mjs';
 
 const ROOT = 'C:/repo';
 
@@ -157,5 +157,30 @@ test('self-heals and marks state as restored when a PDF exists without a manifes
     // Ensure manifest is updated
     const state2 = cvRenderState(root, { target: 'application', slug: 'example' });
     assert.equal(state2.restored, true);
+
+    // The whole point of issue #62: a valid PDF must stay openable, not be blocked.
+    assert.doesNotThrow(() => cvPdfPath(root, { target: 'application', slug: 'example' }));
+    assert.equal(
+      cvPdfPath(root, { target: 'application', slug: 'example' }),
+      path.join(root, 'applications', 'example', 'cv.pdf'),
+    );
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test('a stale PDF is still refused, so restored does not mask a changed source', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'scout-cv-stale-'));
+  try {
+    fs.mkdirSync(path.join(root, 'applications', 'example'), { recursive: true });
+    fs.mkdirSync(path.join(root, '.scout'), { recursive: true });
+    fs.writeFileSync(path.join(root, 'applications', 'example', 'cv.typ'), 'Edited after render');
+    fs.writeFileSync(path.join(root, 'applications', 'example', 'cv.pdf'), '%PDF-1.7\nvalid'.padEnd(25, ' '));
+    fs.writeFileSync(path.join(root, '.scout', 'cv-renders.json'), JSON.stringify({
+      schemaVersion: 1,
+      renders: { 'application:example': { sourceSha256: 'does-not-match-the-source', renderedAt: '2026-07-01T00:00:00.000Z' } },
+    }));
+    const state = cvRenderState(root, { target: 'application', slug: 'example' });
+    assert.equal(state.stale, true);
+    assert.equal(state.restored, false);
+    assert.throws(() => cvPdfPath(root, { target: 'application', slug: 'example' }), /stale/i);
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });

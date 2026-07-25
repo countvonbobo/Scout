@@ -201,8 +201,10 @@ export function cvRenderState(root, request) {
 export function cvPdfPath(root, request) {
   const descriptor = checkedTarget(root, request);
   const state = cvRenderState(root, request);
-  if (!state.current) {
-    if (state.restored) throw new Error('Render record lost — please render this CV again to guarantee it matches the source.');
+  // A restored PDF is served rather than blocked. We cannot prove it matches the
+  // current source, so the UI flags it, but refusing to open a real PDF is what
+  // made this look like "rendering is broken" (issue #62).
+  if (!state.current && !state.restored) {
     if (state.stale) throw new Error('PDF is stale — render this CV again.');
     throw new Error('No current PDF — render this CV first.');
   }
