@@ -356,6 +356,8 @@
       transition: background .15s ease, border-color .15s ease;
     }
     button.act:hover { background: var(--surface-container-high); border-color: var(--outline); }
+    button.act:active { transform: translateY(1px); filter: brightness(.9); }
+    button.act:disabled { cursor: wait; opacity: .7; }
     .act.bridge {
       border-style: dashed;
       border-color: var(--accent);

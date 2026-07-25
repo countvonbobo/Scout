@@ -777,7 +777,30 @@ const Scout = {
   },
 
   triageYes(id) { this.post('/api/status', { id, status: 'shortlist' }); },
-  triageNo(id) { this.post('/api/status', { id, status: 'ignore' }).then((r) => { if (r && r.ok) this.showUndo(id); }); },
+  async triageNo(id) {
+    const entry = this.state.data?.opportunities?.find((item) => item.id === id);
+    if (!entry || entry.status !== 'new') return;
+
+    // Respond to the decision immediately instead of leaving the card in place
+    // while the tracker write and opportunities refresh complete.
+    entry.status = 'ignore';
+    this.renderJobs();
+
+    const result = await this.post('/api/status', { id, status: 'ignore' });
+    if (result?.ok) {
+      this.showUndo(id);
+      return result;
+    }
+
+    // A failed write must put the job back rather than leave optimistic state
+    // that disagrees with the tracker.
+    const current = this.state.data?.opportunities?.find((item) => item.id === id);
+    if (current?.status === 'ignore') {
+      current.status = 'new';
+      this.renderJobs();
+    }
+    return result;
+  },
   undoDismiss(id) { this.post('/api/status', { id, status: 'new' }).then(() => this.hideUndo()); },
   restoreEntry(id) { this.post('/api/status', { id, status: 'new' }); },
 
