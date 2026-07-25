@@ -449,15 +449,42 @@ test('remote restart asks explicitly and does not interrupt active work', async 
   expect(restartRequests).toBe(0);
 });
 
-test('settings close remains reachable on a phone viewport', async ({ page }) => {
+test('settings is a single usable scroll surface on a phone viewport', async ({ page }) => {
   await page.setViewportSize({ width: 360, height: 740 });
   await page.getByRole('button', { name: 'Settings' }).click();
+  const dialog = page.getByRole('dialog');
   const close = page.getByRole('button', { name: 'Close settings' });
   await expect(close).toBeVisible();
   const box = await close.boundingBox();
   expect(box).not.toBeNull();
   expect(box.x + box.width).toBeLessThanOrEqual(360);
   expect(box.y).toBeGreaterThanOrEqual(0);
+
+  await expect(dialog.locator('#setup-actions')).toBeHidden();
+  const geometry = await dialog.evaluate((element) => {
+    const shell = element.querySelector('.setup-dialog');
+    const body = element.querySelector('.setup-body');
+    return {
+      shellHeight: shell.clientHeight,
+      shellScrollHeight: shell.scrollHeight,
+      shellOverflow: getComputedStyle(shell).overflowY,
+      bodyHeight: body.clientHeight,
+      bodyScrollHeight: body.scrollHeight,
+      bodyOverflow: getComputedStyle(body).overflowY,
+    };
+  });
+  expect(geometry.shellHeight).toBeLessThanOrEqual(740);
+  expect(geometry.shellScrollHeight).toBe(geometry.shellHeight);
+  expect(geometry.shellOverflow).toBe('hidden');
+  expect(geometry.bodyScrollHeight).toBeGreaterThan(geometry.bodyHeight);
+  expect(geometry.bodyOverflow).toBe('auto');
+
+  const appDevice = dialog.getByRole('button', { name: 'App & device' });
+  await appDevice.evaluate((element) => element.scrollIntoView({ block: 'end' }));
+  await expect(appDevice).toBeVisible();
+  const appBox = await appDevice.boundingBox();
+  expect(appBox.y).toBeGreaterThanOrEqual(0);
+  expect(appBox.y + appBox.height).toBeLessThanOrEqual(740);
 });
 
 test('phone All view reaches its rightmost column and keeps strong-match controls on screen', async ({ page }) => {
