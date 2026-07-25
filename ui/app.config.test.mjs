@@ -379,11 +379,19 @@ test('cvLinkHtml shows no link (never a wrong-role link) when the chat opportuni
     { id: 'acme-frontend-engineer-2026-07', company: 'Acme', role: 'Frontend Engineer' },
   ] };
   scout.state.cvFiles = { applications: ['acme-frontend-engineer-2026-07'] };
+  // this.chat.id is absent from state.data.opportunities (e.g. the tracker refreshed
+  // and dropped/filtered the opportunity while its chat panel stayed open). The
+  // pre-fix code fell back to `slugOf(company(chat.id))`, and `company()` on a
+  // lookup miss returns the raw id itself; since this id is already slug-shaped,
+  // slugOf() leaves it unchanged, so the pre-fix slug equals the chat id verbatim.
+  // filesTouched below contains exactly that pre-fix-derived path, so a passing
+  // pre-fix run would emit a real (and here, misleadingly self-referential) link;
+  // only the post-fix "no entry -> no link" short-circuit returns ''.
   scout.chat = {
     id: 'acme-backend-engineer-2026-07',
-    data: { filesTouched: ['applications/acme-frontend-engineer-2026-07/cv.typ'] },
+    data: { filesTouched: ['applications/acme-backend-engineer-2026-07/cv.typ'] },
   };
   const html = scout.cvLinkHtml();
   assert.equal(html, '');
-  assert.doesNotMatch(html, /acme-frontend-engineer-2026-07/);
+  assert.doesNotMatch(html, /acme-backend-engineer-2026-07/);
 });
