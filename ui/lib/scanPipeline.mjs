@@ -4,7 +4,7 @@ import { atomicWriteFile } from './atomicWrite.mjs';
 import { serializeTracker } from './tracker.mjs';
 import { workspacePaths } from './workspace.mjs';
 import {
-  advertMateriallyChanged, jobIdentity, mergeSourceReferences, sameUnderlyingJob, sourceReferencesOf,
+  advertMateriallyChanged, invalidateJobIdentity, jobIdentity, mergeSourceReferences, sameUnderlyingJob, sourceReferencesOf,
 } from './jobIdentity.mjs';
 import { isVerifiable } from './statusGroups.mjs';
 
@@ -130,6 +130,39 @@ export function verificationCandidates(candidates, tracker, today, policy = {}) 
   return selected.length ? { candidates: selected, verified: true } : { candidates, verified: false };
 }
 
+// Existing untriaged jobs must not live in the inbox forever merely because a
+// later scan did not rediscover them. Recheck only `new` entries; every status
+// set by the user is deliberately outside this maintenance path.
+export function inboxRecheckCandidates(tracker, incomingCandidates = []) {
+  const checkable = [];
+  const missingSource = [];
+  for (const entry of tracker?.opportunities || []) {
+    if (entry.status !== 'new') continue;
+    if (incomingCandidates.some((candidate) => sameUnderlyingJob(entry, candidate))) continue;
+    const url = (entry.sources || []).map(safeSourceUrl).find(Boolean);
+    const candidate = { _inboxRecheck: true, _trackerId: entry.id, url };
+    if (url) checkable.push(candidate);
+    else missingSource.push({ ...candidate, liveness: { state: 'gone', reason: 'no individual advert URL is stored' } });
+  }
+  return { checkable, missingSource };
+}
+
+function archiveStaleInboxEntries(tracker, entries, date) {
+  const reasons = new Map(entries.map((item) => [item._trackerId, item.liveness?.reason || 'advert is no longer live']));
+  let archived = 0;
+  for (const entry of tracker.opportunities || []) {
+    const reason = reasons.get(entry.id);
+    if (entry.status !== 'new' || !reason) continue;
+    entry.status = 'ignore';
+    entry.tags = [...new Set([...(entry.tags || []), 'Advert unavailable'])];
+    const note = `[${date}] Removed from Jobs automatically: ${reason}.`;
+    if (!String(entry.notes || '').includes(note)) entry.notes = entry.notes ? `${entry.notes}\n${note}` : note;
+    entry.lastChecked = date;
+    archived += 1;
+  }
+  return archived;
+}
+
 export function promptCandidate(candidate) {
   return Object.fromEntries(PROMPT_CANDIDATE_FIELDS
     .filter((field) => candidate[field] !== undefined)
@@ -156,6 +189,7 @@ function absorbDuplicate(existing, incoming) {
   existing.tags = [...new Set([...existing.tags, ...incoming.tags])];
   if (incoming.description.length > existing.description.length) existing.description = incoming.description;
   if (!existing.salary && incoming.salary) existing.salary = incoming.salary;
+  invalidateJobIdentity(existing);
 }
 
 // Candidates were previously filled in source order until the cap was reached,
@@ -393,6 +427,7 @@ export function writeScanArtifacts(root, {
   provider, mode, sources, queries = [], candidates, assessmentResult, policy, exclusions = [], startedAt,
   error = null, skipped = false, dropped = { perSource: {}, total: 0 }, hardExcluded = [], closedAdverts = [],
   livenessSummary = { checked: 0, gone: 0, unverified: 0 }, verificationScoped = false,
+  staleInboxEntries = [], inboxRechecked = 0,
 }) {
   const paths = workspacePaths(root);
   const timestamp = new Date().toISOString();
@@ -407,6 +442,7 @@ export function writeScanArtifacts(root, {
   const merged = trustedAssessments
     ? mergeTracker(existing, candidates, trustedAssessments.assessments, policy, date)
     : { tracker: existing, keepersAdded: 0, keepersUpdated: 0, discarded: { ...EMPTY_DISCARDED }, reviewed: [] };
+  const inboxArchived = archiveStaleInboxEntries(merged.tracker, staleInboxEntries, date);
   const run = {
     schemaVersion: 3, timestamp, started_at: startedAt, agent: provider, mode, degraded, skipped,
     sources_checked: Object.entries(health).filter(([, item]) => item.configured !== false).map(([name]) => name),
@@ -423,6 +459,7 @@ export function writeScanArtifacts(root, {
     candidates_dropped: dropped.total, candidates_dropped_by_source: dropped.perSource,
     adverts_checked: livenessSummary.checked, adverts_closed: livenessSummary.gone,
     adverts_unverified: livenessSummary.unverified, verification_scoped: verificationScoped,
+    inbox_rechecked: inboxRechecked, inbox_archived: inboxArchived,
     reviewed: merged.reviewed, errors, source_health: health,
   };
   const earlierRuns = fs.existsSync(paths.scanRuns)

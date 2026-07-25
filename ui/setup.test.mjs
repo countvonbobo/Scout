@@ -204,9 +204,18 @@ test('the alternating preset gives each provider its own days', () => {
   assert.deepEqual([...primary, ...second].sort((a, b) => a - b), [0, 1, 2, 3, 4, 5, 6]);
 });
 
+test('the alternating weekdays preset offsets providers and excludes weekends', () => {
+  const primary = presetDays('alternating-weekdays', 'primary');
+  const second = presetDays('alternating-weekdays', 'second-pass');
+  assert.deepEqual(primary, [1, 3, 5]);
+  assert.deepEqual(second, [2, 4]);
+  assert.equal(primary.some((day) => second.includes(day)), false);
+  assert.equal([...primary, ...second].some((day) => day === 0 || day === 6), false);
+});
+
 test('day presets round-trip to the selection they describe', () => {
   for (const mode of ['primary', 'second-pass']) {
-    for (const preset of ['every', 'alternating', 'weekdays']) {
+    for (const preset of ['every', 'alternating', 'alternating-weekdays', 'weekdays']) {
       assert.equal(matchingPreset(presetDays(preset, mode), mode), preset);
     }
   }

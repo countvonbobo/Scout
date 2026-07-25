@@ -32,7 +32,7 @@ test('applicationSummary derives current stage and movement age', () => {
   assert.equal(out.daysSinceApplied, 10);
 });
 
-test('pipeline buckets active, awaiting, closed and flags work', () => {
+test('pipeline buckets active, awaiting, accepted and genuinely closed work', () => {
   const data = { opportunities: [
     entry({ id: 'shortlist', status: 'shortlist', score: 80, lastChecked: '2026-07-01' }),
     entry({ id: 'active', status: 'applied', application: { appliedDate: '2026-07-01', stages: [{ name: 'Applied', completed: true, date: '2026-07-01' }] } }),
@@ -47,10 +47,12 @@ test('pipeline buckets active, awaiting, closed and flags work', () => {
   assert.deepEqual(out.watch.map((x) => x.id), ['watch']);
   assert.deepEqual(out.awaitingDecision.map((x) => x.id).sort(), ['shortlist', 'watch']);
   assert.deepEqual(out.active.map((x) => x.id).sort(), ['active', 'prep']);
-  assert.deepEqual(out.recentlyClosed.map((x) => x.id).sort(), ['accepted', 'closed']);
+  assert.deepEqual(out.accepted.map((x) => x.id), ['accepted']);
+  assert.deepEqual(out.recentlyClosed.map((x) => x.id), ['closed']);
   assert.equal(out.summary.total, data.opportunities.length);
-  assert.equal(out.flags.some((f) => f.id === 'prep' && f.kind === 'interview-prep'), true);
-  assert.equal(out.flags.some((f) => f.id === 'active' && f.kind === 'stale'), true);
+  assert.equal(out.summary.accepted, 1);
+  assert.equal(out.summary.recentlyClosed, 1);
+  assert.equal(out.flags, undefined);
 });
 
 test('the uninitialised view matches the shape a populated workspace returns', () => {
@@ -68,7 +70,7 @@ test('the uninitialised view matches the shape a populated workspace returns', (
   assert.deepEqual(Object.keys(empty.pipeline).sort(), Object.keys(live.pipeline).sort());
   assert.deepEqual(Object.keys(empty.triage).sort(), Object.keys(live.triage).sort());
   // The dashboard iterates these directly; a missing array crashes first paint.
-  for (const key of ['shortlist', 'watch', 'active', 'awaitingDecision', 'recentlyClosed', 'flags']) {
+  for (const key of ['shortlist', 'watch', 'active', 'awaitingDecision', 'accepted', 'recentlyClosed']) {
     assert.deepEqual(empty.pipeline[key], [], `pipeline.${key} must be an empty array`);
   }
   assert.equal(empty.pipeline.summary.total, 0);
@@ -95,20 +97,22 @@ test('shortlisted roles are a first-class pipeline bucket and metric', () => {
   assert.equal(result.summary.shortlist, 1);
 });
 
-test('no triage flag is produced for untriaged items', () => {
+test('the pipeline no longer exposes flags', () => {
   const data = { opportunities: [
     { id: 'a', company: 'A', role: 'R', status: 'new', score: 80, lastChecked: '2026-01-01' },
   ] };
   const result = pipeline(data, '2026-07-25', {});
-  assert.equal(result.flags.filter((f) => f.kind === 'decision').length, 0);
+  assert.equal(result.flags, undefined);
+  assert.equal(result.summary.flags, undefined);
 });
 
-test('dismissed items remain reachable in the closed bucket', () => {
+test('dismissed items stay out of the pipeline closed bucket', () => {
   const data = { opportunities: [
     { id: 'c', company: 'C', role: 'R', status: 'ignore', score: 40, lastChecked: '2026-07-20' },
   ] };
   const result = pipeline(data, '2026-07-25', {});
-  assert.equal(result.recentlyClosed.length, 1);
+  assert.equal(result.recentlyClosed.length, 0);
+  assert.ok(!JSON.stringify(result).includes('"id":"c"'));
 });
 
 test('shortlisted roles report a last-checked date', () => {

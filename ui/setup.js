@@ -12,15 +12,18 @@ const DAY_LABELS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
 const EVERY_DAY = [0, 1, 2, 3, 4, 5, 6];
 // Alternating splits the week so the two providers never scan on the same day.
 export const ALTERNATING_DAYS = Object.freeze({ primary: [0, 1, 3, 5], 'second-pass': [2, 4, 6] });
+export const ALTERNATING_WEEKDAYS = Object.freeze({ primary: [1, 3, 5], 'second-pass': [2, 4] });
 const DAY_PRESETS = [
   ['every', 'Every day'],
   ['alternating', 'Alternating with the other provider'],
+  ['alternating-weekdays', 'Alternating weekdays (no weekends)'],
   ['weekdays', 'Weekdays only'],
   ['custom', 'Custom days'],
 ];
 
 export function presetDays(preset, mode = 'primary') {
   if (preset === 'alternating') return [...(ALTERNATING_DAYS[mode] || ALTERNATING_DAYS.primary)];
+  if (preset === 'alternating-weekdays') return [...(ALTERNATING_WEEKDAYS[mode] || ALTERNATING_WEEKDAYS.primary)];
   if (preset === 'weekdays') return [1, 2, 3, 4, 5];
   return [...EVERY_DAY];
 }
@@ -29,6 +32,7 @@ export function matchingPreset(days, mode = 'primary') {
   const value = [...new Set(days || [])].sort((a, b) => a - b).join(',');
   if (!value || value === EVERY_DAY.join(',')) return 'every';
   if (value === presetDays('alternating', mode).join(',')) return 'alternating';
+  if (value === presetDays('alternating-weekdays', mode).join(',')) return 'alternating-weekdays';
   if (value === presetDays('weekdays').join(',')) return 'weekdays';
   return 'custom';
 }

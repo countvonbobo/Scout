@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import {
-  checkAdvert, checkAdverts, classifyStatus, looksClosed, partitionLiveCandidates, redirectedToIndex,
+  checkAdvert, checkAdverts, classifyStatus, isGenericIndexUrl, looksClosed, partitionLiveCandidates, redirectedToIndex,
 } from './advertLiveness.mjs';
 
 function response({ status = 200, url, body = '<html><body>Apply now</body></html>' } = {}) {
@@ -41,6 +41,19 @@ test('a redirect to the board index is treated as gone, other redirects are not'
   assert.equal(redirectedToIndex('https://board.test/jobs/123', 'https://board.test/jobs/456'), false);
   assert.equal(redirectedToIndex('https://board.test/jobs/123', 'https://other.test/jobs'), false);
   assert.equal(redirectedToIndex('https://board.test/jobs', 'https://board.test/jobs'), false);
+});
+
+test('generic board and careers indexes are never accepted as verified adverts', async () => {
+  assert.equal(isGenericIndexUrl('https://example.test/careers'), true);
+  assert.equal(isGenericIndexUrl('https://example.test/jobs-in-f1/'), true);
+  assert.equal(isGenericIndexUrl('https://example.test/en/jobs/233355463f-electronics-support-engineer'), false);
+  let fetched = false;
+  const result = await checkAdvert('https://example.test/jobs-in-f1/', {
+    fetchFn: async () => { fetched = true; throw new Error('should not fetch'); },
+  });
+  assert.equal(result.state, 'gone');
+  assert.match(result.reason, /not an individual advert/);
+  assert.equal(fetched, false);
 });
 
 test('a 404 advert is closed without fetching its body', async () => {

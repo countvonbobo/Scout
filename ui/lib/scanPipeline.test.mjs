@@ -4,7 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { test } from 'node:test';
 import {
-  applyHardExclusions, compactCandidates, DEFAULT_CANDIDATE_LIMIT, gateAssessment, promptCandidate,
+  applyHardExclusions, compactCandidates, DEFAULT_CANDIDATE_LIMIT, gateAssessment, inboxRecheckCandidates, promptCandidate,
   validateAssessments, validateWrittenScanArtifacts, verificationCandidates, writeScanArtifacts,
 } from './scanPipeline.mjs';
 
@@ -330,4 +330,40 @@ test('a verification pass with nothing from today falls back to the full set', (
   }, '2026-07-22', {});
   assert.equal(unmatched.verified, false);
   assert.deepEqual(unmatched.candidates, candidates);
+});
+
+test('inbox recheck covers only untouched new jobs and skips rediscovered roles', () => {
+  const tracker = {
+    opportunities: [
+      { id: 'stale', company: 'Old Co', role: 'Engineer', status: 'new', sources: ['https://example.test/jobs/old'] },
+      { id: 'missing', company: 'No Link', role: 'Engineer', status: 'new', sources: [] },
+      { id: 'chosen', company: 'Chosen', role: 'Engineer', status: 'shortlist', sources: ['https://example.test/jobs/chosen'] },
+      { id: 'fresh', company: 'Fresh Co', role: 'Engineer', status: 'new', sources: ['https://example.test/jobs/fresh'] },
+    ],
+  };
+  const incoming = [{ company: 'Fresh Co', role: 'Engineer', url: 'https://example.test/jobs/fresh' }];
+  const result = inboxRecheckCandidates(tracker, incoming);
+  assert.deepEqual(result.checkable.map((item) => item._trackerId), ['stale']);
+  assert.deepEqual(result.missingSource.map((item) => item._trackerId), ['missing']);
+});
+
+test('scan artifacts archive only stale untriaged jobs', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'scout-inbox-recheck-'));
+  fs.mkdirSync(path.join(root, 'data'), { recursive: true });
+  fs.writeFileSync(path.join(root, 'data', 'opportunities.json'), `${JSON.stringify({
+    updated: '2026-07-24',
+    opportunities: [
+      { id: 'stale', company: 'Old Co', role: 'Engineer', status: 'new', tags: [], sources: ['https://example.test/careers'] },
+      { id: 'chosen', company: 'Chosen', role: 'Engineer', status: 'shortlist', tags: [], sources: ['https://example.test/jobs/chosen'] },
+    ],
+  })}\n`);
+  const artifacts = writeScanArtifacts(root, {
+    provider: 'codex', mode: 'primary', sources: {}, candidates: [], assessmentResult: null,
+    policy: {}, startedAt: new Date().toISOString(), inboxRechecked: 1,
+    staleInboxEntries: [{ _trackerId: 'stale', liveness: { reason: 'URL is a job-board index, not an individual advert' } }],
+  });
+  assert.equal(artifacts.tracker.opportunities.find((item) => item.id === 'stale').status, 'ignore');
+  assert.equal(artifacts.tracker.opportunities.find((item) => item.id === 'chosen').status, 'shortlist');
+  assert.equal(artifacts.run.inbox_rechecked, 1);
+  assert.equal(artifacts.run.inbox_archived, 1);
 });

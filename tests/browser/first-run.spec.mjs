@@ -64,11 +64,11 @@ test('a brand-new install renders its dashboard without a script error', async (
   await page.goto('/');
   await expect(page.getByRole('dialog').getByRole('heading', { name: 'Welcome to Scout' })).toBeVisible();
 
-  // A missing pipeline.flags used to throw inside renderPipeline and abort the
+  // Missing pipeline arrays used to throw inside renderPipeline and abort the
   // whole dashboard render behind the setup dialog. Shape parity between the
   // initialised and uninitialised answers is asserted in ui/lib/pipeline.test.mjs.
   await expect
-    .poll(() => page.evaluate(() => Array.isArray(window.Scout?.state?.data?.pipeline?.flags)))
+    .poll(() => page.evaluate(() => Array.isArray(window.Scout?.state?.data?.pipeline?.recentlyClosed)))
     .toBe(true);
   expect(failures).toEqual([]);
 });
