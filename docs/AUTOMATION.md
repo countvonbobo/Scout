@@ -1,6 +1,6 @@
 # Scheduled scans
 
-Scout can register multiple named, per-user scheduler jobs. Scheduling is optional and may be enabled only after a successful supervised scan. Each job is enabled, changed and disabled independently.
+Scout can register multiple named, per-user scheduler jobs. Scheduling is optional and a job's first enablement requires a successful supervised scan. Once a job exists, its time, days and model can always be changed — and it can be disabled or re-enabled — regardless of whether a later run was healthy, stale or skipped. Each job is enabled, changed and disabled independently.
 
 First-run setup offers only the provider selected for the workspace, for example a Codex primary scan. A second compatible provider appears only after choosing **Add verification pass** in **Settings → Scans & schedule**. It is never enabled implicitly.
 

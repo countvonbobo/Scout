@@ -23,7 +23,7 @@ Scout is a local-first, AI-assisted opportunity finder. Before searching, scorin
 
 - Tracker: `data/opportunities.json`. Every reported opportunity has a stable `id` (`company-role-YYYY-MM`) and is deduplicated before insertion.
 - Reports: `reports/YYYY-MM-DD.md`; newest verified facts win and score changes are explained.
-- Tailored material: `applications/<company-slug>/` with `cv.typ`, rendered `cv.pdf`, and `outreach.md` where applicable.
+- Tailored material: `applications/<slug>/` with `cv.typ`, rendered `cv.pdf`, and `outreach.md` where applicable. The slug is keyed by the tracked opportunity (falling back to company+role), not the company alone, so two roles at the same employer never collide. Folders created before this keying existed are left in place and reused only after an explicit prompt.
 - Use absolute ISO dates (`YYYY-MM-DD`) and the configured currency.
 - Preserve tracker, calibration, and application history; append dated evidence rather than erasing it.
 

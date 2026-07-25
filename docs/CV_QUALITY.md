@@ -6,6 +6,8 @@ When creating a tailored CV, Scout recommends Google XYZ for achievement bullets
 
 With XYZ enabled, the provider first compares the advert with `cv/master-cv.md`. It asks only for a missing accomplishment (X), confirmed quantitative or qualitative outcome (Y), or method (Z), one question per turn. Each question explains the prospective bullet and offers `Skip` and `Finish questions`. Missing metrics are never guessed.
 
+Tailored material is keyed by the tracked opportunity, not the company, so two roles at the same employer each get their own folder and never collide. A folder created before this change (named only from the company) is left exactly where it is: Scout reuses it in place after an explicit prompt naming whose CV it is, and only creates a new per-opportunity folder if you decline.
+
 ## Private evidence record
 
 `applications/<slug>/cv-evidence.json` uses schema version 1:
@@ -43,7 +45,7 @@ The CV library can render both `cv/master-cv.md` and tailored `applications/<slu
 
 Rendering runs as a background operation with visible progress and a 60-second limit. Scout compiles to a temporary file, validates the PDF, then atomically replaces the prior output. `.scout/cv-renders.json` binds each output to its source hash. Editing the source immediately marks the previous PDF stale and disables preview/download until a new render succeeds. A failed render preserves the previous file but never labels it current.
 
-Run `scout cv quality <slug>` to compile the PDF and write `cv-quality.json`. The report contains the CV source hash, enabled options, issues and any explicit draft override. Editing the source invalidates both the report and override.
+Run `scout cv quality <application-slug>` to compile the PDF and write `cv-quality.json`. The report contains the CV source hash, enabled options, issues and any explicit draft override. Editing the source invalidates both the report and override.
 
 Scout packages and supported VPS deployments include a pinned, checksum-verified Typst runtime. `scout doctor` reports whether rendering uses that managed runtime, a packaged runtime or an explicit developer override. If the managed runtime is missing or damaged, repair or reinstall Scout; no separate `winget`, Homebrew or system package is required.
 

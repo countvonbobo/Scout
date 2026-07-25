@@ -85,7 +85,7 @@ The CV library also renders the approved master Markdown as a clearly labelled r
 From a source checkout, rerun the same review with:
 
 ```powershell
-node tools/scout.mjs cv quality <company-slug> --workspace "$HOME\Documents\Scout Workspace"
+node tools/scout.mjs cv quality <application-slug> --workspace "$HOME\Documents\Scout Workspace"
 ```
 
 ## 5. Add sources
@@ -111,7 +111,7 @@ The **All** tab is a searchable table. On a phone, swipe the labelled table regi
 
 ## 7. Enable daily scans (optional)
 
-During setup, choose the local daily time and enable the schedule after the first healthy scan. Return to **Settings → First scan** to change or disable it later. The command-line equivalent is:
+During setup, choose the local daily time and enable the schedule after the first healthy scan. Return to **Settings → First scan** to change or disable it later — an existing schedule's time, days and model stay editable even after a later run is unhealthy, stale or skipped. The command-line equivalent is:
 
 ```powershell
 & $ScoutNode $ScoutCli schedule install --time 07:30 --provider codex

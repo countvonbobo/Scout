@@ -56,7 +56,7 @@ This is not automatically a failed scan. Scout shows the number reviewed, number
 
 ## A PDF is missing, stale or blank
 
-Select the master or tailored source and choose its explicit save-and-render action. Keep Scout open while the background operation runs. A source edit makes the previous PDF stale immediately; render again. If rendering fails, Scout preserves the old file but will not preview or download it as current. Run `scout doctor` and repair/reinstall Scout when the managed Typst runtime is missing. Do not install an unrelated system Typst merely to mask a damaged package.
+Select the master or tailored source and use its **save changes** and **render PDF** actions, which report independent outcomes: saving persists the source without rendering, and rendering compiles the last saved source without rewriting it. Keep Scout open while the background operation runs. A source edit makes the previous PDF stale immediately; render again after saving. If rendering fails, Scout preserves the old file and confirms the saved source is intact, but will not preview or download the stale PDF as current. Run `scout doctor` and repair/reinstall Scout when the managed Typst runtime is missing. Do not install an unrelated system Typst merely to mask a damaged package.
 
 Scout refuses to start a scan when the approved profile, calibration or master CV is incomplete. If Setup reports an empty activated master CV and offers the validated recovery control, use it there; Scout backs up the current file and restores only the hash-checked reviewed staging copy. If the control is unavailable, preserve the workspace and inspect the reported mismatch.
 
