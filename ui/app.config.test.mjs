@@ -57,7 +57,6 @@ test('sync status opens backup details and stale builds require a safe explicit 
 
 test('master CV preview explains how to obtain a rendered PDF', () => {
   const source = fs.readFileSync(new URL('./app.js', import.meta.url), 'utf8');
-  assert.match(source, /save \+ render reference PDF/i);
   assert.match(source, /No master reference PDF yet\. Save and render to create it\./i);
   assert.doesNotMatch(source, /master CV is source material only and has no PDF preview/i);
 });
@@ -289,4 +288,34 @@ test('commute filter refresh re-renders jobs and shortlist', () => {
   scout.setCommuteFilter('mode', 'car');
   assert.equal(jobs, 1);
   assert.equal(shortlist, 1);
+});
+
+test('saveCv persists the source without rendering', async () => {
+  const { scout, context } = loadScout();
+  const calls = [];
+  context.document = {
+    getElementById: (id) => (id === 'cv-text' ? { value: 'source' } : { textContent: '', innerHTML: '', classList: { toggle() {}, add() {}, remove() {} } }),
+    querySelectorAll: () => [],
+  };
+  scout.cvState = { path: 'applications/acme-eng-2026-07/cv.typ', dirty: true };
+  scout.post = (p, payload) => { calls.push([p, payload]); return Promise.resolve({ ok: true }); };
+  scout.renderCvPreview = () => { calls.push(['RENDER_PREVIEW']); };
+  await scout.saveCv();
+  assert.deepEqual(calls.map((c) => c[0]), ['/api/cv/save']);
+  assert.equal(scout.cvState.dirty, false);
+});
+
+test('renderCvOnly renders without re-saving the source', async () => {
+  const { scout, context } = loadScout();
+  const calls = [];
+  context.document = {
+    getElementById: () => ({ textContent: '', innerHTML: '', classList: { toggle() {}, add() {}, remove() {} } }),
+    querySelectorAll: () => [],
+  };
+  scout.cvState = { path: 'applications/acme-eng-2026-07/cv.typ', dirty: false };
+  scout.post = (p, payload) => { calls.push([p, payload]); return Promise.resolve({ ok: true }); };
+  scout.renderCvPreview = () => { calls.push(['RENDER_PREVIEW']); return Promise.resolve(); };
+  await scout.renderCvOnly();
+  assert.ok(!calls.some((c) => c[0] === '/api/cv/save'), 'must not re-save the source');
+  assert.ok(calls.some((c) => c[0] === 'RENDER_PREVIEW'));
 });

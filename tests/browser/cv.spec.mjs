@@ -34,7 +34,8 @@ test('CV library exposes legacy sources whose PDF and quality files are absent',
 test('master reference PDF uses the real same-origin preview endpoint', async ({ page, request }) => {
   await page.getByRole('button', { name: 'CV' }).click();
   await page.locator('[data-cv-path="cv/master-cv.md"]').click();
-  await expect(page.getByRole('button', { name: 'save + render reference PDF' })).toBeVisible();
+  await expect(page.getByRole('button', { name: 'save changes' })).toBeVisible();
+  await expect(page.getByRole('button', { name: 'render PDF' })).toBeVisible();
   await expect(page.locator('#cv-preview iframe')).toBeVisible();
   await expect(page.getByRole('button', { name: 'download PDF' })).toBeEnabled();
   const response = await request.get('/api/cv/pdf?target=master');

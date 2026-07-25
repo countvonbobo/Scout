@@ -1354,10 +1354,11 @@ const Scout = {
           <div class="label">applications</div>${appBtns}
         </aside>
         <section class="cv-editor-panel">
-          <div class="label"><span id="cv-editing">select a file</span> <span id="cv-dirty" style="color:var(--warn)"></span></div>
+          <div class="label"><span id="cv-editing">select a file</span> <span id="cv-dirty" style="color:var(--warn)"></span> <span id="cv-status" class="meta"></span></div>
           <textarea id="cv-text" class="cv-source" data-input-action="cv-dirty"></textarea>
            <div class="controls" style="flex-wrap:wrap;margin-top:6px">
-             <button id="cv-save-render" class="act" data-action="save-cv">save + render</button>
+             <button id="cv-save-render" class="act" data-action="save-cv">save changes</button>
+             <button id="cv-render" class="act" data-action="render-cv">render PDF</button>
              <button id="cv-download" class="act" data-action="download-cv" disabled>download PDF</button>
            </div>
            <div id="cv-quality" class="cv-quality"><div class="meta">Select a tailored CV to see its quality review.</div></div>
@@ -1463,10 +1464,9 @@ const Scout = {
   },
 
   updateCvControls() {
-    const master = Boolean(this.cvState.path && !this.cvState.slug);
     const current = this.currentCvRenderState().current === true;
     const save = document.getElementById('cv-save-render');
-    if (save) save.textContent = master ? 'save + render reference PDF' : 'save + render tailored PDF';
+    if (save) save.textContent = 'save changes';
     for (const id of ['cv-download', 'cv-fullscreen', 'cv-open-pdf']) {
       const button = document.getElementById(id); if (button) button.disabled = !current;
     }
@@ -1480,15 +1480,34 @@ const Scout = {
     else preview.innerHTML = `<div class="cv-preview-status">${state.stale ? 'This PDF is stale because the source changed. Save and render again.' : this.cvState.slug ? 'No tailored PDF yet. Save and render to create it.' : 'No master reference PDF yet. Save and render to create it.'}</div>`;
   },
 
+  setCvStatus(text) {
+    const status = document.getElementById('cv-status');
+    if (status) status.textContent = text;
+  },
+
   async saveCv() {
     if (!this.cvState.path) return alert('Open a file first.');
     const content = document.getElementById('cv-text').value;
+    this.setCvStatus('Saving…');
     const save = await this.post('/api/cv/save', { path: this.cvState.path, content });
-    if (!(save && save.ok)) return;
+    if (!(save && save.ok)) return this.setCvStatus('Save failed. Your changes are still in the editor.');
     this.cvState.dirty = false;
     this.cvState.content = content;
-    document.getElementById('cv-dirty').textContent = '';
-    await this.renderCvPreview();
+    const dirty = document.getElementById('cv-dirty');
+    if (dirty) dirty.textContent = '';
+    this.setCvStatus('Saved. The PDF is out of date until you render it.');
+  },
+
+  async renderCvOnly() {
+    if (!this.cvState.path) return alert('Open a file first.');
+    if (this.cvState.dirty) return this.setCvStatus('Save your changes first — rendering uses the last saved source.');
+    this.setCvStatus('Rendering PDF…');
+    try {
+      await this.renderCvPreview();
+      this.setCvStatus('PDF rendered from the saved source.');
+    } catch (error) {
+      this.setCvStatus(`Saved source is intact. PDF render failed: ${error.message}`);
+    }
   },
 
   async renderCvPreview() {
@@ -2309,6 +2328,7 @@ const Scout = {
       case 'toggle-cv-create': return this.toggleCvCreate();
       case 'start-cv-create': return this.startCvCreate();
       case 'save-cv': return this.saveCv();
+      case 'render-cv': return this.renderCvOnly();
       case 'download-cv': return this.downloadCv();
       case 'open-chat-for-cv': return this.openChatForCv();
       case 'fullscreen-cv': return this.fullscreenCv();
