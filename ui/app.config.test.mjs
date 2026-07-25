@@ -372,6 +372,93 @@ test('an existing artifact for the same role is opened directly', () => {
   assert.deepEqual(opened, [['seeCv', 'acme-backend-engineer-2026-07', 'acme-backend-engineer-2026-07']]);
 });
 
+test('the Shortlist "Review CV options" button goes through the same collision guard as the CV library', () => {
+  const { scout } = loadScout();
+  scout.esc = (value) => String(value);
+  const html = scout.shortlistCardHtml({ id: 'acme-frontend-engineer-2026-07', company: 'Acme', role: 'Frontend Engineer', score: 7 });
+  assert.match(html, /data-action="choose-cv-options"/);
+  assert.match(html, />Review CV options</);
+  // runAction must route that action into the resolve+confirm method, not straight
+  // into generation, so there is exactly one place a collision can be missed.
+  const source = fs.readFileSync(new URL('./app.js', import.meta.url), 'utf8');
+  assert.match(source, /case 'choose-cv-options': return this\.reviewCvOptions\(id\);/);
+  assert.match(source, /case 'start-cv-create': return this\.startCvCreate\(\);/);
+  assert.match(source, /startCvCreate\(\)[\s\S]{0,200}return this\.reviewCvOptions\(id\)/);
+});
+
+test('declining a shared legacy folder starts fresh in the role\'s own folder, never the legacy one', () => {
+  const { scout, context } = loadScout();
+  const chosen = [];
+  context.document = { getElementById: () => ({ value: 'acme-frontend-engineer-2026-07' }), querySelectorAll: () => [] };
+  context.confirm = () => false; // "Cancel" = start a new CV for this role
+  scout.state.data = { opportunities: [
+    { id: 'acme-backend-engineer-2026-07', company: 'Acme', role: 'Backend Engineer' },
+    { id: 'acme-frontend-engineer-2026-07', company: 'Acme', role: 'Frontend Engineer' },
+  ] };
+  scout.state.cvFiles = { applications: ['acme'] }; // one legacy company folder, shared
+  scout.seeCv = (slug, id) => chosen.push(['seeCv', slug, id]);
+  scout.chooseCvOptions = (id, slug) => chosen.push(['chooseCvOptions', id, slug]);
+  scout.reviewCvOptions('acme-frontend-engineer-2026-07');
+  assert.deepEqual(chosen, [['chooseCvOptions', 'acme-frontend-engineer-2026-07', 'acme-frontend-engineer-2026-07']]);
+  // Accepting reuses the legacy folder in place instead.
+  chosen.length = 0;
+  context.confirm = () => true;
+  scout.reviewCvOptions('acme-frontend-engineer-2026-07');
+  assert.deepEqual(chosen, [['seeCv', 'acme', 'acme-frontend-engineer-2026-07']]);
+});
+
+test('the chosen folder is carried into chat start so the agent writes where the user chose', async () => {
+  const { scout, context } = loadScout();
+  const requested = [];
+  context.document = { getElementById: () => ({ checked: true, value: '', classList: { add() {}, remove() {} } }), querySelectorAll: () => [] };
+  scout.api = (url) => { requested.push(url); return Promise.resolve({ prefills: {}, chat: null }); };
+  scout.renderChatDrawer = () => {};
+  scout.refreshUsage = () => {};
+  scout.loadEngineOptions = () => {};
+  scout.cvOptionsOpportunityId = 'acme-frontend-engineer-2026-07';
+  scout.cvOptionsArtifactSlug = 'acme-frontend-engineer-2026-07';
+  await scout.startCvFromOptions();
+  assert.equal(requested.length, 1);
+  assert.match(requested[0], /artifact=acme-frontend-engineer-2026-07/);
+});
+
+test('the user\'s own current-role CV opens without a confusing legacy prompt', () => {
+  const { scout, context } = loadScout();
+  const chosen = [];
+  context.confirm = () => { throw new Error('must not prompt for this role\'s own CV folder'); };
+  scout.state.data = { opportunities: [{ id: 'acme-backend-engineer-2026-07', company: 'Acme', role: 'Backend Engineer' }] };
+  scout.seeCv = (slug, id) => chosen.push(['seeCv', slug, id]);
+  scout.chooseCvOptions = (id, slug) => chosen.push(['chooseCvOptions', id, slug]);
+  // Its own per-role folder.
+  scout.state.cvFiles = { applications: ['acme-backend-engineer-2026-07'] };
+  scout.reviewCvOptions('acme-backend-engineer-2026-07');
+  // A legacy folder that can only belong to this role (no other tracked role at
+  // this employer) is also opened directly.
+  scout.state.cvFiles = { applications: ['acme'] };
+  scout.reviewCvOptions('acme-backend-engineer-2026-07');
+  assert.deepEqual(chosen, [
+    ['seeCv', 'acme-backend-engineer-2026-07', 'acme-backend-engineer-2026-07'],
+    ['seeCv', 'acme', 'acme-backend-engineer-2026-07'],
+  ]);
+});
+
+test('opening a different CV clears the status left by the previous file', async () => {
+  const { scout, context } = loadScout();
+  const elements = {
+    'cv-status': { textContent: 'Saved. The PDF is out of date until you render it.' },
+    'cv-text': { value: '' },
+    'cv-editing': { textContent: '' },
+    'cv-dirty': { textContent: '' },
+    'cv-quality': { innerHTML: '' },
+    'cv-preview': { innerHTML: '' },
+  };
+  context.document = { getElementById: (id) => elements[id], querySelectorAll: () => [] };
+  scout.cvState = { path: 'applications/a/cv.typ', slug: 'a', dirty: false };
+  scout.api = () => Promise.resolve('new source');
+  await scout.openCv('applications/b/cv.typ', null);
+  assert.equal(elements['cv-status'].textContent, '');
+});
+
 test('cvLinkHtml shows no link (never a wrong-role link) when the chat opportunity is not in tracked data', () => {
   const { scout } = loadScout();
   scout.esc = (value) => String(value);

@@ -91,6 +91,13 @@ function resolveArtifact(existingSlugs, opportunity, slugOfCompany, opportunitie
   }
   return { slug: preferred, legacy: false, ambiguous: false };
 }
+function chooseArtifactSlug(existingSlugs, opportunity, slugOfCompany, opportunities = [], requested = '') {
+  const resolved = resolveArtifact(existingSlugs, opportunity, slugOfCompany, opportunities);
+  const fresh = artifactSlugFor(opportunity);
+  const wanted = String(requested || '').trim();
+  if (wanted && (wanted === resolved.slug || wanted === fresh)) return wanted;
+  return resolved.slug;
+}
 function codexTaskUrl(sessionId) {
   const value = String(sessionId || '').trim();
   if (!/^[A-Za-z0-9-]+$/.test(value)) return null;
@@ -772,7 +779,7 @@ const Scout = {
       <div class="detail"></div>
       <div class="triage-actions">
         <button class="act triage-no" data-action="remove-shortlist" data-id="${this.esc(e.id)}">Remove</button>
-        <button class="act bridge" data-action="choose-cv-options" data-id="${this.esc(e.id)}">Create tailored CV</button>
+        <button class="act bridge" data-action="choose-cv-options" data-id="${this.esc(e.id)}">Review CV options</button>
       </div>
     </div>`;
   },
@@ -1333,8 +1340,9 @@ const Scout = {
     this.openCv(`applications/${slug}/outreach.md`, null);
   },
 
-  chooseCvOptions(id) {
+  chooseCvOptions(id, artifactSlug = null) {
     this.cvOptionsOpportunityId = id;
+    this.cvOptionsArtifactSlug = artifactSlug || null;
     document.getElementById('cv-option-xyz').checked = true;
     document.getElementById('cv-option-humanize').checked = true;
     document.getElementById('cv-options-overlay').classList.remove('hidden');
@@ -1342,6 +1350,7 @@ const Scout = {
 
   closeCvOptions() {
     this.cvOptionsOpportunityId = null;
+    this.cvOptionsArtifactSlug = null;
     document.getElementById('cv-options-overlay').classList.add('hidden');
   },
 
@@ -1352,8 +1361,9 @@ const Scout = {
       xyz: document.getElementById('cv-option-xyz').checked,
       humanize: document.getElementById('cv-option-humanize').checked,
     };
+    const artifactSlug = this.cvOptionsArtifactSlug;
     this.closeCvOptions();
-    this.openChat(id, 'cv', cvOptions);
+    this.openChat(id, 'cv', cvOptions, 'job', artifactSlug);
   },
 
   async renderCv() {
@@ -1393,7 +1403,7 @@ const Scout = {
           <div class="label"><span id="cv-editing">select a file</span> <span id="cv-dirty" style="color:var(--warn)"></span> <span id="cv-status" class="meta"></span></div>
           <textarea id="cv-text" class="cv-source" data-input-action="cv-dirty"></textarea>
            <div class="controls" style="flex-wrap:wrap;margin-top:6px">
-             <button id="cv-save-render" class="act" data-action="save-cv">save changes</button>
+             <button id="cv-save" class="act" data-action="save-cv">save changes</button>
              <button id="cv-render" class="act" data-action="render-cv">render PDF</button>
              <button id="cv-download" class="act" data-action="download-cv" disabled>download PDF</button>
            </div>
@@ -1455,19 +1465,30 @@ const Scout = {
   startCvCreate() {
     const id = document.getElementById('cv-create-opportunity')?.value;
     if (!id) return;
+    return this.reviewCvOptions(id);
+  },
+
+  // The single place that resolves an opportunity's CV folder and, where an
+  // existing folder could be reused, asks the user. Every entry point (the CV
+  // library picker and the Shortlist card) routes through here, so no path can
+  // reach generation without the collision prompt. The answer is carried into
+  // generation as the artifact slug, so "start fresh" really does write to a new
+  // per-role folder and the existing folder is never overwritten.
+  reviewCvOptions(id) {
     const entry = (this.state.data?.opportunities || []).find((item) => item.id === id);
     if (!entry) return;
     const resolved = this.resolveArtifactFor(entry);
     const exists = (this.state.cvFiles?.applications || []).includes(resolved.slug);
-    if (exists && !resolved.legacy) return this.seeCv(resolved.slug, id);
-    if (exists && resolved.legacy) {
-      const owner = resolved.ambiguous ? 'another role at this company' : 'this company';
-      if (!confirm(`Scout has an existing CV folder for ${owner}. Open it as-is? Choose Cancel to start a new CV tailored to this role.`)) {
-        return this.chooseCvOptions(id);
+    // Not legacy, or legacy but the only tracked role at that employer: the folder
+    // can only be this role's own CV, so open it without a confusing prompt.
+    if (exists && (!resolved.legacy || !resolved.ambiguous)) return this.seeCv(resolved.slug, id);
+    if (exists) {
+      if (!confirm('Scout has an existing CV folder shared with another role at this company, created before per-role CV folders. Open it as-is? Choose Cancel to start a new CV in its own folder for this role - the existing folder is left untouched.')) {
+        return this.chooseCvOptions(id, this.artifactSlugFor(entry));
       }
       return this.seeCv(resolved.slug, id);
     }
-    this.chooseCvOptions(id);
+    this.chooseCvOptions(id, resolved.slug);
   },
 
   async refreshCvFilesIfTouched(filesTouched = []) {
@@ -1487,6 +1508,7 @@ const Scout = {
     document.getElementById('cv-text').value = content;
     document.getElementById('cv-editing').textContent = `editing: ${pathRel}`;
     document.getElementById('cv-dirty').textContent = '';
+    this.setCvStatus(''); // a save/render status belongs to the file it came from
     document.querySelectorAll('[data-cv-path]').forEach((b) =>
       b.classList.toggle('active', b.dataset.cvPath === pathRel));
     this.updateCvControls();
@@ -1511,8 +1533,6 @@ const Scout = {
 
   updateCvControls() {
     const current = this.currentCvRenderState().current === true;
-    const save = document.getElementById('cv-save-render');
-    if (save) save.textContent = 'save changes';
     for (const id of ['cv-download', 'cv-fullscreen', 'cv-open-pdf']) {
       const button = document.getElementById(id); if (button) button.disabled = !current;
     }
@@ -1552,7 +1572,7 @@ const Scout = {
       await this.renderCvPreview();
       this.setCvStatus('PDF rendered from the saved source.');
     } catch (error) {
-      this.setCvStatus(`Saved source is intact. PDF render failed: ${error.message}`);
+      this.setCvStatus(`Saved source is intact. PDF render failed: ${error?.message || String(error)}`);
     }
   },
 
@@ -1654,7 +1674,7 @@ const Scout = {
 
   reviewEvidenceForMaster() {
     if (!this.cvState.opportunityId) return alert('Open this CV from its opportunity card first.');
-    this.openChat(this.cvState.opportunityId, 'reuseEvidence');
+    this.openChat(this.cvState.opportunityId, 'reuseEvidence', null, 'job', this.cvState.slug || null);
   },
 
   pdfUrl({ download = false } = {}) {
@@ -1721,7 +1741,7 @@ const Scout = {
 
   // --- Embedded chat drawer ---
 
-  async openChat(id, prefillKey = 'ask', cvOptions = null, purpose = 'job') {
+  async openChat(id, prefillKey = 'ask', cvOptions = null, purpose = 'job', artifactSlug = null) {
     this.closeCompanyHistory();
     const previous = this.chat;
     if (previous && previous.streaming) {
@@ -1739,7 +1759,11 @@ const Scout = {
       ? `&xyz=${cvOptions.xyz ? '1' : '0'}&humanize=${cvOptions.humanize ? '1' : '0'}`
       : '';
     const purposeQuery = purpose === 'job' ? '' : `&purpose=${encodeURIComponent(purpose)}`;
-    try { r = await this.api(`/api/chat?id=${encodeURIComponent(id)}${purposeQuery}${optionQuery}`); }
+    // The user's answer to the existing-folder prompt (and the folder an already
+    // open CV lives in). The server re-resolves and only honours a slug it would
+    // produce for this opportunity itself.
+    const artifactQuery = artifactSlug ? `&artifact=${encodeURIComponent(artifactSlug)}` : '';
+    try { r = await this.api(`/api/chat?id=${encodeURIComponent(id)}${purposeQuery}${optionQuery}${artifactQuery}`); }
     catch (e) {
       if (openSeq === this.chatOpenSeq) alert(`Could not open chat: ${e.message}`);
       return;
@@ -2258,7 +2282,7 @@ const Scout = {
     if (!this.cvState.opportunityId) {
       return alert('Open this CV from its opportunity card so Scout knows which job chat it belongs to.');
     }
-    this.openChat(this.cvState.opportunityId, 'tweak');
+    this.openChat(this.cvState.opportunityId, 'tweak', null, 'job', this.cvState.slug || null);
   },
 
   async handoffChat() {
@@ -2365,7 +2389,7 @@ const Scout = {
       case 'mark-accepted': return this.markAccepted(id);
       case 'mark-rejected': return this.rejectOpportunity(id);
       case 'see-cv': return this.seeCv(slug, id || null);
-      case 'choose-cv-options': return this.chooseCvOptions(id);
+      case 'choose-cv-options': return this.reviewCvOptions(id);
       case 'see-cover-letter': return this.seeCoverLetter(slug);
       case 'open-chat': return this.openChat(id, prefill);
       case 'open-company-history': return this.openCompanyHistory(id);
