@@ -1,9 +1,7 @@
 import { daysBetween, followUpsDue, triage } from './derive.mjs';
 import { currentStage, isInterviewStage, lastCompletedStage, stagesOf } from './tracker.mjs';
 
-const ACTIVE_STATUSES = ['outreach', 'applied', 'interviewing'];
-const OPEN_STATUSES = ['new', 'watch'];
-const CLOSED_STATUSES = ['accepted', 'rejected', 'ignore'];
+import { ACTIVE_STATUSES, CLOSED_STATUSES, OPEN_STATUSES, isOpen } from './statusGroups.mjs';
 
 function latestDate(dates) {
   return dates.filter(Boolean).sort().at(-1) || null;
@@ -16,7 +14,7 @@ export function applicationSummary(entry, today, policy = {}) {
   const rejectedDate = entry.application?.rejectedDate || null;
   const logDate = latestDate((entry.log || []).map((l) => l.date));
   const stageDate = latestDate(stages.map((s) => s.date));
-  const trackerCheckDate = ['new', 'watch'].includes(entry.status) ? entry.lastChecked : null;
+  const trackerCheckDate = (isOpen(entry.status) || entry.status === 'new') ? entry.lastChecked : null;
   const lastMovementDate = latestDate([rejectedDate, stageDate, logDate, appliedDate, trackerCheckDate]);
   const current = currentStage(entry);
   return {
@@ -25,6 +23,7 @@ export function applicationSummary(entry, today, policy = {}) {
     role: entry.role,
     status: entry.status,
     score: entry.score,
+    lastChecked: trackerCheckDate,
     currentStage: current,
     lastCompletedStage: completed ? completed.name : null,
     appliedDate,
@@ -51,8 +50,8 @@ export function pipeline(data, today, policy = {}) {
   const byStatus = {};
   for (const item of summaries) byStatus[item.status] = (byStatus[item.status] || 0) + 1;
 
-  const newItems = summaries
-    .filter((item) => item.status === 'new')
+  const shortlist = summaries
+    .filter((item) => item.status === 'shortlist')
     .sort(byScoreThenMovement);
   const watch = summaries
     .filter((item) => item.status === 'watch')
@@ -96,29 +95,20 @@ export function pipeline(data, today, policy = {}) {
         detail: `${item.daysSinceLastMovement} days since movement`,
       });
     }
-    if (item.status === 'new' && item.daysSinceLastMovement !== null && item.daysSinceLastMovement >= decisionDays) {
-      flags.push({
-        id: item.id,
-        company: item.company,
-        role: item.role,
-        kind: 'decision',
-        detail: 'new item awaiting triage',
-      });
-    }
   }
 
   return {
     summary: {
       total: summaries.length,
       byStatus,
-      new: newItems.length,
+      shortlist: shortlist.length,
       watch: watch.length,
       active: active.length,
       awaitingDecision: awaitingDecision.length,
       recentlyClosed: recentlyClosed.length,
       flags: flags.length,
     },
-    new: newItems,
+    shortlist,
     watch,
     active,
     awaitingDecision,

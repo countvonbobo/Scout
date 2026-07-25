@@ -837,7 +837,7 @@ const Scout = {
     </div>`;
     el.innerHTML = `
       <div class="metrics">
-        ${metric('new', p.summary.new ?? (p.new || []).length)}
+        ${metric('shortlist', p.summary.shortlist ?? (p.shortlist || []).length)}
         ${metric('watch', p.summary.watch ?? (p.watch || []).length)}
         ${metric('active', p.summary.active)}
         ${metric('closed / ignored', p.summary.recentlyClosed)}
@@ -852,7 +852,7 @@ const Scout = {
       </div>
       ${flags}
       <div class="split">
-        ${list('New', p.new || [])}
+        ${list('Shortlist', p.shortlist || [])}
         ${list('Watch', p.watch || [])}
         ${list('Active', p.active)}
         ${list('Closed / ignored', p.recentlyClosed)}
