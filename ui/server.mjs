@@ -853,7 +853,7 @@ routes['POST /api/cv/render'] = (req, res, body) => {
       update({ phase: target === 'master' ? 'Preparing master reference PDF' : 'Preparing tailored PDF', current: 1, total: 3 });
       const result = await renderCvTarget(WORKSPACE_ROOT, { target, slug }, { appRoot: APP_ROOT });
       update({ phase: 'Validating PDF', current: 2, total: 3 });
-      if (target === 'application') void queueCheckpoint(`render cv - ${slug}`);
+      void queueCheckpoint(target === 'application' ? `render cv - ${slug}` : 'render master cv');
       update({ phase: 'PDF ready', current: 3, total: 3 });
       return result;
     }, { phase: 'Queued for rendering', total: 3 });
