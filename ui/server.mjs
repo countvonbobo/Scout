@@ -532,7 +532,7 @@ async function handleRead(req, res, url) {
     const slug = url.searchParams.get('slug') || '';
     let pdf;
     try { pdf = cvPdfPath(WORKSPACE_ROOT, { target, slug }); }
-    catch (e) { return sendJson(res, /stale/i.test(e.message) ? 409 : 404, { error: e.message }); }
+    catch (e) { return sendJson(res, /(stale|record lost)/i.test(e.message) ? 409 : 404, { error: e.message }); }
     if (target === 'application' && url.searchParams.get('download') === '1') {
       let decision;
       try { decision = cvDownloadDecision(WORKSPACE_ROOT, slug); }

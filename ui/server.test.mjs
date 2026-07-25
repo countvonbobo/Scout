@@ -516,10 +516,10 @@ test('CV index keeps legacy sources visible and describes missing derived files'
   fs.writeFileSync(path.join(app, 'cv.typ'), '= Legacy source\n');
   const response = await request({ path: '/api/cv' });
   assert.equal(response.status, 200);
-  const index = JSON.parse(response.text);
-  assert.ok(index.applications.includes(slug));
-  assert.deepEqual(index.entries.find((entry) => entry.slug === slug), {
-    slug, source: true, pdf: false, pdfCurrent: false, pdfStale: false, renderedAt: null,
+  const cvs = JSON.parse(response.text);
+  assert.ok(cvs.applications.includes(slug));
+  assert.deepEqual(cvs.entries.find((entry) => entry.slug === slug), {
+    slug: 'legacy-visible', source: true, pdf: false, pdfCurrent: false, pdfStale: false, restored: false, renderedAt: null,
     outreach: false, evidence: false, quality: false,
   });
 });

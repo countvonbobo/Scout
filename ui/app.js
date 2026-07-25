@@ -1380,7 +1380,7 @@ const Scout = {
       const label = matches.length === 1
         ? `${matches[0].company} — ${matches[0].role}`
         : matches.length > 1 ? `${matches[0].company} — ${matches.length} tracked roles (shared folder — created before per-role CVs)` : entry.slug;
-      const pdfState = entry.pdfCurrent ? 'PDF ready' : entry.pdfStale ? 'PDF stale' : 'PDF missing';
+      const pdfState = entry.restored ? 'Needs re-rendering after restore' : entry.pdfCurrent ? 'PDF ready' : entry.pdfStale ? 'PDF stale' : 'PDF missing';
       const states = [pdfState, entry.quality ? 'quality recorded' : 'legacy', matches.length ? null : 'unmatched']
         .filter(Boolean).map((value) => `<span class="chip">${this.esc(value)}</span>`).join('');
       return `<button class="act cv-entry" data-action="open-cv" data-cv-path="${this.esc(cvPath)}" data-slug="${this.esc(entry.slug)}" data-opportunity-id="${this.esc(opportunityId || '')}"><span class="cv-entry-label">${this.esc(label)}</span><span class="cv-entry-state">${states}</span></button>`;

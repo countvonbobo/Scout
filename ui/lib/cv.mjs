@@ -175,18 +175,37 @@ export function renderCv(root, slug, {
 
 export function cvRenderState(root, request) {
   const descriptor = checkedTarget(root, request);
-  if (!fs.existsSync(descriptor.source)) return { pdf: false, current: false, stale: false, renderedAt: null };
-  const record = readManifest(root).renders?.[descriptor.key];
+  if (!fs.existsSync(descriptor.source)) return { pdf: false, current: false, stale: false, restored: false, renderedAt: null };
+  let record = readManifest(root).renders?.[descriptor.key];
   const pdf = fs.existsSync(descriptor.pdf);
   const currentHash = sha256(fs.readFileSync(descriptor.source));
+
+  if (pdf && !record && validPdf(descriptor.pdf)) {
+    const manifest = readManifest(root);
+    manifest.schemaVersion = 1;
+    manifest.renders ||= {};
+    manifest.renders[descriptor.key] = { sourceSha256: null, renderedAt: fs.statSync(descriptor.pdf).mtime.toISOString(), restored: true };
+    writeManifest(root, manifest);
+    record = manifest.renders[descriptor.key];
+  }
+
+  const restored = Boolean(record?.restored);
+  if (restored) {
+    return { pdf, current: false, stale: false, restored: true, renderedAt: record?.renderedAt || null };
+  }
+
   const current = Boolean(pdf && record?.sourceSha256 === currentHash && validPdf(descriptor.pdf));
-  return { pdf, current, stale: pdf && !current, renderedAt: record?.renderedAt || null };
+  return { pdf, current, stale: pdf && !current, restored: false, renderedAt: record?.renderedAt || null };
 }
 
 export function cvPdfPath(root, request) {
   const descriptor = checkedTarget(root, request);
   const state = cvRenderState(root, request);
-  if (!state.current) throw new Error(state.stale ? 'PDF is stale — render this CV again.' : 'No current PDF — render this CV first.');
+  if (!state.current) {
+    if (state.restored) throw new Error('Render record lost — please render this CV again to guarantee it matches the source.');
+    if (state.stale) throw new Error('PDF is stale — render this CV again.');
+    throw new Error('No current PDF — render this CV first.');
+  }
   return descriptor.pdf;
 }
 
@@ -203,7 +222,7 @@ export function listCvFiles(root) {
     const directory = path.join(appsDir, slug);
     const render = cvRenderState(root, { target: 'application', slug });
     return {
-      slug, source: true, pdf: render.pdf, pdfCurrent: render.current, pdfStale: render.stale, renderedAt: render.renderedAt,
+      slug, source: true, pdf: render.pdf, pdfCurrent: render.current, pdfStale: render.stale, restored: render.restored, renderedAt: render.renderedAt,
       outreach: fs.existsSync(path.join(directory, 'outreach.md')), evidence: fs.existsSync(path.join(directory, 'cv-evidence.json')),
       quality: fs.existsSync(path.join(directory, 'cv-quality.json')),
     };

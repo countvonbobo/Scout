@@ -46,10 +46,10 @@ test('lists legacy CV sources even when their PDFs and quality records are absen
     const result = listCvFiles(root);
     assert.deepEqual(result.applications, ['legacy-role']);
     assert.deepEqual(result.entries, [{
-      slug: 'legacy-role', source: true, pdf: false, pdfCurrent: false, pdfStale: false, renderedAt: null,
+      slug: 'legacy-role', source: true, pdf: false, pdfCurrent: false, pdfStale: false, restored: false, renderedAt: null,
       outreach: false, evidence: false, quality: false,
     }]);
-    assert.deepEqual(result.masterRender, { pdf: false, current: false, stale: false, renderedAt: null });
+    assert.deepEqual(result.masterRender, { pdf: false, current: false, stale: false, restored: false, renderedAt: null });
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 
@@ -64,7 +64,7 @@ test('renders with the resolved managed Typst executable', () => {
       runtimeResolver: () => ({ available: true, command: 'C:/app/.scout-runtime/typst.exe', source: 'managed', version: 'typst 0.14.2' }),
       spawnSyncImpl: (command, args, options) => {
         invocation = { command, args, options };
-        fs.writeFileSync(path.join(root, args.at(-1)), '%PDF-1.7\nsynthetic valid pdf body');
+        fs.writeFileSync(path.join(root, args.at(-1)), '%PDF-1.7\nsynthetic valid pdf body'.padEnd(25, ' '));
         return { status: 0, stdout: '', stderr: '' };
       },
     });
@@ -88,7 +88,7 @@ function successfulSpawn(root) {
     const child = new EventEmitter();
     child.stdout = new PassThrough(); child.stderr = new PassThrough(); child.kill = () => {};
     process.nextTick(() => {
-      fs.writeFileSync(path.join(root, args.at(-1)), '%PDF-1.7\nsynthetic valid pdf body');
+      fs.writeFileSync(path.join(root, args.at(-1)), '%PDF-1.7\nsynthetic valid pdf body'.padEnd(25, ' '));
       child.emit('close', 0);
     });
     return child;
@@ -107,7 +107,7 @@ test('background master rendering is atomic and becomes stale after a source edi
     assert.equal(cvRenderState(root, { target: 'master' }).current, true);
     fs.appendFileSync(path.join(root, 'cv', 'master-cv.md'), '\nChanged source.\n');
     assert.deepEqual(cvRenderState(root, { target: 'master' }), {
-      pdf: true, current: false, stale: true, renderedAt: result.renderedAt,
+      pdf: true, current: false, stale: true, restored: false, renderedAt: result.renderedAt,
     });
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
@@ -139,5 +139,23 @@ test('reports a Scout repair action when no Typst runtime is usable', () => {
     });
     assert.equal(result.ok, false);
     assert.match(result.stderr, /repair or reinstall Scout/i);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test('self-heals and marks state as restored when a PDF exists without a manifest', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'scout-cv-restore-'));
+  try {
+    fs.mkdirSync(path.join(root, 'applications', 'example'), { recursive: true });
+    fs.writeFileSync(path.join(root, 'applications', 'example', 'cv.typ'), 'Example');
+    fs.writeFileSync(path.join(root, 'applications', 'example', 'cv.pdf'), '%PDF-1.7\nvalid'.padEnd(25, ' '));
+    const state = cvRenderState(root, { target: 'application', slug: 'example' });
+    assert.equal(state.pdf, true);
+    assert.equal(state.current, false);
+    assert.equal(state.stale, false);
+    assert.equal(state.restored, true);
+    
+    // Ensure manifest is updated
+    const state2 = cvRenderState(root, { target: 'application', slug: 'example' });
+    assert.equal(state2.restored, true);
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
