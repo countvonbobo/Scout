@@ -201,10 +201,35 @@ test('pipeline shows application outcomes without ignored jobs, flags or scan he
   const html = doc.getElementById('tab-pipeline').innerHTML;
   assert.match(html, />Accepted</);
   assert.match(html, />Closed</);
+  assert.match(html, /data-pipeline-status="new"/);
+  assert.match(html, /data-pipeline-status="shortlist"/);
+  assert.match(html, /data-pipeline-status="watch"/);
+  assert.match(html, /data-pipeline-status="outreach"/);
+  assert.match(html, /data-pipeline-status="accepted"/);
+  assert.match(html, /data-pipeline-status="rejected"/);
+  assert.match(html, /Drag a card into another column/);
+  assert.match(html, /draggable="true"/);
   assert.match(html, /data-id="accepted"/);
   assert.match(html, /data-id="rejected"/);
   assert.doesNotMatch(html, /data-id="ignored"/);
   assert.doesNotMatch(html, /Closed \/ ignored|Flags|Scan health/);
+});
+
+test('pipeline moves persist status and preserve an existing active stage', async () => {
+  const { scout } = loadScout();
+  scout.state.data = {
+    opportunities: [
+      { id: 'watch', status: 'watch' },
+      { id: 'interview', status: 'interviewing' },
+    ],
+  };
+  const calls = [];
+  scout.post = async (...args) => { calls.push(args); return { ok: true }; };
+
+  await scout.movePipelineEntry('watch', 'new');
+  await scout.movePipelineEntry('interview', 'outreach');
+
+  assert.deepEqual(JSON.parse(JSON.stringify(calls)), [['/api/status', { id: 'watch', status: 'new' }]]);
 });
 
 test('reports shows scan health above dated reports', async () => {
@@ -240,7 +265,7 @@ test('renderJobs lists only new jobs, highest score first, with tags and actions
     categories: [{ id: 'startup', label: 'Priority' }],
     opportunities: [
       { id: 'a', company: 'A', role: 'Eng', status: 'new', score: 60, category: 'startup' },
-      { id: 'b', company: 'B', role: 'Eng', status: 'new', score: 90, category: 'startup' },
+      { id: 'b', company: 'B', role: 'Eng', status: 'new', score: 90, category: 'startup', sources: ['https://example.com/jobs/b'] },
       { id: 'c', company: 'C', role: 'Eng', status: 'shortlist', score: 99, category: 'startup' },
     ],
   };
@@ -248,6 +273,8 @@ test('renderJobs lists only new jobs, highest score first, with tags and actions
   const html = doc.getElementById('tab-jobs').innerHTML;
   assert.match(html, /data-action="triage-yes"/);
   assert.match(html, /data-action="triage-no"/);
+  assert.match(html, /href="https:\/\/example\.com\/jobs\/b"/);
+  assert.match(html, /view source/);
   assert.ok(html.indexOf('data-id="b"') < html.indexOf('data-id="a"')); // 90 before 60
   assert.doesNotMatch(html, /data-id="c"/); // shortlisted excluded
 });
@@ -537,6 +564,17 @@ test('opening a different CV clears the status left by the previous file', async
   scout.api = () => Promise.resolve('new source');
   await scout.openCv('applications/b/cv.typ', null);
   assert.equal(elements['cv-status'].textContent, '');
+});
+
+test('tailored CV preview maps the application render state returned by the API', () => {
+  const { scout } = loadScout();
+  scout.cvState = { path: 'applications/helsing/cv.typ', slug: 'helsing' };
+  scout.state.cvFiles = {
+    entries: [{ slug: 'helsing', pdf: true, pdfCurrent: true, pdfStale: false }],
+  };
+  assert.deepEqual(JSON.parse(JSON.stringify(scout.currentCvRenderState())), {
+    slug: 'helsing', pdf: true, pdfCurrent: true, pdfStale: false, current: true, stale: false,
+  });
 });
 
 test('cvLinkHtml shows no link (never a wrong-role link) when the chat opportunity is not in tracked data', () => {

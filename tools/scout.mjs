@@ -13,7 +13,7 @@ import { assertSafeModel, providerStatus } from '../ui/lib/providers.mjs';
 import { setupReadiness } from '../ui/lib/setupReadiness.mjs';
 import { runStructuredTurn } from '../ui/lib/structuredTurn.mjs';
 import {
-  applyHardExclusions, compactCandidates, DEFAULT_CANDIDATE_LIMIT, promptCandidate,
+  applyHardExclusions, compactCandidates, DEFAULT_CANDIDATE_LIMIT, inboxRecheckCandidates, promptCandidate,
   SCAN_ASSESSMENT_SCHEMA, validateAssessments, verificationCandidates, writeScanArtifacts,
 } from '../ui/lib/scanPipeline.mjs';
 import { partitionLiveCandidates } from '../ui/lib/advertLiveness.mjs';
@@ -289,6 +289,8 @@ export async function runScanWith(root, provider, mode, {
   let hardExcluded = [];
   let closedAdverts = [];
   let livenessSummary = { checked: 0, gone: 0, unverified: 0 };
+  let staleInboxEntries = [];
+  let inboxRechecked = 0;
   let verificationScoped = false;
   try {
     onProgress({ phase: 'Collecting current opportunities', current: 2, total: 5 });
@@ -306,11 +308,18 @@ export async function runScanWith(root, provider, mode, {
       afterExclusions.kept = verification.candidates;
       verificationScoped = verification.verified;
     }
-    onProgress({ phase: `Checking ${afterExclusions.kept.length} adverts are still open`, current: 2, total: 5 });
-    const liveness = await checkLivenessFn(afterExclusions.kept);
-    closedAdverts = liveness.removed;
+    const tracker = JSON.parse(fs.readFileSync(workspacePaths(root).tracker, 'utf8'));
+    const inboxRecheck = inboxRecheckCandidates(tracker, afterExclusions.kept);
+    inboxRechecked = inboxRecheck.checkable.length + inboxRecheck.missingSource.length;
+    onProgress({ phase: `Checking ${afterExclusions.kept.length + inboxRecheck.checkable.length} adverts are still open`, current: 2, total: 5 });
+    const liveness = await checkLivenessFn([...afterExclusions.kept, ...inboxRecheck.checkable]);
+    closedAdverts = liveness.removed.filter((candidate) => !candidate._inboxRecheck);
+    staleInboxEntries = [
+      ...inboxRecheck.missingSource,
+      ...liveness.removed.filter((candidate) => candidate._inboxRecheck),
+    ];
     livenessSummary = liveness.summary;
-    candidates = liveness.live.map((candidate, index) => ({
+    candidates = liveness.live.filter((candidate) => !candidate._inboxRecheck).map((candidate, index) => ({
       ...candidate,
       candidateId: `candidate-${String(index + 1).padStart(3, '0')}`,
     }));
@@ -346,6 +355,7 @@ export async function runScanWith(root, provider, mode, {
       provider, mode, sources: collected.sources, queries: collected.queries, candidates, assessmentResult,
       policy: config.triage, exclusions: config.search?.exclusions || [], startedAt,
       dropped, hardExcluded, closedAdverts, livenessSummary, verificationScoped,
+      staleInboxEntries, inboxRechecked,
     });
     result = { ok: true, status: artifacts.run.degraded ? 'degraded' : candidates.length ? 'completed' : 'healthy-empty', scan: artifacts.run, usage };
     onProgress({ phase: 'Scan completed', current: 5, total: 5 });

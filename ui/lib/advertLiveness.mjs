@@ -34,7 +34,21 @@ const CLOSED_PHRASES = [
 ];
 
 // A redirect that lands on a board's generic index rather than an advert.
-const GENERIC_INDEX_PATHS = new Set(['', '/', '/jobs', '/jobs/', '/careers', '/careers/', '/search', '/search/', '/vacancies', '/vacancies/']);
+const GENERIC_INDEX_PATHS = new Set([
+  '', '/', '/jobs', '/jobs/', '/careers', '/careers/', '/search', '/search/',
+  '/vacancies', '/vacancies/', '/positions', '/positions/', '/opportunities', '/opportunities/',
+]);
+
+export function isGenericIndexUrl(value) {
+  try {
+    const path = new URL(value).pathname.toLowerCase();
+    if (GENERIC_INDEX_PATHS.has(path)) return true;
+    const last = path.replace(/\/+$/, '').split('/').at(-1) || '';
+    return /^(?:jobs-in-[a-z0-9-]+|open-(?:jobs|positions|roles|vacancies))$/.test(last);
+  } catch {
+    return false;
+  }
+}
 
 export function classifyStatus(status) {
   if (status === 404 || status === 410) return 'gone';
@@ -54,9 +68,9 @@ export function redirectedToIndex(requestedUrl, finalUrl) {
     const requested = new URL(requestedUrl);
     const landed = new URL(finalUrl);
     if (landed.host !== requested.host) return false;
-    if (!GENERIC_INDEX_PATHS.has(landed.pathname.toLowerCase())) return false;
+    if (!isGenericIndexUrl(landed.href)) return false;
     // Only meaningful when the request actually asked for a specific advert.
-    return !GENERIC_INDEX_PATHS.has(requested.pathname.toLowerCase());
+    return !isGenericIndexUrl(requested.href);
   } catch { return false; }
 }
 
@@ -70,6 +84,9 @@ export async function checkAdvert(url, {
 } = {}) {
   const headers = { 'user-agent': USER_AGENT, accept: 'text/html,application/xhtml+xml,*/*;q=0.8' };
   const checkedAt = new Date(now()).toISOString();
+  if (isGenericIndexUrl(url)) {
+    return { url, state: 'gone', reason: 'URL is a job-board index, not an individual advert', checkedAt };
+  }
   let head;
   try {
     head = await fetchFn(url, { method: 'HEAD', redirect: 'follow', signal: AbortSignal.timeout(timeoutMs), headers });

@@ -736,10 +736,15 @@ const Scout = {
 
   triageCardHtml(e) {
     const score = typeof e.score === 'number' ? e.score : '-';
+    const source = this.primarySource(e);
+    const sourceLink = source
+      ? `<a class="source-btn" href="${source}" target="_blank" rel="noopener">view source &#8599;</a>`
+      : '';
     return `<div class="card triage-card" data-id="${this.esc(e.id)}" role="button" tabindex="0">
       <div class="chiprow">${this.tagHtml(e)}<span class="score ${this.fitClass(e.score)}">${this.esc(score)}</span></div>
       <div class="top"><b>${this.esc(e.company)} - ${this.esc(e.role)}</b></div>
       <div class="meta">${this.metaLine(e)}</div>
+      ${sourceLink}
       <div class="detail"></div>
       <div class="triage-actions">
         <button class="act triage-no" data-action="triage-no" data-id="${this.esc(e.id)}">No</button>
@@ -830,10 +835,11 @@ const Scout = {
     const el = document.getElementById('tab-pipeline');
     if (!p || !el) return;
     const metric = (label, value) => `<div class="metric"><b>${this.esc(value)}</b>${this.esc(label)}</div>`;
-    const list = (title, items) => `<div>
+    const list = (title, status, items, hint = '') => `<section class="pipeline-column" data-pipeline-status="${this.esc(status)}">
       <div class="label">${title}</div>
+      ${hint ? `<div class="meta pipeline-column-hint">${this.esc(hint)}</div>` : ''}
       ${items.length ? items.map((i) => this.pipelineCard(i)).join('') : '<p>Nothing here.</p>'}
-    </div>`;
+    </section>`;
     el.innerHTML = `
       <div class="metrics">
         ${metric('shortlist', p.summary.shortlist ?? (p.shortlist || []).length)}
@@ -842,13 +848,24 @@ const Scout = {
         ${metric('accepted', p.summary.accepted ?? (p.accepted || []).length)}
         ${metric('closed', p.summary.recentlyClosed)}
       </div>
-      <div class="split">
-        ${list('Shortlist', p.shortlist || [])}
-        ${list('Watch', p.watch || [])}
-        ${list('Active', p.active)}
-        ${list('Accepted', p.accepted || [])}
-        ${list('Closed', p.recentlyClosed)}
+      <p class="meta pipeline-drag-help">Drag a card into another column to update its status. Drop into Jobs to return it to the inbox.</p>
+      <div class="split pipeline-board">
+        ${list('Jobs', 'new', [], 'Return to the Jobs inbox')}
+        ${list('Shortlist', 'shortlist', p.shortlist || [])}
+        ${list('Watch', 'watch', p.watch || [])}
+        ${list('Active', 'outreach', p.active, 'Starts at outreach')}
+        ${list('Accepted', 'accepted', p.accepted || [])}
+        ${list('Closed', 'rejected', p.recentlyClosed)}
       </div>`;
+  },
+
+  movePipelineEntry(id, status) {
+    const entry = this.state.data?.opportunities?.find((item) => item.id === id);
+    if (!entry || entry.status === status) return Promise.resolve({ ok: true, unchanged: true });
+    if (status === 'outreach' && ['outreach', 'applied', 'interviewing'].includes(entry.status)) {
+      return Promise.resolve({ ok: true, unchanged: true });
+    }
+    return this.post('/api/status', { id, status });
   },
 
   async openScanResult() {
@@ -880,7 +897,7 @@ const Scout = {
       item.appliedDate ? `applied ${item.appliedDate}` : null,
       item.daysSinceLastMovement !== null ? `${item.daysSinceLastMovement}d since movement` : null,
     ].filter(Boolean).join(' - ');
-    return `<div class="card" data-id="${this.esc(item.id)}" role="button" tabindex="0">
+    return `<div class="card pipeline-card" data-id="${this.esc(item.id)}" data-status="${this.esc(item.status)}" draggable="true" role="button" tabindex="0">
       <div class="top"><span class="score ${this.fitClass(item.score)}">${this.esc(item.score ?? '-')}</span><b>${this.esc(item.company)} - ${this.esc(item.role)}</b><span class="chip">${this.esc(item.status)}</span></div>
       <div class="meta">${this.esc(bits) || this.metaLine(entry)}</div>
       <div class="detail"></div>
@@ -1521,7 +1538,9 @@ const Scout = {
   currentCvRenderState() {
     if (!this.cvState.path) return { pdf: false, current: false, stale: false };
     if (!this.cvState.slug) return this.state.cvFiles?.masterRender || { pdf: false, current: false, stale: false };
-    return this.state.cvFiles?.entries?.find((entry) => entry.slug === this.cvState.slug) || { pdf: false, current: false, stale: false };
+    const entry = this.state.cvFiles?.entries?.find((item) => item.slug === this.cvState.slug);
+    if (!entry) return { pdf: false, current: false, stale: false };
+    return { ...entry, current: entry.pdfCurrent === true, stale: entry.pdfStale === true };
   },
 
   updateCvControls() {
@@ -2467,6 +2486,39 @@ const Scout = {
       if (event.target.dataset.submitAction !== 'save-company-communication') return;
       event.preventDefault();
       this.saveCompanyCommunication();
+    });
+    document.addEventListener?.('dragstart', (event) => {
+      const card = event.target.closest?.('.pipeline-card[data-id]');
+      if (!card) return;
+      this.pipelineDragId = card.dataset.id;
+      card.classList.add('dragging');
+      event.dataTransfer?.setData('text/plain', card.dataset.id);
+      if (event.dataTransfer) event.dataTransfer.effectAllowed = 'move';
+    });
+    document.addEventListener?.('dragover', (event) => {
+      const column = event.target.closest?.('.pipeline-column[data-pipeline-status]');
+      if (!column || !this.pipelineDragId) return;
+      event.preventDefault();
+      if (event.dataTransfer) event.dataTransfer.dropEffect = 'move';
+      column.classList.add('drag-over');
+    });
+    document.addEventListener?.('dragleave', (event) => {
+      const column = event.target.closest?.('.pipeline-column[data-pipeline-status]');
+      if (column && !column.contains(event.relatedTarget)) column.classList.remove('drag-over');
+    });
+    document.addEventListener?.('drop', (event) => {
+      const column = event.target.closest?.('.pipeline-column[data-pipeline-status]');
+      const id = this.pipelineDragId || event.dataTransfer?.getData('text/plain');
+      if (!column || !id) return;
+      event.preventDefault();
+      column.classList.remove('drag-over');
+      this.pipelineDragId = null;
+      this.movePipelineEntry(id, column.dataset.pipelineStatus);
+    });
+    document.addEventListener?.('dragend', (event) => {
+      event.target.closest?.('.pipeline-card')?.classList.remove('dragging');
+      document.querySelectorAll?.('.pipeline-column.drag-over').forEach((column) => column.classList.remove('drag-over'));
+      this.pipelineDragId = null;
     });
   },
 
