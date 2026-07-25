@@ -13,9 +13,9 @@
     text = text.replace(/\*\*([^*\n]+)\*\*/g, '<strong>$1</strong>');
     text = text.replace(/\*([^*\n]+)\*/g, '<em>$1</em>');
     text = text.replace(/\[([^\]\n]+)\]\((https?:\/\/[^)\s]+)\)/gi, (_all, label, href) =>
-      `<a href="${escape(href)}" target="_blank" rel="noreferrer noopener">${label}</a>`);
+      `<a href="${href}" target="_blank" rel="noreferrer noopener">${label}</a>`);
     text = text.replace(/(?<!["'=>])(https?:\/\/[^\s<)]+)/gi, (href) =>
-      `<a href="${escape(href)}" target="_blank" rel="noreferrer noopener">${escape(href)}</a>`);
+      `<a href="${href}" target="_blank" rel="noreferrer noopener">${href}</a>`);
     return text;
   }
 

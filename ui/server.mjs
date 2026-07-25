@@ -292,7 +292,7 @@ export function requestAccess(req, url, settings = loadDeviceSettings()) {
     || url.pathname.startsWith('/api/sync/')
     || url.pathname.startsWith('/api/workspace/')
     || url.pathname.startsWith('/api/remote-access/')
-    || ['POST /api/restart', 'POST /api/setup/proposal', 'POST /api/setup/activate', 'POST /api/setup/recovery', 'DELETE /api/setup/proposal'].includes(`${req.method} ${url.pathname}`);
+    || ['POST /api/restart', 'POST /api/setup/proposal', 'POST /api/setup/activate', 'POST /api/setup/recovery'].includes(`${req.method} ${url.pathname}`);
   if (mutatingApi && requiresJson) {
     const mediaType = String(req.headers['content-type'] || '').split(';', 1)[0].trim().toLowerCase();
     if (mediaType !== 'application/json') {
