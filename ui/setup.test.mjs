@@ -130,18 +130,69 @@ test('first-run setup offers optional local create, private backup guidance, and
   assert.doesNotMatch(source, /setup-next'\)\.onclick/);
 });
 
-test('a configured schedule job stays editable and drops first-run wording once there is scan history', () => {
-  const source = fs.readFileSync(new URL('./setup.js', import.meta.url), 'utf8');
-  // The schedule action button must not be disabled just because the latest scan is unhealthy
-  // when the job is already configured.
-  assert.match(source, /\$\{\(healthy \|\| run\?\.configured\) \? '' : 'disabled'\}/);
-  assert.doesNotMatch(source, /\$\{healthy \? '' : 'disabled'\}/);
-  // First-run wording (heading/callout/button label) must be gated on whether there is any
-  // history at all (a previous run or a configured job), not on the latest run being healthy.
-  assert.match(source, /const hasHistory = Boolean\(health\.lastRunAt\) \|\| configuredJobs;/);
-  assert.match(source, /\$\{hasHistory \? 'Your first scan is ready to review' : 'Run your first search with me'\}/);
-  assert.match(source, /\$\{hasHistory \? 'Supervised scan completed' : 'Supervised first scan'\}/);
-  assert.match(source, /\$\{scanning \? 'Scan running…' : hasHistory \? 'Scan now' : 'Run first scan now'\}/);
+// Renders renderFirstScan for real and inspects the output, so a behavioural
+// regression fails here even if the source text is rewritten, and a harmless
+// reformat does not.
+async function renderFirstScanHtml({ scanHealth, jobs = [], runs = [] }) {
+  globalThis.window = globalThis.window || {};
+  // A query string gives a module instance loaded after `window` exists, so the
+  // module's `window.ScoutSetup = Setup` export runs. `document` is deliberately
+  // installed only afterwards, so the module's auto-init does not fire.
+  await import('./setup.js?render-harness');
+  const Setup = globalThis.window.ScoutSetup;
+  const body = { innerHTML: '', querySelectorAll: () => [], querySelector: () => null };
+  const noop = { addEventListener() {}, textContent: '' };
+  const elements = { 'setup-body': body, 'setup-run-scan': noop, 'setup-next': noop };
+  const previousDocument = globalThis.document;
+  globalThis.document = { getElementById: (id) => elements[id] };
+  try {
+    const view = Object.create(Setup);
+    view.view = 'section';
+    view.operations = {};
+    view.status = {
+      scanHealth, schedule: { runs },
+      config: { ai: { provider: 'claude' }, locale: 'en-GB', schedule: { jobs } },
+      providers: {},
+    };
+    view.renderFirstScan({ includeBackup: false });
+    return body.innerHTML;
+  } finally {
+    if (previousDocument === undefined) delete globalThis.document;
+    else globalThis.document = previousDocument;
+  }
+}
+
+function scheduleButton(html) {
+  return html.match(/<button[^>]*data-schedule-enable[^>]*>[^<]*<\/button>/)[0];
+}
+
+test('a configured schedule job stays editable and drops first-run wording once there is scan history', async () => {
+  // Already configured, but the latest scan is unhealthy: the settings must stay
+  // saveable — this is the regression the fix is for.
+  const configured = await renderFirstScanHtml({
+    scanHealth: { lastRunAt: '2026-07-20T07:30:00.000Z', healthy: false },
+    jobs: [{ id: 'claude-primary', enabled: true }],
+    runs: [{ id: 'claude-primary', provider: 'claude', mode: 'primary', configured: true, time: '07:30', days: [0, 1, 2, 3, 4, 5, 6] }],
+  });
+  const button = scheduleButton(configured);
+  assert.match(button, />Save scan settings</);
+  assert.doesNotMatch(button, /\bdisabled\b/);
+  // History exists, so none of the first-run wording is used.
+  assert.match(configured, /Your first scan is ready to review/);
+  assert.match(configured, /Supervised scan completed/);
+  assert.match(configured, />Scan now</);
+  assert.doesNotMatch(configured, /Run your first search with me/);
+  assert.doesNotMatch(configured, /Run first scan now/);
+
+  // Nothing configured and no healthy run: first enablement is still gated, and
+  // the first-run wording is still used.
+  const firstRun = await renderFirstScanHtml({ scanHealth: {}, jobs: [], runs: [] });
+  const firstButton = scheduleButton(firstRun);
+  assert.match(firstButton, />Enable claude scan</);
+  assert.match(firstButton, /\bdisabled\b/);
+  assert.match(firstRun, /Run your first search with me/);
+  assert.match(firstRun, /Supervised first scan/);
+  assert.match(firstRun, />Run first scan now</);
 });
 
 test('the alternating preset gives each provider its own days', () => {
