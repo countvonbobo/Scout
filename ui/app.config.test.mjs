@@ -371,3 +371,19 @@ test('an existing artifact for the same role is opened directly', () => {
   scout.startCvCreate();
   assert.deepEqual(opened, [['seeCv', 'acme-backend-engineer-2026-07', 'acme-backend-engineer-2026-07']]);
 });
+
+test('cvLinkHtml shows no link (never a wrong-role link) when the chat opportunity is not in tracked data', () => {
+  const { scout } = loadScout();
+  scout.esc = (value) => String(value);
+  scout.state.data = { opportunities: [
+    { id: 'acme-frontend-engineer-2026-07', company: 'Acme', role: 'Frontend Engineer' },
+  ] };
+  scout.state.cvFiles = { applications: ['acme-frontend-engineer-2026-07'] };
+  scout.chat = {
+    id: 'acme-backend-engineer-2026-07',
+    data: { filesTouched: ['applications/acme-frontend-engineer-2026-07/cv.typ'] },
+  };
+  const html = scout.cvLinkHtml();
+  assert.equal(html, '');
+  assert.doesNotMatch(html, /acme-frontend-engineer-2026-07/);
+});

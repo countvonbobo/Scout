@@ -2023,7 +2023,8 @@ const Scout = {
   cvLinkHtml() {
     if (this.chat?.id === 'setup-onboarding') return '';
     const entry = (this.state.data?.opportunities || []).find((item) => item.id === this.chat.id);
-    const slug = entry ? this.resolveArtifactFor(entry).slug : this.slugOf(this.company(this.chat.id));
+    if (!entry) return '';
+    const slug = this.resolveArtifactFor(entry).slug;
     return (this.chat.data.filesTouched || []).includes(`applications/${slug}/cv.typ`)
       ? `<div class="chat-msg system"><a href="#" data-action="see-cv" data-slug="${this.esc(slug)}" data-id="${this.esc(this.chat.id)}">view rendered CV</a></div>`
       : '';
