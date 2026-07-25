@@ -70,3 +70,11 @@ test('report date navigation stays a vertical sidebar on desktop', () => {
   assert.match(rule[0], /min-width:\s*0/);
   assert.match(rule[0], /flex:\s*0 0 220px/);
 });
+
+test('CV create panel keeps its primary action on screen', () => {
+  const html = fs.readFileSync(new URL('./index.html', import.meta.url), 'utf8');
+  const rule = html.match(/\.cv-create[^{]*\{[^}]*\}/);
+  assert.ok(rule, 'expected a .cv-create rule');
+  assert.match(html, /\.cv-create select \{[^}]*max-width/);
+  assert.match(html, /\.cv-create label \{[^}]*min-width:\s*0/);
+});

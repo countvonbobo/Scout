@@ -864,6 +864,9 @@
     #undo-toast { position:fixed; left:50%; bottom:24px; transform:translateX(-50%); background:#2a2420; border:1px solid #4a3a2a; color:#d7c3a8; border-radius:10px; padding:11px 14px; display:flex; gap:14px; align-items:center; z-index:50; }
     #undo-toast.hidden { display:none; }
     #undo-toast button { background:none; border:none; color:#f0a982; font-weight:600; cursor:pointer; }
+    .cv-create { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
+    .cv-create label { min-width: 0; flex: 1 1 240px; display: flex; gap: 6px; align-items: center; }
+    .cv-create select { min-width: 0; max-width: 100%; flex: 1 1 auto; text-overflow: ellipsis; }
   </style>
 </head>
 <body>
@@ -926,7 +929,7 @@
       <label class="cv-option"><input id="cv-option-humanize" type="checkbox" checked><span><b>Natural-voice review <span class="chip">Recommended</span></b><span class="meta">Run a separate evidence-preserving rewrite and checks for generic phrasing, repetition, long bullets and locale mismatches.</span></span></label>
       <div class="controls" style="justify-content:flex-end;margin-top:18px">
         <button id="cv-options-cancel" class="act" type="button">Cancel</button>
-        <button id="cv-options-continue" class="act primary" type="button">Continue to job chat</button>
+        <button id="cv-options-continue" class="act primary" type="button">Start tailored CV</button>
       </div>
     </div>
   </div>

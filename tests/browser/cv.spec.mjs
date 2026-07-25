@@ -46,15 +46,15 @@ test('master reference PDF uses the real same-origin preview endpoint', async ({
 
 test('CV creation is available from the library and opportunity card', async ({ page }) => {
   await page.getByRole('button', { name: 'CV' }).click();
-  await page.getByRole('button', { name: 'Create tailored CV' }).click();
+  await page.getByRole('button', { name: 'Review CV options' }).click();
   await page.locator('#cv-create-opportunity').selectOption({ label: 'New Systems — Product Engineer' });
-  const continueFromLibrary = page.getByRole('button', { name: 'Continue' });
+  const continueFromLibrary = page.getByRole('button', { name: 'Start tailored CV' }).first();
   await continueFromLibrary.click();
   await expect(page.getByRole('heading', { name: 'Build this custom CV' })).toBeVisible();
   await expect(page.getByRole('heading', { name: 'Build this custom CV' })).toBeFocused();
   await expect.poll(() => page.locator('main').evaluate((element) => element.inert)).toBe(true);
   await page.keyboard.press('Shift+Tab');
-  await expect(page.getByRole('button', { name: 'Continue to job chat' })).toBeFocused();
+  await expect(page.locator('#cv-options-overlay').getByRole('button', { name: 'Start tailored CV' })).toBeFocused();
   await page.keyboard.press('Tab');
   await expect(page.locator('#cv-option-xyz')).toBeFocused();
   await page.keyboard.press('Escape');

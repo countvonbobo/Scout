@@ -243,6 +243,27 @@ test('removeFromShortlist dismisses to ignore with undo', () => {
   assert.deepEqual(normalized[0], ['/api/status', { id: 'b', status: 'ignore' }]);
 });
 
+test('switching tabs resets scroll position', () => {
+  const { scout, context } = loadScout();
+  let scrolled = null;
+  context.window.scrollTo = (x, y) => { scrolled = [x, y]; };
+  context.document = {
+    getElementById: () => ({ innerHTML: '', classList: { toggle() {}, add() {}, remove() {} } }),
+    querySelectorAll: () => [],
+  };
+  scout.state.data = { opportunities: [] };
+  scout.renderJobs = () => {}; scout.renderShortlist = () => {};
+  scout.renderPipeline = () => {}; scout.renderReports = () => {}; scout.renderCv = () => {};
+  scout.showTab('cv');
+  assert.deepEqual(scrolled, [0, 0]);
+});
+
+test('tailored CV actions are named for their outcome', () => {
+  const source = fs.readFileSync(new URL('./app.js', import.meta.url), 'utf8');
+  assert.match(source, /Review CV options/);
+  assert.match(source, /Start tailored CV/);
+});
+
 test('app.js inlined CATEGORY_PALETTE stays in sync with the canonical ui/lib/categoryColor.mjs copy', () => {
   const source = fs.readFileSync(new URL('./app.js', import.meta.url), 'utf8');
   for (const { bg, fg } of CATEGORY_PALETTE) {

@@ -1343,9 +1343,9 @@ const Scout = {
     const opportunityOptions = opportunities.map((entry) =>
       `<option value="${this.esc(entry.id)}">${this.esc(entry.company)} — ${this.esc(entry.role)}</option>`).join('');
     el.innerHTML = `
-      <div class="cv-library-head"><div><h2>CV library</h2><div class="meta">Existing sources remain available even before a PDF or quality review exists.</div></div><button class="act bridge" data-action="toggle-cv-create">Create tailored CV</button></div>
-      <div id="cv-create-panel" class="cv-create-panel hidden">
-        ${opportunityOptions ? `<label>Tracked opportunity<select id="cv-create-opportunity">${opportunityOptions}</select></label><button class="act primary" data-action="start-cv-create">Continue</button>` : '<div class="meta">Add a tracked opportunity before creating a tailored CV.</div>'}
+      <div class="cv-library-head"><div><h2>CV library</h2><div class="meta">Existing sources remain available even before a PDF or quality review exists.</div></div><button class="act bridge" data-action="toggle-cv-create">Review CV options</button></div>
+      <div id="cv-create-panel" class="cv-create-panel hidden cv-create">
+        ${opportunityOptions ? `<label>Tracked opportunity<select id="cv-create-opportunity">${opportunityOptions}</select></label><button class="act primary" data-action="start-cv-create">Start tailored CV</button>` : '<div class="meta">Add a tracked opportunity before creating a tailored CV.</div>'}
       </div>
       <div class="cv-layout">
         <aside class="cv-sidebar">
@@ -2272,6 +2272,7 @@ const Scout = {
     document.querySelectorAll('nav button').forEach((b) => b.classList.toggle('active', b.dataset.tab === tab));
     ['jobs', 'shortlist', 'pipeline', 'all', 'reports', 'cv'].forEach((t) =>
       document.getElementById(`tab-${t}`)?.classList.toggle('hidden', t !== tab));
+    window.scrollTo?.(0, 0);
     if (tab === 'jobs') this.renderJobs();
     if (tab === 'shortlist') this.renderShortlist();
     if (tab === 'pipeline') this.renderPipeline();
