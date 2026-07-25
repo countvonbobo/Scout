@@ -241,6 +241,16 @@ export function syncManagedInstructions(appRoot, workspaceRoot) {
     fs.mkdirSync(workspaceRoot, { recursive: true });
     fs.appendFileSync(ignore, `${ignoreText && !ignoreText.endsWith('\n') ? '\n' : ''}data/chats/\n`, 'utf8');
   }
+  const currentIgnore = fs.existsSync(ignore) ? fs.readFileSync(ignore, 'utf8') : '';
+  const lines = currentIgnore.split(/\r?\n/);
+  const scoutIndex = lines.indexOf('.scout/');
+  if (scoutIndex !== -1) {
+    // Note: applications/**/*.pdf remains ignored because PDFs are large and regenerable,
+    // while the manifest (cv-renders.json) persists their state across restores.
+    lines[scoutIndex] = '.scout/*\n!.scout/cv-renders.json';
+    const joined = currentIgnore.includes('\r\n') ? lines.join('\r\n') : lines.join('\n');
+    fs.writeFileSync(ignore, joined, 'utf8');
+  }
   // A source checkout can still act as its own legacy workspace. Its managed
   // files are already present and may be protected by the host sandbox.
   if (path.resolve(appRoot) === path.resolve(workspaceRoot)) return;

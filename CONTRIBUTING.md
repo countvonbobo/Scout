@@ -48,7 +48,7 @@ Do not run destructive migration or scheduler tests against your real workspace.
 - Make workspace migrations versioned, backed up, and safe to rerun.
 - Use direct child-process invocation with explicit arguments; do not introduce `shell: true` for user-controlled content.
 - Treat missing source data as uncertainty and individual source failures as degraded coverage.
-- Add focused tests for behaviour and failure modes.
+- Add focused tests for behaviour and failure modes. **Every new test must fail against the pre-fix code.** Revert the change locally, confirm RED, restore it, confirm GREEN. Put both outputs in the report. A regression test that has never been observed to fail is not evidence. Where a bug has a user-visible symptom, at least one assertion must exercise that symptom — the action the user takes, not the flag the code sets.
 - Follow [Documentation maintenance](docs/DOCUMENTATION.md) whenever a change affects commands, configuration, setup, migrations, providers, sources, installers, operations, privacy, or user-visible copy.
 
 ## Pull requests

@@ -139,7 +139,7 @@ export function migrateLegacyWorkspace(sourceRoot, targetRoot) {
     .reduce((count, rel) => count + verifyCopiedTree(path.join(sourceRoot, rel), path.join(targetRoot, rel)), 0);
   inferLegacyConfig(sourceRoot, targetRoot);
   const ignore = path.join(targetRoot, '.gitignore');
-  if (!fs.existsSync(ignore)) fs.writeFileSync(ignore, '.env\n.agents/\n.claude/\nAGENTS.md\nCLAUDE.md\n.scout/\nlogs/\napplications/**/*.pdf\napplications/**/*.docx\ndata/chats/\n', 'utf8');
+  if (!fs.existsSync(ignore)) fs.writeFileSync(ignore, '.env\n.agents/\n.claude/\nAGENTS.md\nCLAUDE.md\n.scout/*\n!.scout/cv-renders.json\nlogs/\napplications/**/*.pdf\napplications/**/*.docx\ndata/chats/\n', 'utf8');
   spawnSync('git', ['add', '--', '.'], { cwd: targetRoot, encoding: 'utf8', windowsHide: true });
   const commit = spawnSync('git', ['commit', '-m', 'Initial private Scout workspace'], { cwd: targetRoot, encoding: 'utf8', windowsHide: true });
   return { sourceRoot, targetRoot, verifiedFiles, committed: commit.status === 0, commitMessage: String(commit.stderr || commit.stdout || '').trim() };
