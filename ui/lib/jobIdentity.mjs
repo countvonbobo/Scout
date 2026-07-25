@@ -4,6 +4,7 @@ const EVIDENCE_NOISE = new Set([
   'about', 'after', 'also', 'and', 'are', 'but', 'for', 'from', 'have', 'into', 'our', 'that', 'the',
   'their', 'this', 'with', 'will', 'you', 'your', 'role', 'team', 'work', 'working',
 ]);
+const IDENTITY_CACHE = new WeakMap();
 
 export function normaliseIdentityText(value) {
   return String(value || '').normalize('NFKD').replace(/[\u0300-\u036f]/g, '')
@@ -66,11 +67,15 @@ export function sourceReferencesOf(job) {
 }
 
 export function jobIdentity(job) {
+  if (job && typeof job === 'object') {
+    const cached = IDENTITY_CACHE.get(job);
+    if (cached) return cached;
+  }
   const role = job?.role || job?.title;
   const description = job?.description || job?.jobIdentity?.advertFingerprint
     || (job?.mandatoryRequirements || []).map((item) => `${item.requirement || ''} ${item.advertEvidence || ''}`).join(' ');
   const location = job?.location || job?.jobIdentity?.location || '';
-  return {
+  const identity = {
     company: companyKey(job?.company || job?.jobIdentity?.company),
     title: titleKey(role || job?.jobIdentity?.title),
     titleTokens: tokens(role || job?.jobIdentity?.title),
@@ -80,6 +85,12 @@ export function jobIdentity(job) {
     evidenceTokens: evidenceTokens(description),
     references: sourceReferencesOf(job),
   };
+  if (job && typeof job === 'object') IDENTITY_CACHE.set(job, identity);
+  return identity;
+}
+
+export function invalidateJobIdentity(job) {
+  if (job && typeof job === 'object') IDENTITY_CACHE.delete(job);
 }
 
 function locationsCompatible(a, b) {

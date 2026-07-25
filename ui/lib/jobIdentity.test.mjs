@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { advertMateriallyChanged, canonicalJobUrl, sameUnderlyingJob } from './jobIdentity.mjs';
+import {
+  advertMateriallyChanged, canonicalJobUrl, invalidateJobIdentity, jobIdentity, sameUnderlyingJob,
+} from './jobIdentity.mjs';
 
 test('canonical URLs ignore fragments and common tracking parameters', () => {
   assert.equal(canonicalJobUrl('https://EXAMPLE.test/jobs/1/?utm_source=x&ref=mail#apply'), 'https://example.test/jobs/1');
@@ -27,4 +29,14 @@ test('material advert changes are distinguished from wording changes', () => {
   const base = { company: 'Acme', title: 'Engineer', description: 'Design embedded electronics PCB hardware testing production verification firmware sensors.' };
   assert.equal(advertMateriallyChanged(base, { ...base, description: 'Design embedded electronics and PCB hardware, including testing, production verification, firmware and sensors.' }), false);
   assert.equal(advertMateriallyChanged(base, { ...base, description: 'Lead enterprise sales accounts pipeline forecasting negotiation contracts revenue customer acquisition.' }), true);
+});
+
+test('job identities are cached until a deliberate candidate merge invalidates them', () => {
+  const job = { company: 'Acme', role: 'Engineer', description: 'Build the first version with embedded systems expertise.' };
+  const first = jobIdentity(job);
+  assert.equal(jobIdentity(job), first);
+  job.description = 'Lead an entirely different production platform and safety programme.';
+  assert.equal(jobIdentity(job), first);
+  invalidateJobIdentity(job);
+  assert.notEqual(jobIdentity(job), first);
 });

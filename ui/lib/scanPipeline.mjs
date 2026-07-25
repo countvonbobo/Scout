@@ -4,7 +4,7 @@ import { atomicWriteFile } from './atomicWrite.mjs';
 import { serializeTracker } from './tracker.mjs';
 import { workspacePaths } from './workspace.mjs';
 import {
-  advertMateriallyChanged, jobIdentity, mergeSourceReferences, sameUnderlyingJob, sourceReferencesOf,
+  advertMateriallyChanged, invalidateJobIdentity, jobIdentity, mergeSourceReferences, sameUnderlyingJob, sourceReferencesOf,
 } from './jobIdentity.mjs';
 import { isVerifiable } from './statusGroups.mjs';
 
@@ -189,6 +189,7 @@ function absorbDuplicate(existing, incoming) {
   existing.tags = [...new Set([...existing.tags, ...incoming.tags])];
   if (incoming.description.length > existing.description.length) existing.description = incoming.description;
   if (!existing.salary && incoming.salary) existing.salary = incoming.salary;
+  invalidateJobIdentity(existing);
 }
 
 // Candidates were previously filled in source order until the cap was reached,
