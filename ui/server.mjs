@@ -1182,8 +1182,11 @@ routes['POST /api/schedule'] = (req, res, body) => {
     const model = assertSafeModel(b.model);
     let result;
     if (b.action === 'install') {
-      const health = readScanHealth();
-      if (!health.lastRunAt || !health.healthy) return replyJson(res, 409, { error: 'complete a healthy supervised scan before enabling daily scans' });
+      const configured = (config.schedule?.jobs || []).some((job) => job.id === id);
+      if (!configured) {
+        const health = readScanHealth();
+        if (!health.lastRunAt || !health.healthy) return replyJson(res, 409, { error: 'complete a healthy supervised scan before enabling daily scans' });
+      }
       if (b.days !== undefined && b.days !== null && !Array.isArray(b.days)) {
         return replyJson(res, 400, { error: 'days must be an array of whole numbers from 0 (Sunday) to 6 (Saturday)' });
       }

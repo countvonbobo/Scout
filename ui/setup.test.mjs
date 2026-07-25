@@ -130,6 +130,20 @@ test('first-run setup offers optional local create, private backup guidance, and
   assert.doesNotMatch(source, /setup-next'\)\.onclick/);
 });
 
+test('a configured schedule job stays editable and drops first-run wording once there is scan history', () => {
+  const source = fs.readFileSync(new URL('./setup.js', import.meta.url), 'utf8');
+  // The schedule action button must not be disabled just because the latest scan is unhealthy
+  // when the job is already configured.
+  assert.match(source, /\$\{\(healthy \|\| run\?\.configured\) \? '' : 'disabled'\}/);
+  assert.doesNotMatch(source, /\$\{healthy \? '' : 'disabled'\}/);
+  // First-run wording (heading/callout/button label) must be gated on whether there is any
+  // history at all (a previous run or a configured job), not on the latest run being healthy.
+  assert.match(source, /const hasHistory = Boolean\(health\.lastRunAt\) \|\| configuredJobs;/);
+  assert.match(source, /\$\{hasHistory \? 'Your first scan is ready to review' : 'Run your first search with me'\}/);
+  assert.match(source, /\$\{hasHistory \? 'Supervised scan completed' : 'Supervised first scan'\}/);
+  assert.match(source, /\$\{scanning \? 'Scan running…' : hasHistory \? 'Scan now' : 'Run first scan now'\}/);
+});
+
 test('the alternating preset gives each provider its own days', () => {
   const primary = presetDays('alternating', 'primary');
   const second = presetDays('alternating', 'second-pass');

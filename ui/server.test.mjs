@@ -12,7 +12,7 @@ const testWorkspace = fs.mkdtempSync(path.join(os.tmpdir(), 'scout-server-test-'
 process.env.SCOUT_WORKSPACE = testWorkspace;
 process.env.SCOUT_DEVICE_SETTINGS = path.join(testWorkspace, 'device-settings.json');
 const { APP_ROOT, APP_VERSION, UI_BUILD_ID, WORKSPACE_ROOT, createServer, operations, providerDetection, restartControl, shutdownControl } = await import('./server.mjs');
-const { seedWorkspace } = await import('./lib/workspace.mjs');
+const { seedWorkspace, loadWorkspaceConfig, writeWorkspaceConfig } = await import('./lib/workspace.mjs');
 const { acquireScanLock, releaseScanLock } = await import('../tools/scan-lock.mjs');
 
 let server;
@@ -388,6 +388,44 @@ test('daily schedule is blocked before a healthy supervised scan', async () => {
   const response = await request({ method: 'POST', path: '/api/schedule', headers: { host, origin: `http://${host}`, 'content-type': 'application/json' }, body: JSON.stringify({ action: 'install', provider: 'codex', time: '07:30' }) });
   assert.equal(response.status, 409);
   assert.match(JSON.parse(response.text).error, /healthy supervised scan/i);
+});
+
+test('an already-configured schedule job can be updated despite an unhealthy latest scan', async () => {
+  const host = `127.0.0.1:${port}`;
+  fs.mkdirSync(path.join(testWorkspace, 'data'), { recursive: true });
+  fs.writeFileSync(path.join(testWorkspace, 'data', 'scan-runs.jsonl'), `${JSON.stringify({
+    schemaVersion: 3, timestamp: '2020-01-01T09:00:00.000Z', started_at: '2020-01-01T08:53:00.000Z',
+    agent: 'claude', mode: 'primary', degraded: true, skipped: true, candidates_found: 0, keepers_added: 0, keepers_updated: 0,
+    discarded: {}, errors: ['stale/skipped run'], source_health: {}, queries_checked: [], reviewed: [],
+  })}\n`);
+  const config = loadWorkspaceConfig(WORKSPACE_ROOT);
+  config.schedule.jobs = [{ id: 'claude-primary', enabled: true, time: '07:30', days: null, provider: 'claude', mode: 'primary', model: null }];
+  writeWorkspaceConfig(WORKSPACE_ROOT, config);
+  try {
+    const response = await request({ method: 'POST', path: '/api/schedule', headers: { host, origin: `http://${host}`, 'content-type': 'application/json' }, body: JSON.stringify({ action: 'install', id: 'claude-primary', provider: 'claude', time: '09:15' }) });
+    assert.equal(response.status, 200);
+    assert.equal(JSON.parse(response.text).ok, true);
+  } finally {
+    await request({ method: 'POST', path: '/api/schedule', headers: { host, origin: `http://${host}`, 'content-type': 'application/json' }, body: JSON.stringify({ action: 'remove', id: 'claude-primary' }) });
+    fs.rmSync(path.join(testWorkspace, 'data', 'scan-runs.jsonl'), { force: true });
+  }
+});
+
+test('first enablement of an unconfigured schedule job is still blocked when unhealthy', async () => {
+  const host = `127.0.0.1:${port}`;
+  fs.mkdirSync(path.join(testWorkspace, 'data'), { recursive: true });
+  fs.writeFileSync(path.join(testWorkspace, 'data', 'scan-runs.jsonl'), `${JSON.stringify({
+    schemaVersion: 3, timestamp: '2020-01-01T09:00:00.000Z', started_at: '2020-01-01T08:53:00.000Z',
+    agent: 'claude', mode: 'primary', degraded: true, skipped: true, candidates_found: 0, keepers_added: 0, keepers_updated: 0,
+    discarded: {}, errors: ['stale/skipped run'], source_health: {}, queries_checked: [], reviewed: [],
+  })}\n`);
+  try {
+    const response = await request({ method: 'POST', path: '/api/schedule', headers: { host, origin: `http://${host}`, 'content-type': 'application/json' }, body: JSON.stringify({ action: 'install', id: 'codex-verify', provider: 'codex', time: '07:30' }) });
+    assert.equal(response.status, 409);
+    assert.match(JSON.parse(response.text).error, /healthy supervised scan/i);
+  } finally {
+    fs.rmSync(path.join(testWorkspace, 'data', 'scan-runs.jsonl'), { force: true });
+  }
 });
 
 test('latest scan API exposes only bounded review fields and scan health omits raw queries', async () => {
