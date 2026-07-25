@@ -319,3 +319,28 @@ test('renderCvOnly renders without re-saving the source', async () => {
   assert.ok(!calls.some((c) => c[0] === '/api/cv/save'), 'must not re-save the source');
   assert.ok(calls.some((c) => c[0] === 'RENDER_PREVIEW'));
 });
+
+test('renderCvOnly reports a saved-but-render-failed status when the real render path fails', async () => {
+  const { scout, context } = loadScout();
+  const elements = {
+    'cv-status': { textContent: '' },
+    'cv-preview': { innerHTML: '' },
+  };
+  context.document = {
+    getElementById: (id) => elements[id],
+    querySelectorAll: () => [],
+  };
+  // Exercise renderCvPreview's real fetch-driven implementation (not a throwing
+  // test double) so the failure path actually observed in production is covered.
+  context.fetch = () => Promise.resolve({
+    ok: false,
+    status: 500,
+    json: () => Promise.resolve({ error: 'render engine crashed' }),
+  });
+  scout.cvState = { path: 'applications/acme-eng-2026-07/cv.typ', slug: 'acme-eng-2026-07', dirty: false };
+  scout.post = () => { throw new Error('must not re-save the source'); };
+  await scout.renderCvOnly();
+  assert.match(elements['cv-preview'].innerHTML, /render engine crashed/);
+  assert.match(elements['cv-status'].textContent, /Saved source is intact/);
+  assert.match(elements['cv-status'].textContent, /render engine crashed/);
+});

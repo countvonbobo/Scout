@@ -1526,6 +1526,7 @@ const Scout = {
       await this.watchCvRender(body.operation.id);
     } catch (e) {
       preview.innerHTML = `<div class="cv-preview-error">Preview could not load: ${this.esc(e.message)}</div>`;
+      throw e;
     }
   },
 
