@@ -1,7 +1,7 @@
 import { daysBetween, followUpsDue, triage } from './derive.mjs';
 import { currentStage, isInterviewStage, lastCompletedStage, stagesOf } from './tracker.mjs';
 
-import { ACTIVE_STATUSES, CLOSED_STATUSES, OPEN_STATUSES, isOpen } from './statusGroups.mjs';
+import { ACTIVE_STATUSES, OPEN_STATUSES, isOpen } from './statusGroups.mjs';
 
 function latestDate(dates) {
   return dates.filter(Boolean).sort().at(-1) || null;
@@ -44,8 +44,6 @@ function byScoreThenMovement(a, b) {
 }
 
 export function pipeline(data, today, policy = {}) {
-  const staleDays = Number(policy.staleDays ?? 10);
-  const decisionDays = Number(policy.decisionDays ?? 2);
   const summaries = (data.opportunities || []).map((entry) => applicationSummary(entry, today, policy));
   const byStatus = {};
   for (const item of summaries) byStatus[item.status] = (byStatus[item.status] || 0) + 1;
@@ -62,40 +60,12 @@ export function pipeline(data, today, policy = {}) {
   const awaitingDecision = summaries
     .filter((item) => OPEN_STATUSES.includes(item.status))
     .sort(byScoreThenMovement);
+  const accepted = summaries
+    .filter((item) => item.status === 'accepted')
+    .sort((a, b) => String(b.lastMovementDate || '').localeCompare(String(a.lastMovementDate || '')));
   const recentlyClosed = summaries
-    .filter((item) => CLOSED_STATUSES.includes(item.status))
+    .filter((item) => item.status === 'rejected')
     .sort((a, b) => String(b.rejectedDate || b.lastMovementDate || '').localeCompare(String(a.rejectedDate || a.lastMovementDate || '')));
-
-  const flags = [];
-  for (const item of summaries) {
-    if (item.followUps.length) {
-      flags.push({
-        id: item.id,
-        company: item.company,
-        role: item.role,
-        kind: item.followUps[0].kind === 'nudge' ? 'nudge' : 'closeout',
-        detail: `follow-up due since ${item.followUps[0].since}`,
-      });
-    }
-    if (item.needsInterviewPrep) {
-      flags.push({
-        id: item.id,
-        company: item.company,
-        role: item.role,
-        kind: 'interview-prep',
-        detail: `prep for ${item.currentStage}`,
-      });
-    }
-    if (ACTIVE_STATUSES.includes(item.status) && item.daysSinceLastMovement !== null && item.daysSinceLastMovement >= staleDays) {
-      flags.push({
-        id: item.id,
-        company: item.company,
-        role: item.role,
-        kind: 'stale',
-        detail: `${item.daysSinceLastMovement} days since movement`,
-      });
-    }
-  }
 
   return {
     summary: {
@@ -105,23 +75,23 @@ export function pipeline(data, today, policy = {}) {
       watch: watch.length,
       active: active.length,
       awaitingDecision: awaitingDecision.length,
+      accepted: accepted.length,
       recentlyClosed: recentlyClosed.length,
-      flags: flags.length,
     },
     shortlist,
     watch,
     active,
     awaitingDecision,
+    accepted,
     recentlyClosed,
-    flags,
   };
 }
 
 // A workspace that has not been created yet must still answer /api/opportunities
 // with exactly the shape a populated workspace returns. Deriving it from the
 // same functions keeps the two branches from drifting apart: a hand-written
-// literal previously omitted pipeline.flags, which crashed the dashboard on
-// every fresh install.
+// literal previously drifted from the live pipeline shape, which crashed the
+// dashboard on every fresh install.
 export function emptyTrackerView(today, policy = {}) {
   const data = { updated: today, opportunities: [] };
   return {

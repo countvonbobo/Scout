@@ -449,6 +449,24 @@ const Scout = {
     </div>`;
   },
 
+  scanHealthCard() {
+    const health = this.state.data?.scanHealth;
+    const healthText = health
+      ? `${health.healthy ? 'healthy' : (health.stale ? 'stale' : 'degraded')}${health.reason ? ' - ' + health.reason : ''}`
+      : 'unknown';
+    const sourceHealth = (health?.sourceHealth || []).length
+      ? `<div class="source-health">${health.sourceHealth.map((source) => `<span class="chip source-${this.esc(source.status)}" title="${this.esc(source.reason || '')}">${this.esc(source.name)}: ${this.esc(source.status)}${source.count === null ? '' : ` (${this.esc(source.count)})`}</span>`).join('')}</div>`
+      : '<div class="meta">No per-source health was recorded for this run.</div>';
+    const reportDate = String(health?.lastRunAt || '').slice(0, 10);
+    return `<div class="card">
+      <div class="top"><b>Scan health</b><span class="chip">${this.esc(healthText)}</span></div>
+      <p><strong>${this.esc(Number(health?.candidatesFound || 0))} reviewed, ${this.esc(Number(health?.keepersAdded || 0))} kept</strong>${this.discardBreakdown(health) ? ` — ${this.esc(this.discardBreakdown(health))}` : ''}. Zero keepers can be a valid result when strict gates exclude every candidate.</p>
+      <div class="meta">last run: ${this.esc(health?.lastRunAt || 'never')}</div>
+      ${sourceHealth}
+      <p><button class="act" data-action="open-scan-result">Review this scan</button> ${/^\d{4}-\d{2}-\d{2}$/.test(reportDate) ? `<button class="act" data-action="open-scan-report" data-date="${this.esc(reportDate)}">Review dated report</button>` : ''}</p>
+    </div>`;
+  },
+
   async watchScanOperation(id) {
     if (!id) return;
     if (this.scanOperationTimer) clearTimeout(this.scanOperationTimer);
@@ -809,30 +827,9 @@ const Scout = {
     // empty board rather than throwing, which would abort loadOpportunities()
     // before the dashboard and discovery prompts are drawn.
     const p = this.state.data.pipeline;
-    const h = this.state.data.scanHealth;
     const el = document.getElementById('tab-pipeline');
-    if (!p || !el || !Array.isArray(p.flags)) return;
+    if (!p || !el) return;
     const metric = (label, value) => `<div class="metric"><b>${this.esc(value)}</b>${this.esc(label)}</div>`;
-    const healthText = h
-      ? `${h.healthy ? 'healthy' : (h.stale ? 'stale' : 'degraded')}${h.reason ? ' - ' + h.reason : ''}`
-      : 'unknown';
-    const sourceHealth = (h?.sourceHealth || []).length
-      ? `<div class="source-health">${h.sourceHealth.map((source) => `<span class="chip source-${this.esc(source.status)}" title="${this.esc(source.reason || '')}">${this.esc(source.name)}: ${this.esc(source.status)}${source.count === null ? '' : ` (${this.esc(source.count)})`}</span>`).join('')}</div>`
-      : '<div class="meta">No per-source health was recorded for this run.</div>';
-    const reviewed = Number(h?.candidatesFound || 0);
-    const kept = Number(h?.keepersAdded || 0);
-    const discardLabels = { hard_exclusion: 'hard exclusions', mandatory_unmet: 'mandatory gates', below_threshold: 'below threshold', provider_discarded: 'assessment discards' };
-    const discardBreakdown = Object.entries(h?.discarded || {}).filter(([, count]) => Number(count) > 0)
-      .map(([key, count]) => `${count} ${discardLabels[key] || key.replaceAll('_', ' ')}`).join(', ');
-    const reportDate = String(h?.lastRunAt || '').slice(0, 10);
-    const flags = p.flags.length
-      ? '<div class="label">Flags</div>' + p.flags.map((f) =>
-          `<div class="card flag" data-id="${this.esc(f.id)}" role="button" tabindex="0">
-            <div class="top"><b>${this.esc(f.company)}</b><span class="chip">${this.esc(f.kind)}</span></div>
-            <div class="meta">${this.esc(f.role)} - ${this.esc(f.detail)}</div>
-            <div class="detail"></div>
-          </div>`).join('')
-      : '<p>No pipeline flags.</p>';
     const list = (title, items) => `<div>
       <div class="label">${title}</div>
       ${items.length ? items.map((i) => this.pipelineCard(i)).join('') : '<p>Nothing here.</p>'}
@@ -842,22 +839,15 @@ const Scout = {
         ${metric('shortlist', p.summary.shortlist ?? (p.shortlist || []).length)}
         ${metric('watch', p.summary.watch ?? (p.watch || []).length)}
         ${metric('active', p.summary.active)}
-        ${metric('closed / ignored', p.summary.recentlyClosed)}
-        ${metric('flags', p.summary.flags)}
+        ${metric('accepted', p.summary.accepted ?? (p.accepted || []).length)}
+        ${metric('closed', p.summary.recentlyClosed)}
       </div>
-      <div class="card">
-        <div class="top"><b>Scan health</b><span class="chip">${this.esc(healthText)}</span></div>
-        <p><strong>${this.esc(reviewed)} reviewed, ${this.esc(kept)} kept</strong>${discardBreakdown ? ` — ${this.esc(discardBreakdown)}` : ''}. Zero keepers can be a valid result when strict gates exclude every candidate.</p>
-        <div class="meta">last run: ${this.esc(h && h.lastRunAt ? h.lastRunAt : 'never')}</div>
-        ${sourceHealth}
-        <p><button class="act" data-action="open-scan-result">Review this scan</button> ${/^\d{4}-\d{2}-\d{2}$/.test(reportDate) ? `<button class="act" data-action="open-scan-report" data-date="${this.esc(reportDate)}">Review dated report</button>` : ''}</p>
-      </div>
-      ${flags}
       <div class="split">
         ${list('Shortlist', p.shortlist || [])}
         ${list('Watch', p.watch || [])}
         ${list('Active', p.active)}
-        ${list('Closed / ignored', p.recentlyClosed)}
+        ${list('Accepted', p.accepted || [])}
+        ${list('Closed', p.recentlyClosed)}
       </div>`;
   },
 
@@ -950,12 +940,13 @@ const Scout = {
   async renderReports() {
     const { reports } = await this.api('/api/reports');
     const el = document.getElementById('tab-reports');
-    if (!reports.length) { el.innerHTML = '<p>No reports yet.</p>'; return; }
-    el.innerHTML = `<div class="report-list">
+    const scanHealth = this.scanHealthCard();
+    if (!reports.length) { el.innerHTML = `${scanHealth}<p>No reports yet.</p>`; return; }
+    el.innerHTML = `${scanHealth}<div class="report-list">
       <label class="report-date-select">Report date<select data-action="select-report">${reports.map((d) => `<option value="${this.esc(d)}">${d}</option>`).join('')}</select></label>
       <nav class="dates" aria-label="Report dates">${reports.map((d) => `<button class="act" data-action="open-report" data-date="${this.esc(d)}">${d}</button>`).join('')}</nav>
       <div id="report-body" class="report-body" style="flex:1"></div></div>`;
-    this.openReport(reports[0]);
+    await this.openReport(reports[0]);
   },
 
   async openReport(date) {
@@ -1803,8 +1794,8 @@ const Scout = {
   },
 
   interviewPrepRecommended(id) {
-    return (this.state.data?.pipeline?.flags || [])
-      .some((flag) => flag.id === id && flag.kind === 'interview-prep');
+    return (this.state.data?.pipeline?.active || [])
+      .some((item) => item.id === id && item.needsInterviewPrep);
   },
 
   scheduleChatRecovery(c) {
