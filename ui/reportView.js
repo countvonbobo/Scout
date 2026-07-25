@@ -28,7 +28,7 @@
       list = null;
     };
     for (const raw of lines) {
-      const heading = raw.match(/^\s*(#{3,6})\s+(.+?)\s*$/);
+      const heading = raw.match(/^\s*(#{3,})\s+(.+?)\s*$/);
       if (heading) {
         closeList();
         const level = Math.min(heading[1].length + 1, 6);
