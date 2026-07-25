@@ -344,3 +344,30 @@ test('renderCvOnly reports a saved-but-render-failed status when the real render
   assert.match(elements['cv-status'].textContent, /Saved source is intact/);
   assert.match(elements['cv-status'].textContent, /render engine crashed/);
 });
+
+test('creating a CV for a second role at one company does not open the first role\'s CV', () => {
+  const { scout, context } = loadScout();
+  const opened = [];
+  context.document = { getElementById: () => ({ value: 'acme-frontend-engineer-2026-07' }), querySelectorAll: () => [] };
+  scout.state.data = { opportunities: [
+    { id: 'acme-backend-engineer-2026-07', company: 'Acme', role: 'Backend Engineer' },
+    { id: 'acme-frontend-engineer-2026-07', company: 'Acme', role: 'Frontend Engineer' },
+  ] };
+  scout.state.cvFiles = { applications: ['acme-backend-engineer-2026-07'] };
+  scout.seeCv = (slug, id) => opened.push(['seeCv', slug, id]);
+  scout.chooseCvOptions = (id) => opened.push(['chooseCvOptions', id]);
+  scout.startCvCreate();
+  assert.deepEqual(opened, [['chooseCvOptions', 'acme-frontend-engineer-2026-07']]);
+});
+
+test('an existing artifact for the same role is opened directly', () => {
+  const { scout, context } = loadScout();
+  const opened = [];
+  context.document = { getElementById: () => ({ value: 'acme-backend-engineer-2026-07' }), querySelectorAll: () => [] };
+  scout.state.data = { opportunities: [{ id: 'acme-backend-engineer-2026-07', company: 'Acme', role: 'Backend Engineer' }] };
+  scout.state.cvFiles = { applications: ['acme-backend-engineer-2026-07'] };
+  scout.seeCv = (slug, id) => opened.push(['seeCv', slug, id]);
+  scout.chooseCvOptions = (id) => opened.push(['chooseCvOptions', id]);
+  scout.startCvCreate();
+  assert.deepEqual(opened, [['seeCv', 'acme-backend-engineer-2026-07', 'acme-backend-engineer-2026-07']]);
+});

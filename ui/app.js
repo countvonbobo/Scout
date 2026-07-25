@@ -65,6 +65,32 @@ function categoryColor(categoryId, categoryIds) {
   const position = index >= 0 ? index : 0;
   return CATEGORY_PALETTE[position % CATEGORY_PALETTE.length];
 }
+// Tailored CV artifacts are keyed by the tracked opportunity so two roles at one
+// company never share a directory. Legacy company-slug directories stay exactly
+// where they are: they are reused in place and flagged, never moved or deleted.
+// Inlined verbatim (behaviourally) from ui/lib/cvArtifacts.mjs — this is a classic
+// script and cannot use `import`.
+const CV_SLUG = /^[a-z0-9-]+$/;
+function cvSlugify(value) {
+  return String(value || '').toLowerCase().replace(/&/g, ' and ')
+    .replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
+}
+function artifactSlugFor(opportunity) {
+  const id = String(opportunity?.id || '');
+  if (CV_SLUG.test(id)) return id;
+  return [cvSlugify(opportunity?.company), cvSlugify(opportunity?.role)].filter(Boolean).join('-');
+}
+function resolveArtifact(existingSlugs, opportunity, slugOfCompany, opportunities = []) {
+  const slugs = new Set(existingSlugs || []);
+  const preferred = artifactSlugFor(opportunity);
+  if (slugs.has(preferred)) return { slug: preferred, legacy: false, ambiguous: false };
+  const legacy = slugOfCompany(opportunity?.company);
+  if (legacy && slugs.has(legacy)) {
+    const sharing = (opportunities || []).filter((o) => slugOfCompany(o.company) === legacy).length;
+    return { slug: legacy, legacy: true, ambiguous: sharing > 1 };
+  }
+  return { slug: preferred, legacy: false, ambiguous: false };
+}
 function codexTaskUrl(sessionId) {
   const value = String(sessionId || '').trim();
   if (!/^[A-Za-z0-9-]+$/.test(value)) return null;
@@ -1029,7 +1055,7 @@ const Scout = {
       ? `<ol class="stage-list">${stages.map((s, i) =>
           `<li>${this.esc(s.completed ? '[x]' : '[ ]')} ${this.esc(s.name)}${s.date ? ' - ' + this.esc(s.date) : ''}${!s.completed ? ` <button class="act" data-action="complete-stage" data-id="${this.esc(e.id)}" data-index="${i}">complete</button>` : ''}</li>`).join('')}</ol>`
       : '<div class="meta">no application stages yet</div>';
-    const slug = this.slugOf(e.company);
+    const slug = this.resolveArtifactFor(e).slug;
     const cvFiles = this.state.cvFiles || { applications: [], outreach: [] };
     const hasCv = (cvFiles.applications || []).includes(slug);
     const hasOutreach = (cvFiles.outreach || []).includes(slug);
@@ -1122,6 +1148,16 @@ const Scout = {
       .replace(/&/g, ' and ')
       .replace(/[^a-z0-9]+/g, '-')
       .replace(/^-+|-+$/g, '');
+  },
+
+  artifactSlugFor(entry) { return artifactSlugFor(entry); },
+  resolveArtifactFor(entry) {
+    return resolveArtifact(
+      this.state.cvFiles?.applications || [],
+      entry,
+      (company) => this.slugOf(company),
+      this.state.data?.opportunities || [],
+    );
   },
 
   localToday() {
@@ -1331,7 +1367,7 @@ const Scout = {
       const opportunityId = matches.length === 1 ? matches[0].id : null;
       const label = matches.length === 1
         ? `${matches[0].company} — ${matches[0].role}`
-        : matches.length > 1 ? `${matches[0].company} — ${matches.length} tracked roles` : entry.slug;
+        : matches.length > 1 ? `${matches[0].company} — ${matches.length} tracked roles (shared folder — created before per-role CVs)` : entry.slug;
       const pdfState = entry.pdfCurrent ? 'PDF ready' : entry.pdfStale ? 'PDF stale' : 'PDF missing';
       const states = [pdfState, entry.quality ? 'quality recorded' : 'legacy', matches.length ? null : 'unmatched']
         .filter(Boolean).map((value) => `<span class="chip">${this.esc(value)}</span>`).join('');
@@ -1408,7 +1444,8 @@ const Scout = {
   },
 
   opportunitiesForSlug(slug) {
-    return (this.state.data?.opportunities || []).filter((entry) => this.slugOf(entry.company) === slug);
+    return (this.state.data?.opportunities || []).filter((entry) =>
+      this.artifactSlugFor(entry) === slug || this.slugOf(entry.company) === slug);
   },
 
   toggleCvCreate() {
@@ -1419,8 +1456,17 @@ const Scout = {
     const id = document.getElementById('cv-create-opportunity')?.value;
     if (!id) return;
     const entry = (this.state.data?.opportunities || []).find((item) => item.id === id);
-    const slug = this.slugOf(entry?.company);
-    if ((this.state.cvFiles?.applications || []).includes(slug)) return this.seeCv(slug, id);
+    if (!entry) return;
+    const resolved = this.resolveArtifactFor(entry);
+    const exists = (this.state.cvFiles?.applications || []).includes(resolved.slug);
+    if (exists && !resolved.legacy) return this.seeCv(resolved.slug, id);
+    if (exists && resolved.legacy) {
+      const owner = resolved.ambiguous ? 'another role at this company' : 'this company';
+      if (!confirm(`Scout has an existing CV folder for ${owner}. Open it as-is? Choose Cancel to start a new CV tailored to this role.`)) {
+        return this.chooseCvOptions(id);
+      }
+      return this.seeCv(resolved.slug, id);
+    }
     this.chooseCvOptions(id);
   },
 
@@ -1976,7 +2022,8 @@ const Scout = {
 
   cvLinkHtml() {
     if (this.chat?.id === 'setup-onboarding') return '';
-    const slug = this.slugOf(this.company(this.chat.id));
+    const entry = (this.state.data?.opportunities || []).find((item) => item.id === this.chat.id);
+    const slug = entry ? this.resolveArtifactFor(entry).slug : this.slugOf(this.company(this.chat.id));
     return (this.chat.data.filesTouched || []).includes(`applications/${slug}/cv.typ`)
       ? `<div class="chat-msg system"><a href="#" data-action="see-cv" data-slug="${this.esc(slug)}" data-id="${this.esc(this.chat.id)}">view rendered CV</a></div>`
       : '';
