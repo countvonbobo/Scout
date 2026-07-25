@@ -462,7 +462,7 @@ test('settings close remains reachable on a phone viewport', async ({ page }) =>
 
 test('phone All view reaches its rightmost column and keeps strong-match controls on screen', async ({ page }) => {
   await page.setViewportSize({ width: 360, height: 740 });
-  await page.getByRole('button', { name: 'All' }).click();
+  await page.getByRole('button', { name: 'Archive' }).click();
   const tableRegion = page.getByRole('region', { name: 'All opportunities table' });
   await expect(tableRegion).toBeVisible();
   const scroll = await tableRegion.evaluate((element) => {
@@ -493,7 +493,7 @@ test('phone All view reaches its rightmost column and keeps strong-match control
 });
 
 test('All filter preserves start, middle, end, and composition editing', async ({ page }) => {
-  await page.getByRole('button', { name: 'All' }).click();
+  await page.getByRole('button', { name: 'Archive' }).click();
   const filter = page.locator('#filter');
   await filter.fill('Legacy');
   await page.evaluate(() => { window.filterIdentity = document.getElementById('filter'); });

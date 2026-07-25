@@ -656,6 +656,7 @@ const Scout = {
   tabForEntry(e) {
     if (e.status === 'new') return 'jobs';
     if (e.status === 'shortlist') return 'shortlist';
+    if (e.status === 'ignore') return 'all';
     return 'pipeline';
   },
 
@@ -755,6 +756,7 @@ const Scout = {
   triageYes(id) { this.post('/api/status', { id, status: 'shortlist' }); },
   triageNo(id) { this.post('/api/status', { id, status: 'ignore' }).then((r) => { if (r && r.ok) this.showUndo(id); }); },
   undoDismiss(id) { this.post('/api/status', { id, status: 'new' }).then(() => this.hideUndo()); },
+  restoreEntry(id) { this.post('/api/status', { id, status: 'new' }); },
 
   showUndo(id) {
     const toast = document.getElementById('undo-toast');
@@ -914,7 +916,7 @@ const Scout = {
         <td>${this.esc(this.commuteMinutes(e, 'car') ?? '-')}</td>
         <td>${this.esc(this.commuteMinutes(e, 'public') ?? '-')}</td>
         <td>${this.esc(this.currentStage(e) || '-')}</td>
-        <td>${this.esc(e.status)}</td><td>${this.esc(e.lastChecked || 'never')}</td></tr>`).join('');
+        <td>${this.esc(e.status)}${e.status === 'ignore' ? ` <button class="act min" data-action="restore" data-id="${this.esc(e.id)}">Restore</button>` : ''}</td><td>${this.esc(e.lastChecked || 'never')}</td></tr>`).join('');
     };
     document.getElementById('tab-all').innerHTML =
       `${this.filterBar()}
@@ -2419,6 +2421,7 @@ const Scout = {
       case 'triage-no': return this.triageNo(id);
       case 'undo-dismiss': return this.undoDismiss(id);
       case 'remove-shortlist': return this.removeFromShortlist(id);
+      case 'restore': return this.restoreEntry(id);
       default: return undefined;
     }
   },

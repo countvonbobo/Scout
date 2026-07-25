@@ -83,6 +83,7 @@ test('tabForEntry routes by status', () => {
   assert.equal(scout.tabForEntry({ status: 'new' }), 'jobs');
   assert.equal(scout.tabForEntry({ status: 'shortlist' }), 'shortlist');
   assert.equal(scout.tabForEntry({ status: 'applied' }), 'pipeline');
+  assert.equal(scout.tabForEntry({ status: 'ignore' }), 'all');
 });
 
 test('company history keeps real correspondence separate from role-specific Scout chats', () => {
@@ -168,7 +169,7 @@ test('index.html defines static Jobs and Shortlist tabs, not category lanes', ()
 
 function withJobsDom() {
   const sections = {};
-  const make = () => ({ innerHTML: '', classList: { toggle() {}, add() {}, remove() {} } });
+  const make = () => ({ innerHTML: '', classList: { toggle() {}, add() {}, remove() {} }, addEventListener() {} });
   const doc = {
     getElementById: (id) => (sections[id] ||= make()),
     querySelectorAll: () => [],
@@ -240,6 +241,32 @@ test('removeFromShortlist dismisses to ignore with undo', () => {
   scout.removeFromShortlist('b');
   const normalized = calls.map(([path, payload]) => [path, JSON.parse(JSON.stringify(payload))]);
   assert.deepEqual(normalized[0], ['/api/status', { id: 'b', status: 'ignore' }]);
+});
+
+test('renderAll lists ignored items with a restore action', () => {
+  const { scout, context } = loadScout();
+  const { doc } = withJobsDom();
+  context.document = doc;
+  scout.state.data = {
+    categories: [{ id: 'startup', label: 'Priority' }],
+    opportunities: [
+      { id: 'i', company: 'I', role: 'Eng', status: 'ignore', score: 20, category: 'startup' },
+    ],
+  };
+  scout.renderAll();
+  const html = doc.getElementById('tab-all').innerHTML;
+  assert.match(html, /data-id="i"/);
+  assert.match(html, /data-action="restore"/);
+});
+
+test('restore action moves an item back to new', () => {
+  const { scout } = loadScout();
+  const calls = [];
+  scout.post = (p, payload) => { calls.push([p, payload]); return Promise.resolve({ ok: true }); };
+  scout.showUndo = () => {};
+  scout.restoreEntry('i');
+  const normalized = calls.map(([path, payload]) => [path, JSON.parse(JSON.stringify(payload))]);
+  assert.deepEqual(normalized[0], ['/api/status', { id: 'i', status: 'new' }]);
 });
 
 test('switching tabs resets scroll position', () => {
