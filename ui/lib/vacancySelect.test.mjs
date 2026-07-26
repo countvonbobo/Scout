@@ -82,3 +82,36 @@ test('seeded exploration only replaces deterministic above-threshold selections'
   assert.ok(exploratory.selected.some((job) => !deterministic.selected.includes(job)));
   assert.ok(exploratory.selected.every((job) => job.preRankScore >= 40));
 });
+
+test('exploration preserves diversity limits that were not relaxed', () => {
+  const result = selectVacancies([
+    ...Array.from({ length: 8 }, (_, index) => ranked({
+      vacancyId: `dominant-${index}`, score: 100 - index, employerId: 'dominant',
+      source: 'ats', laneId: 'lane-a',
+    })),
+    ...Array.from({ length: 7 }, (_, index) => ranked({
+      vacancyId: `alternative-${index}`, score: 80 - index, employerId: `alternative-${index}`,
+      source: index % 2 ? 'board' : 'ats', laneId: index % 3 ? 'lane-b' : 'lane-c',
+    })),
+  ], { limit: 10, threshold: 40, exploration: 5, seed: 'run-1' });
+
+  assert.equal(result.constraintsRelaxed.includes('employer'), false);
+  assert.ok(result.selected.filter((job) => job.employerId === 'dominant').length <= 3);
+});
+
+test('stable vacancy identifiers use code-unit order rather than the host locale', () => {
+  const original = String.prototype.localeCompare;
+  String.prototype.localeCompare = function reversedLocaleCompare(other) {
+    return original.call(String(other), String(this));
+  };
+  try {
+    const result = selectVacancies([
+      ranked({ vacancyId: 'vacancy-b', employerId: 'employer-b' }),
+      ranked({ vacancyId: 'vacancy-a', employerId: 'employer-a' }),
+    ], { limit: 2, threshold: 40, exploration: 0, seed: 'run-1' });
+
+    assert.deepEqual(result.selected.map((job) => job.vacancyId), ['vacancy-a', 'vacancy-b']);
+  } finally {
+    String.prototype.localeCompare = original;
+  }
+});

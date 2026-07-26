@@ -15,6 +15,12 @@ function vacancyId(vacancy) {
   return text(vacancy?.vacancyId ?? vacancy?.candidateId ?? vacancy?.canonicalUrl ?? vacancy?.observationId ?? vacancy?.sourceRecordId);
 }
 
+function compareText(left, right) {
+  const a = String(left);
+  const b = String(right);
+  return a < b ? -1 : a > b ? 1 : 0;
+}
+
 function employerOf(vacancy) {
   return text(vacancy?.employerId ?? valueOf(vacancy?.employer) ?? vacancy?.company) || 'unknown-employer';
 }
@@ -50,7 +56,7 @@ function compareRanked(left, right) {
     if (leftAssessed === null && rightAssessed !== null) return -1;
     if (rightAssessed === null && leftAssessed !== null) return 1;
   } else if (leftAssessed !== rightAssessed) return leftAssessed - rightAssessed;
-  return vacancyId(left).localeCompare(vacancyId(right));
+  return compareText(vacancyId(left), vacancyId(right));
 }
 
 function countBy(values, keyOf) {
@@ -115,18 +121,24 @@ function chooseDeterministic(eligible, limit) {
     constraints[nextConstraint] = null;
     relaxed.push(nextConstraint);
   }
-  return { selected, constraintsRelaxed: relaxed };
+  return { selected, constraintsRelaxed: relaxed, constraints };
 }
 
-function explore(selection, eligible, exploration, seed) {
+function explore(selection, eligible, exploration, seed, constraints) {
   const count = Math.min(explorationCount(exploration, selection.length), selection.length);
   if (!count) return selection;
-  const remaining = eligible.filter((vacancy) => !selection.includes(vacancy))
-    .sort((left, right) => hash(seed, vacancyId(left)) - hash(seed, vacancyId(right)) || vacancyId(left).localeCompare(vacancyId(right)));
+  const deterministicSet = new Set(selection);
+  const remaining = eligible.filter((vacancy) => !deterministicSet.has(vacancy))
+    .sort((left, right) => hash(seed, vacancyId(left)) - hash(seed, vacancyId(right)) || compareText(vacancyId(left), vacancyId(right)));
   if (!remaining.length) return selection;
   const result = [...selection];
   for (let index = 0; index < count && remaining.length; index += 1) {
-    result[result.length - 1 - index] = remaining.shift();
+    const candidate = remaining.shift();
+    const replacement = [...result].sort(compareRanked).reverse().find((vacancy) => {
+      const withoutVacancy = result.filter((item) => item !== vacancy);
+      return permitted(candidate, withoutVacancy, constraints);
+    });
+    if (replacement) result.splice(result.indexOf(replacement), 1, candidate);
   }
   return result.sort(compareRanked);
 }
@@ -139,7 +151,7 @@ export function selectVacancies(ranked, {
   const eligible = ordered.filter((vacancy) => scoreOf(vacancy) >= Number(threshold));
   const belowCutoff = ordered.filter((vacancy) => scoreOf(vacancy) < Number(threshold));
   const deterministic = chooseDeterministic(eligible, boundedLimit);
-  const selected = explore(deterministic.selected, eligible, exploration, seed);
+  const selected = explore(deterministic.selected, eligible, exploration, seed, deterministic.constraints);
   const selectedIds = new Set(deterministic.selected.map(vacancyId));
   return {
     selected,
