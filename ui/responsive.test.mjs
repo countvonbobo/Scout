@@ -41,6 +41,14 @@ test('manual settings has a persistent accessible close control', () => {
   assert.match(setup, /event\.target === this\.el\('setup-overlay'\)[\s\S]*closeSettings\(\)/);
 });
 
+test('phone settings use one internal scroll surface without an empty footer', () => {
+  assert.match(html, /id="setup-actions" class="setup-actions"/);
+  assert.match(html, /@media \(max-width: 650px\)[\s\S]*\.setup-dialog \{[^}]*display:flex[^}]*overflow:hidden/s);
+  assert.match(html, /@media \(max-width: 650px\)[\s\S]*\.setup-body \{[^}]*overflow-y:auto/s);
+  assert.match(html, /\.setup-field input\[type="checkbox"\][^}]*width:\s*auto/s);
+  assert.match(setup, /this\.el\('setup-actions'\)\.classList\.toggle\('hidden', !back\)/);
+});
+
 test('dialogs share focus, inert-background, escape, and nested-layer management', () => {
   assert.match(app, /const ScoutModal = \(\(\) =>/);
   assert.match(app, /document\.body\.children[\s\S]*element\.inert/);

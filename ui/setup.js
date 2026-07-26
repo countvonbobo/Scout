@@ -549,6 +549,7 @@ const Setup = {
 
   render() {
     this.setMessage();
+    this.el('setup-actions').classList.remove('hidden');
     if (this.view === 'hub') return this.renderSettingsHub();
     if (this.view === 'section') return this.renderSettingsSection();
     if (this.view === 'backup-details') return this.renderBackupDetails();
@@ -593,6 +594,7 @@ const Setup = {
     this.el('setup-next').classList.add('hidden');
     this.el('setup-back').classList.toggle('hidden', !back);
     this.el('setup-back').textContent = back ? 'Back to settings' : 'Back';
+    this.el('setup-actions').classList.toggle('hidden', !back);
   },
 
   showSettingsHub() {

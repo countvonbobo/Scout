@@ -618,7 +618,8 @@
     .setup-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
     .setup-field { display: grid; gap: 5px; color: var(--muted); font-size: 12px; }
     .setup-field.wide { grid-column: 1 / -1; }
-    .setup-field input, .setup-field select, .setup-field textarea { width: 100%; padding: 9px 10px; }
+    .setup-field > input, .setup-field > select, .setup-field > textarea { width: 100%; padding: 9px 10px; }
+    .setup-field input[type="checkbox"], .setup-field input[type="radio"] { width: auto; flex: 0 0 auto; }
     .setup-field textarea { min-height: 76px; resize: vertical; }
     .setup-callout {
       padding: 14px;
@@ -679,9 +680,35 @@
     @keyframes setup-scout-wave { 0%{background-position:0 0} 35%{background-position:100% 33.333%} 60%{background-position:33.333% 66.667%} 100%{background-position:0 0} }
     @media (max-width: 650px) {
       .setup-overlay { padding: 0; }
-      .setup-dialog { max-height: 100vh; max-height: 100dvh; min-height: 100vh; min-height: 100dvh; border-radius: 0; }
+      .setup-dialog {
+        display:flex;
+        flex-direction:column;
+        width:100vw;
+        height:100vh;
+        height:100dvh;
+        min-height:0;
+        max-height:none;
+        overflow:hidden;
+        border:0;
+        border-radius:0;
+      }
+      .setup-head { flex:0 0 auto; padding:16px 64px 12px 16px; }
+      .setup-head h1 { font-size:21px; line-height:28px; }
+      .setup-body {
+        flex:1 1 auto;
+        min-height:0;
+        overflow-y:auto;
+        overscroll-behavior-y:contain;
+        -webkit-overflow-scrolling:touch;
+        padding:16px;
+      }
+      .setup-actions { flex:0 0 auto; }
       .setup-grid, .setup-provider-list { grid-template-columns: 1fr; }
       .settings-hub { grid-template-columns:1fr; }
+      .settings-card { min-height:76px; padding:14px; }
+      .setup-body { overflow-wrap:anywhere; }
+      .setup-body .act { min-height:44px; max-width:100%; white-space:normal; }
+      .setup-callout p:has(> .act) { display:flex; flex-wrap:wrap; gap:8px; }
       .setup-conversation { grid-template-columns:1fr; justify-items:center; }
       .setup-scout { width:140px; padding-top:0; }
       .setup-scout img { width:132px; height:132px; }
@@ -845,9 +872,7 @@
       .report-sections { grid-template-columns: 1fr; }
       .report-section { grid-column: auto; }
       .daily-report-header { padding: 15px; }
-      .setup-head { padding:16px; }
-      .setup-body { padding:16px; }
-      .setup-actions { position:sticky; bottom:0; z-index:2; padding:12px 16px calc(12px + env(safe-area-inset-bottom)); background:var(--card-bg); flex-wrap:wrap; }
+      .setup-actions { z-index:2; padding:12px 16px calc(12px + env(safe-area-inset-bottom)); background:var(--card-bg); flex-wrap:wrap; }
       .setup-actions button { min-height:44px; }
       .chat-drawer { width:100vw; border-left:0; }
       .company-form-grid { grid-template-columns:1fr; }
@@ -924,7 +949,7 @@
         <div id="setup-progress" class="setup-progress" aria-label="Setup progress"></div>
       </div>
       <div id="setup-body" class="setup-body"></div>
-      <div class="setup-actions">
+      <div id="setup-actions" class="setup-actions">
         <button id="setup-skip" class="danger-link hidden" type="button">Finish for now</button>
         <span id="setup-status" class="setup-status" role="status" aria-live="polite"></span>
         <button id="setup-back" class="act" type="button">Back</button>
