@@ -27,21 +27,24 @@ function temporaryWorkspace() {
   return root;
 }
 
-function sourceJob({ vacancyId, title, arrangement, compensation }) {
-  return {
+function sourceJob({ vacancyId, title, arrangement, compensation = null }) {
+  const job = {
     company: `${vacancyId} employer`,
     title,
     location: `${vacancyId} location`,
     workingPattern: arrangement,
     employmentType: 'permanent',
-    salaryMin: compensation.minimum,
-    salaryMax: compensation.minimum + 10,
-    salaryCurrency: compensation.currency,
-    salaryPeriod: compensation.period,
     providerId: vacancyId,
     url: `https://jobs.example.test/${vacancyId}`,
     description: `${title} position with ${arrangement} work.`,
   };
+  if (compensation) Object.assign(job, {
+    salaryMin: compensation.minimum,
+    salaryMax: compensation.minimum + 10,
+    salaryCurrency: compensation.currency,
+    salaryPeriod: compensation.period,
+  });
+  return job;
 }
 
 function profileCases() {
@@ -85,6 +88,33 @@ test('one generic engine produces different justified rankings for six profiles'
     assert.ok(result.ranked.every((item) => item.dimensions.length > 0));
     assert.equal(result.funnel.ranked, result.funnel.eligible);
   }
+});
+
+test('published unknown-compensation policies change end-to-end discovery decisions', () => {
+  const excludeProfile = hospitalityWorkerProfile();
+  const excluded = discover([sourceJob({
+    vacancyId: 'hospitality-worker',
+    title: excludeProfile.target.primaryTitles[0].value,
+    arrangement: excludeProfile.target.workingPatterns[0].value,
+  })], excludeProfile);
+  assert.equal(excluded.exclusions[0].code, 'compensation-unknown');
+  assert.equal(excluded.funnel.eligible, 0);
+
+  const penaliseProfile = hospitalAdministratorProfile();
+  const job = sourceJob({
+    vacancyId: 'hospital-administrator',
+    title: penaliseProfile.target.primaryTitles[0].value,
+    arrangement: penaliseProfile.target.workingPatterns[0].value,
+  });
+  const penalised = discover([job], penaliseProfile);
+  const included = discover([job], {
+    ...penaliseProfile,
+    compensation: { ...penaliseProfile.compensation, unknownPolicy: 'include' },
+  });
+  const compensation = penalised.ranked[0].dimensions.find((dimension) => dimension.name === 'compensation');
+
+  assert.ok(compensation.score < 0);
+  assert.ok(penalised.ranked[0].preRankScore < included.ranked[0].preRankScore);
 });
 
 test('production-shaped legacy migration preserves unrelated private artifacts byte-for-byte', () => {
