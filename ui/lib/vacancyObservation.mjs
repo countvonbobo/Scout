@@ -84,9 +84,12 @@ export function normaliseObservation(job, { sourceName, fetchedAt, laneId } = {}
   const description = text(job.description) || '';
   const warnings = [];
   const location = field(text(job.location), 'explicit-source');
-  const workingPattern = explicitOrExtracted(job.workingPattern || job.workingType, description, [
+  const workingPatterns = [
     ['remote', /\bremote\b/i], ['hybrid', /\bhybrid\b/i], ['on-site', /\b(?:on[ -]?site|onsite)\b/i],
-  ], warnings, 'working pattern');
+  ];
+  const explicitWorkingPattern = text(job.workingPattern || job.workingType);
+  const workingPatternAmbiguous = !explicitWorkingPattern && extraction(description, workingPatterns).ambiguous;
+  const workingPattern = explicitOrExtracted(explicitWorkingPattern, description, workingPatterns, warnings, 'working pattern');
   if (!workingPattern.value && /\b(?:flexible|flexibility)\b/i.test(description)) warnings.push('ambiguous working pattern was left unknown');
   const employmentType = explicitOrExtracted(job.employmentType, description, [
     ['permanent', /\bpermanent\b/i], ['contract', /\b(?:contract|contractor)\b/i], ['temporary', /\btemporary\b/i], ['internship', /\bintern(?:ship)?\b/i],
@@ -109,7 +112,9 @@ export function normaliseObservation(job, { sourceName, fetchedAt, laneId } = {}
     title: field(title, 'explicit-source'),
     description,
     location,
-    workingPattern: workingPattern.value ? workingPattern : field(fullTime.value, fullTime.value ? 'deterministic-extraction' : 'unknown'),
+    workingPattern: workingPattern.value || workingPatternAmbiguous
+      ? workingPattern
+      : field(fullTime.value, fullTime.value ? 'deterministic-extraction' : 'unknown'),
     employmentType,
     seniority,
     compensation: compensation(job, warnings),

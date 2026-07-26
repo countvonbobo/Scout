@@ -67,7 +67,7 @@ test('normalisation parses explicit structured source fields without AI inferenc
 test('normalisation records warnings when bounded extraction is ambiguous and freezes nested values', () => {
   const observation = normaliseObservation({
     providerId: 'job-4', title: 'Senior Lead Engineer', company: 'Acme', url: 'https://jobs.example/4',
-    description: 'Permanent contract with remote and hybrid working.',
+    description: 'Permanent contract with remote and hybrid working in this full-time role.',
     salaryMin: 60000, salaryMax: 70000, salaryCurrency: 'GBP', salaryPeriod: 'year',
   }, { sourceName: 'fixture', fetchedAt: NOW, laneId: 'lane-1' });
 
