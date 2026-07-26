@@ -57,7 +57,7 @@
 - Produces: `assertDiscoveryFunnel(funnel) -> DiscoveryFunnel`
 - `DiscoveryFunnel` has `sourceRecords`, `failedSourceRecords`, `parsed`, `normalised`, `duplicateObservations`, `uniqueVacancies`, `deterministicallyExcluded`, `eligible`, `ranked`, `aboveThreshold`, `selected`, `assessed`, `assessmentFailed`, `added`, `updated`, `unchanged`, `closed`, plus `bySource`.
 
-- [ ] **Step 1: Write failing reconciliation and source-order tests**
+- [ ] **Step 1: Write failing funnel reconciliation tests**
 
 ```js
 test('funnel reconciles every observation before assessment selection', () => {
@@ -73,18 +73,13 @@ test('funnel reconciles every observation before assessment selection', () => {
   assert.equal(assertDiscoveryFunnel(complete).selected, 60);
 });
 
-test('candidate fixture proves source order cannot define the final selection', () => {
-  const forward = compactCandidates(sourceFixture(['ats-a', 'ats-b']), 2);
-  const reverse = compactCandidates(sourceFixture(['ats-b', 'ats-a']), 2);
-  assert.notDeepEqual(forward.candidates.map((item) => item.url), reverse.candidates.map((item) => item.url));
-});
 ```
 
 - [ ] **Step 2: Run tests and verify the new contract test fails**
 
 Run: `node --test ui/lib/discoveryFunnel.test.mjs ui/lib/scanPipeline.test.mjs`
 
-Expected: FAIL because `discoveryFunnel.mjs` does not exist; the regression demonstrates the current source-order dependence.
+Expected: FAIL because `discoveryFunnel.mjs` does not exist.
 
 - [ ] **Step 3: Implement the immutable funnel and invariant checks**
 
@@ -123,7 +118,7 @@ export function assertDiscoveryFunnel(value) {
 
 Run: `node --test ui/lib/discoveryFunnel.test.mjs ui/lib/scanPipeline.test.mjs`
 
-Expected: PASS for funnel tests; the source-order regression remains documented as the behaviour later tasks must reverse.
+Expected: PASS for funnel tests. Task 10 introduces the failing end-to-end order-independence regression immediately before integrating the ranked pipeline.
 
 - [ ] **Step 5: Commit**
 
@@ -194,11 +189,11 @@ export const UNKNOWN_POLICIES = Object.freeze(['include', 'penalise', 'exclude']
 export function publishSearchProfile(draft, { publishedAt = new Date().toISOString() } = {}) {
   const validated = validateSearchProfile({ ...structuredClone(draft), status: 'published', publishedAt });
   const fingerprint = profileFingerprint({ ...validated, id: undefined });
-  return Object.freeze({ ...validated, id: `profile-${fingerprint.slice(0, 12)}` });
+  return deepFreeze({ ...validated, id: `profile-${fingerprint.slice(0, 12)}` });
 }
 ```
 
-Store profile artifacts under `profile/search/raw.json`, `profile/search/draft.json`, and `profile/search/published.json`. Raw answers are append-only evidence; publishing atomically replaces only the draft/published profile artifacts.
+`deepFreeze(value)` must recursively freeze every array and plain object in the returned profile. Store profile artifacts under `profile/search/raw.json`, `profile/search/draft.json`, and `profile/search/published.json`. Raw answers are append-only evidence; publishing atomically replaces only the draft/published profile artifacts.
 
 - [ ] **Step 4: Add additive workspace path/default support**
 
@@ -683,6 +678,15 @@ git commit -m "feat: diversify ranked assessment candidates"
 - [ ] **Step 1: Write the failing full-pool integration test**
 
 ```js
+test('runtime selection is independent of source and portal order', async () => {
+  const forward = await prepareRankedDiscovery(discoveryFixture(['ats-a', 'ats-b']), rankedOptions);
+  const reverse = await prepareRankedDiscovery(discoveryFixture(['ats-b', 'ats-a']), rankedOptions);
+  assert.deepEqual(
+    forward.selection.selected.map((item) => item.url),
+    reverse.selection.selected.map((item) => item.url),
+  );
+});
+
 test('runtime ranks all unique jobs before selecting sixty', async () => {
   const result = await runScanWith(root, 'codex', 'primary', harness({
     sources: sourceSetWithLaterStrongCandidate(2500),
@@ -866,4 +870,3 @@ This plan intentionally creates the shared contracts first. Gate A remains block
 4. combined migration, packaging, VPS rehearsal, rollback and release acceptance.
 
 Those plans must consume the interfaces defined here rather than redesign them.
-
