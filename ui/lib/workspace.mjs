@@ -99,6 +99,7 @@ export function workspacePaths(root) {
     reports: path.join(workspaceRoot, 'reports'),
     applications: path.join(workspaceRoot, 'applications'),
     profile: path.join(workspaceRoot, 'profile'),
+    profileContext: path.join(workspaceRoot, 'profile', 'context.md'),
     searchProfileRaw: path.join(workspaceRoot, 'profile', 'search', 'raw.json'),
     searchProfileDraft: path.join(workspaceRoot, 'profile', 'search', 'draft.json'),
     searchProfilePublished: path.join(workspaceRoot, 'profile', 'search', 'published.json'),

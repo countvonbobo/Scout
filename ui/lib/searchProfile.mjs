@@ -1,6 +1,7 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs';
-import { workspacePaths } from './workspace.mjs';
+import { atomicWriteFile } from './atomicWrite.mjs';
+import { backupWorkspace, workspacePaths } from './workspace.mjs';
 
 export const PREFERENCE_STRENGTHS = Object.freeze([
   'mandatory', 'strong-preference', 'nice-to-have',
@@ -147,4 +148,23 @@ export function loadPublishedSearchProfile(root) {
   const expectedId = `profile-${profileFingerprint({ ...profile, id: undefined }).slice(0, 12)}`;
   if (profile.id !== expectedId) throw new Error(`published search profile fingerprint does not match: ${file}`);
   return deepFreeze(profile);
+}
+
+export function migrateSearchProfile(root) {
+  const paths = workspacePaths(root);
+  if (fs.existsSync(paths.searchProfileDraft) || fs.existsSync(paths.searchProfilePublished)) {
+    return { migrated: false, draftPath: paths.searchProfileDraft, backupPath: null };
+  }
+  if (!fs.existsSync(paths.config)) throw new Error(`workspace config missing: ${paths.config}`);
+
+  // Retain the legacy source text itself as evidence, rather than reserialising
+  // parsed values and silently losing formatting or line endings.
+  const workspaceJson = fs.readFileSync(paths.config, 'utf8');
+  const context = fs.existsSync(paths.profileContext) ? fs.readFileSync(paths.profileContext, 'utf8') : '';
+  const draft = draftProfileFromLegacy(JSON.parse(workspaceJson), context);
+  const backupPath = backupWorkspace(root, 'search-profile-v1');
+
+  atomicWriteFile(paths.searchProfileRaw, `${JSON.stringify({ version: 1, workspaceJson, context }, null, 2)}\n`);
+  atomicWriteFile(paths.searchProfileDraft, `${JSON.stringify(draft, null, 2)}\n`);
+  return { migrated: true, draftPath: paths.searchProfileDraft, backupPath };
 }

@@ -7,6 +7,7 @@ import { afterEach, test } from 'node:test';
 import {
   draftProfileFromLegacy,
   loadPublishedSearchProfile,
+  migrateSearchProfile,
   profileFingerprint,
   publishSearchProfile,
 } from './searchProfile.mjs';
@@ -145,4 +146,56 @@ test('loadPublishedSearchProfile rejects a syntactically valid but tampered prof
 
 test('loadPublishedSearchProfile returns null when no artifact is present', () => {
   assert.equal(loadPublishedSearchProfile(temp()), null);
+});
+
+test('migration stages byte-preserved legacy evidence in an unpublished draft', () => {
+  const root = temp();
+  const workspaceJson = '{\n  "schemaVersion": 2,\n  "locale": "en-GB",\n  "currency": "GBP",\n  "search": { "roleFamilies": ["Hardware Engineer"], "locations": ["Reading"], "exclusions": ["Pure software roles"], "salaryMinimum": 60000 }\n}\n';
+  const context = 'User-authored profile prose\r\nKeep this exact.\r\n';
+  fs.writeFileSync(path.join(root, 'workspace.json'), workspaceJson);
+  fs.mkdirSync(path.join(root, 'profile'), { recursive: true });
+  fs.writeFileSync(path.join(root, 'profile', 'context.md'), context);
+  fs.mkdirSync(path.join(root, 'data'), { recursive: true });
+  fs.mkdirSync(path.join(root, 'reports'), { recursive: true });
+  fs.mkdirSync(path.join(root, 'applications', 'example'), { recursive: true });
+  fs.writeFileSync(path.join(root, 'data', 'opportunities.json'), '{"existing":true}\n');
+  fs.writeFileSync(path.join(root, 'reports', '2026-07-26.md'), 'Existing report\n');
+  fs.writeFileSync(path.join(root, 'applications', 'example', 'outreach.md'), 'Existing application\n');
+
+  const result = migrateSearchProfile(root);
+  const paths = workspacePaths(root);
+  const raw = JSON.parse(fs.readFileSync(paths.searchProfileRaw, 'utf8'));
+  const draft = JSON.parse(fs.readFileSync(paths.searchProfileDraft, 'utf8'));
+
+  assert.equal(result.migrated, true);
+  assert.equal(result.draftPath, paths.searchProfileDraft);
+  assert.match(result.backupPath, /search-profile-v1\.json$/);
+  assert.equal(raw.workspaceJson, workspaceJson);
+  assert.equal(raw.context, context);
+  assert.equal(draft.status, 'draft');
+  assert.equal(draft.target.primaryTitles[0].provenance, 'deterministic-derivation');
+  assert.equal(draft.negative.excludedResponsibilities[0].strength, 'strong-negative');
+  assert.equal(draft.compensation.minimumStrength, 'strong-preference');
+  assert.equal(draft.compensation.unknownPolicy, 'include');
+  assert.equal(JSON.parse(fs.readFileSync(paths.config, 'utf8')).searchProfile, undefined);
+  assert.equal(fs.readFileSync(paths.tracker, 'utf8'), '{"existing":true}\n');
+  assert.equal(fs.readFileSync(path.join(paths.reports, '2026-07-26.md'), 'utf8'), 'Existing report\n');
+  assert.equal(fs.readFileSync(path.join(paths.applications, 'example', 'outreach.md'), 'utf8'), 'Existing application\n');
+  assert.equal(fs.readFileSync(paths.profileContext, 'utf8'), context);
+  assert.deepEqual(migrateSearchProfile(root), {
+    migrated: false, draftPath: paths.searchProfileDraft, backupPath: null,
+  });
+});
+
+test('migration is idempotent when a draft or published profile already exists', () => {
+  const root = temp();
+  fs.writeFileSync(path.join(root, 'workspace.json'), '{"locale":"en-GB","search":{}}\n');
+  const paths = workspacePaths(root);
+  fs.mkdirSync(path.dirname(paths.searchProfileDraft), { recursive: true });
+  fs.writeFileSync(paths.searchProfileDraft, '{"status":"draft"}\n');
+
+  const result = migrateSearchProfile(root);
+
+  assert.deepEqual(result, { migrated: false, draftPath: paths.searchProfileDraft, backupPath: null });
+  assert.equal(fs.existsSync(paths.searchProfileRaw), false);
 });
