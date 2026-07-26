@@ -39,6 +39,7 @@ import {
   releaseTrackerMutationLock, TrackerRevisionConflictError,
 } from './lib/trackerPersistence.mjs';
 import { loadEnv, saveEnv } from './lib/env.mjs';
+import { loadPublishedSearchProfile, profileFingerprint, publishSearchProfile, validateSearchProfile } from './lib/searchProfile.mjs';
 import {
   loadWorkspaceConfig, migrateWorkspace, resolveWorkspaceRoot, seedWorkspace, syncManagedInstructions,
   workspacePaths, writeWorkspaceConfig,
@@ -289,6 +290,7 @@ export function requestAccess(req, url, settings = loadDeviceSettings()) {
   }
 
   const requiresJson = url.pathname.startsWith('/api/chat/')
+    || url.pathname.startsWith('/api/search-profile')
     || url.pathname.startsWith('/api/sync/')
     || url.pathname.startsWith('/api/workspace/')
     || url.pathname.startsWith('/api/remote-access/')
@@ -453,6 +455,10 @@ async function handleRead(req, res, url) {
   }
   if (req.method === 'GET' && url.pathname === '/api/setup/proposal') {
     try { return sendJson(res, 200, { proposal: readOnboardingProposal(WORKSPACE_ROOT) }); }
+    catch (e) { return sendJson(res, 400, { error: e.message }); }
+  }
+  if (req.method === 'GET' && url.pathname === '/api/search-profile') {
+    try { return sendJson(res, 200, readSearchProfileState()); }
     catch (e) { return sendJson(res, 400, { error: e.message }); }
   }
   if (req.method === 'GET' && url.pathname === '/api/app-info') {
@@ -641,6 +647,85 @@ function replyJson(res, status, obj) {
 function parseBody(body) {
   try { return JSON.parse(body || '{}'); } catch { return null; }
 }
+
+function readDraftSearchProfile() {
+  if (!fs.existsSync(WORKSPACE.searchProfileDraft)) return null;
+  const draft = validateSearchProfile(JSON.parse(fs.readFileSync(WORKSPACE.searchProfileDraft, 'utf8')));
+  if (draft.status !== 'draft') throw new Error('search profile draft must have draft status');
+  return draft;
+}
+
+function readSearchProfileState() {
+  const draft = readDraftSearchProfile();
+  return {
+    rawPresent: fs.existsSync(WORKSPACE.searchProfileRaw),
+    draft,
+    published: loadPublishedSearchProfile(WORKSPACE_ROOT),
+    draftRevision: draft ? profileFingerprint(draft) : null,
+  };
+}
+
+function currentDraftForRevision(revision) {
+  const draft = readDraftSearchProfile();
+  const currentRevision = draft ? profileFingerprint(draft) : null;
+  if (revision !== currentRevision) {
+    const error = new Error('The search-profile draft changed while this page was open. Refresh and retry.');
+    error.currentRevision = currentRevision;
+    throw error;
+  }
+  return draft;
+}
+
+function replySearchProfileConflict(res, error) {
+  return replyJson(res, 409, {
+    conflict: true, currentRevision: error.currentRevision,
+    error: error.message,
+  });
+}
+
+routes['PUT /api/search-profile/draft'] = (req, res, body) => {
+  const value = parseBody(body);
+  if (!value || !Object.hasOwn(value, 'draft') || !Object.hasOwn(value, 'revision')) {
+    return replyJson(res, 400, { error: 'complete draft and current revision are required' });
+  }
+  try {
+    currentDraftForRevision(value.revision);
+    const draft = validateSearchProfile(value.draft);
+    if (draft.status !== 'draft') throw new Error('search profile draft must have draft status');
+    atomicWriteFile(WORKSPACE.searchProfileDraft, `${JSON.stringify(draft, null, 2)}\n`);
+    const state = readSearchProfileState();
+    void queueCheckpoint('ui: save search profile draft');
+    return replyJson(res, 200, { ok: true, draft: state.draft, draftRevision: state.draftRevision });
+  } catch (e) {
+    if (Object.hasOwn(e, 'currentRevision')) return replySearchProfileConflict(res, e);
+    return replyJson(res, 400, { error: e.message });
+  }
+};
+
+routes['POST /api/search-profile/publish'] = (req, res, body) => {
+  const value = parseBody(body);
+  if (!value) return replyJson(res, 400, { error: 'bad json' });
+  try {
+    const draft = currentDraftForRevision(value.revision);
+    if (value.confirmed !== true) {
+      const error = new Error('Explicit confirmation is required before publishing this search profile.');
+      error.currentRevision = profileFingerprint(draft);
+      throw error;
+    }
+    const published = publishSearchProfile(draft);
+    atomicWriteFile(WORKSPACE.searchProfilePublished, `${JSON.stringify(published, null, 2)}\n`);
+    const config = loadWorkspaceConfig(WORKSPACE_ROOT);
+    writeWorkspaceConfig(WORKSPACE_ROOT, {
+      ...config,
+      searchProfile: { ...(config.searchProfile || {}), publishedId: published.id },
+    });
+    void queueCheckpoint('ui: publish search profile');
+    return replyJson(res, 200, { ok: true, published });
+  } catch (e) {
+    if (Object.hasOwn(e, 'currentRevision')) return replySearchProfileConflict(res, e);
+    return replyJson(res, 400, { error: e.message });
+  }
+};
 
 routes['POST /api/workspace/create'] = (req, res, body) => {
   const b = parseBody(body); if (!b) return replyJson(res, 400, { error: 'bad json' });

@@ -15,9 +15,38 @@ import {
   scanOutcomeSummary,
   shouldAutoRunFirstScan,
   shouldRequestRecoveryKey,
+  searchProfileReviewHtml,
   splitList,
   validateCvName,
 } from './setup.js';
+
+test('profile review names every decision area and keeps unconfirmed inferences non-blocking', () => {
+  const html = searchProfileReviewHtml({
+    rawPresent: true,
+    draftRevision: 'r1',
+    published: null,
+    draft: {
+      target: {
+        primaryTitles: [{ value: 'Researcher', strength: 'mandatory', provenance: 'explicit' }],
+        sectors: [{ value: 'Education', strength: 'nice-to-have', provenance: 'unconfirmed-inference' }],
+        locations: [{ value: 'Remote', strength: 'strong-preference', provenance: 'explicit' }],
+      },
+      negative: {
+        excludedTitles: [{ value: 'Commission-only', strength: 'hard-exclusion', provenance: 'explicit' }],
+        excludedResponsibilities: [],
+      },
+      compensation: { currency: 'GBP', period: 'year', minimum: 60000, minimumStrength: 'strong-preference', unknownPolicy: 'include' },
+    },
+  });
+
+  for (const label of [
+    'Primary work', 'Adjacent work', 'Mandatory requirements', 'Preferences',
+    'Confirmed exclusions', 'Accepted locations and working patterns',
+    'Compensation and unknown handling', 'Focused, balanced or exploratory breadth',
+  ]) assert.match(html, new RegExp(label));
+  assert.match(html, /Unconfirmed inferences remain non-blocking/);
+  assert.match(html, /Publish this reviewed profile/);
+});
 
 test('splitList accepts comma and newline separated settings', () => {
   assert.deepEqual(splitList('Robotics, climate tech\nHealthcare,  '), [

@@ -161,6 +161,50 @@ export function operationRemaining(operation, now = Date.now()) {
   return lowMinutes < 1 ? `About ${highMinutes} min or less remaining` : `About ${lowMinutes}–${highMinutes} min remaining`;
 }
 
+function escapeProfileText(value) {
+  return String(value ?? '').replace(/[&<>"']/g, (char) => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
+  }[char]));
+}
+
+function profileRules(profile, section, field = null, strengths = null) {
+  const lists = field ? [profile?.[section]?.[field] || []] : Object.values(profile?.[section] || {});
+  return lists.flat()
+    .filter((rule) => !strengths || strengths.includes(rule.strength))
+    .map((rule) => rule.value);
+}
+
+function profileRuleText(profile, section, field, strengths) {
+  const values = profileRules(profile, section, field, strengths);
+  return values.length ? escapeProfileText(values.join(', ')) : 'None recorded';
+}
+
+export function searchProfileReviewHtml(state = {}) {
+  const draft = state.draft || null;
+  const published = state.published || null;
+  const compensation = draft?.compensation || {};
+  const confirmedExclusions = profileRules(draft, 'negative', null, ['hard-exclusion']);
+  const draftJson = draft ? escapeProfileText(JSON.stringify(draft, null, 2)) : '';
+  const noDraft = draft ? '' : '<p>No complete draft is available yet. Migrate or save a complete draft before publishing.</p>';
+  const compensationText = draft
+    ? `${escapeProfileText(compensation.minimum == null ? 'No minimum' : `${compensation.currency || 'currency not set'} ${compensation.minimum} per ${compensation.period}`)}; unknown compensation facts: ${escapeProfileText(compensation.unknownPolicy || 'not configured')}.`
+    : 'No compensation policy recorded.';
+  return `<section class="setup-callout" id="search-profile-review"><h3>Review your published search profile</h3>
+    ${noDraft}
+    <section><h4>Primary work</h4><p>${profileRuleText(draft, 'target', 'primaryTitles', null)}</p></section>
+    <section><h4>Adjacent work</h4><p>${profileRuleText(draft, 'target', 'sectors', null)}</p></section>
+    <section><h4>Mandatory requirements</h4><p>${profileRuleText(draft, 'target', null, ['mandatory'])}</p></section>
+    <section><h4>Preferences</h4><p>${profileRuleText(draft, 'target', null, ['strong-preference', 'nice-to-have', 'neutral'])}</p></section>
+    <section><h4>Confirmed exclusions</h4><p>${confirmedExclusions.length ? escapeProfileText(confirmedExclusions.join(', ')) : 'None recorded'}</p></section>
+    <section><h4>Accepted locations and working patterns</h4><p>${profileRuleText(draft, 'target', 'locations', null)}</p></section>
+    <section><h4>Compensation and unknown handling</h4><p>${compensationText}</p></section>
+    <section><h4>Focused, balanced or exploratory breadth</h4><p>This draft does not make breadth a hard rule; review it as focused, balanced or exploratory before publishing.</p></section>
+    <p class="meta">Unconfirmed inferences remain non-blocking until you explicitly confirm them.</p>
+    ${published ? `<p>Published version: ${escapeProfileText(published.id)}</p>` : '<p>Not yet published.</p>'}
+    ${draft ? `<details><summary>Edit the complete validated draft</summary><label class="setup-field wide">Complete draft JSON<textarea id="search-profile-draft" rows="16">${draftJson}</textarea></label><p><button id="search-profile-save" class="act" type="button">Save complete draft</button></p></details><label class="setup-field"><span><input id="search-profile-confirm" type="checkbox"> I reviewed this complete profile and want to publish it</span></label><p><button id="search-profile-publish" class="act primary" type="button">Publish this reviewed profile</button></p>` : ''}
+  </section>`;
+}
+
 async function requestJson(pathname, options) {
   const response = await fetch(pathname, options);
   const body = await response.json().catch(() => ({}));
@@ -188,6 +232,7 @@ const Setup = {
   settingsSection: null,
   refreshSequence: 0,
   statusRetry: null,
+  searchProfile: null,
   operations: { proposal: null, scan: null },
   operationTimers: {},
   backgroundOperations: new Set(),
@@ -649,12 +694,58 @@ const Setup = {
       <p>Locations: ${this.escape((search.locations || []).join(', ') || 'Not configured')}</p>
       <p>Minimum salary: ${search.salaryMinimum == null ? 'Not set' : `${this.escape(config.currency || '')} ${this.escape(search.salaryMinimum)}`}</p>
       <p>Hard exclusions: ${this.escape((search.exclusions || []).join(', ') || 'None')}</p></div>
+      ${searchProfileReviewHtml(this.searchProfile)}
       <p><button id="settings-retune-search" class="act primary" type="button">Retune my search</button></p>
       <p class="meta">Retuning stages evidence-led changes for review. It does not reset tracker, application, report or chat history.</p>`;
     this.el('settings-retune-search').addEventListener('click', () => {
       this.enterRetune('search');
       this.focusDialogTitle();
     });
+    this.el('search-profile-save')?.addEventListener('click', () => this.saveSearchProfileDraft());
+    this.el('search-profile-publish')?.addEventListener('click', () => this.publishSearchProfile());
+    if (!this.searchProfile) void this.loadSearchProfileReview();
+  },
+
+  async loadSearchProfileReview() {
+    try {
+      this.searchProfile = await requestJson('/api/search-profile');
+      if (this.view === 'section' && this.settingsSection === 'search') this.renderSearchSettings();
+    } catch (error) {
+      this.setMessage(error.message, 'error');
+    }
+  },
+
+  async saveSearchProfileDraft() {
+    try {
+      const draft = JSON.parse(this.el('search-profile-draft').value);
+      const result = await requestJson('/api/search-profile/draft', {
+        method: 'PUT', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ draft, revision: this.searchProfile?.draftRevision ?? null }),
+      });
+      this.searchProfile = { ...this.searchProfile, draft: result.draft, draftRevision: result.draftRevision };
+      this.renderSearchSettings();
+      this.setMessage('Complete search-profile draft saved for review.', 'good');
+    } catch (error) {
+      this.setMessage(error.message, 'error');
+    }
+  },
+
+  async publishSearchProfile() {
+    if (!this.el('search-profile-confirm')?.checked) {
+      this.setMessage('Confirm that you reviewed the complete profile before publishing.', 'error');
+      return;
+    }
+    try {
+      const result = await requestJson('/api/search-profile/publish', {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ revision: this.searchProfile?.draftRevision ?? null, confirmed: true }),
+      });
+      this.searchProfile = { ...this.searchProfile, published: result.published };
+      this.renderSearchSettings();
+      this.setMessage('Search profile published. New ranked discovery uses this version.', 'good');
+    } catch (error) {
+      this.setMessage(error.message, 'error');
+    }
   },
 
   renderProviderSettings() {

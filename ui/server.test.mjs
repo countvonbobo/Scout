@@ -12,7 +12,8 @@ const testWorkspace = fs.mkdtempSync(path.join(os.tmpdir(), 'scout-server-test-'
 process.env.SCOUT_WORKSPACE = testWorkspace;
 process.env.SCOUT_DEVICE_SETTINGS = path.join(testWorkspace, 'device-settings.json');
 const { APP_ROOT, APP_VERSION, UI_BUILD_ID, WORKSPACE_ROOT, createServer, operations, providerDetection, restartControl, shutdownControl } = await import('./server.mjs');
-const { seedWorkspace, loadWorkspaceConfig, writeWorkspaceConfig } = await import('./lib/workspace.mjs');
+const { seedWorkspace, loadWorkspaceConfig, workspacePaths, writeWorkspaceConfig } = await import('./lib/workspace.mjs');
+const { profileFingerprint } = await import('./lib/searchProfile.mjs');
 const { acquireScanLock, releaseScanLock } = await import('../tools/scan-lock.mjs');
 
 let server;
@@ -51,6 +52,82 @@ function request({ method = 'GET', path = '/', headers = {}, body = '' }) {
     } else req.end(body);
   });
 }
+
+const JSON_HEADERS = () => {
+  const host = `127.0.0.1:${port}`;
+  return { host, origin: `http://${host}`, 'content-type': 'application/json' };
+};
+
+function profileDraft() {
+  return {
+    version: 1,
+    status: 'draft',
+    target: {
+      primaryTitles: [{ value: 'Researcher', strength: 'mandatory', provenance: 'explicit' }],
+      locations: [{ value: 'Remote', strength: 'strong-preference', provenance: 'explicit' }],
+      sectors: [{ value: 'Public interest', strength: 'nice-to-have', provenance: 'unconfirmed-inference' }],
+    },
+    negative: {
+      excludedTitles: [{ value: 'Commission-only', strength: 'hard-exclusion', provenance: 'explicit' }],
+      excludedResponsibilities: [],
+    },
+    compensation: {
+      currency: 'GBP', period: 'year', minimum: 60000,
+      minimumStrength: 'strong-preference', unknownPolicy: 'include',
+    },
+  };
+}
+
+test('search-profile routes review a complete draft and publish only the current confirmed version', async () => {
+  seedWorkspace(APP_ROOT, testWorkspace);
+  const paths = workspacePaths(WORKSPACE_ROOT);
+  const draft = profileDraft();
+  fs.mkdirSync(path.dirname(paths.searchProfileDraft), { recursive: true });
+  fs.writeFileSync(paths.searchProfileRaw, '{"source":"migration"}\n');
+  fs.writeFileSync(paths.searchProfileDraft, `${JSON.stringify(draft)}\n`);
+  const revision = profileFingerprint(draft);
+
+  const reviewed = await request({ method: 'GET', path: '/api/search-profile' });
+  assert.equal(reviewed.status, 200);
+  assert.deepEqual(JSON.parse(reviewed.text), {
+    rawPresent: true, draft, published: null, draftRevision: revision,
+  });
+
+  const partial = await request({
+    method: 'PUT', path: '/api/search-profile/draft', headers: JSON_HEADERS(),
+    body: JSON.stringify({ draft: { status: 'draft' }, revision }),
+  });
+  assert.equal(partial.status, 400);
+
+  const saved = await request({
+    method: 'PUT', path: '/api/search-profile/draft', headers: JSON_HEADERS(),
+    body: JSON.stringify({ draft, revision }),
+  });
+  assert.equal(saved.status, 200);
+  assert.equal(JSON.parse(saved.text).draftRevision, revision);
+
+  const unconfirmed = await request({
+    method: 'POST', path: '/api/search-profile/publish', headers: JSON_HEADERS(),
+    body: JSON.stringify({ revision, confirmed: false }),
+  });
+  assert.equal(unconfirmed.status, 409);
+
+  const stale = await request({
+    method: 'POST', path: '/api/search-profile/publish', headers: JSON_HEADERS(),
+    body: JSON.stringify({ revision: 'stale', confirmed: true }),
+  });
+  assert.equal(stale.status, 409);
+
+  const published = await request({
+    method: 'POST', path: '/api/search-profile/publish', headers: JSON_HEADERS(),
+    body: JSON.stringify({ revision, confirmed: true }),
+  });
+  assert.equal(published.status, 200);
+  const result = JSON.parse(published.text);
+  assert.match(result.published.id, /^profile-[a-f0-9]{12}$/);
+  assert.deepEqual(JSON.parse(fs.readFileSync(paths.searchProfilePublished, 'utf8')), result.published);
+  assert.equal(loadWorkspaceConfig(WORKSPACE_ROOT).searchProfile.publishedId, result.published.id);
+});
 
 test('local server rejects a non-loopback Host header', async () => {
   const response = await request({ headers: { host: 'attacker.example' } });
