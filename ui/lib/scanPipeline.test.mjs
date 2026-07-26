@@ -5,7 +5,7 @@ import path from 'node:path';
 import { test } from 'node:test';
 import {
   applyHardExclusions, compactCandidates, DEFAULT_CANDIDATE_LIMIT, gateAssessment, inboxRecheckCandidates, promptCandidate,
-  validateAssessments, validateWrittenScanArtifacts, verificationCandidates, writeScanArtifacts,
+  filterVacancies, validateAssessments, validateWrittenScanArtifacts, verificationCandidates, writeScanArtifacts,
 } from './scanPipeline.mjs';
 
 const dimensions = [{ name: 'Fit', score: 90, maximum: 100, evidence: 'Advert and profile' }];
@@ -20,6 +20,18 @@ test('candidate input is deduplicated, capped and descriptions are bounded', () 
   const { candidates: result } = compactCandidates({ one: { jobs: [job, job] } }, 40);
   assert.equal(result.length, 1);
   assert.equal(result[0].description.length, 1200);
+});
+
+test('the assessment boundary receives only structured-filter eligible vacancies', () => {
+  const candidate = { vacancyId: 'vacancy-001', title: { value: 'Software Engineer', provenance: 'explicit-source' }, description: 'Perform coding.' };
+  const profile = {
+    id: 'profile-filter0001', version: 1,
+    target: {}, negative: { excludedResponsibilities: [{ value: 'coding', strength: 'hard-exclusion', provenance: 'confirmed-inference' }] },
+    compensation: { unknownPolicy: 'include', minimum: null },
+  };
+  const result = filterVacancies([candidate], profile);
+  assert.equal(result.eligible.length, 0);
+  assert.equal(result.excluded[0].code, 'excluded-responsibility');
 });
 
 test('candidate input collapses the same cross-provider role and preserves every source', () => {
