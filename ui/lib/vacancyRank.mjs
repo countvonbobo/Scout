@@ -39,6 +39,11 @@ function ruleId(rule) {
   return `rule-${normalise(rule?.value).replace(/\s+/g, '-')}`;
 }
 
+function vacancyIdentifier(vacancy) {
+  return String(vacancy?.vacancyId || vacancy?.candidateId || vacancy?.canonicalUrl
+    || vacancy?.observationId || vacancy?.sourceRecordId || 'unknown-vacancy');
+}
+
 function field(vacancy, name) {
   const aliases = {
     title: ['title', 'role'], employer: ['employer', 'company'],
@@ -71,13 +76,15 @@ function scoreRules(vacancy, name, sourceName, mode, rules) {
   const unknown = actual === null || actual === undefined || actual === '';
   const positiveRules = rules.filter((rule) => (STRENGTH_WEIGHT[rule?.strength] || 0) > 0);
   const maximum = positiveRules.reduce((total, rule) => total + STRENGTH_WEIGHT[rule.strength], 0);
+  const confidenceWeight = rules.reduce((total, rule) => total + Math.abs(STRENGTH_WEIGHT[rule?.strength] || 0), 0);
   const matched = rules.filter((rule) => !unknown && match(actual, rule.value, mode));
   const score = matched.reduce((total, rule) => total + STRENGTH_WEIGHT[rule.strength], 0);
   return {
     name,
     score,
     maximum,
-    confidence: maximum ? (unknown ? 0 : 1) : 1,
+    confidence: confidenceWeight ? (unknown ? 0 : 1) : 1,
+    confidenceWeight,
     evidence: rules.map((rule) => evidenceFor(source, rule, matched.includes(rule), unknown)),
     profileRuleIds: rules.map(ruleId),
     contributions: matched.map((rule) => ({
@@ -92,7 +99,7 @@ function compensationDimension(vacancy, profile) {
   const weight = STRENGTH_WEIGHT[preference.minimumStrength] || 0;
   const maximum = weight > 0 ? weight : 0;
   if (!maximum && weight === 0) {
-    return { name: 'compensation', score: 0, maximum: 0, confidence: 1, evidence: [], profileRuleIds: [], contributions: [] };
+    return { name: 'compensation', score: 0, maximum: 0, confidence: 1, confidenceWeight: 0, evidence: [], profileRuleIds: [], contributions: [] };
   }
   const source = field(vacancy, 'compensation');
   const amount = valueOf(source);
@@ -112,7 +119,7 @@ function compensationDimension(vacancy, profile) {
   const rule = { value: `${preference.currency || 'unknown'} ${preference.period || 'unknown'} ${preference.rateType || 'unknown'} ${preference.minimum}`, strength: preference.minimumStrength };
   const comparison = knownComparable ? (meetsMinimum ? 'meets-minimum' : 'below-minimum') : 'unknown';
   return {
-    name: 'compensation', score, maximum, confidence: knownComparable ? 1 : 0,
+    name: 'compensation', score, maximum, confidence: knownComparable ? 1 : 0, confidenceWeight: Math.abs(weight),
     evidence: [{ vacancy: amount || null, rule: preference.minimum, comparison }],
     profileRuleIds: [ruleId(rule)],
     contributions: score ? [{ name: 'compensation', profileRuleId: ruleId(rule), score, evidence: { vacancy: amount || null, rule: preference.minimum, comparison } }] : [],
@@ -139,7 +146,7 @@ function dateValue(value) {
 }
 
 function stableTieBreak(vacancy) {
-  const vacancyId = String(vacancy?.vacancyId || vacancy?.candidateId || vacancy?.canonicalUrl || 'unknown-vacancy');
+  const vacancyId = vacancyIdentifier(vacancy);
   return {
     postedAt: vacancy?.postedAt || vacancy?.postedDate || null,
     employer: normalise(valueOf(field(vacancy, 'employer'))),
@@ -166,14 +173,15 @@ export function rankVacancies(vacancies, profile, history = []) {
     const dimensions = dimensionsFor(vacancy, profile);
     const positiveMaximum = dimensions.reduce((total, dimension) => total + dimension.maximum, 0);
     const rawScore = dimensions.reduce((total, dimension) => total + dimension.score, 0);
-    const weightedConfidence = dimensions.reduce((total, dimension) => total + dimension.maximum * dimension.confidence, 0);
+    const confidenceMaximum = dimensions.reduce((total, dimension) => total + dimension.confidenceWeight, 0);
+    const weightedConfidence = dimensions.reduce((total, dimension) => total + dimension.confidenceWeight * dimension.confidence, 0);
     const preRankScore = positiveMaximum ? Math.round(Math.max(0, Math.min(100, (rawScore / positiveMaximum) * 100)) * 100) / 100 : 0;
-    const preRankConfidence = positiveMaximum ? Math.round((weightedConfidence / positiveMaximum) * 10000) / 100 : 100;
+    const preRankConfidence = confidenceMaximum ? Math.round((weightedConfidence / confidenceMaximum) * 10000) / 100 : 100;
     const contributions = dimensions.flatMap((dimension) => dimension.contributions);
-    const publicDimensions = dimensions.map(({ contributions: _contributions, ...dimension }) => dimension);
+    const publicDimensions = dimensions.map(({ contributions: _contributions, confidenceWeight: _confidenceWeight, ...dimension }) => dimension);
     return {
       ...vacancy,
-      vacancyId: vacancy?.vacancyId || vacancy?.candidateId || vacancy?.canonicalUrl || 'unknown-vacancy',
+      vacancyId: vacancyIdentifier(vacancy),
       preRankScore,
       preRankConfidence,
       dimensions: publicDimensions,

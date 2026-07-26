@@ -126,6 +126,32 @@ test('ties use confidence, posted date, employer/title, then vacancy id determin
   assert.deepEqual(ranked.map(({ vacancyId }) => vacancyId), ['a', 'b', 'z']);
 });
 
+test('normalized observations without a canonical URL still have an order-independent tie break', () => {
+  const first = vacancy({ vacancyId: undefined, title: 'Engineer', employer: 'Acme', postedAt: null });
+  const second = vacancy({ vacancyId: undefined, title: 'Engineer', employer: 'Acme', postedAt: null });
+  first.canonicalUrl = null;
+  second.canonicalUrl = null;
+  first.observationId = 'observation-b';
+  second.observationId = 'observation-a';
+
+  const forward = rankVacancies([first, second], profile());
+  const reverse = rankVacancies([second, first], profile());
+
+  assert.deepEqual(forward.map(({ stableTieBreak }) => stableTieBreak.vacancyId), ['observation-a', 'observation-b']);
+  assert.deepEqual(forward.map(({ stableTieBreak }) => stableTieBreak.vacancyId), reverse.map(({ stableTieBreak }) => stableTieBreak.vacancyId));
+});
+
+test('unknown negative-rule evidence lowers confidence without receiving a penalty', () => {
+  const result = rankVacancies([vacancy({ vacancyId: 'unknown-negative', title: null })], profile({
+    excludedResponsibilities: [rule('coding', 'strong-negative')],
+  }))[0];
+  const negative = result.dimensions.find((dimension) => dimension.name === 'excludedResponsibilities');
+
+  assert.equal(negative.score, 0);
+  assert.equal(negative.confidence, 0);
+  assert.ok(result.preRankConfidence < 100);
+});
+
 test('the generic ranker gives six distinct profile fixtures their matching vacancy first', () => {
   const jobs = [
     vacancy({ vacancyId: 'developer', title: 'Software Developer' }),
