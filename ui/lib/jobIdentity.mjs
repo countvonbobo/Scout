@@ -103,6 +103,12 @@ function locationsCompatible(a, b) {
   if (a.location === b.location) return true;
   const remoteA = a.locationTokens.includes('remote'); const remoteB = b.locationTokens.includes('remote');
   if (remoteA || remoteB) return remoteA && remoteB;
+  const [cityOnly, qualifiedLocation] = a.locationTokens.length === 1
+    ? [a.locationTokens, b.locationTokens]
+    : b.locationTokens.length === 1
+      ? [b.locationTokens, a.locationTokens]
+      : [[], []];
+  if (cityOnly.length && qualifiedLocation[0] === cityOnly[0]) return true;
   return similarity(a.locationTokens, b.locationTokens) >= 0.5;
 }
 
