@@ -177,7 +177,9 @@ test('migration stages byte-preserved legacy evidence in an unpublished draft', 
   assert.equal(draft.negative.excludedResponsibilities[0].strength, 'strong-negative');
   assert.equal(draft.compensation.minimumStrength, 'strong-preference');
   assert.equal(draft.compensation.unknownPolicy, 'include');
-  assert.equal(JSON.parse(fs.readFileSync(paths.config, 'utf8')).searchProfile, undefined);
+  assert.deepEqual(JSON.parse(fs.readFileSync(paths.config, 'utf8')).searchProfile, {
+    publishedId: null,
+  });
   assert.equal(fs.readFileSync(paths.tracker, 'utf8'), '{"existing":true}\n');
   assert.equal(fs.readFileSync(path.join(paths.reports, '2026-07-26.md'), 'utf8'), 'Existing report\n');
   assert.equal(fs.readFileSync(path.join(paths.applications, 'example', 'outreach.md'), 'utf8'), 'Existing application\n');

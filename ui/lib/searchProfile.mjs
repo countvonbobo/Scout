@@ -1,5 +1,6 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs';
+import path from 'node:path';
 import { atomicWriteFile } from './atomicWrite.mjs';
 import { backupWorkspace, workspacePaths } from './workspace.mjs';
 
@@ -161,10 +162,23 @@ export function migrateSearchProfile(root) {
   // parsed values and silently losing formatting or line endings.
   const workspaceJson = fs.readFileSync(paths.config, 'utf8');
   const context = fs.existsSync(paths.profileContext) ? fs.readFileSync(paths.profileContext, 'utf8') : '';
-  const draft = draftProfileFromLegacy(JSON.parse(workspaceJson), context);
+  const config = JSON.parse(workspaceJson);
+  const draft = draftProfileFromLegacy(config, context);
   const backupPath = backupWorkspace(root, 'search-profile-v1');
-
-  atomicWriteFile(paths.searchProfileRaw, `${JSON.stringify({ version: 1, workspaceJson, context }, null, 2)}\n`);
-  atomicWriteFile(paths.searchProfileDraft, `${JSON.stringify(draft, null, 2)}\n`);
+  const searchDirectory = path.dirname(paths.searchProfileRaw);
+  if (fs.existsSync(searchDirectory)) throw new Error(`search profile evidence already exists: ${searchDirectory}`);
+  const stagingDirectory = path.join(paths.profile, `.search-profile-v1-${crypto.randomUUID()}`);
+  try {
+    atomicWriteFile(path.join(stagingDirectory, 'raw.json'), `${JSON.stringify({ version: 1, workspaceJson, context }, null, 2)}\n`);
+    atomicWriteFile(path.join(stagingDirectory, 'draft.json'), `${JSON.stringify(draft, null, 2)}\n`);
+    atomicWriteFile(paths.config, `${JSON.stringify({
+      ...config,
+      searchProfile: { ...(config.searchProfile || {}), publishedId: null },
+    }, null, 2)}\n`);
+    fs.renameSync(stagingDirectory, searchDirectory);
+  } catch (error) {
+    fs.rmSync(stagingDirectory, { recursive: true, force: true });
+    throw error;
+  }
   return { migrated: true, draftPath: paths.searchProfileDraft, backupPath };
 }
