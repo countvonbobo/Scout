@@ -279,19 +279,44 @@ test('renderJobs lists only new jobs, highest score first, with tags and actions
   assert.doesNotMatch(html, /data-id="c"/); // shortlisted excluded
 });
 
-test('triage actions post the right status transitions', () => {
+test('triage actions post the right status transitions', async () => {
   const { scout } = loadScout();
+  scout.state.data = {
+    opportunities: [
+      { id: 'a', status: 'new' },
+      { id: 'b', status: 'new' },
+    ],
+  };
+  scout.renderJobs = () => {};
   const calls = [];
   scout.post = (path, payload) => { calls.push([path, payload]); return Promise.resolve({ ok: true }); };
   scout.showUndo = () => {};
   scout.hideUndo = () => {};
   scout.triageYes('a');
-  scout.triageNo('b');
+  await scout.triageNo('b');
   scout.undoDismiss('b');
   const normalized = calls.map(([path, payload]) => [path, JSON.parse(JSON.stringify(payload))]);
   assert.deepEqual(normalized[0], ['/api/status', { id: 'a', status: 'shortlist' }]);
   assert.deepEqual(normalized[1], ['/api/status', { id: 'b', status: 'ignore' }]);
   assert.deepEqual(normalized[2], ['/api/status', { id: 'b', status: 'new' }]);
+});
+
+test('No removes a job immediately and restores it when persistence fails', async () => {
+  const { scout } = loadScout();
+  scout.state.data = { opportunities: [{ id: 'b', status: 'new' }] };
+  let finishWrite;
+  scout.post = () => new Promise((resolve) => { finishWrite = resolve; });
+  const renderedStatuses = [];
+  scout.renderJobs = () => renderedStatuses.push(scout.state.data.opportunities[0].status);
+
+  const pending = scout.triageNo('b');
+  assert.equal(scout.state.data.opportunities[0].status, 'ignore');
+  assert.deepEqual(renderedStatuses, ['ignore']);
+
+  finishWrite({ ok: false });
+  await pending;
+  assert.equal(scout.state.data.opportunities[0].status, 'new');
+  assert.deepEqual(renderedStatuses, ['ignore', 'new']);
 });
 
 test('renderShortlist lists only shortlisted jobs with a remove action', () => {
