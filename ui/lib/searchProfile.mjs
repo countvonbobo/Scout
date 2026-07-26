@@ -168,18 +168,18 @@ export function migrateSearchProfile(root, { fileSystem = fs } = {}) {
   const searchDirectory = path.dirname(paths.searchProfileRaw);
   if (fileSystem.existsSync(searchDirectory)) throw new Error(`search profile evidence already exists: ${searchDirectory}`);
   const stagingDirectory = path.join(paths.profile, `.search-profile-v1-${crypto.randomUUID()}`);
-  let artifactsVisible = false;
+  let configWritten = false;
   try {
     atomicWriteFile(path.join(stagingDirectory, 'raw.json'), `${JSON.stringify({ version: 1, workspaceJson, context }, null, 2)}\n`, { fileSystem });
     atomicWriteFile(path.join(stagingDirectory, 'draft.json'), `${JSON.stringify(draft, null, 2)}\n`, { fileSystem });
-    fileSystem.renameSync(stagingDirectory, searchDirectory);
-    artifactsVisible = true;
     atomicWriteFile(paths.config, `${JSON.stringify({
       ...config,
       searchProfile: { ...(config.searchProfile || {}), publishedId: null },
     }, null, 2)}\n`, { fileSystem });
+    configWritten = true;
+    fileSystem.renameSync(stagingDirectory, searchDirectory);
   } catch (error) {
-    if (artifactsVisible) fileSystem.renameSync(searchDirectory, stagingDirectory);
+    if (configWritten) atomicWriteFile(paths.config, fileSystem.readFileSync(backupPath), { fileSystem });
     fileSystem.rmSync(stagingDirectory, { recursive: true, force: true });
     throw error;
   }
