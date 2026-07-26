@@ -17,6 +17,46 @@ function scanRoot() {
 
 const authenticated = () => ({ installed: true, authenticated: true, executable: 'codex', capabilities: { structuredOutput: true } });
 
+function publishedRankingProfile() {
+  return publishSearchProfile({
+    version: 1, status: 'draft',
+    target: { primaryTitles: [{ value: 'Ideal Role', strength: 'strong-preference', provenance: 'explicit' }] },
+    negative: {},
+    compensation: { currency: null, period: 'year', minimum: null, minimumStrength: 'neutral', unknownPolicy: 'include' },
+  }, { publishedAt: '2026-07-26T20:00:00.000Z' });
+}
+
+function enableRankedDiscovery(root) {
+  const profile = publishedRankingProfile();
+  fs.mkdirSync(path.join(root, 'profile', 'search'), { recursive: true });
+  fs.writeFileSync(path.join(root, 'profile', 'search', 'published.json'), `${JSON.stringify(profile)}\n`);
+}
+
+function assessmentFor(candidates) {
+  return {
+    assessments: candidates.map((candidate) => ({
+      candidateId: candidate.candidateId, categoryId: null, summary: 'Synthetic assessment', hardExclusionMatches: [],
+      mandatoryRequirements: [], dimensions: [{ name: 'fit', score: 80, maximum: 100, evidence: 'Synthetic evidence' }], recommendation: 'keep',
+    })),
+  };
+}
+
+function scanHarness(sources, seenCandidates) {
+  return {
+    providerStatusFn: authenticated,
+    collectSourcesFn: async () => ({ generatedAt: '2026-07-26T20:00:00Z', queries: [], sources }),
+    runStructuredTurnFn: async ({ validate }) => {
+      const candidates = seenCandidates();
+      const value = assessmentFor(candidates);
+      validate(value);
+      return { value, usage: {} };
+    },
+    acquireLockFn: () => ({ ok: true, lock: { token: 'ranked-discovery-test' } }),
+    releaseLockFn: () => ({ ok: true }),
+    checkLivenessFn: async (candidates) => ({ live: candidates, removed: [], summary: { checked: candidates.length, gone: 0, unverified: 0 } }),
+  };
+}
+
 test('safe broadening adds adjacent discovery queries without changing approved gates', () => {
   const config = {
     search: {
@@ -107,6 +147,8 @@ test('runtime scan skips AI for a healthy empty source result and needs no Git r
   assert.equal(result.ok, true);
   assert.equal(result.status, 'healthy-empty');
   assert.equal(result.scan.candidates_found, 0);
+  assert.equal(result.scan.discovery_engine, 'legacy-discovery');
+  assert.equal(result.scan.funnel, undefined);
   assert.equal(providerCalls, 0);
   assert.equal(released, true);
   assert.equal(fs.existsSync(path.join(root, '.git')), false);
@@ -134,6 +176,87 @@ test('runtime scan filters from the published profile before provider assessment
   assert.equal(result.scan.candidates_found, 0);
   assert.equal(result.scan.discarded.hard_exclusion, 1);
   assert.equal(providerCalls, 0);
+});
+
+test('runtime selection is independent of source and portal order', async () => {
+  const source = (name, jobs) => ({ configured: true, status: 'healthy', count: jobs.length, jobs: jobs.map((job) => ({ ...job, source: name })) });
+  const jobs = [
+    { company: 'Able', title: 'Ideal Role', url: 'https://example.test/able', providerId: 'able' },
+    { company: 'Baker', title: 'Ideal Role', url: 'https://example.test/baker', providerId: 'baker' },
+  ];
+  const selectedUrls = [];
+  for (const sources of [
+    { 'ats-a': source('ats-a', [jobs[0]]), 'ats-b': source('ats-b', [jobs[1]]) },
+    { 'ats-b': source('ats-b', [jobs[1]]), 'ats-a': source('ats-a', [jobs[0]]) },
+  ]) {
+    const root = scanRoot();
+    enableRankedDiscovery(root);
+    let candidates = [];
+    const result = await runScanWith(root, 'codex', 'primary', {
+      ...scanHarness(sources, () => candidates),
+      checkLivenessFn: async (items) => { candidates = items; return { live: items, removed: [], summary: { checked: items.length, gone: 0, unverified: 0 } }; },
+    });
+    assert.equal(result.ok, true);
+    selectedUrls.push(candidates.map((item) => item.url));
+  }
+  assert.deepEqual(selectedUrls[0], selectedUrls[1]);
+});
+
+test('runtime ranks all unique jobs before selecting sixty', async () => {
+  const root = scanRoot();
+  enableRankedDiscovery(root);
+  const lateStrongUrl = 'https://example.test/jobs/late-strong';
+  const jobs = Array.from({ length: 2500 }, (_, index) => ({
+    company: `Company ${index}`, title: index === 2499 ? 'Ideal Role' : 'Other Role',
+    url: index === 2499 ? lateStrongUrl : `https://example.test/jobs/${index}`,
+    providerId: `job-${index}`,
+  }));
+  let candidates = [];
+  const result = await runScanWith(root, 'codex', 'primary', {
+    ...scanHarness({ ats: { configured: true, status: 'healthy', count: jobs.length, jobs } }, () => candidates),
+    checkLivenessFn: async (items) => { candidates = items; return { live: items, removed: [], summary: { checked: items.length, gone: 0, unverified: 0 } }; },
+  });
+  assert.equal(result.ok, true);
+  assert.equal(result.scan.funnel.uniqueVacancies, 2500);
+  assert.equal(result.scan.funnel.ranked, result.scan.funnel.eligible);
+  assert.equal(result.scan.funnel.selected, 60);
+  assert.ok(candidates.some((item) => item.url === lateStrongUrl));
+});
+
+test('closed selected adverts are replaced by the next ranked eligible vacancy', async () => {
+  const root = scanRoot();
+  enableRankedDiscovery(root);
+  const jobs = Array.from({ length: 61 }, (_, index) => ({
+    company: `Company ${String(index).padStart(2, '0')}`, title: 'Ideal Role',
+    url: `https://example.test/backfill/${index}`, providerId: `backfill-${index}`,
+  }));
+  let assessed = [];
+  const result = await runScanWith(root, 'codex', 'primary', {
+    providerStatusFn: authenticated,
+    collectSourcesFn: async () => ({ generatedAt: '2026-07-26T20:00:00Z', queries: [], sources: {
+      ats: { configured: true, status: 'healthy', count: jobs.length, jobs },
+    } }),
+    checkLivenessFn: async (items) => ({
+      live: items.filter((item) => item.url !== 'https://example.test/backfill/0'),
+      removed: items.filter((item) => item.url === 'https://example.test/backfill/0').map((item) => ({ ...item, liveness: { reason: 'closed' } })),
+      summary: { checked: items.length, gone: items.some((item) => item.url.endsWith('/0')) ? 1 : 0, unverified: 0 },
+    }),
+    runStructuredTurnFn: async ({ prompt, validate }) => {
+      assessed = JSON.parse(prompt.split('\n\n').at(-1)).candidates;
+      const value = assessmentFor(assessed);
+      validate(value);
+      return { value, usage: {} };
+    },
+    acquireLockFn: () => ({ ok: true, lock: { token: 'liveness-backfill-test' } }),
+    releaseLockFn: () => ({ ok: true }),
+    onProgress: () => {},
+  });
+  assert.equal(result.ok, true);
+  assert.equal(assessed.length, 60);
+  assert.ok(assessed.some((item) => item.url === 'https://example.test/backfill/60'));
+  assert.ok(!assessed.some((item) => item.url === 'https://example.test/backfill/0'));
+  assert.equal(result.scan.funnel.selected, 60);
+  assert.equal(result.scan.funnel.assessed, 60);
 });
 
 test('runtime scan model is independent from the job-work model', async () => {

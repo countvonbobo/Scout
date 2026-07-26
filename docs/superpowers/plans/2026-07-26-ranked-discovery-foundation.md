@@ -864,6 +864,8 @@ git commit -m "test: verify generic ranked discovery foundation"
 
 This plan intentionally creates the shared contracts first. Gate A remains blocked until separate plans are written and executed for:
 
+- [ ] Remove the deprecated `applyHardExclusions()` compatibility export after legacy-discovery retirement and confirm no runtime caller remains.
+
 1. persistent scan stages, leases, heartbeats, resumable batches and focused assessment repair;
 2. PR #71 review/merge/acceptance;
 3. issues #72, #73, #74, #75 and #76;

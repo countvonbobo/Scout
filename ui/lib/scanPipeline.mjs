@@ -7,6 +7,12 @@ import {
   advertMateriallyChanged, invalidateJobIdentity, jobIdentity, mergeSourceReferences, sameUnderlyingJob, sourceReferencesOf,
 } from './jobIdentity.mjs';
 import { isVerifiable } from './statusGroups.mjs';
+import { canonicaliseObservations } from './vacancyCanonical.mjs';
+import { createDiscoveryFunnel, advanceDiscoveryFunnel, assertDiscoveryFunnel } from './discoveryFunnel.mjs';
+import { filterVacancies } from './vacancyFilter.mjs';
+import { normaliseObservation } from './vacancyObservation.mjs';
+import { rankVacancies } from './vacancyRank.mjs';
+import { selectVacancies } from './vacancySelect.mjs';
 export { filterVacancies } from './vacancyFilter.mjs';
 
 const EMPTY_DISCARDED = Object.freeze({ hard_exclusion: 0, mandatory_unmet: 0, below_threshold: 0, provider_discarded: 0 });
@@ -68,6 +74,122 @@ function mandatorySignals(description, requirements) {
     .map((text) => text.trim()).filter((text) => text && /\b(?:required|essential|must|mandatory|non-negotiable)\b/i.test(text));
   return [...new Set([...sourceRequirements, ...explicitLanguage])]
     .slice(0, 12).map((text, index) => ({ id: `mandatory-${String(index + 1).padStart(2, '0')}`, text: text.slice(0, 300) }));
+}
+
+function valueOf(value) {
+  return value && typeof value === 'object' && Object.hasOwn(value, 'value') ? value.value : value;
+}
+
+function compareText(left, right) {
+  const a = String(left);
+  const b = String(right);
+  return a < b ? -1 : a > b ? 1 : 0;
+}
+
+function sourceReferences(vacancy) {
+  return (vacancy?.sourceReferences || []).map((reference) => ({
+    source: reference.source || reference.sourceName || '',
+    providerId: reference.providerId || reference.sourceRecordId || '',
+    url: reference.url || reference.sourceUrl || '',
+  }));
+}
+
+function assessmentVacancy(vacancy) {
+  const observation = vacancy?.observations?.[0] || {};
+  const references = sourceReferences(vacancy);
+  const url = vacancy?.canonicalUrl || observation.sourceUrl || references[0]?.url || '';
+  return {
+    ...vacancy,
+    company: valueOf(vacancy?.employer) || '',
+    role: valueOf(vacancy?.title) || '',
+    url,
+    location: valueOf(vacancy?.location) || '',
+    workingType: valueOf(vacancy?.workingPattern) || '',
+    salary: valueOf(vacancy?.compensation) || null,
+    postedDate: vacancy?.postedAt || null,
+    source: observation.source || references[0]?.source || '',
+    providerId: observation.sourceRecordId || references[0]?.providerId || '',
+    sourceReferences: references,
+    sources: [...new Set([url, ...references.map((reference) => reference.url)].filter(Boolean))],
+    duplicateCount: Math.max(1, Number(vacancy?.observations?.length || 1)),
+    tags: [],
+    requirements: '',
+  };
+}
+
+function candidateFromSelected(vacancy, index) {
+  const candidate = assessmentVacancy(vacancy);
+  return {
+    ...candidate,
+    candidateId: `candidate-${String(index + 1).padStart(3, '0')}`,
+    description: String(candidate.description || '').slice(0, 1200),
+    mandatorySignals: mandatorySignals(candidate.description, candidate.requirements),
+  };
+}
+
+export function assessmentCandidatesForSelection(selected) {
+  return (selected || []).map(candidateFromSelected);
+}
+
+function observationInputs(sources) {
+  return Object.entries(sources || {}).sort(([left], [right]) => compareText(left, right)).flatMap(([sourceName, source]) => (
+    [...(source?.jobs || [])].map((job) => normaliseObservation(job, {
+      sourceName: job?.source || sourceName,
+      fetchedAt: source?.fetchedAt || source?.generatedAt || null,
+      laneId: job?.laneId || job?.source || source?.laneId || sourceName,
+    })).filter(Boolean)
+  ));
+}
+
+// The deterministic discovery boundary deliberately evaluates every
+// normalised, canonical vacancy before it applies the bounded assessment set.
+// Candidate identifiers are generated only after selection, so a source's
+// response order cannot leak into provider-facing identities.
+export function prepareRankedDiscovery({
+  sources, profile, tracker = { opportunities: [] }, runId = '', limit = DEFAULT_CANDIDATE_LIMIT,
+} = {}) {
+  if (!profile || profile.status !== 'published') throw new Error('ranked discovery requires a published search profile');
+  const initialFunnel = createDiscoveryFunnel(sources);
+  const observations = observationInputs(sources);
+  const canonical = canonicaliseObservations(observations);
+  const vacancies = canonical.vacancies.map(assessmentVacancy);
+  const filtered = filterVacancies(vacancies, profile);
+  const ranked = rankVacancies(filtered.eligible, profile, tracker?.opportunities || []);
+  const selection = selectVacancies(ranked, { limit, seed: runId });
+  const funnel = assertDiscoveryFunnel(advanceDiscoveryFunnel(initialFunnel, 'selection', {
+    parsed: initialFunnel.sourceRecords - initialFunnel.failedSourceRecords,
+    normalised: observations.length,
+    duplicateObservations: canonical.duplicateObservations,
+    uniqueVacancies: vacancies.length,
+    deterministicallyExcluded: vacancies.length - filtered.eligible.length,
+    eligible: filtered.eligible.length,
+    ranked: ranked.length,
+    aboveThreshold: ranked.length - selection.belowCutoff.length,
+    selected: selection.selected.length,
+  }));
+  return {
+    observations,
+    vacancies,
+    exclusions: filtered.excluded,
+    ranked,
+    selection,
+    funnel,
+    candidates: assessmentCandidatesForSelection(selection.selected),
+  };
+}
+
+// Deprecated: retained only for beta.22 compatibility consumers. Ranked
+// discovery uses filterVacancies() and never performs whole-prose matching.
+export function applyHardExclusions(candidates, exclusions = []) {
+  const terms = (exclusions || []).map((value) => String(value || '').trim().toLowerCase()).filter(Boolean);
+  const kept = [];
+  const excluded = [];
+  for (const candidate of candidates || []) {
+    const matches = terms.filter((term) => String(candidate?.description || '').toLowerCase().includes(term));
+    if (matches.length) excluded.push({ ...candidate, hardExclusionMatches: matches });
+    else kept.push(candidate);
+  }
+  return { candidates: kept, excluded };
 }
 
 export const DEFAULT_CANDIDATE_LIMIT = 60;
@@ -385,7 +507,7 @@ export function writeScanArtifacts(root, {
   provider, mode, sources, queries = [], candidates, assessmentResult, policy, startedAt,
   error = null, skipped = false, dropped = { perSource: {}, total: 0 }, hardExcluded = [], closedAdverts = [],
   livenessSummary = { checked: 0, gone: 0, unverified: 0 }, verificationScoped = false,
-  staleInboxEntries = [], inboxRechecked = 0,
+  staleInboxEntries = [], inboxRechecked = 0, funnel = null, selection = [], discoveryEngine = 'legacy-discovery',
 }) {
   const paths = workspacePaths(root);
   const timestamp = new Date().toISOString();
@@ -417,6 +539,9 @@ export function writeScanArtifacts(root, {
     adverts_checked: livenessSummary.checked, adverts_closed: livenessSummary.gone,
     adverts_unverified: livenessSummary.unverified, verification_scoped: verificationScoped,
     inbox_rechecked: inboxRechecked, inbox_archived: inboxArchived,
+    discovery_engine: discoveryEngine,
+    ...(funnel ? { funnel } : {}),
+    ...(selection.length ? { selection } : {}),
     reviewed: merged.reviewed, errors, source_health: health,
   };
   const earlierRuns = fs.existsSync(paths.scanRuns)

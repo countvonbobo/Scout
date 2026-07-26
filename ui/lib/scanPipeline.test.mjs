@@ -4,7 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { test } from 'node:test';
 import {
-  compactCandidates, DEFAULT_CANDIDATE_LIMIT, gateAssessment, inboxRecheckCandidates, promptCandidate,
+  compactCandidates, DEFAULT_CANDIDATE_LIMIT, gateAssessment, inboxRecheckCandidates, prepareRankedDiscovery, promptCandidate,
   filterVacancies, validateAssessments, validateWrittenScanArtifacts, verificationCandidates, writeScanArtifacts,
 } from './scanPipeline.mjs';
 
@@ -20,6 +20,24 @@ test('candidate input is deduplicated, capped and descriptions are bounded', () 
   const { candidates: result } = compactCandidates({ one: { jobs: [job, job] } }, 40);
   assert.equal(result.length, 1);
   assert.equal(result[0].description.length, 1200);
+});
+
+test('ranked discovery is independent of source and portal order', () => {
+  const profile = {
+    version: 1, status: 'published', id: 'profile-123456789abc',
+    target: { primaryTitles: [{ value: 'Ideal Role', strength: 'strong-preference', provenance: 'explicit' }] },
+    negative: {}, compensation: { currency: null, period: 'year', minimum: null, minimumStrength: 'neutral', unknownPolicy: 'include' },
+  };
+  const job = (company) => ({ company, title: 'Ideal Role', url: `https://example.test/${company.toLowerCase()}`, providerId: company.toLowerCase() });
+  const options = { profile, tracker: { opportunities: [] }, runId: 'scan-1', limit: 60 };
+  const forward = prepareRankedDiscovery({ sources: {
+    'ats-a': { count: 1, jobs: [job('Able')] }, 'ats-b': { count: 1, jobs: [job('Baker')] },
+  }, ...options });
+  const reverse = prepareRankedDiscovery({ sources: {
+    'ats-b': { count: 1, jobs: [job('Baker')] }, 'ats-a': { count: 1, jobs: [job('Able')] },
+  }, ...options });
+  assert.deepEqual(forward.selection.selected.map((item) => item.url), reverse.selection.selected.map((item) => item.url));
+  assert.deepEqual(forward.candidates.map((item) => item.candidateId), ['candidate-001', 'candidate-002']);
 });
 
 test('the assessment boundary receives only structured-filter eligible vacancies', () => {
