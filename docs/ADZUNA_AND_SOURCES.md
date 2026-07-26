@@ -30,4 +30,8 @@ scout source hiring-cafe
 
 Before reporting an opportunity, verify the original advert/careers page is current, cite its URL and record the absolute date checked. Deduplicate into `data/opportunities.json` using a stable `company-role-YYYY-MM` ID. Never infer salary, location, qualifications or availability from missing fields.
 
+For a published search profile, Scout normalises and deduplicates every returned vacancy, applies only confirmed exclusions, ranks the entire eligible pool, and then selects a bounded set for detailed assessment. Source records can be stale, incomplete, duplicated or ambiguous; an unknown salary, arrangement or location remains unknown and follows the profile's selected unknown-value policy. Source order, a missing optional source, and an unverified advert do not create a positive fact or a hard exclusion.
+
+Configured sources are discovery inputs, not a promise to discover every employer or opening. Scout does not yet learn new search rules from feedback; review and publish profile changes yourself before a later scan uses them.
+
 Respect site terms, robots/rate limits and personal-data rules. Do not work around access controls.
