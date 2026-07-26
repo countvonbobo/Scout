@@ -57,3 +57,17 @@ test('strong negatives and unconfirmed hard rules do not exclude', () => {
   }));
   assert.deepEqual(result, { eligible: [softwareJob], excluded: [] });
 });
+
+test('structured rules require normalized equality rather than token containment', () => {
+  const result = filterVacancies([{ ...softwareJob, location: { value: 'York, New', provenance: 'explicit-source' } }], profile({
+    locations: [rule('New York', 'mandatory')],
+  }));
+  assert.equal(result.excluded[0].code, 'mandatory-location-unmet');
+});
+
+test('unconfirmed target hard rules do not exclude', () => {
+  const result = filterVacancies([softwareJob], profile({
+    primaryTitles: [rule('Data Engineer', 'hard-exclusion', 'unconfirmed-inference')],
+  }));
+  assert.deepEqual(result, { eligible: [softwareJob], excluded: [] });
+});

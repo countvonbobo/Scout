@@ -13,9 +13,10 @@ import { assertSafeModel, providerStatus } from '../ui/lib/providers.mjs';
 import { setupReadiness } from '../ui/lib/setupReadiness.mjs';
 import { runStructuredTurn } from '../ui/lib/structuredTurn.mjs';
 import {
-  applyHardExclusions, compactCandidates, DEFAULT_CANDIDATE_LIMIT, inboxRecheckCandidates, promptCandidate,
+  compactCandidates, DEFAULT_CANDIDATE_LIMIT, filterVacancies, inboxRecheckCandidates, promptCandidate,
   SCAN_ASSESSMENT_SCHEMA, validateAssessments, verificationCandidates, writeScanArtifacts,
 } from '../ui/lib/scanPipeline.mjs';
+import { loadPublishedSearchProfile } from '../ui/lib/searchProfile.mjs';
 import { partitionLiveCandidates } from '../ui/lib/advertLiveness.mjs';
 import { isMainModule } from '../ui/lib/mainModule.mjs';
 import { runCvQuality } from '../ui/lib/cvQuality.mjs';
@@ -278,7 +279,7 @@ export async function runScanWith(root, provider, mode, {
   if (!lock.ok) {
     const artifacts = writeScanArtifacts(root, {
       provider, mode, sources: {}, candidates: [], assessmentResult: null, policy: config.triage,
-      exclusions: config.search?.exclusions || [], startedAt, error: 'another scan is already running', skipped: true,
+      startedAt, error: 'another scan is already running', skipped: true,
     });
     return { ok: false, status: 'skipped', error: 'another scan is already running', lock: lock.lock, scan: artifacts.run };
   }
@@ -300,19 +301,22 @@ export async function runScanWith(root, provider, mode, {
 
     // Everything below runs before the assessment turn, so each candidate it
     // removes is one the provider is never asked to score.
-    const afterExclusions = applyHardExclusions(compacted.candidates, config.search?.exclusions || []);
+    const publishedProfile = loadPublishedSearchProfile(root);
+    const afterExclusions = publishedProfile
+      ? filterVacancies(compacted.candidates, publishedProfile)
+      : { eligible: compacted.candidates, excluded: [] };
     hardExcluded = afterExclusions.excluded;
     if (mode === 'second-pass') {
       const tracker = JSON.parse(fs.readFileSync(workspacePaths(root).tracker, 'utf8'));
-      const verification = verificationCandidates(afterExclusions.kept, tracker, new Date().toISOString().slice(0, 10), config.triage);
-      afterExclusions.kept = verification.candidates;
+      const verification = verificationCandidates(afterExclusions.eligible, tracker, new Date().toISOString().slice(0, 10), config.triage);
+      afterExclusions.eligible = verification.candidates;
       verificationScoped = verification.verified;
     }
     const tracker = JSON.parse(fs.readFileSync(workspacePaths(root).tracker, 'utf8'));
-    const inboxRecheck = inboxRecheckCandidates(tracker, afterExclusions.kept);
+    const inboxRecheck = inboxRecheckCandidates(tracker, afterExclusions.eligible);
     inboxRechecked = inboxRecheck.checkable.length + inboxRecheck.missingSource.length;
-    onProgress({ phase: `Checking ${afterExclusions.kept.length + inboxRecheck.checkable.length} adverts are still open`, current: 2, total: 5 });
-    const liveness = await checkLivenessFn([...afterExclusions.kept, ...inboxRecheck.checkable]);
+    onProgress({ phase: `Checking ${afterExclusions.eligible.length + inboxRecheck.checkable.length} adverts are still open`, current: 2, total: 5 });
+    const liveness = await checkLivenessFn([...afterExclusions.eligible, ...inboxRecheck.checkable]);
     closedAdverts = liveness.removed.filter((candidate) => !candidate._inboxRecheck);
     staleInboxEntries = [
       ...inboxRecheck.missingSource,
@@ -353,7 +357,7 @@ export async function runScanWith(root, provider, mode, {
     onProgress({ phase: 'Writing tracker and report', current: 4, total: 5 });
     const artifacts = writeScanArtifacts(root, {
       provider, mode, sources: collected.sources, queries: collected.queries, candidates, assessmentResult,
-      policy: config.triage, exclusions: config.search?.exclusions || [], startedAt,
+      policy: config.triage, startedAt,
       dropped, hardExcluded, closedAdverts, livenessSummary, verificationScoped,
       staleInboxEntries, inboxRechecked,
     });
@@ -363,7 +367,7 @@ export async function runScanWith(root, provider, mode, {
     try {
       const artifacts = writeScanArtifacts(root, {
         provider, mode, sources: collected?.sources || {}, queries: collected?.queries || [], candidates,
-        assessmentResult: null, policy: config.triage, exclusions: config.search?.exclusions || [], startedAt, error: error.message,
+        assessmentResult: null, policy: config.triage, startedAt, error: error.message,
       });
       result = { ok: false, status: 'failed', error: error.message, scan: artifacts.run };
     } catch {

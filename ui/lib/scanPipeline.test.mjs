@@ -4,7 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { test } from 'node:test';
 import {
-  applyHardExclusions, compactCandidates, DEFAULT_CANDIDATE_LIMIT, gateAssessment, inboxRecheckCandidates, promptCandidate,
+  compactCandidates, DEFAULT_CANDIDATE_LIMIT, gateAssessment, inboxRecheckCandidates, promptCandidate,
   filterVacancies, validateAssessments, validateWrittenScanArtifacts, verificationCandidates, writeScanArtifacts,
 } from './scanPipeline.mjs';
 
@@ -215,20 +215,6 @@ test('zero configured sources is degraded and still produces a truthful empty ru
   assert.equal(artifacts.run.candidates_found, 0);
 });
 
-test('trusted runtime applies configured hard exclusions even when provider omits them', () => {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'scout-exclusion-scan-'));
-  fs.mkdirSync(path.join(root, 'data'), { recursive: true });
-  fs.writeFileSync(path.join(root, 'data', 'opportunities.json'), '{"updated":"2026-07-01","opportunities":[]}\n');
-  const candidates = [{ candidateId: 'candidate-001', company: 'BetCo', role: 'Engineer', url: 'https://example.test/job', source: 'ats', description: 'Gambling platform' }];
-  const artifacts = writeScanArtifacts(root, {
-    provider: 'codex', mode: 'primary', sources: { ats: { configured: true, status: 'healthy', count: 1 } },
-    candidates, assessmentResult: { assessments: [assessment('met')] }, policy: { actionScore: 70, checkScore: 55 },
-    exclusions: ['gambling'], startedAt: '2026-07-14T10:00:00Z',
-  });
-  assert.equal(artifacts.tracker.opportunities.length, 0);
-  assert.equal(artifacts.run.discarded.hard_exclusion, 1);
-});
-
 // Distinct company names, so the identity rules treat these as separate jobs.
 const WORDS = ['Alder', 'Birch', 'Cedar', 'Dahlia', 'Elm', 'Fern', 'Ginkgo', 'Hazel', 'Iris', 'Juniper'];
 const uniqueName = (prefix, index) => `${prefix}-${WORDS[index % WORDS.length]}${Math.floor(index / WORDS.length)}`;
@@ -265,23 +251,6 @@ test('a scan that fits reports nothing dropped and keeps stable candidate ids', 
   assert.deepEqual(candidates.map((candidate) => candidate.candidateId), [
     'candidate-001', 'candidate-002', 'candidate-003', 'candidate-004', 'candidate-005',
   ]);
-});
-
-test('hard exclusions are applied before any provider turn', () => {
-  const { candidates } = compactCandidates({ one: { jobs: [
-    { company: 'Acme', title: 'Engineer', url: 'https://x.test/1', description: 'Extensive travel is required.' },
-    { company: 'Beta', title: 'Engineer', url: 'https://x.test/2', description: 'Fully remote role.' },
-    { company: 'Gamma', title: 'Gambling Product Engineer', url: 'https://x.test/3', description: 'Casino products.' },
-  ] } });
-  const result = applyHardExclusions(candidates, ['extensive travel', 'gambling']);
-  assert.deepEqual(result.kept.map((item) => item.company), ['Beta']);
-  assert.deepEqual(result.excluded.map((item) => item.hardExclusionMatches), [['extensive travel'], ['gambling']]);
-  assert.equal(applyHardExclusions(candidates, []).kept.length, candidates.length);
-  assert.equal(applyHardExclusions(candidates, ['', '   ']).kept.length, candidates.length);
-  // Tags are deliberately not searched: the post-assessment trusted pass looks
-  // only at company, role and description, and the two must agree.
-  const tagged = [{ company: 'Acme', role: 'Engineer', description: 'Remote role.', tags: ['gambling'] }];
-  assert.equal(applyHardExclusions(tagged, ['gambling']).kept.length, 1);
 });
 
 test('the prompt payload drops fields the model never reads', () => {

@@ -5,6 +5,7 @@ import path from 'node:path';
 import test from 'node:test';
 import { broadenSearchQueries, collectScanSources, migrateLegacyWorkspace, runScanWith, shouldAutoBroaden } from './scout.mjs';
 import { DEFAULT_WORKSPACE_CONFIG, writeWorkspaceConfig } from '../ui/lib/workspace.mjs';
+import { publishSearchProfile } from '../ui/lib/searchProfile.mjs';
 
 function scanRoot() {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'scout-runtime-scan-'));
@@ -109,6 +110,30 @@ test('runtime scan skips AI for a healthy empty source result and needs no Git r
   assert.equal(providerCalls, 0);
   assert.equal(released, true);
   assert.equal(fs.existsSync(path.join(root, '.git')), false);
+});
+
+test('runtime scan filters from the published profile before provider assessment', async () => {
+  const root = scanRoot();
+  const published = publishSearchProfile({
+    version: 1, status: 'draft', target: {},
+    negative: { excludedTitles: [], excludedResponsibilities: [{ value: 'coding', strength: 'hard-exclusion', provenance: 'confirmed-inference' }] },
+    compensation: { currency: null, period: 'year', minimum: null, minimumStrength: 'neutral', unknownPolicy: 'include' },
+  }, { publishedAt: '2026-07-26T20:00:00.000Z' });
+  fs.mkdirSync(path.join(root, 'profile', 'search'), { recursive: true });
+  fs.writeFileSync(path.join(root, 'profile', 'search', 'published.json'), `${JSON.stringify(published)}\n`);
+  let providerCalls = 0;
+  const result = await runScanWith(root, 'codex', 'primary', {
+    providerStatusFn: authenticated,
+    collectSourcesFn: async () => ({ generatedAt: '2026-07-26T20:00:00Z', queries: [], sources: {
+      hiring_cafe: { configured: true, status: 'healthy', count: 1, jobs: [{ company: 'Acme', title: 'Engineer', url: 'https://example.test/job', description: 'Perform coding.' }] },
+    } }),
+    runStructuredTurnFn: async () => { providerCalls += 1; throw new Error('excluded vacancy must not be assessed'); },
+    acquireLockFn: () => ({ ok: true, lock: { token: 'filter-test' } }), releaseLockFn: () => ({ ok: true }),
+  });
+  assert.equal(result.ok, true);
+  assert.equal(result.scan.candidates_found, 0);
+  assert.equal(result.scan.discarded.hard_exclusion, 1);
+  assert.equal(providerCalls, 0);
 });
 
 test('runtime scan model is independent from the job-work model', async () => {

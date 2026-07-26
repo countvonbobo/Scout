@@ -80,34 +80,6 @@ const PROMPT_CANDIDATE_FIELDS = [
   'postedDate', 'source', 'tags', 'description', 'mandatorySignals',
 ];
 
-function hardExclusionMatchesFor(candidate, terms) {
-  const haystack = `${candidate?.company || ''}
-${candidate?.role || ''}
-${candidate?.description || ''}`.toLowerCase();
-  return terms.filter((term) => haystack.includes(term.toLowerCase()));
-}
-
-// Hard exclusions are the user's stated dealbreakers, so a candidate matching
-// one can never be kept. Applying them in code before the assessment turn is
-// both cheaper and more reliable than asking the model to do it, and the run
-// record already reports a hard_exclusion discard count.
-export function applyHardExclusions(candidates, exclusions = []) {
-  const terms = (exclusions || []).map((value) => String(value || '').trim()).filter(Boolean);
-  if (!terms.length) return { kept: candidates, excluded: [] };
-  const kept = [];
-  const excluded = [];
-  for (const candidate of candidates) {
-    // Exactly the haystack and matching rule applyTrustedExclusions uses after
-    // assessment, so this can only remove candidates that would have been
-    // discarded anyway. Diverging here would silently change which roles a
-    // scan reports, rather than only what it costs.
-    const matched = hardExclusionMatchesFor(candidate, terms);
-    if (matched.length) excluded.push({ ...candidate, hardExclusionMatches: matched });
-    else kept.push(candidate);
-  }
-  return { kept, excluded };
-}
-
 // `second-pass` previously changed nothing but the artifact label: the second
 // provider re-collected every source and re-scored every candidate, so two
 // daily jobs cost roughly double for largely the same work. A verification pass
@@ -377,21 +349,6 @@ function mergeTracker(existing, candidates, assessments, policy, date) {
   return { tracker: existing, keepersAdded, keepersUpdated, discarded, reviewed };
 }
 
-function applyTrustedExclusions(candidates, assessmentResult, exclusions = []) {
-  if (!assessmentResult) return null;
-  const byId = new Map(candidates.map((candidate) => [candidate.candidateId, candidate]));
-  const terms = exclusions.map((term) => String(term || '').trim()).filter(Boolean);
-  return {
-    ...assessmentResult,
-    assessments: assessmentResult.assessments.map((assessment) => {
-      const candidate = byId.get(assessment.candidateId);
-      const haystack = `${candidate?.company || ''}\n${candidate?.role || ''}\n${candidate?.description || ''}`.toLowerCase();
-      const matches = terms.filter((term) => haystack.includes(term.toLowerCase()));
-      return { ...assessment, hardExclusionMatches: [...new Set([...(assessment.hardExclusionMatches || []), ...matches])] };
-    }),
-  };
-}
-
 function reportText({ date, degraded, source_health, kept, discarded, reviewed, errors }) {
   const coverage = Object.entries(source_health).map(([name, value]) => `- ${name}: ${value.configured === false ? 'not configured' : value.status} (${value.count ?? 'unknown'})${value.reason ? ` — ${value.reason}` : ''}`).join('\n');
   const actions = kept.filter((item) => item.eligibility?.status === 'eligible').map((item) => `- **${item.company} — ${item.role}** (${item.score}) — ${item.sources?.[0] || ''}`).join('\n') || '- None.';
@@ -425,7 +382,7 @@ export function validateWrittenScanArtifacts(root, expectedRun) {
 }
 
 export function writeScanArtifacts(root, {
-  provider, mode, sources, queries = [], candidates, assessmentResult, policy, exclusions = [], startedAt,
+  provider, mode, sources, queries = [], candidates, assessmentResult, policy, startedAt,
   error = null, skipped = false, dropped = { perSource: {}, total: 0 }, hardExcluded = [], closedAdverts = [],
   livenessSummary = { checked: 0, gone: 0, unverified: 0 }, verificationScoped = false,
   staleInboxEntries = [], inboxRechecked = 0,
@@ -439,9 +396,8 @@ export function writeScanArtifacts(root, {
   const errors = [...(error ? [error] : []), ...(configuredSources.length ? [] : ['no job sources are configured'])];
   const degraded = configuredFailures.length > 0 || errors.length > 0;
   const existing = JSON.parse(fs.readFileSync(paths.tracker, 'utf8'));
-  const trustedAssessments = applyTrustedExclusions(candidates, assessmentResult, exclusions);
-  const merged = trustedAssessments
-    ? mergeTracker(existing, candidates, trustedAssessments.assessments, policy, date)
+  const merged = assessmentResult
+    ? mergeTracker(existing, candidates, assessmentResult.assessments, policy, date)
     : { tracker: existing, keepersAdded: 0, keepersUpdated: 0, discarded: { ...EMPTY_DISCARDED }, reviewed: [] };
   const inboxArchived = archiveStaleInboxEntries(merged.tracker, staleInboxEntries, date);
   const run = {

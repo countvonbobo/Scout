@@ -25,6 +25,10 @@ function phraseMatches(value, phrase) {
   return tokens.length > 0 && tokens.every((token) => target.split(' ').includes(token));
 }
 
+function exactMatches(value, rule) {
+  return normalise(value) === normalise(rule);
+}
+
 function hardRule(rule) {
   return rule?.strength === 'hard-exclusion' && ['explicit', 'confirmed-inference'].includes(rule?.provenance);
 }
@@ -56,10 +60,11 @@ function structuredExclusions(vacancy, profile) {
   for (const [listName, [field, name]] of Object.entries(POSITIVE_FIELDS)) {
     for (const rule of profile?.target?.[listName] || []) {
       if (!['mandatory', 'hard-exclusion'].includes(rule?.strength)) continue;
+      if (rule?.strength === 'hard-exclusion' && !hardRule(rule)) continue;
       const source = vacancy?.[field];
       const actual = valueOf(source);
       if (actual === null || actual === undefined || actual === '') continue;
-      if (!phraseMatches(actual, rule.value)) {
+      if (!exactMatches(actual, rule.value)) {
         found.push(exclusion(vacancy, profile, `mandatory-${name}-unmet`, rule,
           { vacancy: actual, rule: rule.value }, confidence(source), true));
       }
@@ -70,7 +75,7 @@ function structuredExclusions(vacancy, profile) {
       if (!hardRule(rule)) continue;
       const source = vacancy?.[field];
       const actual = valueOf(source);
-      if (actual && phraseMatches(actual, rule.value)) {
+      if (actual && exactMatches(actual, rule.value)) {
         found.push(exclusion(vacancy, profile, code, rule, { vacancy: actual, rule: rule.value }, confidence(source), true));
       }
     }
