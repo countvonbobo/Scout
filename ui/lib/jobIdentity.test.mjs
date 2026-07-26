@@ -14,6 +14,11 @@ test('cross-provider copies of one role match by normalised evidence', () => {
   assert.equal(sameUnderlyingJob(first, second), true);
 });
 
+test('location identity retains country tokens without a country-specific default', () => {
+  assert.deepEqual(jobIdentity({ location: 'London, United Kingdom' }).locationTokens, ['london', 'united', 'kingdom']);
+  assert.deepEqual(jobIdentity({ location: 'Toronto, Canada' }).locationTokens, ['toronto', 'canada']);
+});
+
 test('different provider IDs from one source protect distinct openings', () => {
   const common = { company: 'Acme', title: 'Software Engineer', location: 'London', source: 'ats-greenhouse', description: 'Build the same platform services.' };
   assert.equal(sameUnderlyingJob({ ...common, providerId: '1', url: 'https://x.test/1' }, { ...common, providerId: '2', url: 'https://x.test/2' }), false);

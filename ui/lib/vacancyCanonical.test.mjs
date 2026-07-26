@@ -52,6 +52,16 @@ test('canonicalisation prefers explicit fields and the longer verified descripti
   assert.equal(result.description, `${DESCRIPTION} Own incident response and production improvements.`);
 });
 
+test('canonicalisation is stable when the same observations arrive in another order', () => {
+  const observations = [
+    observation({ source: 'adzuna', providerId: 'a-1', description: 'Build systems A.', employmentType: 'permanent' }),
+    observation({ source: 'greenhouse', providerId: 'g-1', description: 'Build systems B.', employmentType: 'full-time' }),
+    observation({ providerId: 'data-1', url: 'https://careers.acme.test/jobs/data-engineer', title: 'Data Engineer' }),
+  ];
+
+  assert.deepEqual(canonicaliseObservations(observations), canonicaliseObservations([...observations].reverse()));
+});
+
 test('content fingerprints ignore tracking copy and identify material updates', () => {
   const oldJob = observation({ description: DESCRIPTION, url: `${DIRECT_URL}?utm_source=board` });
   const sameContent = { ...oldJob, fetchedAt: '2026-07-27T20:00:00.000Z', description: `${DESCRIPTION}\nApply now.` };

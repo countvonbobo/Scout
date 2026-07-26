@@ -20,6 +20,23 @@ function stableJson(value) {
   return JSON.stringify(value);
 }
 
+function compareStable(left, right) {
+  const a = String(left); const b = String(right);
+  return a < b ? -1 : a > b ? 1 : 0;
+}
+
+function observationKey(observation) {
+  return observation?.observationId || stableJson(observation);
+}
+
+function sortObservations(observations) {
+  return [...observations].sort((left, right) => compareStable(observationKey(left), observationKey(right)));
+}
+
+function groupKey(group) {
+  return sortObservations(group).map(observationKey).join('|');
+}
+
 function responsibilityDescription(vacancy) {
   return normaliseText(vacancy?.description).replace(APPLICATION_BOILERPLATE, '').replace(/\s+/g, ' ').trim();
 }
@@ -44,7 +61,9 @@ function compareDisplayValues(left, right) {
   const rank = (value) => PROVENANCE_RANK[value?.provenance] || 0;
   const rankDifference = rank(right) - rank(left);
   if (rankDifference) return rankDifference;
-  return String(valueOf(right) || '').length - String(valueOf(left) || '').length;
+  const lengthDifference = String(valueOf(right) || '').length - String(valueOf(left) || '').length;
+  if (lengthDifference) return lengthDifference;
+  return compareStable(stableJson(left), stableJson(right));
 }
 
 function displayField(observations, name) {
@@ -53,27 +72,29 @@ function displayField(observations, name) {
 }
 
 function canonicalVacancy(observations) {
-  const description = observations.map((observation) => String(observation?.description || '').trim())
-    .sort((left, right) => right.length - left.length)[0] || '';
+  const orderedObservations = sortObservations(observations);
+  const description = orderedObservations.map((observation) => String(observation?.description || '').trim())
+    .sort((left, right) => right.length - left.length || compareStable(left, right))[0] || '';
   return {
-    observations: [...observations],
-    canonicalUrl: observations.map((observation) => observation?.canonicalUrl).find(Boolean) || null,
-    sourceReferences: mergeSourceReferences(...observations),
+    observations: orderedObservations,
+    canonicalUrl: orderedObservations.map((observation) => observation?.canonicalUrl).find(Boolean) || null,
+    sourceReferences: mergeSourceReferences(...orderedObservations),
     description,
-    ...Object.fromEntries(DISPLAY_FIELDS.map((name) => [name, displayField(observations, name)])),
+    ...Object.fromEntries(DISPLAY_FIELDS.map((name) => [name, displayField(orderedObservations, name)])),
   };
 }
 
 export function canonicaliseObservations(observations) {
   const groups = [];
-  for (const observation of observations || []) {
+  const orderedObservations = sortObservations(observations || []);
+  for (const observation of orderedObservations) {
     const group = groups.find((candidate) => candidate.every((existing) => sameUnderlyingJob(existing, observation)));
     if (group) group.push(observation);
     else groups.push([observation]);
   }
   return {
-    vacancies: groups.map(canonicalVacancy),
-    duplicateObservations: (observations || []).length - groups.length,
+    vacancies: groups.sort((left, right) => compareStable(groupKey(left), groupKey(right))).map(canonicalVacancy),
+    duplicateObservations: orderedObservations.length - groups.length,
   };
 }
 

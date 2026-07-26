@@ -1,5 +1,4 @@
 const COMPANY_SUFFIXES = new Set(['co', 'company', 'corp', 'corporation', 'inc', 'incorporated', 'limited', 'llc', 'ltd', 'plc']);
-const LOCATION_NOISE = new Set(['gb', 'great', 'kingdom', 'uk', 'united']);
 const EVIDENCE_NOISE = new Set([
   'about', 'after', 'also', 'and', 'are', 'but', 'for', 'from', 'have', 'into', 'our', 'that', 'the',
   'their', 'this', 'with', 'will', 'you', 'your', 'role', 'team', 'work', 'working',
@@ -26,7 +25,7 @@ function companyKey(value) {
 }
 
 function titleKey(value) { return tokens(value).join(' '); }
-function locationTokens(value) { return tokens(value, LOCATION_NOISE); }
+function locationTokens(value) { return tokens(value); }
 
 function evidenceTokens(value) {
   return [...new Set(tokens(value, EVIDENCE_NOISE).filter((token) => token.length > 2))].sort().slice(0, 80);
