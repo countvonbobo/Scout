@@ -71,3 +71,13 @@ test('unconfirmed target hard rules do not exclude', () => {
   }));
   assert.deepEqual(result, { eligible: [softwareJob], excluded: [] });
 });
+
+test('structured title and employer rules read compacted runtime candidate fields', () => {
+  const candidate = { vacancyId: 'runtime-001', company: 'Acme', role: 'Software Engineer', workingType: 'permanent', description: '' };
+  const title = filterVacancies([candidate], profile({ primaryTitles: [rule('Data Engineer', 'mandatory')] }));
+  assert.equal(title.excluded[0].code, 'mandatory-title-unmet');
+  const employer = filterVacancies([candidate], {
+    ...profile(), negative: { excludedTitles: [], excludedEmployers: [rule('Acme', 'hard-exclusion', 'explicit')] },
+  });
+  assert.equal(employer.excluded[0].code, 'excluded-employer');
+});

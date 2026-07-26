@@ -55,13 +55,21 @@ const NEGATIVE_FIELDS = Object.freeze({
   excludedEmploymentTypes: ['employmentType', 'excluded-employment-type'], excludedLocations: ['location', 'excluded-location'],
 });
 
+function fieldValue(vacancy, field) {
+  const aliases = {
+    title: ['title', 'role'], employer: ['employer', 'company'],
+    employmentType: ['employmentType', 'employment', 'workingType'],
+  };
+  return (aliases[field] || [field]).map((name) => vacancy?.[name]).find((value) => value !== undefined && value !== null && value !== '');
+}
+
 function structuredExclusions(vacancy, profile) {
   const found = [];
   for (const [listName, [field, name]] of Object.entries(POSITIVE_FIELDS)) {
     for (const rule of profile?.target?.[listName] || []) {
       if (!['mandatory', 'hard-exclusion'].includes(rule?.strength)) continue;
       if (rule?.strength === 'hard-exclusion' && !hardRule(rule)) continue;
-      const source = vacancy?.[field];
+      const source = fieldValue(vacancy, field);
       const actual = valueOf(source);
       if (actual === null || actual === undefined || actual === '') continue;
       if (!exactMatches(actual, rule.value)) {
@@ -73,7 +81,7 @@ function structuredExclusions(vacancy, profile) {
   for (const [listName, [field, code]] of Object.entries(NEGATIVE_FIELDS)) {
     for (const rule of profile?.negative?.[listName] || []) {
       if (!hardRule(rule)) continue;
-      const source = vacancy?.[field];
+      const source = fieldValue(vacancy, field);
       const actual = valueOf(source);
       if (actual && exactMatches(actual, rule.value)) {
         found.push(exclusion(vacancy, profile, code, rule, { vacancy: actual, rule: rule.value }, confidence(source), true));
