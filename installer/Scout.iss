@@ -1,5 +1,5 @@
 #ifndef MyAppVersion
-  #define MyAppVersion "0.1.0-beta.21"
+  #define MyAppVersion "0.1.0-beta.22"
 #endif
 
 #ifndef StageDir
