@@ -78,8 +78,9 @@ test('tagHtml escapes a hostile category label', () => {
   assert.doesNotMatch(html, /<img/);
 });
 
-test('tabForEntry routes by status', () => {
+test('tabForEntry routes speculative opportunities before status-based tabs', () => {
   const { scout } = loadScout();
+  assert.equal(scout.tabForEntry({ status: 'new', tags: ['SPECULATIVE OUTREACH'] }), 'speculative');
   assert.equal(scout.tabForEntry({ status: 'new' }), 'jobs');
   assert.equal(scout.tabForEntry({ status: 'shortlist' }), 'shortlist');
   assert.equal(scout.tabForEntry({ status: 'applied' }), 'pipeline');
@@ -156,11 +157,13 @@ test('interview prep is a manual, separate conversation with escaped saved-pack 
   assert.doesNotMatch(source, /openInterviewPrep[\s\S]{0,200}sendChat\(/);
 });
 
-test('index.html defines static Jobs and Shortlist tabs, not category lanes', () => {
+test('index.html defines static Jobs, Speculative and Shortlist tabs, not category lanes', () => {
   const html = fs.readFileSync(new URL('./index.html', import.meta.url), 'utf8');
   assert.match(html, /data-tab="jobs"/);
+  assert.match(html, /data-tab="speculative"/);
   assert.match(html, /data-tab="shortlist"/);
   assert.match(html, /id="tab-jobs"/);
+  assert.match(html, /id="tab-speculative"/);
   assert.match(html, /id="tab-shortlist"/);
   assert.doesNotMatch(html, /data-tab="startup"/);
   assert.doesNotMatch(html, /data-tab="established"/);
@@ -267,6 +270,7 @@ test('renderJobs lists only new jobs, highest score first, with tags and actions
       { id: 'a', company: 'A', role: 'Eng', status: 'new', score: 60, category: 'startup' },
       { id: 'b', company: 'B', role: 'Eng', status: 'new', score: 90, category: 'startup', sources: ['https://example.com/jobs/b'] },
       { id: 'c', company: 'C', role: 'Eng', status: 'shortlist', score: 99, category: 'startup' },
+      { id: 's', company: 'S', role: 'Speculative', status: 'new', score: 95, category: 'startup', tags: ['Speculative Outreach'] },
     ],
   };
   scout.renderJobs();
@@ -277,6 +281,48 @@ test('renderJobs lists only new jobs, highest score first, with tags and actions
   assert.match(html, /view source/);
   assert.ok(html.indexOf('data-id="b"') < html.indexOf('data-id="a"')); // 90 before 60
   assert.doesNotMatch(html, /data-id="c"/); // shortlisted excluded
+  assert.doesNotMatch(html, /data-id="s"/); // speculative excluded
+});
+
+test('speculative classification uses the exact tag case-insensitively', () => {
+  const { scout } = loadScout();
+  assert.equal(scout.isSpeculative({ tags: ['Speculative Outreach'] }), true);
+  assert.equal(scout.isSpeculative({ tags: [' speculative outreach '] }), true);
+  assert.equal(scout.isSpeculative({ role: 'Speculative engineer', tags: [] }), false);
+  assert.equal(scout.isSpeculative({ tags: ['Speculative'] }), false);
+});
+
+test('renderSpeculative groups tagged opportunities and honours commute filtering', () => {
+  const { scout, context } = loadScout();
+  const { doc } = withJobsDom();
+  context.document = doc;
+  scout.filterBar = () => '';
+  scout.state.commute = { mode: 'car', maxMinutes: '60', includeUnknown: false };
+  scout.state.data = {
+    categories: [{ id: 'startup', label: 'Priority' }],
+    opportunities: [
+      { id: 'near', company: 'Near', role: 'Eng', status: 'new', score: 70, category: 'startup', tags: ['SPECULATIVE OUTREACH'], commute: { carMinutes: 45 } },
+      { id: 'far', company: 'Far', role: 'Eng', status: 'watch', score: 80, category: 'startup', tags: ['Speculative Outreach'], commute: { carMinutes: 90 } },
+      { id: 'normal', company: 'Normal', role: 'Eng', status: 'new', score: 90, category: 'startup', commute: { carMinutes: 30 } },
+    ],
+  };
+  scout.renderSpeculative();
+  const html = doc.getElementById('tab-speculative').innerHTML;
+  assert.match(html, /Speculative opportunities \(1\)/);
+  assert.match(html, /New \(1\)/);
+  assert.match(html, /data-id="near"/);
+  assert.doesNotMatch(html, /data-id="far"/);
+  assert.doesNotMatch(html, /data-id="normal"/);
+});
+
+test('renderSpeculative shows an empty state when nothing matches', () => {
+  const { scout, context } = loadScout();
+  const { doc } = withJobsDom();
+  context.document = doc;
+  scout.filterBar = () => '';
+  scout.state.data = { opportunities: [] };
+  scout.renderSpeculative();
+  assert.match(doc.getElementById('tab-speculative').innerHTML, /No speculative opportunities match/);
 });
 
 test('triage actions post the right status transitions', async () => {
@@ -356,11 +402,13 @@ test('renderAll lists ignored items with a restore action', () => {
     categories: [{ id: 'startup', label: 'Priority' }],
     opportunities: [
       { id: 'i', company: 'I', role: 'Eng', status: 'ignore', score: 20, category: 'startup' },
+      { id: 's', company: 'S', role: 'Speculative', status: 'new', score: 70, category: 'startup', tags: ['Speculative Outreach'] },
     ],
   };
   scout.renderAll();
   const html = doc.getElementById('tab-all').innerHTML;
   assert.match(html, /data-id="i"/);
+  assert.match(html, /data-id="s"/);
   assert.match(html, /data-action="restore"/);
 });
 
@@ -408,17 +456,19 @@ test('dynamic category lane machinery is gone', () => {
   assert.doesNotMatch(source, /setupCategoryUi/);
 });
 
-test('commute filter refresh re-renders jobs and shortlist', () => {
+test('commute filter refresh re-renders jobs, speculative and shortlist', () => {
   const { scout, context } = loadScout();
   const { doc } = withJobsDom();
   context.document = doc;
-  let jobs = 0; let shortlist = 0;
+  let jobs = 0; let speculative = 0; let shortlist = 0;
   scout.renderJobs = () => { jobs += 1; };
+  scout.renderSpeculative = () => { speculative += 1; };
   scout.renderShortlist = () => { shortlist += 1; };
   scout.renderAll = () => {};
   scout.state.data = { opportunities: [] };
   scout.setCommuteFilter('mode', 'car');
   assert.equal(jobs, 1);
+  assert.equal(speculative, 1);
   assert.equal(shortlist, 1);
 });
 
