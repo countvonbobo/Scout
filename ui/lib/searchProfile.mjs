@@ -84,6 +84,7 @@ export function validateSearchProfile(profile) {
   if (typeof period !== 'string' || !period.trim()) throw new Error('search profile.compensation.period is required');
   if (minimum !== null && (!Number.isFinite(minimum) || minimum < 0)) throw new Error('search profile.compensation.minimum must be a non-negative number or null');
   requireEnum(minimumStrength, PREFERENCE_STRENGTHS, 'search profile.compensation.minimumStrength');
+  if (minimumStrength === 'hard-exclusion') throw new Error('search profile.compensation hard exclusion requires a rule provenance');
   requireEnum(unknownPolicy, UNKNOWN_POLICIES, 'search profile.compensation.unknownPolicy');
 
   if (profile.status === 'published') {
@@ -99,6 +100,39 @@ export function profileFingerprint(profile) {
   return crypto.createHash('sha256').update(canonicalJson(profile)).digest('hex');
 }
 
+function derivedRules(values, strength) {
+  return (Array.isArray(values) ? values : [])
+    .filter((value) => typeof value === 'string' && value.trim())
+    .map((value) => ({ value, strength, provenance: 'deterministic-derivation' }));
+}
+
+export function draftProfileFromLegacy(config = {}, context = '') {
+  const search = isPlainObject(config.search) ? config.search : {};
+  const minimum = Number.isFinite(search.salaryMinimum) && search.salaryMinimum >= 0 ? search.salaryMinimum : null;
+  const draft = {
+    version: 1,
+    status: 'draft',
+    target: {
+      primaryTitles: derivedRules(search.roleFamilies, 'strong-preference'),
+      locations: derivedRules(search.locations, 'strong-preference'),
+      sectors: [],
+    },
+    negative: {
+      excludedTitles: [],
+      excludedResponsibilities: derivedRules(search.exclusions, 'strong-negative'),
+    },
+    compensation: {
+      currency: typeof config.currency === 'string' && config.currency.trim() ? config.currency : null,
+      period: 'year',
+      minimum,
+      minimumStrength: minimum === null ? 'neutral' : 'strong-preference',
+      unknownPolicy: 'include',
+    },
+  };
+  void context;
+  return validateSearchProfile(draft);
+}
+
 export function publishSearchProfile(draft, { publishedAt = new Date().toISOString() } = {}) {
   const validated = validateSearchProfile({ ...structuredClone(draft), status: 'published', publishedAt });
   const fingerprint = profileFingerprint({ ...validated, id: undefined });
@@ -110,5 +144,7 @@ export function loadPublishedSearchProfile(root) {
   if (!fs.existsSync(file)) return null;
   const profile = validateSearchProfile(JSON.parse(fs.readFileSync(file, 'utf8')));
   if (profile.status !== 'published') throw new Error(`published search profile is not published: ${file}`);
+  const expectedId = `profile-${profileFingerprint({ ...profile, id: undefined }).slice(0, 12)}`;
+  if (profile.id !== expectedId) throw new Error(`published search profile fingerprint does not match: ${file}`);
   return deepFreeze(profile);
 }

@@ -5,6 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { afterEach, test } from 'node:test';
 import {
+  draftProfileFromLegacy,
   loadPublishedSearchProfile,
   profileFingerprint,
   publishSearchProfile,
@@ -68,6 +69,38 @@ test('unconfirmed inference cannot publish as a hard exclusion', () => {
   assert.throws(() => publishSearchProfile(draft, { publishedAt: NOW }), /hard exclusion.*confirmation/i);
 });
 
+test('legacy preferences become a conservative, reviewable draft', () => {
+  const draft = draftProfileFromLegacy({
+    locale: 'en-GB',
+    currency: 'GBP',
+    search: {
+      roleFamilies: ['Hardware Engineer'],
+      locations: ['Reading'],
+      exclusions: ['Pure software roles'],
+      salaryMinimum: 60000,
+    },
+  }, 'user-authored profile prose');
+
+  assert.equal(draft.status, 'draft');
+  assert.deepEqual(draft.target.primaryTitles[0], {
+    value: 'Hardware Engineer', strength: 'strong-preference', provenance: 'deterministic-derivation',
+  });
+  assert.deepEqual(draft.target.locations[0], {
+    value: 'Reading', strength: 'strong-preference', provenance: 'deterministic-derivation',
+  });
+  assert.equal(draft.negative.excludedResponsibilities[0].strength, 'strong-negative');
+  assert.notEqual(draft.negative.excludedResponsibilities[0].strength, 'hard-exclusion');
+  assert.equal(draft.compensation.minimumStrength, 'strong-preference');
+  assert.equal(draft.compensation.unknownPolicy, 'include');
+});
+
+test('compensation cannot publish as a hard exclusion without confirmation provenance', () => {
+  const draft = genericProfileDraft({
+    compensation: { minimum: 450, minimumStrength: 'hard-exclusion' },
+  });
+  assert.throws(() => publishSearchProfile(draft, { publishedAt: NOW }), /compensation.*hard exclusion/i);
+});
+
 test('published profiles recursively freeze nested arrays and plain objects', () => {
   const profile = publishSearchProfile(genericProfileDraft({
     primaryTitles: [{ value: 'Researcher', strength: 'mandatory', provenance: 'explicit' }],
@@ -98,6 +131,16 @@ test('loadPublishedSearchProfile returns an immutable published artifact when pr
   const loaded = loadPublishedSearchProfile(root);
   assert.equal(loaded.id, profile.id);
   assert.ok(Object.isFrozen(loaded.compensation));
+});
+
+test('loadPublishedSearchProfile rejects a syntactically valid but tampered profile id', () => {
+  const root = temp();
+  const profile = publishSearchProfile(genericProfileDraft(), { publishedAt: NOW });
+  const file = workspacePaths(root).searchProfilePublished;
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file, `${JSON.stringify({ ...profile, id: 'profile-000000000000' })}\n`);
+
+  assert.throws(() => loadPublishedSearchProfile(root), /fingerprint/i);
 });
 
 test('loadPublishedSearchProfile returns null when no artifact is present', () => {
