@@ -335,6 +335,9 @@ const Scout = {
     const rows = [...(this.state.data?.opportunities || [])];
     return rows.filter((e) => (category === 'all' || this.categoryOf(e) === category) && this.matchesCommute(e));
   },
+  isSpeculative(e) {
+    return (e?.tags || []).some((tag) => String(tag).trim().toLowerCase() === 'speculative outreach');
+  },
   fitClass(score) {
     if (typeof score !== 'number') return 'fit-weak';
     const policy = this.triagePolicy();
@@ -375,6 +378,7 @@ const Scout = {
       status.setAttribute('role', h?.lastRunAt ? 'button' : 'status');
     }
     this.renderJobs();
+    this.renderSpeculative();
     this.renderShortlist();
     this.renderPipeline();
     this.renderAll();
@@ -672,6 +676,7 @@ const Scout = {
     return `<span class="cat-tag" style="background:${color.bg};color:${color.fg}">${this.esc(this.categoryLabel(id))}</span>`;
   },
   tabForEntry(e) {
+    if (this.isSpeculative(e)) return 'speculative';
     if (e.status === 'new') return 'jobs';
     if (e.status === 'shortlist') return 'shortlist';
     if (e.status === 'ignore') return 'all';
@@ -716,6 +721,7 @@ const Scout = {
   setCommuteFilter(key, value) {
     this.state.commute[key] = value;
     this.renderJobs();
+    this.renderSpeculative();
     this.renderShortlist();
     this.renderAll();
   },
@@ -730,6 +736,7 @@ const Scout = {
     }
     if (!this.state.data || !render) return;
     this.renderJobs();
+    this.renderSpeculative();
     this.renderShortlist();
     this.renderAll();
   },
@@ -758,7 +765,7 @@ const Scout = {
     const target = document.getElementById('tab-jobs');
     if (!target) return;
     const entries = this.filteredEntries('all')
-      .filter((e) => e.status === 'new')
+      .filter((e) => e.status === 'new' && !this.isSpeculative(e))
       .sort((a, b) => (typeof b.score === 'number' ? b.score : -1) - (typeof a.score === 'number' ? a.score : -1));
     const list = entries.length
       ? entries.map((e) => this.triageCardHtml(e)).join('')
@@ -767,6 +774,29 @@ const Scout = {
       + `<div class="label">${entries.length} new job${entries.length === 1 ? '' : 's'} to review</div>`
       + list;
     this.updateJobsBadge(entries.length);
+  },
+
+  renderSpeculative() {
+    if (!this.state.data) return;
+    const target = document.getElementById('tab-speculative');
+    if (!target) return;
+    const entries = this.filteredEntries('all')
+      .filter((e) => this.isSpeculative(e))
+      .sort((a, b) => (typeof b.score === 'number' ? b.score : -1) - (typeof a.score === 'number' ? a.score : -1));
+    const groups = [
+      ['New', entries.filter((e) => e.status === 'new')],
+      ['Shortlisted', entries.filter((e) => e.status === 'shortlist')],
+      ['Watch', entries.filter((e) => e.status === 'watch')],
+      ['Active', entries.filter((e) => ['outreach', 'applied', 'interviewing'].includes(e.status))],
+      ['Closed', entries.filter((e) => ['accepted', 'rejected', 'ignore'].includes(e.status))],
+    ];
+    const list = groups
+      .filter(([, items]) => items.length)
+      .map(([label, items]) => `<div class="label">${label} (${items.length})</div>${items.map((e) => this.cardHtml(e)).join('')}`)
+      .join('');
+    target.innerHTML = this.filterBar()
+      + `<div class="label">Speculative opportunities (${entries.length})</div>`
+      + (list || '<p class="inbox-empty">No speculative opportunities match the current commute filter.</p>');
   },
 
   updateJobsBadge(count) {
@@ -2397,10 +2427,11 @@ const Scout = {
   showTab(tab) {
     this.state.tab = tab;
     document.querySelectorAll('nav button').forEach((b) => b.classList.toggle('active', b.dataset.tab === tab));
-    ['jobs', 'shortlist', 'pipeline', 'all', 'reports', 'cv'].forEach((t) =>
+    ['jobs', 'speculative', 'shortlist', 'pipeline', 'all', 'reports', 'cv'].forEach((t) =>
       document.getElementById(`tab-${t}`)?.classList.toggle('hidden', t !== tab));
     window.scrollTo?.(0, 0);
     if (tab === 'jobs') this.renderJobs();
+    if (tab === 'speculative') this.renderSpeculative();
     if (tab === 'shortlist') this.renderShortlist();
     if (tab === 'pipeline') this.renderPipeline();
     if (tab === 'reports') this.renderReports();
