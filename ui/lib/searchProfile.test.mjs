@@ -201,3 +201,21 @@ test('migration is idempotent when a draft or published profile already exists',
   assert.deepEqual(result, { migrated: false, draftPath: paths.searchProfileDraft, backupPath: null });
   assert.equal(fs.existsSync(paths.searchProfileRaw), false);
 });
+
+test('migration leaves the legacy config untouched when its paired artifact swap fails', () => {
+  const root = temp();
+  const workspaceJson = '{"locale":"en-GB","search":{}}\n';
+  fs.writeFileSync(path.join(root, 'workspace.json'), workspaceJson);
+  const searchDirectory = path.dirname(workspacePaths(root).searchProfileRaw);
+  const fileSystem = {
+    ...fs,
+    renameSync(source, destination) {
+      if (destination === searchDirectory) throw new Error('simulated directory swap failure');
+      return fs.renameSync(source, destination);
+    },
+  };
+
+  assert.throws(() => migrateSearchProfile(root, { fileSystem }), /simulated directory swap failure/);
+  assert.equal(fs.readFileSync(path.join(root, 'workspace.json'), 'utf8'), workspaceJson);
+  assert.equal(fs.existsSync(searchDirectory), false);
+});

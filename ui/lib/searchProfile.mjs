@@ -151,33 +151,36 @@ export function loadPublishedSearchProfile(root) {
   return deepFreeze(profile);
 }
 
-export function migrateSearchProfile(root) {
+export function migrateSearchProfile(root, { fileSystem = fs } = {}) {
   const paths = workspacePaths(root);
-  if (fs.existsSync(paths.searchProfileDraft) || fs.existsSync(paths.searchProfilePublished)) {
+  if (fileSystem.existsSync(paths.searchProfileDraft) || fileSystem.existsSync(paths.searchProfilePublished)) {
     return { migrated: false, draftPath: paths.searchProfileDraft, backupPath: null };
   }
-  if (!fs.existsSync(paths.config)) throw new Error(`workspace config missing: ${paths.config}`);
+  if (!fileSystem.existsSync(paths.config)) throw new Error(`workspace config missing: ${paths.config}`);
 
   // Retain the legacy source text itself as evidence, rather than reserialising
   // parsed values and silently losing formatting or line endings.
-  const workspaceJson = fs.readFileSync(paths.config, 'utf8');
-  const context = fs.existsSync(paths.profileContext) ? fs.readFileSync(paths.profileContext, 'utf8') : '';
+  const workspaceJson = fileSystem.readFileSync(paths.config, 'utf8');
+  const context = fileSystem.existsSync(paths.profileContext) ? fileSystem.readFileSync(paths.profileContext, 'utf8') : '';
   const config = JSON.parse(workspaceJson);
   const draft = draftProfileFromLegacy(config, context);
   const backupPath = backupWorkspace(root, 'search-profile-v1');
   const searchDirectory = path.dirname(paths.searchProfileRaw);
-  if (fs.existsSync(searchDirectory)) throw new Error(`search profile evidence already exists: ${searchDirectory}`);
+  if (fileSystem.existsSync(searchDirectory)) throw new Error(`search profile evidence already exists: ${searchDirectory}`);
   const stagingDirectory = path.join(paths.profile, `.search-profile-v1-${crypto.randomUUID()}`);
+  let artifactsVisible = false;
   try {
-    atomicWriteFile(path.join(stagingDirectory, 'raw.json'), `${JSON.stringify({ version: 1, workspaceJson, context }, null, 2)}\n`);
-    atomicWriteFile(path.join(stagingDirectory, 'draft.json'), `${JSON.stringify(draft, null, 2)}\n`);
+    atomicWriteFile(path.join(stagingDirectory, 'raw.json'), `${JSON.stringify({ version: 1, workspaceJson, context }, null, 2)}\n`, { fileSystem });
+    atomicWriteFile(path.join(stagingDirectory, 'draft.json'), `${JSON.stringify(draft, null, 2)}\n`, { fileSystem });
+    fileSystem.renameSync(stagingDirectory, searchDirectory);
+    artifactsVisible = true;
     atomicWriteFile(paths.config, `${JSON.stringify({
       ...config,
       searchProfile: { ...(config.searchProfile || {}), publishedId: null },
-    }, null, 2)}\n`);
-    fs.renameSync(stagingDirectory, searchDirectory);
+    }, null, 2)}\n`, { fileSystem });
   } catch (error) {
-    fs.rmSync(stagingDirectory, { recursive: true, force: true });
+    if (artifactsVisible) fileSystem.renameSync(searchDirectory, stagingDirectory);
+    fileSystem.rmSync(stagingDirectory, { recursive: true, force: true });
     throw error;
   }
   return { migrated: true, draftPath: paths.searchProfileDraft, backupPath };
