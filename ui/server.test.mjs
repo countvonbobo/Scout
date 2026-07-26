@@ -539,6 +539,29 @@ test('latest scan API exposes only bounded review fields and scan health omits r
   assert.doesNotMatch(health.text, /private query/);
 });
 
+test('latest scan API exposes reconciled metrics and bounded explanations only', async () => {
+  fs.mkdirSync(path.join(testWorkspace, 'data'), { recursive: true });
+  fs.writeFileSync(path.join(testWorkspace, 'data', 'scan-runs.jsonl'), `${JSON.stringify({
+    schemaVersion: 4, timestamp: '2026-07-26T10:00:00.000Z', agent: 'codex', mode: 'primary', errors: [],
+    profile_id: 'profile-123456789abc', discovery_engine: 'ranked-discovery',
+    funnel: { sourceRecords: 2532, uniqueVacancies: 120, deterministicallyExcluded: 40, eligible: 80, ranked: 80, selected: 60, assessed: 59, assessmentFailed: 1 },
+    explanations: [{ vacancy_id: 'vacancy-1', pre_rank: { score: 82, positive: [{ code: 'title', score: 4, raw: 'private payload' }], negative: [{ code: 'negative', score: -1, path: 'C:\\private' }] }, selection_reason: 'score-band', assessment_status: 'assessed', source: 'ats', sourceUrl: 'https://example.test/job', raw: 'private payload', path: 'C:\\private' }],
+  })}\n`);
+  const response = await request({ path: '/api/scans/latest' });
+  assert.equal(response.status, 200);
+  assert.match(response.text, /Source records|2532|profile-123456789abc|vacancy-1/);
+  assert.doesNotMatch(response.text, /private payload|C:\\private/);
+});
+
+test('latest scan API bounds source URLs in persisted explanation records', async () => {
+  fs.mkdirSync(path.join(testWorkspace, 'data'), { recursive: true });
+  const oversizedUrl = `https://example.test/job?${'x'.repeat(5000)}`;
+  fs.writeFileSync(path.join(testWorkspace, 'data', 'scan-runs.jsonl'), `${JSON.stringify({ timestamp: '2026-07-26T10:00:00.000Z', explanations: [{ vacancy_id: 'vacancy-1', pre_rank: {}, assessment_status: 'assessed', source: 'ats', sourceUrl: oversizedUrl }] })}\n`);
+  const response = await request({ path: '/api/scans/latest' });
+  const { scan } = JSON.parse(response.text);
+  assert.equal(scan.explanations[0].sourceUrl, null);
+});
+
 test('legacy CV downloads require a hash-bound explicit override', async () => {
   const slug = 'synthetic-quality';
   const app = path.join(testWorkspace, 'applications', slug);

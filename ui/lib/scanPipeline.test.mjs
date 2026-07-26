@@ -132,7 +132,7 @@ test('runtime writes canonical scan records and preserves user tracker state', (
     sources: { hiring_cafe: { configured: true, status: 'healthy', count: 1, jobs: [] } },
     assessmentResult: { assessments: [assessment('met')] }, policy: { actionScore: 70, checkScore: 55 },
   });
-  assert.equal(artifacts.run.schemaVersion, 3);
+  assert.equal(artifacts.run.schemaVersion, 4);
   assert.deepEqual(artifacts.run.sources_checked, ['hiring_cafe']);
   assert.deepEqual(artifacts.run.queries_checked, ['engineer']);
   assert.equal(artifacts.run.candidates_found, 1);
@@ -144,6 +144,48 @@ test('runtime writes canonical scan records and preserves user tracker state', (
   assert.deepEqual(saved.log, [{ date: '2026-07-01', event: 'replied', note: '' }]);
   assert.equal(saved.eligibility.status, 'eligible');
   assert.equal(validateWrittenScanArtifacts(root, artifacts.run).run.agent, 'codex');
+});
+
+test('scan artifact exposes a reconciled funnel without claiming all jobs were assessed', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'scout-ranked-scan-artifact-'));
+  fs.mkdirSync(path.join(root, 'data'), { recursive: true });
+  fs.writeFileSync(path.join(root, 'data', 'opportunities.json'), '{"updated":"2026-07-01","opportunities":[]}\n');
+  const candidates = Array.from({ length: 60 }, (_, index) => ({
+    candidateId: `candidate-${String(index + 1).padStart(3, '0')}`, company: `Company ${index + 1}`,
+    role: 'Engineer', url: `https://example.test/jobs/${index + 1}`, source: 'ats',
+    preRank: { vacancyId: `vacancy-${index + 1}`, score: 80, positive: ['title'], negative: [] },
+    selectionReason: 'score-band',
+  }));
+  const artifacts = writeScanArtifacts(root, {
+    provider: 'codex', mode: 'primary', sources: { ats: { configured: true, status: 'healthy', count: 2532 } },
+    candidates, assessmentResult: { assessments: candidates.slice(0, 59).map((candidate) => ({ ...assessment('met'), candidateId: candidate.candidateId })) },
+    policy: {}, startedAt: '2026-07-26T09:00:00Z', profileId: 'profile-123456789abc', discoveryEngine: 'ranked-discovery',
+    funnel: { sourceRecords: 2532, uniqueVacancies: 120, deterministicallyExcluded: 60, eligible: 60, ranked: 60, aboveThreshold: 60, selected: 60, assessed: 59, assessmentFailed: 1 },
+    selection: [{ vacancyId: 'vacancy-1', score: 80, selectionReason: 'score-band', source: 'ats', sourceUrl: 'https://example.test/jobs/1' }],
+    exclusions: [{ vacancyId: 'vacancy-excluded', exclusionCode: 'confirmed-location', source: 'ats', sourceUrl: 'https://example.test/excluded' }],
+  });
+  assert.equal(artifacts.run.funnel.sourceRecords, 2532);
+  assert.equal(artifacts.run.funnel.selected, 60);
+  assert.equal(artifacts.run.funnel.assessed, 59);
+  assert.equal(artifacts.run.funnel.assessmentFailed, 1);
+  assert.equal(artifacts.run.candidates_found, 60);
+  assert.equal(artifacts.run.profile_id, 'profile-123456789abc');
+  assert.equal(artifacts.run.selection_summary.selected, 60);
+  assert.deepEqual(Object.keys(artifacts.run.explanations[0]).sort(), ['assessment_status', 'deterministic_exclusion', 'pre_rank', 'selection_reason', 'source', 'sourceUrl', 'vacancy_id'].sort());
+  assert.doesNotMatch(JSON.stringify(artifacts.run), /description|profileEvidence/);
+});
+
+test('failed assessment reconciles selected candidates as assessment failures', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'scout-failed-ranked-scan-'));
+  fs.mkdirSync(path.join(root, 'data'), { recursive: true });
+  fs.writeFileSync(path.join(root, 'data', 'opportunities.json'), '{"updated":"2026-07-01","opportunities":[]}\n');
+  const artifacts = writeScanArtifacts(root, {
+    provider: 'codex', mode: 'primary', sources: {}, candidates: [{ candidateId: 'candidate-001', vacancyId: 'vacancy-1', company: 'A', role: 'Engineer', url: 'https://example.test/job', source: 'ats' }],
+    assessmentResult: null, policy: {}, startedAt: '2026-07-26T09:00:00Z', error: 'provider failed',
+    funnel: { selected: 1, assessed: 0, assessmentFailed: 0 },
+  });
+  assert.equal(artifacts.run.funnel.assessmentFailed, 1);
+  assert.equal(artifacts.run.selection_summary.assessmentFailed, 1);
 });
 
 test('forty zero-keeper candidates produce a bounded sanitised audit without tracker padding', () => {

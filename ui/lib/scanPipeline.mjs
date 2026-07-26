@@ -25,7 +25,7 @@ function boundedText(value, maximum = 220) {
 function safeSourceUrl(value) {
   try {
     const parsed = new URL(String(value || ''));
-    return ['http:', 'https:'].includes(parsed.protocol) ? parsed.href : null;
+    return ['http:', 'https:'].includes(parsed.protocol) && parsed.href.length <= 2048 ? parsed.href : null;
   } catch { return null; }
 }
 
@@ -74,6 +74,24 @@ function mandatorySignals(description, requirements) {
     .map((text) => text.trim()).filter((text) => text && /\b(?:required|essential|must|mandatory|non-negotiable)\b/i.test(text));
   return [...new Set([...sourceRequirements, ...explicitLanguage])]
     .slice(0, 12).map((text, index) => ({ id: `mandatory-${String(index + 1).padStart(2, '0')}`, text: text.slice(0, 300) }));
+}
+
+function boundedContributions(contributions, positive) {
+  return (contributions || []).filter((item) => (positive ? Number(item?.score) > 0 : Number(item?.score) < 0))
+    .sort((left, right) => Math.abs(Number(right.score)) - Math.abs(Number(left.score))).slice(0, 3)
+    .map((item) => ({ code: boundedText(item.profileRuleId, 100), score: Number(item.score) }));
+}
+
+function boundedExplanation(candidate, { assessmentStatus, selectionReason = null, deterministicExclusion = null } = {}) {
+  const preRank = candidate?.preRank || { score: candidate?.preRankScore, positive: boundedContributions(candidate?.contributions, true), negative: boundedContributions(candidate?.contributions, false) };
+  const compact = (items) => (items || []).map((item) => typeof item === 'string' ? boundedText(item, 100) : { code: boundedText(item?.code, 100), score: Number(item?.score) }).slice(0, 3);
+  return {
+    vacancy_id: boundedText(candidate?.vacancyId || candidate?.candidateId, 160),
+    pre_rank: { score: Number.isFinite(Number(preRank?.score)) ? Number(preRank.score) : null, positive: compact(preRank?.positive), negative: compact(preRank?.negative) },
+    selection_reason: selectionReason ? boundedText(selectionReason, 100) : null,
+    deterministic_exclusion: deterministicExclusion ? boundedText(deterministicExclusion, 100) : null,
+    assessment_status: assessmentStatus, source: boundedText(candidate?.source, 80), sourceUrl: safeSourceUrl(candidate?.url),
+  };
 }
 
 function valueOf(value) {
@@ -167,10 +185,15 @@ export function prepareRankedDiscovery({
     aboveThreshold: ranked.length - selection.belowCutoff.length,
     selected: selection.selected.length,
   }));
+  const vacancyById = new Map(vacancies.map((vacancy) => [String(vacancy.vacancyId || vacancy.canonicalUrl), vacancy]));
+  const exclusions = filtered.excluded.map((item) => {
+    const vacancy = vacancyById.get(String(item.vacancyId));
+    return { ...item, source: vacancy?.source || '', url: vacancy?.url || vacancy?.canonicalUrl || '' };
+  });
   return {
     observations,
     vacancies,
-    exclusions: filtered.excluded,
+    exclusions,
     ranked,
     selection,
     funnel,
@@ -505,9 +528,9 @@ export function validateWrittenScanArtifacts(root, expectedRun) {
 
 export function writeScanArtifacts(root, {
   provider, mode, sources, queries = [], candidates, assessmentResult, policy, startedAt,
-  error = null, skipped = false, dropped = { perSource: {}, total: 0 }, hardExcluded = [], closedAdverts = [],
+  error = null, skipped = false, dropped = { perSource: {}, total: 0 }, hardExcluded = [], closedAdverts = [], exclusions = [],
   livenessSummary = { checked: 0, gone: 0, unverified: 0 }, verificationScoped = false,
-  staleInboxEntries = [], inboxRechecked = 0, funnel = null, selection = [], discoveryEngine = 'legacy-discovery',
+  staleInboxEntries = [], inboxRechecked = 0, funnel = null, selection = [], discoveryEngine = 'legacy-discovery', profileId = null,
 }) {
   const paths = workspacePaths(root);
   const timestamp = new Date().toISOString();
@@ -522,8 +545,16 @@ export function writeScanArtifacts(root, {
     ? mergeTracker(existing, candidates, assessmentResult.assessments, policy, date)
     : { tracker: existing, keepersAdded: 0, keepersUpdated: 0, discarded: { ...EMPTY_DISCARDED }, reviewed: [] };
   const inboxArchived = archiveStaleInboxEntries(merged.tracker, staleInboxEntries, date);
+  const reconciledFunnel = funnel && error ? { ...funnel, assessed: Number(assessmentResult?.assessments?.length || 0), assessmentFailed: Math.max(0, Number(funnel.selected || candidates.length) - Number(assessmentResult?.assessments?.length || 0)) } : funnel;
+  const assessedIds = new Set((assessmentResult?.assessments || []).map((item) => item.candidateId));
+  const selectionByVacancy = new Map((selection || []).map((item) => [String(item?.vacancyId || ''), item]));
+  const explanations = [
+    ...candidates.map((candidate) => boundedExplanation(candidate, { assessmentStatus: assessedIds.has(candidate.candidateId) ? 'assessed' : 'assessment-failed', selectionReason: selectionByVacancy.get(String(candidate.vacancyId || ''))?.reason || candidate.selectionReason || 'selected' })),
+    ...exclusions.map((item) => boundedExplanation(item, { assessmentStatus: 'not-selected', deterministicExclusion: item.code || item.exclusionCode })),
+  ].slice(0, 180);
+  const selection_summary = reconciledFunnel ? { selected: Number(reconciledFunnel.selected || 0), assessed: Number(reconciledFunnel.assessed || 0), assessmentFailed: Number(reconciledFunnel.assessmentFailed || 0) } : null;
   const run = {
-    schemaVersion: 3, timestamp, started_at: startedAt, agent: provider, mode, degraded, skipped,
+    schemaVersion: 4, timestamp, started_at: startedAt, agent: provider, mode, degraded, skipped,
     sources_checked: Object.entries(health).filter(([, item]) => item.configured !== false).map(([name]) => name),
     queries_checked: [...queries], candidates_found: candidates.length, keepers_added: merged.keepersAdded,
     duplicates_collapsed: candidates.reduce((total, candidate) => total + Math.max(0, Number(candidate.duplicateCount || 1) - 1), 0),
@@ -539,9 +570,11 @@ export function writeScanArtifacts(root, {
     adverts_checked: livenessSummary.checked, adverts_closed: livenessSummary.gone,
     adverts_unverified: livenessSummary.unverified, verification_scoped: verificationScoped,
     inbox_rechecked: inboxRechecked, inbox_archived: inboxArchived,
-    discovery_engine: discoveryEngine,
-    ...(funnel ? { funnel } : {}),
+    profile_id: profileId, discovery_engine: discoveryEngine,
+    ...(reconciledFunnel ? { funnel: reconciledFunnel } : {}),
+    ...(selection_summary ? { selection_summary } : {}),
     ...(selection.length ? { selection } : {}),
+    ...(explanations.length ? { explanations } : {}),
     reviewed: merged.reviewed, errors, source_health: health,
   };
   const earlierRuns = fs.existsSync(paths.scanRuns)

@@ -158,21 +158,43 @@ function readScanRecords() {
 function publicLatestScan() {
   const run = readScanRecords().at(-1);
   if (!run) return null;
+  const safePublicUrl = (value) => {
+    const url = String(value || '');
+    return /^https?:\/\//i.test(url) && url.length <= 2048 ? url : null;
+  };
   const reviewed = Array.isArray(run.reviewed) ? run.reviewed.map((item) => ({
     company: String(item?.company || '').slice(0, 120), role: String(item?.role || '').slice(0, 160),
     source: String(item?.source || '').slice(0, 80),
-    sourceUrl: /^https?:\/\//i.test(String(item?.sourceUrl || '')) ? String(item.sourceUrl) : null,
+    sourceUrl: safePublicUrl(item?.sourceUrl),
     categoryId: item?.categoryId ? String(item.categoryId).slice(0, 80) : null,
     outcome: ['kept', 'hard_exclusion', 'mandatory_unmet', 'below_threshold', 'provider_discarded'].includes(item?.outcome) ? item.outcome : 'provider_discarded',
     score: Number.isFinite(Number(item?.score)) ? Number(item.score) : null,
     reasons: (Array.isArray(item?.reasons) ? item.reasons : []).map((reason) => String(reason).slice(0, 220)).slice(0, 3),
   })).slice(0, 80) : [];
+  const boundedContribution = (item) => typeof item === 'string' ? item.slice(0, 100) : ({ code: String(item?.code || '').slice(0, 100), score: Number.isFinite(Number(item?.score)) ? Number(item.score) : null });
+  const boundedFunnel = (value) => {
+    const names = ['sourceRecords', 'uniqueVacancies', 'deterministicallyExcluded', 'eligible', 'ranked', 'selected', 'assessed', 'assessmentFailed'];
+    return value && typeof value === 'object' ? Object.fromEntries(names.filter((name) => Number.isFinite(Number(value[name]))).map((name) => [name, Number(value[name])])) : null;
+  };
+  const boundedSelectionSummary = (value) => value && typeof value === 'object' ? Object.fromEntries(['selected', 'assessed', 'assessmentFailed'].filter((name) => Number.isFinite(Number(value[name]))).map((name) => [name, Number(value[name])])) : null;
+  const explanations = Array.isArray(run.explanations) ? run.explanations.map((item) => ({
+    vacancyId: String(item?.vacancy_id || '').slice(0, 160),
+    preRank: { score: Number.isFinite(Number(item?.pre_rank?.score)) ? Number(item.pre_rank.score) : null,
+      positive: (Array.isArray(item?.pre_rank?.positive) ? item.pre_rank.positive : []).slice(0, 3).map(boundedContribution), negative: (Array.isArray(item?.pre_rank?.negative) ? item.pre_rank.negative : []).slice(0, 3).map(boundedContribution) },
+    selectionReason: item?.selection_reason ? String(item.selection_reason).slice(0, 100) : null,
+    deterministicExclusion: item?.deterministic_exclusion ? String(item.deterministic_exclusion).slice(0, 100) : null,
+    assessmentStatus: ['assessed', 'assessment-failed', 'not-selected'].includes(item?.assessment_status) ? item.assessment_status : 'not-selected',
+    source: String(item?.source || '').slice(0, 80), sourceUrl: safePublicUrl(item?.sourceUrl),
+  })).slice(0, 180) : [];
   return {
     schemaVersion: Number(run.schemaVersion || 1), runAt: run.timestamp || null,
     provider: run.agent || null, mode: run.mode || null, degraded: Boolean(run.degraded),
     candidatesFound: Number(run.candidates_found || 0), keepersAdded: Number(run.keepers_added || 0),
     keepersUpdated: Number(run.keepers_updated || 0), discarded: run.discarded || {},
     sourceHealth: run.source_health || {}, reportDate: String(run.timestamp || '').slice(0, 10) || null,
+    profileId: run.profile_id ? String(run.profile_id).slice(0, 80) : null,
+    discoveryEngine: run.discovery_engine ? String(run.discovery_engine).slice(0, 80) : null,
+    funnel: boundedFunnel(run.funnel), selectionSummary: boundedSelectionSummary(run.selection_summary), explanations,
     automaticBroadened: run.mode === 'broadened', reviewed,
   };
 }

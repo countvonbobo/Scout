@@ -373,7 +373,7 @@ export async function runScanWith(root, provider, mode, {
         verificationScoped = verification.verified;
       }
       candidates = assessmentCandidatesForSelection(selectedVacancies);
-      selection = candidates.map((candidate) => ({ url: candidate.url, vacancyId: candidate.vacancyId, preRankScore: candidate.preRankScore }));
+      selection = candidates.map((candidate) => ({ url: candidate.url, vacancyId: candidate.vacancyId, preRankScore: candidate.preRankScore, reason: discovery.selection.reasons.find((item) => item.vacancyId === candidate.vacancyId)?.reason || 'deterministic-rank' }));
       funnel = { ...discovery.funnel, selected: candidates.length };
     } else {
       // beta.22 compatibility for migrated and grandfathered workspaces. A
@@ -435,6 +435,7 @@ export async function runScanWith(root, provider, mode, {
         ...funnel,
         selected: candidates.length,
         assessed: assessmentResult?.assessments?.length || 0,
+        assessmentFailed: Math.max(0, candidates.length - (assessmentResult?.assessments?.length || 0)),
         closed: closedAdverts.length,
       };
     }
@@ -442,7 +443,7 @@ export async function runScanWith(root, provider, mode, {
     const artifacts = writeScanArtifacts(root, {
       provider, mode, sources: collected.sources, queries: collected.queries, candidates, assessmentResult,
       policy: config.triage, startedAt,
-      dropped, hardExcluded, closedAdverts, livenessSummary, verificationScoped, funnel, selection, discoveryEngine,
+      dropped, hardExcluded, closedAdverts, exclusions: discovery?.exclusions || [], livenessSummary, verificationScoped, funnel, selection, discoveryEngine, profileId: publishedProfile?.id || null,
       staleInboxEntries, inboxRechecked,
     });
     result = { ok: true, status: artifacts.run.degraded ? 'degraded' : candidates.length ? 'completed' : 'healthy-empty', scan: artifacts.run, usage };

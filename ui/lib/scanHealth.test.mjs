@@ -33,6 +33,19 @@ test('scanHealthFromText reports a healthy same-day run', () => {
   assert.deepEqual(out.sourcesChecked, ['ats']);
 });
 
+test('scan health exposes reconciled ranked funnel metrics', () => {
+  const out = scanHealthFromText(`${JSON.stringify({
+    timestamp: '2026-07-08T07:30:00Z', errors: [], funnel: {
+      sourceRecords: 2532, uniqueVacancies: 120, deterministicallyExcluded: 40,
+      eligible: 80, ranked: 80, selected: 60, assessed: 59, assessmentFailed: 1,
+    },
+  })}\n`, '2026-07-08');
+  assert.deepEqual(out.funnel, {
+    sourceRecords: 2532, uniqueVacancies: 120, deterministicallyExcluded: 40,
+    eligible: 80, ranked: 80, selected: 60, assessed: 59, assessmentFailed: 1,
+  });
+});
+
 test('scanHealthFromText flags stale and degraded runs', () => {
   const stale = scanHealthFromText('{"timestamp":"2026-07-07T07:30:00","errors":[]}\n', '2026-07-08');
   assert.equal(stale.stale, true);
