@@ -31,6 +31,13 @@ test('workspace paths stay under the selected root', () => {
   for (const value of Object.values(workspacePaths(root))) assert.ok(value === path.resolve(root) || value.startsWith(`${path.resolve(root)}${path.sep}`));
 });
 
+test('workspace paths reserve the search-profile artifacts under profile/search', () => {
+  const paths = workspacePaths(temp());
+  assert.match(paths.searchProfileRaw, /profile[\\/]search[\\/]raw\.json$/);
+  assert.match(paths.searchProfileDraft, /profile[\\/]search[\\/]draft\.json$/);
+  assert.match(paths.searchProfilePublished, /profile[\\/]search[\\/]published\.json$/);
+});
+
 test('migration creates a valid current-schema workspace', () => {
   const root = temp();
   const result = migrateWorkspace(root);
@@ -67,6 +74,7 @@ test('workspace defaults are merged deeply for older schema-one files', () => {
   assert.deepEqual(merged.search.locations, []);
   assert.equal(merged.triage.actionScore, 70);
   assert.equal(merged.sources.adzuna.country, 'gb');
+  assert.deepEqual(merged.searchProfile, { publishedId: null, schemaVersion: 1 });
 });
 
 test('job-work models are selected independently for each provider with a legacy fallback', () => {

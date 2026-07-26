@@ -15,6 +15,10 @@ export const DEFAULT_WORKSPACE_CONFIG = Object.freeze({
     displayName: '',
     tone: 'natural, direct and evidence-led',
   },
+  searchProfile: {
+    publishedId: null,
+    schemaVersion: 1,
+  },
   search: {
     roleFamilies: [],
     sectors: [],
@@ -95,6 +99,9 @@ export function workspacePaths(root) {
     reports: path.join(workspaceRoot, 'reports'),
     applications: path.join(workspaceRoot, 'applications'),
     profile: path.join(workspaceRoot, 'profile'),
+    searchProfileRaw: path.join(workspaceRoot, 'profile', 'search', 'raw.json'),
+    searchProfileDraft: path.join(workspaceRoot, 'profile', 'search', 'draft.json'),
+    searchProfilePublished: path.join(workspaceRoot, 'profile', 'search', 'published.json'),
     cv: path.join(workspaceRoot, 'cv'),
     imports: path.join(workspaceRoot, 'imports'),
     logs: path.join(workspaceRoot, 'logs'),
@@ -136,6 +143,7 @@ export function mergeWorkspaceDefaults(value = {}) {
     ...defaults,
     ...value,
     profile: { ...defaults.profile, ...(value.profile || {}) },
+    searchProfile: { ...defaults.searchProfile, ...(value.searchProfile || {}) },
     search: { ...defaults.search, ...(value.search || {}) },
     triage: { ...defaults.triage, ...(value.triage || {}) },
     sources: {

@@ -4,6 +4,7 @@
   "currency": "GBP",
   "timezone": "Europe/London",
   "profile": { "displayName": "", "tone": "natural, direct and evidence-led" },
+  "searchProfile": { "publishedId": null, "schemaVersion": 1 },
   "search": { "roleFamilies": [], "sectors": [], "locations": [], "exclusions": [], "salaryMinimum": null },
   "triage": { "actionScore": 70, "checkScore": 55, "nudgeDays": 8, "closeoutDays": 10, "staleDays": 10, "decisionDays": 2 },
   "sources": {
