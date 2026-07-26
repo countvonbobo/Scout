@@ -33,6 +33,16 @@ test('funnel preserves source-level observation and failure counts', () => {
   });
 });
 
+test('funnel rejects source counts that do not reconcile with parsed records', () => {
+  const funnel = advanceDiscoveryFunnel(createDiscoveryFunnel({
+    source: { count: 2, errors: ['malformed record'] },
+  }), 'selection', {
+    sourceRecords: 0, failedSourceRecords: 0,
+  });
+
+  assert.throws(() => assertDiscoveryFunnel(funnel), /parsed must equal source records minus failed source records/);
+});
+
 test('funnel advances without mutating the previous snapshot', () => {
   const initial = createDiscoveryFunnel({ source: { count: 1, errors: [] } });
   const next = advanceDiscoveryFunnel(initial, 'selection', {
@@ -50,7 +60,7 @@ test('funnel advances without mutating the previous snapshot', () => {
 
 test('funnel rejects vacancies selected before every eligible vacancy is ranked', () => {
   const funnel = advanceDiscoveryFunnel(createDiscoveryFunnel({ source: { count: 2, errors: [] } }), 'selection', {
-    normalised: 2, duplicateObservations: 0, uniqueVacancies: 2,
+    parsed: 2, normalised: 2, duplicateObservations: 0, uniqueVacancies: 2,
     deterministicallyExcluded: 0, eligible: 2, ranked: 1,
   });
 

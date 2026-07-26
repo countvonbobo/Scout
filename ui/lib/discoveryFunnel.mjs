@@ -4,6 +4,7 @@ const STAGES = Object.freeze([
   'eligible', 'ranked', 'aboveThreshold', 'selected', 'assessed',
   'assessmentFailed', 'added', 'updated', 'unchanged', 'closed',
 ]);
+const SOURCE_DERIVED_STAGES = new Set(['sourceRecords', 'failedSourceRecords']);
 
 function freeze(value) {
   if (value && typeof value === 'object' && !Object.isFrozen(value)) {
@@ -36,12 +37,21 @@ export function createDiscoveryFunnel(sourceResults = {}) {
 export function advanceDiscoveryFunnel(funnel, _stage, counts = {}) {
   const next = structuredClone(funnel);
   for (const key of STAGES) {
-    if (counts[key] !== undefined) next[key] = Number(counts[key]);
+    if (!SOURCE_DERIVED_STAGES.has(key) && counts[key] !== undefined) next[key] = Number(counts[key]);
   }
   return freeze(next);
 }
 
 export function assertDiscoveryFunnel(value) {
+  const sources = Object.values(value.bySource);
+  const sourceRecords = sources.reduce((total, source) => total + Number(source.count), 0);
+  const failedSourceRecords = sources.reduce((total, source) => total + Number(source.failedRecords), 0);
+  if (value.sourceRecords !== sourceRecords || value.failedSourceRecords !== failedSourceRecords) {
+    throw new Error('source record totals must equal the source-level counts');
+  }
+  if (value.parsed !== value.sourceRecords - value.failedSourceRecords) {
+    throw new Error('parsed must equal source records minus failed source records');
+  }
   if (value.normalised !== value.duplicateObservations + value.uniqueVacancies) {
     throw new Error('normalised must equal duplicate observations plus unique vacancies');
   }
