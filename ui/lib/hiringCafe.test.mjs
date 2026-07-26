@@ -63,6 +63,15 @@ test('fetchHiringCafe fingerprints the canonical apply URL when the provider omi
   assert.notEqual(result.jobs[0].sourceRecordId, result.jobs[0].url);
 });
 
+test('fetchHiringCafe leaves sourceRecordId absent when a hit has neither ID nor apply URL', async () => {
+  let call = 0;
+  const result = await fetchHiringCafe(['product designer'], async () => {
+    call += 1;
+    return call === 1 ? homepage('bld1') : dataResponse([{ ...hit, objectID: '', apply_url: '' }]);
+  });
+  assert.equal(result.jobs[0].sourceRecordId, '');
+});
+
 test('fetchHiringCafe fails soft and records bounded retry recovery', async () => {
   const missing = await fetchHiringCafe(['x'], async () => ({ ok: true, text: async () => 'not next.js' }));
   assert.equal(missing.available, false);

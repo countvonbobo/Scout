@@ -63,3 +63,20 @@ test('normalisation parses explicit structured source fields without AI inferenc
   assert.equal(observation.seniority.provenance, 'deterministic-extraction');
   assert.equal(observation.postedAt, '2026-07-01');
 });
+
+test('normalisation records warnings when bounded extraction is ambiguous and freezes nested values', () => {
+  const observation = normaliseObservation({
+    providerId: 'job-4', title: 'Senior Lead Engineer', company: 'Acme', url: 'https://jobs.example/4',
+    description: 'Permanent contract with remote and hybrid working.',
+    salaryMin: 60000, salaryMax: 70000, salaryCurrency: 'GBP', salaryPeriod: 'year',
+  }, { sourceName: 'fixture', fetchedAt: NOW, laneId: 'lane-1' });
+
+  assert.equal(observation.employmentType.value, null);
+  assert.equal(observation.seniority.value, null);
+  assert.equal(observation.workingPattern.value, null);
+  assert.ok(observation.warnings.some((warning) => /ambiguous employment type/i.test(warning)));
+  assert.ok(observation.warnings.some((warning) => /ambiguous seniority/i.test(warning)));
+  assert.ok(observation.warnings.some((warning) => /ambiguous working pattern/i.test(warning)));
+  assert.throws(() => { observation.compensation.value.minimum = 1; }, TypeError);
+  assert.throws(() => { observation.warnings.push('mutated'); }, TypeError);
+});

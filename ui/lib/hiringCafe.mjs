@@ -78,7 +78,7 @@ function normalise(hit, options) {
   const providerId = String(hit.objectID || hit.id || hit.job_information?.id || '');
   return {
     providerId,
-    sourceRecordId: providerId || `url-${crypto.createHash('sha256').update(canonicaliseUrl(hit.apply_url) || '').digest('hex')}`,
+    sourceRecordId: providerId || (canonicaliseUrl(hit.apply_url) ? `url-${crypto.createHash('sha256').update(canonicaliseUrl(hit.apply_url)).digest('hex')}` : ''),
     title: hit.job_information?.title || '',
     company: v5.company_name || '',
     description,

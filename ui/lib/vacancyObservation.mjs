@@ -39,16 +39,17 @@ export function canonicaliseUrl(value) {
   }
 }
 
-function extractedValue(description, patterns) {
-  const matches = patterns.filter(([, pattern]) => pattern.test(description)).map(([value]) => value);
-  return [...new Set(matches)].length === 1 ? matches[0] : null;
+function extraction(description, patterns) {
+  const matches = [...new Set(patterns.filter(([, pattern]) => pattern.test(description)).map(([value]) => value))];
+  return { value: matches.length === 1 ? matches[0] : null, ambiguous: matches.length > 1 };
 }
 
-function explicitOrExtracted(value, description, patterns) {
+function explicitOrExtracted(value, description, patterns, warnings, label) {
   const explicit = text(value);
   if (explicit) return field(explicit.toLowerCase(), 'explicit-source');
-  const extracted = extractedValue(description, patterns);
-  return field(extracted, extracted ? 'deterministic-extraction' : 'unknown');
+  const extracted = extraction(description, patterns);
+  if (extracted.ambiguous) warnings.push(`ambiguous ${label} was left unknown`);
+  return field(extracted.value, extracted.value ? 'deterministic-extraction' : 'unknown');
 }
 
 function compensation(job, warnings) {
@@ -85,15 +86,16 @@ export function normaliseObservation(job, { sourceName, fetchedAt, laneId } = {}
   const location = field(text(job.location), 'explicit-source');
   const workingPattern = explicitOrExtracted(job.workingPattern || job.workingType, description, [
     ['remote', /\bremote\b/i], ['hybrid', /\bhybrid\b/i], ['on-site', /\b(?:on[ -]?site|onsite)\b/i],
-  ]);
+  ], warnings, 'working pattern');
   if (!workingPattern.value && /\b(?:flexible|flexibility)\b/i.test(description)) warnings.push('ambiguous working pattern was left unknown');
   const employmentType = explicitOrExtracted(job.employmentType, description, [
     ['permanent', /\bpermanent\b/i], ['contract', /\b(?:contract|contractor)\b/i], ['temporary', /\btemporary\b/i], ['internship', /\bintern(?:ship)?\b/i],
-  ]);
+  ], warnings, 'employment type');
   const seniority = explicitOrExtracted(job.seniority, `${title} ${description}`, [
     ['junior', /\bjunior\b/i], ['mid', /\b(?:mid[- ]?level|midlevel)\b/i], ['senior', /\bsenior\b/i], ['lead', /\blead\b/i], ['principal', /\bprincipal\b/i],
-  ]);
-  const fullTime = extractedValue(description, [['full-time', /\bfull[ -]?time\b/i], ['part-time', /\bpart[ -]?time\b/i]]);
+  ], warnings, 'seniority');
+  const fullTime = extraction(description, [['full-time', /\bfull[ -]?time\b/i], ['part-time', /\bpart[ -]?time\b/i]]);
+  if (fullTime.ambiguous) warnings.push('ambiguous working pattern was left unknown');
   const fingerprintInput = { ...job, url: canonicalUrl || text(job.url), sourceUrl: canonicalUrl || text(job.sourceUrl) };
   const rawFingerprint = fingerprint(stableJson(fingerprintInput));
   const observationId = fingerprint(`${source}\n${recordId || canonicalUrl || ''}\n${rawFingerprint}`);
@@ -107,7 +109,7 @@ export function normaliseObservation(job, { sourceName, fetchedAt, laneId } = {}
     title: field(title, 'explicit-source'),
     description,
     location,
-    workingPattern: workingPattern.value ? workingPattern : field(fullTime, fullTime ? 'deterministic-extraction' : 'unknown'),
+    workingPattern: workingPattern.value ? workingPattern : field(fullTime.value, fullTime.value ? 'deterministic-extraction' : 'unknown'),
     employmentType,
     seniority,
     compensation: compensation(job, warnings),
@@ -117,8 +119,14 @@ export function normaliseObservation(job, { sourceName, fetchedAt, laneId } = {}
     warnings,
     rawFingerprint,
   };
-  result.fieldProvenance = Object.freeze(Object.fromEntries([
+  result.fieldProvenance = Object.fromEntries([
     'employer', 'title', 'location', 'workingPattern', 'employmentType', 'seniority', 'compensation',
-  ].map((name) => [name, result[name].provenance])));
-  return Object.freeze(result);
+  ].map((name) => [name, result[name].provenance]));
+  return deepFreeze(result);
+}
+
+function deepFreeze(value) {
+  if (!value || typeof value !== 'object' || Object.isFrozen(value)) return value;
+  for (const child of Object.values(value)) deepFreeze(child);
+  return Object.freeze(value);
 }
