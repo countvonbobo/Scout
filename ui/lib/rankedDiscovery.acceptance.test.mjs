@@ -115,6 +115,24 @@ test('published unknown-compensation policies change end-to-end discovery decisi
 
   assert.ok(compensation.score < 0);
   assert.ok(penalised.ranked[0].preRankScore < included.ranked[0].preRankScore);
+
+  const nonComparable = sourceJob({
+    vacancyId: 'hospital-administrator-non-comparable',
+    title: penaliseProfile.target.primaryTitles[0].value,
+    arrangement: penaliseProfile.target.workingPatterns[0].value,
+    compensation: { ...penaliseProfile.compensation, currency: 'JPY', period: 'day' },
+  });
+  const nonComparablePenalised = discover([nonComparable], penaliseProfile);
+  const nonComparableIncluded = discover([nonComparable], {
+    ...penaliseProfile,
+    compensation: { ...penaliseProfile.compensation, unknownPolicy: 'include' },
+  });
+  const nonComparableCompensation = nonComparablePenalised.ranked[0].dimensions
+    .find((dimension) => dimension.name === 'compensation');
+
+  assert.equal(nonComparableCompensation.evidence[0].comparison, 'unknown');
+  assert.ok(nonComparableCompensation.score < 0);
+  assert.ok(nonComparablePenalised.ranked[0].preRankScore < nonComparableIncluded.ranked[0].preRankScore);
 });
 
 test('production-shaped legacy migration preserves unrelated private artifacts byte-for-byte', () => {
