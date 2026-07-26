@@ -17,6 +17,7 @@ async function getJson(url, fetchImpl) {
 function normalise(job, portal, fields) {
   return {
     providerId: String(fields.providerId || ''),
+    sourceRecordId: String(fields.providerId || ''),
     title: fields.title || '',
     company: portal.name,
     description: fields.description || '',

@@ -38,6 +38,7 @@ test('fetchHiringCafe normalises hits and skips expired ones', async () => {
   assert.equal(result.jobs.length, 1);
   assert.equal(result.jobs[0].salary, 'GBP 60,000-75,000');
   assert.equal(result.jobs[0].providerId, 'hiring-cafe-123');
+  assert.equal(result.jobs[0].sourceRecordId, 'hiring-cafe-123');
   assert.deepEqual(result.sources, { 'product designer': 1 });
 });
 
@@ -50,6 +51,16 @@ test('fetchHiringCafe keeps distinct openings with the same company and title', 
     ]);
   });
   assert.equal(result.jobs.length, 2);
+});
+
+test('fetchHiringCafe fingerprints the canonical apply URL when the provider omits an identifier', async () => {
+  let call = 0;
+  const result = await fetchHiringCafe(['product designer'], async () => {
+    call += 1;
+    return call === 1 ? homepage('bld1') : dataResponse([{ ...hit, objectID: '', apply_url: 'https://apply/x?utm_source=board' }]);
+  });
+  assert.match(result.jobs[0].sourceRecordId, /^url-[a-f0-9]{64}$/);
+  assert.notEqual(result.jobs[0].sourceRecordId, result.jobs[0].url);
 });
 
 test('fetchHiringCafe fails soft and records bounded retry recovery', async () => {

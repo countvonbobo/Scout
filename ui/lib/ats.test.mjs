@@ -20,6 +20,7 @@ test('fetchGreenhouse maps public board jobs', async () => {
   assert.equal(jobs[0].description, 'PCB and test rigs');
   assert.equal(jobs[0].postedDate, '2026-07-08');
   assert.equal(jobs[0].providerId, '123');
+  assert.equal(jobs[0].sourceRecordId, '123');
 });
 
 test('fetchLever maps public postings', async () => {
@@ -28,6 +29,7 @@ test('fetchLever maps public postings', async () => {
   ]));
   assert.equal(jobs[0].source, 'ats-lever');
   assert.equal(jobs[0].location, 'London');
+  assert.equal(jobs[0].sourceRecordId, jobs[0].providerId);
 });
 
 test('fetchAshby maps public postings', async () => {
@@ -36,6 +38,7 @@ test('fetchAshby maps public postings', async () => {
   }));
   assert.equal(jobs[0].source, 'ats-ashby');
   assert.equal(jobs[0].postedDate, '2026-07-07');
+  assert.equal(jobs[0].sourceRecordId, jobs[0].providerId);
 });
 
 test('parsePortalConfig validates shape and summary hides tokens', () => {

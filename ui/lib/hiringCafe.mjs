@@ -1,4 +1,6 @@
 import { withSourceStatus } from './sourceHealth.mjs';
+import crypto from 'node:crypto';
+import { canonicaliseUrl } from './vacancyObservation.mjs';
 
 const HOME_URL = 'https://hiringcafe.com/';
 
@@ -73,14 +75,20 @@ function normalise(hit, options) {
     v5.requirements_summary || '', v5.job_category || '', (v5.role_activities || []).join(', '),
     v5.company_tagline || '', v5.company_sector_and_industry || '', (v5.company_activities || []).join(', '),
   ].filter(Boolean).join(' ');
+  const providerId = String(hit.objectID || hit.id || hit.job_information?.id || '');
   return {
-    providerId: String(hit.objectID || hit.id || hit.job_information?.id || ''),
+    providerId,
+    sourceRecordId: providerId || `url-${crypto.createHash('sha256').update(canonicaliseUrl(hit.apply_url) || '').digest('hex')}`,
     title: hit.job_information?.title || '',
     company: v5.company_name || '',
     description,
     requirements: String(v5.requirements_summary || '').trim(),
     url: hit.apply_url || '',
     salary: salaryText(v5.yearly_min_compensation, v5.yearly_max_compensation, v5.listed_compensation_currency, options.locale),
+    salaryMin: v5.yearly_min_compensation ?? null,
+    salaryMax: v5.yearly_max_compensation ?? null,
+    salaryCurrency: v5.listed_compensation_currency || null,
+    salaryPeriod: 'year',
     location: v5.formatted_workplace_location || '',
     workingType: v5.workplace_type || '',
     postedDate: (v5.estimated_publish_date || '').slice(0, 10) || null,

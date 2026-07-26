@@ -50,11 +50,16 @@ function salaryText(min, max, options) {
 function normalise(item, options) {
   return {
     providerId: String(item.id || ''),
+    sourceRecordId: String(item.id || ''),
     title: item.title || '',
     company: item.company?.display_name || '',
     description: item.description || '',
     url: item.redirect_url || '',
     salary: salaryText(item.salary_min, item.salary_max, options),
+    salaryMin: item.salary_min ?? null,
+    salaryMax: item.salary_max ?? null,
+    salaryCurrency: options.currency || null,
+    salaryPeriod: 'year',
     location: item.location?.display_name || '',
     workingType: '',
     postedDate: (item.created || '').slice(0, 10) || null,
