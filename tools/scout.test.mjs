@@ -259,6 +259,63 @@ test('closed selected adverts are replaced by the next ranked eligible vacancy',
   assert.equal(result.scan.funnel.assessed, 60);
 });
 
+test('a failed ranked scan retains its discovery engine and available orchestration state', async () => {
+  const root = scanRoot();
+  enableRankedDiscovery(root);
+  const result = await runScanWith(root, 'codex', 'primary', {
+    providerStatusFn: authenticated,
+    collectSourcesFn: async () => ({ generatedAt: '2026-07-26T20:00:00Z', queries: [], sources: {
+      ats: { configured: true, status: 'healthy', count: 1, jobs: [{ company: 'Able', title: 'Ideal Role', url: 'https://example.test/failed-ranked', providerId: 'failed-ranked' }] },
+    } }),
+    checkLivenessFn: async (items) => ({ live: items, removed: [], summary: { checked: items.length, gone: 0, unverified: 0 } }),
+    runStructuredTurnFn: async () => { throw new Error('ranked provider failure'); },
+    acquireLockFn: () => ({ ok: true, lock: { token: 'failed-ranked-test' } }),
+    releaseLockFn: () => ({ ok: true }),
+  });
+  assert.equal(result.ok, false);
+  assert.equal(result.scan.discovery_engine, 'ranked-discovery');
+  assert.equal(result.scan.funnel.selected, 1);
+  assert.deepEqual(result.scan.selection.map((item) => item.url), ['https://example.test/failed-ranked']);
+  assert.equal(result.scan.discarded.hard_exclusion, 0);
+  assert.equal(result.scan.adverts_checked, 1);
+});
+
+test('ranked second-pass candidates are renumbered and match persisted selection', async () => {
+  const root = scanRoot();
+  enableRankedDiscovery(root);
+  fs.writeFileSync(path.join(root, 'data', 'opportunities.json'), `${JSON.stringify({
+    updated: '2026-07-26', opportunities: [{
+      id: 'baker', company: 'Baker', role: 'Ideal Role', status: 'shortlist', score: 80,
+      lastChecked: new Date().toISOString().slice(0, 10), sources: ['https://example.test/baker'], tags: [], contacts: [], log: [],
+    }],
+  })}\n`);
+  let prompted = [];
+  const result = await runScanWith(root, 'codex', 'second-pass', {
+    providerStatusFn: authenticated,
+    collectSourcesFn: async () => ({ generatedAt: '2026-07-26T20:00:00Z', queries: [], sources: {
+      ats: { configured: true, status: 'healthy', count: 2, jobs: [
+        { company: 'Able', title: 'Ideal Role', url: 'https://example.test/able', providerId: 'able' },
+        { company: 'Baker', title: 'Ideal Role', url: 'https://example.test/baker', providerId: 'baker' },
+      ] },
+    } }),
+    checkLivenessFn: async (items) => ({ live: items, removed: [], summary: { checked: items.length, gone: 0, unverified: 0 } }),
+    runStructuredTurnFn: async ({ prompt, validate }) => {
+      prompted = JSON.parse(prompt.split('\n\n').at(-1)).candidates;
+      const value = assessmentFor(prompted);
+      validate(value);
+      return { value, usage: {} };
+    },
+    acquireLockFn: () => ({ ok: true, lock: { token: 'second-pass-ranked-test' } }),
+    releaseLockFn: () => ({ ok: true }),
+  });
+  assert.equal(result.ok, true);
+  assert.deepEqual(prompted.map((item) => item.candidateId), ['candidate-001']);
+  assert.deepEqual(prompted.map((item) => item.url), ['https://example.test/baker']);
+  assert.deepEqual(result.scan.selection.map((item) => item.url), prompted.map((item) => item.url));
+  assert.equal(result.scan.funnel.selected, prompted.length);
+  assert.equal(result.scan.funnel.assessed, prompted.length);
+});
+
 test('runtime scan model is independent from the job-work model', async () => {
   const root = scanRoot();
   writeWorkspaceConfig(root, {

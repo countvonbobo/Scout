@@ -363,7 +363,16 @@ export async function runScanWith(root, provider, mode, {
       closedAdverts = liveness.closed;
       staleInboxEntries = liveness.staleInboxEntries;
       livenessSummary = liveness.summary;
-      candidates = assessmentCandidatesForSelection(liveness.selected);
+      let selectedVacancies = liveness.selected;
+      if (mode === 'second-pass') {
+        const verification = verificationCandidates(
+          assessmentCandidatesForSelection(selectedVacancies), tracker, new Date().toISOString().slice(0, 10), config.triage,
+        );
+        const selectedIds = new Set(verification.candidates.map((candidate) => candidate.vacancyId));
+        selectedVacancies = selectedVacancies.filter((vacancy) => selectedIds.has(vacancy.vacancyId));
+        verificationScoped = verification.verified;
+      }
+      candidates = assessmentCandidatesForSelection(selectedVacancies);
       selection = candidates.map((candidate) => ({ url: candidate.url, vacancyId: candidate.vacancyId, preRankScore: candidate.preRankScore }));
       funnel = { ...discovery.funnel, selected: candidates.length };
     } else {
@@ -385,11 +394,14 @@ export async function runScanWith(root, provider, mode, {
         ...candidate,
         candidateId: `candidate-${String(index + 1).padStart(3, '0')}`,
       }));
-    }
-    if (mode === 'second-pass') {
-      const verification = verificationCandidates(candidates, tracker, new Date().toISOString().slice(0, 10), config.triage);
-      candidates = verification.candidates;
-      verificationScoped = verification.verified;
+      if (mode === 'second-pass') {
+        const verification = verificationCandidates(candidates, tracker, new Date().toISOString().slice(0, 10), config.triage);
+        candidates = verification.candidates.map((candidate, index) => ({
+          ...candidate,
+          candidateId: `candidate-${String(index + 1).padStart(3, '0')}`,
+        }));
+        verificationScoped = verification.verified;
+      }
     }
 
     const bundleDir = path.join(root, '.scout', 'scan-input');
@@ -440,6 +452,8 @@ export async function runScanWith(root, provider, mode, {
       const artifacts = writeScanArtifacts(root, {
         provider, mode, sources: collected?.sources || {}, queries: collected?.queries || [], candidates,
         assessmentResult: null, policy: config.triage, startedAt, error: error.message,
+        dropped, hardExcluded, closedAdverts, livenessSummary, verificationScoped, funnel, selection, discoveryEngine,
+        staleInboxEntries, inboxRechecked,
       });
       result = { ok: false, status: 'failed', error: error.message, scan: artifacts.run };
     } catch {
