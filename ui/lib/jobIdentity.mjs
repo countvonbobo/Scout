@@ -6,6 +6,10 @@ const EVIDENCE_NOISE = new Set([
 ]);
 const IDENTITY_CACHE = new WeakMap();
 
+function fieldValue(value) {
+  return value && typeof value === 'object' && 'value' in value ? value.value : value;
+}
+
 export function normaliseIdentityText(value) {
   return String(value || '').normalize('NFKD').replace(/[\u0300-\u036f]/g, '')
     .toLowerCase().replace(/&/g, ' and ').replace(/[^a-z0-9]+/g, ' ').trim().replace(/\s+/g, ' ');
@@ -51,10 +55,10 @@ export function canonicalJobUrl(value) {
 
 export function sourceReferencesOf(job) {
   const provided = Array.isArray(job?.sourceReferences) ? job.sourceReferences : [];
-  const urls = [...(Array.isArray(job?.sources) ? job.sources : []), job?.url].filter(Boolean);
+  const urls = [...(Array.isArray(job?.sources) ? job.sources : []), job?.canonicalUrl, job?.url, job?.sourceUrl].filter(Boolean);
   const references = [
     ...provided,
-    { source: job?.source, providerId: job?.providerId, url: job?.url },
+    { source: job?.source, providerId: job?.providerId || job?.sourceRecordId, url: job?.canonicalUrl || job?.url || job?.sourceUrl },
     ...urls.map((url) => ({ source: '', providerId: '', url })),
   ].map((reference) => ({
     source: normaliseIdentityText(reference?.source),
@@ -71,16 +75,18 @@ export function jobIdentity(job) {
     const cached = IDENTITY_CACHE.get(job);
     if (cached) return cached;
   }
-  const role = job?.role || job?.title;
+  const role = fieldValue(job?.role) || fieldValue(job?.title);
   const description = job?.description || job?.jobIdentity?.advertFingerprint
     || (job?.mandatoryRequirements || []).map((item) => `${item.requirement || ''} ${item.advertEvidence || ''}`).join(' ');
-  const location = job?.location || job?.jobIdentity?.location || '';
+  const location = fieldValue(job?.location) || job?.jobIdentity?.location || '';
+  const seniority = fieldValue(job?.seniority) || job?.jobIdentity?.seniority || '';
   const identity = {
-    company: companyKey(job?.company || job?.jobIdentity?.company),
+    company: companyKey(fieldValue(job?.company) || fieldValue(job?.employer) || job?.jobIdentity?.company),
     title: titleKey(role || job?.jobIdentity?.title),
     titleTokens: tokens(role || job?.jobIdentity?.title),
     location: normaliseIdentityText(location),
     locationTokens: locationTokens(location),
+    seniority: normaliseIdentityText(seniority),
     advertFingerprint: evidenceTokens(description).join(' '),
     evidenceTokens: evidenceTokens(description),
     references: sourceReferencesOf(job),
@@ -103,19 +109,24 @@ function locationsCompatible(a, b) {
 
 export function sameUnderlyingJob(left, right) {
   const a = jobIdentity(left); const b = jobIdentity(right);
+  if (!locationsCompatible(a, b)) return false;
+  if (a.seniority && b.seniority && a.seniority !== b.seniority) return false;
+  for (const first of a.references) {
+    for (const second of b.references) {
+      if (first.source && first.source === second.source && first.providerId && second.providerId && first.providerId !== second.providerId) return false;
+    }
+  }
   const urlsA = new Set(a.references.map((item) => item.url).filter(Boolean));
   if (b.references.some((item) => item.url && urlsA.has(item.url))) return true;
   for (const first of a.references) {
     for (const second of b.references) {
       if (first.source && first.source === second.source && first.providerId && second.providerId) {
         if (first.providerId === second.providerId) return true;
-        return false;
       }
     }
   }
   if (!a.company || a.company !== b.company || !a.title || !b.title) return false;
   if (a.title !== b.title && similarity(a.titleTokens, b.titleTokens) < 0.8) return false;
-  if (!locationsCompatible(a, b)) return false;
   if (a.evidenceTokens.length >= 8 && b.evidenceTokens.length >= 8) {
     return similarity(a.evidenceTokens, b.evidenceTokens) >= 0.35;
   }

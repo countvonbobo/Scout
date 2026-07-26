@@ -19,6 +19,11 @@ test('different provider IDs from one source protect distinct openings', () => {
   assert.equal(sameUnderlyingJob({ ...common, providerId: '1', url: 'https://x.test/1' }, { ...common, providerId: '2', url: 'https://x.test/2' }), false);
 });
 
+test('different IDs from one provider stay distinct even when their canonical URLs match', () => {
+  const common = { company: 'Acme', title: 'Software Engineer', location: 'London', source: 'ats-greenhouse', url: 'https://careers.acme.test/jobs/engineer', description: 'Build the same platform services.' };
+  assert.equal(sameUnderlyingJob({ ...common, providerId: '1' }, { ...common, providerId: '2' }), false);
+});
+
 test('different locations and seniority remain separate', () => {
   const common = { company: 'Acme', source: 'adzuna', description: 'Build embedded control systems for production hardware.' };
   assert.equal(sameUnderlyingJob({ ...common, title: 'Senior Engineer', location: 'London' }, { ...common, title: 'Staff Engineer', location: 'London' }), false);
