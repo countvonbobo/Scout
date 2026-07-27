@@ -344,6 +344,26 @@ test('replays a version-one journal and preserves queued work when version-two e
   }
 });
 
+test('replays a valid cross-compatibility version-one scheduled replacement before v2 append and claim', () => {
+  const root = workspace();
+  const activeLease = lease(root, 'queue-v1-replacement');
+  const oldProfile = 'c'.repeat(64);
+  try {
+    const { lease: firstLease, ...first } = request({ id: 'v1-scheduled-old', requester: 'scheduled', key: 'v1-schedule', windowAt: '2026-07-27T09:00:00.000Z', expiresAt: '2026-07-27T09:00:00.000Z', requestCompatibility: { profileFingerprint: oldProfile, configFingerprint: config, schemaVersion: 1 }, lease: activeLease });
+    const { lease: secondLease, ...second } = request({ id: 'v1-scheduled-new', requester: 'scheduled', key: 'v1-schedule', requestedAt: '2026-07-27T08:30:00.000Z', windowAt: '2026-07-27T10:00:00.000Z', expiresAt: '2026-07-27T10:00:00.000Z', lease: activeLease });
+    void firstLease; void secondLease;
+    const file = path.join(root, '.scout', 'scan-queue.jsonl');
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, `${JSON.stringify({ schemaVersion: 1, eventId: '11111111-1111-4111-8111-111111111111', type: 'enqueue', at: '2026-07-27T08:00:00.000Z', request: first })}\n${JSON.stringify({ schemaVersion: 1, eventId: '22222222-2222-4222-8222-222222222222', type: 'scheduled-replaced', at: '2026-07-27T08:30:00.000Z', request: second, supersededRequestId: first.id })}\n`, 'utf8');
+    assert.deepEqual(projectScanQueue(root).ready.map((item) => item.id), ['v1-scheduled-new']);
+    enqueueScanRequest(root, request({ id: 'v2-manual', key: 'v2-manual', lease: activeLease }));
+    assert.equal(claimNextScanRequest(root, compatibility, activeLease, new Date('2026-07-27T08:31:00.000Z')).id, 'v2-manual');
+  } finally {
+    releaseScanLease(activeLease);
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test('claims accept the reviewed scan-lease token grammar for lease IDs', () => {
   const root = workspace();
   const activeLease = acquireScanLease(root, currentLeaseOwner(), {

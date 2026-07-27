@@ -176,8 +176,11 @@ function stateFromEvents(events) {
     }
     if (record.type === 'scheduled-replaced') {
       const previous = byId.get(record.supersededRequestId);
+      const equivalent = record.legacy
+        ? previous?.requester === record.request.requester && previous?.key === record.request.key
+        : sameExecutionContract(previous, record.request);
       if (inputs.has(record.request.id) || !previous || previous.status !== 'queued' || previous.requester !== 'scheduled'
-        || record.request.requester !== 'scheduled' || !sameExecutionContract(previous, record.request) || !newerScheduled(record.request, previous)) throw new Error('scan queue scheduled replacement is invalid');
+        || record.request.requester !== 'scheduled' || !equivalent || !newerScheduled(record.request, previous)) throw new Error('scan queue scheduled replacement is invalid');
       inputs.set(record.request.id, record.request); previous.status = 'superseded'; byId.set(record.request.id, { ...record.request, status: 'queued', enqueuedAt: record.at, claim: null, completion: null }); continue;
     }
     if (record.type === 'deduplicated') {
