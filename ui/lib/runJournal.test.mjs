@@ -7,12 +7,18 @@ import { afterEach, test } from 'node:test';
 import {
   JournalCorruptionError, appendRunEvent, openRunJournal, replayRunJournal, validateRunJournal,
 } from './runJournal.mjs';
+import { acquireScanLease, currentLeaseOwner } from './scanLease.mjs';
 
 const roots = [];
 afterEach(() => { for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true }); });
-function temp() { const root = fs.mkdtempSync(path.join(os.tmpdir(), 'scout-run-journal-')); roots.push(root); return root; }
+let lease;
+function temp() {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'scout-run-journal-'));
+  roots.push(root);
+  lease = acquireScanLease(root, currentLeaseOwner(), { kind: 'scan', runId: 'run-1' });
+  return root;
+}
 
-const lease = { leaseId: 'lease-1', generation: 1 };
 const collected = {
   type: 'stage.completed', stageId: 'collect', idempotencyKey: 'collect-v1', payload: {
     schemaVersion: 1, reference: { kind: 'source', id: 'adzuna' }, count: 2, version: { kind: 'provider', value: 'adzuna' },

@@ -3,12 +3,14 @@ import path from 'node:path';
 import {
   LeaseLostError,
   acquireScanLease,
+  assertCurrentFence,
   currentLeaseOwner,
   releaseScanLease,
   startLeaseHeartbeat,
 } from '../scanLease.mjs';
 import { commitRunArtifact } from '../runArtifacts.mjs';
 import { appendRunEvent, openRunJournal } from '../runJournal.mjs';
+import { acquireScanLock, releaseScanLock } from '../../../tools/scan-lock.mjs';
 
 const pause = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
 
@@ -108,6 +110,7 @@ if (command === 'race-acquire') {
   fs.mkdirSync(guard, { recursive: true });
   fs.writeFileSync(path.join(guard, 'owner.json'), `${JSON.stringify({
     schemaVersion: 1,
+    guardId: `guard-${process.pid}`,
     owner: currentLeaseOwner(),
     acquiredAt,
   })}\n`, 'utf8');
@@ -115,6 +118,90 @@ if (command === 'race-acquire') {
   await waitFor(stop);
   fs.rmSync(guard, { recursive: true, force: true });
   write({ held: true });
+} else if (command === 'adversarial-recover') {
+  const [observed, proceed, active, release, overlap, runId, moved, resumeAfterMove] = args;
+  const lease = acquireScanLease(root, currentLeaseOwner(), operation(runId), {
+    leaseDurationMs: 5_000,
+    takeoverMarginMs: 0,
+    _testHooks: {
+      afterGuardObservation() {
+        fs.writeFileSync(observed, '', 'utf8');
+        while (!fs.existsSync(proceed)) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 5);
+      },
+      afterGuardRecoveryRename() {
+        if (!moved) return;
+        fs.writeFileSync(moved, '', 'utf8');
+        if (!resumeAfterMove) return;
+        while (!fs.existsSync(resumeAfterMove)) {
+          Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 5);
+        }
+      },
+      beforeGuardedAction() {
+        if (fs.existsSync(active)) fs.writeFileSync(overlap, '', 'utf8');
+      },
+    },
+  });
+  write({ acquired: Boolean(lease) });
+} else if (command === 'gap-contender') {
+  const [checked, proceed, active, overlap, runId] = args;
+  const lease = acquireScanLease(root, currentLeaseOwner(), operation(runId), {
+    leaseDurationMs: 5_000,
+    takeoverMarginMs: 0,
+    _testHooks: {
+      afterRecoveryCheck() {
+        fs.writeFileSync(checked, '', 'utf8');
+        while (!fs.existsSync(proceed)) {
+          Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 5);
+        }
+      },
+      beforeGuardedAction() {
+        if (fs.existsSync(active)) fs.writeFileSync(overlap, '', 'utf8');
+      },
+    },
+  });
+  write({ acquired: Boolean(lease) });
+} else if (command === 'recover-and-hold') {
+  const [entered, release, active, overlap, runId] = args;
+  const lease = acquireScanLease(root, currentLeaseOwner(), operation(runId), {
+    leaseDurationMs: 5_000,
+    takeoverMarginMs: 0,
+    _testHooks: {
+      beforeGuardedAction() {
+        if (fs.existsSync(active)) fs.writeFileSync(overlap, '', 'utf8');
+      },
+    },
+  });
+  if (!lease) throw new Error('recovery holder could not acquire');
+  assertCurrentFence(lease, () => {
+    if (fs.existsSync(active)) fs.writeFileSync(overlap, '', 'utf8');
+    fs.writeFileSync(active, '', 'utf8');
+    fs.writeFileSync(entered, '', 'utf8');
+    while (!fs.existsSync(release)) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 5);
+    fs.rmSync(active, { force: true });
+  });
+  releaseScanLease(lease);
+  write({ acquired: true });
+} else if (command === 'legacy-acquire') {
+  const [token] = args;
+  write(acquireScanLock(root, { agent: 'codex', mode: 'primary', token }));
+} else if (command === 'legacy-release') {
+  const [token] = args;
+  write(releaseScanLock(root, token));
+} else if (command === 'plain-write-after-signal') {
+  const [ready, proceed, runId] = args;
+  const run = openRunJournal(root, runId);
+  const plain = { leaseId: 'plain-worker', generation: 1, runId };
+  fs.writeFileSync(ready, '', 'utf8');
+  await waitFor(proceed);
+  try {
+    appendRunEvent(run, {
+      type: 'stage.completed', stageId: 'collect', idempotencyKey: 'plain-v1',
+      payload: { schemaVersion: 1, count: 0 },
+    }, plain);
+    write({ appended: true });
+  } catch (error) {
+    write({ appended: false, leaseLost: error instanceof LeaseLostError });
+  }
 } else if (command === 'owner') {
   write(currentLeaseOwner());
 } else {

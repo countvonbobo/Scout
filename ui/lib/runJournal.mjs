@@ -2,7 +2,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import {
-  LeaseLostError, assertCurrentFence, isScanLease, readScanLease,
+  LeaseLostError, assertCurrentFence, assertScanLeaseScope, isScanLease,
 } from './scanLease.mjs';
 import { workspacePaths } from './workspace.mjs';
 
@@ -418,10 +418,7 @@ export function appendRunEvent(handle, input, lease) {
     return event;
   };
 
-  if (isScanLease(lease)) {
-    if (lease.runId !== handle.runId) throw new LeaseLostError('scan lease does not own this run');
-    return assertCurrentFence(lease, commit);
-  }
-  if (readScanLease(handle.root)) throw new LeaseLostError('a current scan lease is required to append');
-  return commit();
+  if (!isScanLease(lease)) throw new LeaseLostError('a genuine current scan lease is required to append');
+  assertScanLeaseScope(lease, handle.root, handle.runId, handle.directory, handle.file);
+  return assertCurrentFence(lease, commit);
 }

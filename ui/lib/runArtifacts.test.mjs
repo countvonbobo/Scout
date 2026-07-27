@@ -9,15 +9,17 @@ import {
   ArtifactIntegrityError, ManifestAgreementError, commitRunArtifact, projectRunManifest,
   readRunArtifact, replaceRunManifest, validateManifestAgreement,
 } from './runArtifacts.mjs';
+import { acquireScanLease, currentLeaseOwner } from './scanLease.mjs';
 
 const roots = [];
-const lease = { leaseId: 'lease-1', generation: 1 };
+let lease;
 
 afterEach(() => { for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true }); });
 
 function temp() {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'scout-run-artifacts-'));
   roots.push(root);
+  lease = acquireScanLease(root, currentLeaseOwner(), { kind: 'scan', runId: 'run-1' });
   return root;
 }
 
@@ -49,7 +51,7 @@ function completed(run, artifact) {
 test('commits a bounded versioned artifact and reads it only when its digest matches', () => {
   const run = openRunJournal(temp(), 'run-1');
   const value = { schemaVersion: 1, stableIds: ['vacancy-1', 'vacancy-2'] };
-  const ref = commitRunArtifact(run, { id: 'collect-v1', schemaVersion: 1 }, value);
+  const ref = commitRunArtifact(run, { id: 'collect-v1', schemaVersion: 1 }, value, lease);
 
   assert.deepEqual(ref, { id: 'collect-v1', schemaVersion: 1, digest: sha256(value) });
   assert.deepEqual(readRunArtifact(ref), value);
@@ -61,7 +63,7 @@ test('rejects artifacts whose schema is not supported before writing them', () =
   const run = openRunJournal(temp(), 'run-1');
 
   assert.throws(
-    () => commitRunArtifact(run, { id: 'collect-v1', schemaVersion: 2 }, { schemaVersion: 2, stableIds: [] }),
+    () => commitRunArtifact(run, { id: 'collect-v1', schemaVersion: 2 }, { schemaVersion: 2, stableIds: [] }, lease),
     /unsupported artifact schema/i,
   );
   assert.equal(fs.existsSync(path.join(run.directory, 'artifacts')), false);
@@ -69,7 +71,7 @@ test('rejects artifacts whose schema is not supported before writing them', () =
 
 test('rebuilds a missing manifest entirely from journalled completion, compatibility, outcome, and receipt events', () => {
   const run = openRunJournal(temp(), 'run-1');
-  const artifact = commitRunArtifact(run, { id: 'collect-v1', schemaVersion: 1 }, { schemaVersion: 1, stableIds: ['vacancy-1'] });
+  const artifact = commitRunArtifact(run, { id: 'collect-v1', schemaVersion: 1 }, { schemaVersion: 1, stableIds: ['vacancy-1'] }, lease);
   completed(run, artifact);
   appendRunEvent(run, {
     type: 'run.completed', stageId: 'finalise', idempotencyKey: 'run-complete-v1',
@@ -81,7 +83,7 @@ test('rebuilds a missing manifest entirely from journalled completion, compatibi
   }, lease);
 
   const expected = projectRunManifest(run.events);
-  const result = validateManifestAgreement(run);
+  const result = validateManifestAgreement(run, lease);
 
   assert.equal(result.rebuilt, true);
   assert.deepEqual(result.manifest, expected);
@@ -90,13 +92,13 @@ test('rebuilds a missing manifest entirely from journalled completion, compatibi
 
 test('rejects a manifest that claims an artifact not referenced by the journal', () => {
   const run = openRunJournal(temp(), 'run-1');
-  const artifact = commitRunArtifact(run, { id: 'collect-v1', schemaVersion: 1 }, { schemaVersion: 1, stableIds: [] });
+  const artifact = commitRunArtifact(run, { id: 'collect-v1', schemaVersion: 1 }, { schemaVersion: 1, stableIds: [] }, lease);
   completed(run, artifact);
   const manifest = projectRunManifest(run.events);
   manifest.artifacts.push({ id: 'not-journalled', schemaVersion: 1, digest: 'b'.repeat(64) });
   fs.writeFileSync(path.join(run.directory, 'manifest.json'), `${JSON.stringify(manifest)}\n`, 'utf8');
 
-  assert.throws(() => validateManifestAgreement(run), ManifestAgreementError);
+  assert.throws(() => validateManifestAgreement(run, lease), ManifestAgreementError);
 });
 
 test('rejects raw or invented manifest content before it can be stored', () => {
@@ -106,7 +108,7 @@ test('rejects raw or invented manifest content before it can be stored', () => {
     { rawCv: 'private content' },
     { schemaVersion: 1, runId: 'run-1', artifacts: [{ id: 'invented', schemaVersion: 1, digest: 'a'.repeat(64) }] },
   ]) {
-    assert.throws(() => replaceRunManifest(run, manifest), ManifestAgreementError);
+    assert.throws(() => replaceRunManifest(run, manifest, lease), ManifestAgreementError);
   }
   assert.equal(fs.existsSync(path.join(run.directory, 'manifest.json')), false);
 });
@@ -114,13 +116,13 @@ test('rejects raw or invented manifest content before it can be stored', () => {
 test('keeps a journalled artifact readable when a later commit uses its ID with a different digest', () => {
   const run = openRunJournal(temp(), 'run-1');
   const firstValue = { schemaVersion: 1, stableIds: ['vacancy-1'] };
-  const first = commitRunArtifact(run, { id: 'collect-v1', schemaVersion: 1 }, firstValue);
+  const first = commitRunArtifact(run, { id: 'collect-v1', schemaVersion: 1 }, firstValue, lease);
   completed(run, first);
-  const second = commitRunArtifact(run, { id: 'collect-v1', schemaVersion: 1 }, { schemaVersion: 1, stableIds: ['vacancy-2'] });
+  const second = commitRunArtifact(run, { id: 'collect-v1', schemaVersion: 1 }, { schemaVersion: 1, stableIds: ['vacancy-2'] }, lease);
 
   assert.notEqual(second.digest, first.digest);
   assert.deepEqual(readRunArtifact(first), firstValue);
-  assert.equal(validateManifestAgreement(run).rebuilt, true);
+  assert.equal(validateManifestAgreement(run, lease).rebuilt, true);
 });
 
 test('rebuilds from a fully verified artifact written in the original ID-only layout', () => {
@@ -134,5 +136,5 @@ test('rebuilds from a fully verified artifact written in the original ID-only la
   completed(run, ref);
 
   assert.deepEqual(readRunArtifact({ ...run, ...ref }), value);
-  assert.equal(validateManifestAgreement(run).rebuilt, true);
+  assert.equal(validateManifestAgreement(run, lease).rebuilt, true);
 });

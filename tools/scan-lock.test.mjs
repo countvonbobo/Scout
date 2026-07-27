@@ -4,6 +4,9 @@ import os from 'node:os';
 import path from 'node:path';
 import { afterEach, test } from 'node:test';
 import { acquireScanLock, readScanLock, releaseScanLock } from './scan-lock.mjs';
+import {
+  acquireScanLease, currentLeaseOwner, releaseScanLease, renewScanLease,
+} from '../ui/lib/scanLease.mjs';
 
 const dirs = [];
 function tempRepo() {
@@ -35,4 +38,20 @@ test('scan lock recovers a lock older than two hours', () => {
   assert.equal(next.ok, true);
   assert.equal(next.recoveredStale, true);
   assert.equal(readScanLock(repo).token, 'new');
+});
+
+test('legacy status preserves durable acquisition time after sentinel refresh', () => {
+  const repo = tempRepo();
+  let wall = Date.parse('2026-07-27T10:00:00.000Z');
+  let monotonic = 0;
+  const lease = acquireScanLease(repo, currentLeaseOwner(), {
+    kind: 'scan', runId: 'run-status', provider: 'codex', mode: 'primary', phase: 'collect',
+  }, {
+    wallNow: () => wall, monotonicNow: () => monotonic, leaseDurationMs: 3 * 60 * 60 * 1000,
+  });
+  wall += 60 * 60 * 1000;
+  monotonic += 60 * 60 * 1000;
+  renewScanLease(lease);
+  assert.equal(readScanLock(repo).startedAt, '2026-07-27T10:00:00.000Z');
+  releaseScanLease(lease);
 });

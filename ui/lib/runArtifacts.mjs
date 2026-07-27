@@ -4,7 +4,7 @@ import path from 'node:path';
 import { atomicWriteFile } from './atomicWrite.mjs';
 import { validateRunJournal } from './runJournal.mjs';
 import {
-  LeaseLostError, assertCurrentFence, isScanLease, readScanLease,
+  LeaseLostError, assertCurrentFence, assertScanLeaseScope, isScanLease,
 } from './scanLease.mjs';
 
 export const RUN_ARTIFACT_SCHEMA_VERSION = 1;
@@ -101,19 +101,10 @@ function referenceFor(directory, descriptor, value) {
   return ref;
 }
 
-function workspaceRootForRun(run) {
-  return path.resolve(requireRunDirectory(run?.directory), '..', '..', '..');
-}
-
 function commitWithFence(run, lease, commit) {
-  if (isScanLease(lease)) {
-    if (lease.runId !== run?.runId) throw new LeaseLostError('scan lease does not own this run');
-    return assertCurrentFence(lease, commit);
-  }
-  if (readScanLease(workspaceRootForRun(run))) {
-    throw new LeaseLostError('a current scan lease is required to commit an artifact');
-  }
-  return commit();
+  if (!isScanLease(lease)) throw new LeaseLostError('a genuine current scan lease is required to commit an artifact');
+  assertScanLeaseScope(lease, run?.root, run?.runId, run?.directory, run?.file);
+  return assertCurrentFence(lease, commit);
 }
 
 function directoryForReference(ref, ErrorType = ArtifactIntegrityError) {

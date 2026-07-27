@@ -1,4 +1,5 @@
 import crypto from 'node:crypto';
+import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { isMainModule } from '../ui/lib/mainModule.mjs';
@@ -6,11 +7,11 @@ import {
   acquireScanLease,
   currentLeaseOwner,
   readScanLease,
-  releaseScanLease,
+  releaseScanLeaseByToken,
 } from '../ui/lib/scanLease.mjs';
 import { resolveWorkspaceRoot } from '../ui/lib/workspace.mjs';
 
-export const LOCK_FILE = path.join('.scout', 'scan-lease.json');
+export const LOCK_FILE = '.scout-scan.lock';
 export const STALE_AFTER_MS = 2 * 60 * 60 * 1000;
 
 export function scanLockPath(repoRoot) {
@@ -19,11 +20,32 @@ export function scanLockPath(repoRoot) {
 
 export function readScanLock(repoRoot) {
   try {
+    const legacyFile = scanLockPath(repoRoot);
+    if (fs.existsSync(legacyFile)) {
+      const legacy = JSON.parse(fs.readFileSync(legacyFile, 'utf8'));
+      if (legacy.fencedLease === true) {
+        const lease = readScanLease(repoRoot);
+        if (lease) {
+          return {
+            agent: lease.operation.provider ?? lease.operation.kind,
+            mode: lease.operation.mode ?? lease.operation.kind,
+            token: lease.leaseId,
+            startedAt: lease.acquiredAt,
+          };
+        }
+      }
+      return {
+        agent: legacy.agent,
+        mode: legacy.mode,
+        token: legacy.token,
+        startedAt: legacy.startedAt,
+      };
+    }
     const lease = readScanLease(repoRoot);
     if (!lease) return null;
     return {
-      agent: lease.operation.provider,
-      mode: lease.operation.mode,
+      agent: lease.operation.provider ?? lease.operation.kind,
+      mode: lease.operation.mode ?? lease.operation.kind,
       token: lease.leaseId,
       startedAt: lease.acquiredAt,
     };
@@ -40,7 +62,7 @@ export function acquireScanLock(repoRoot, {
   token = crypto.randomUUID(),
 } = {}) {
   if (!agent || !mode) throw new Error('agent and mode are required');
-  const previous = readScanLease(repoRoot);
+  const previous = readScanLock(repoRoot);
   const lease = acquireScanLease(repoRoot, currentLeaseOwner(), {
     kind: 'scan',
     runId: `legacy-${crypto.randomUUID()}`,
@@ -62,11 +84,13 @@ export function acquireScanLock(repoRoot, {
 }
 
 export function releaseScanLock(repoRoot, token) {
-  const current = readScanLease(repoRoot);
+  const current = readScanLock(repoRoot);
   if (!current) return { ok: true, released: false };
-  if (!token || current.leaseId !== token) return { ok: false, reason: 'token-mismatch', lock: readScanLock(repoRoot) };
+  if (!token || current.token !== token) return { ok: false, reason: 'token-mismatch', lock: current };
   try {
-    releaseScanLease({ ...current, root: path.resolve(repoRoot) });
+    if (!releaseScanLeaseByToken(repoRoot, token)) {
+      return { ok: false, reason: 'token-mismatch', lock: readScanLock(repoRoot) };
+    }
     return { ok: true, released: true };
   } catch {
     return { ok: false, reason: 'token-mismatch', lock: readScanLock(repoRoot) };
