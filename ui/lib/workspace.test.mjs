@@ -39,6 +39,13 @@ test('workspace paths reserve the search-profile artifacts under profile/search'
   assert.match(paths.profileContext, /profile[\\/]context\.md$/);
 });
 
+test('workspace paths reserve private per-run journal directories without changing legacy paths', () => {
+  const root = temp();
+  const paths = workspacePaths(root);
+  assert.equal(paths.runs, path.join(root, '.scout', 'runs'));
+  assert.equal(paths.scanRuns, path.join(root, 'data', 'scan-runs.jsonl'));
+});
+
 test('search-profile migration backups use a distinct reviewable label', () => {
   const root = temp();
   fs.writeFileSync(path.join(root, 'workspace.json'), '{"schemaVersion":2}\n');

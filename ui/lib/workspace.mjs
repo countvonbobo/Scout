@@ -107,6 +107,7 @@ export function workspacePaths(root) {
     imports: path.join(workspaceRoot, 'imports'),
     logs: path.join(workspaceRoot, 'logs'),
     backups: path.join(workspaceRoot, '.scout', 'backups'),
+    runs: path.join(workspaceRoot, '.scout', 'runs'),
   });
 }
 
@@ -228,7 +229,7 @@ export function writeWorkspaceConfig(root, config) {
 
 export function ensureWorkspaceDirectories(root) {
   const p = workspacePaths(root);
-  for (const dir of [p.root, p.profile, p.cv, path.dirname(p.tracker), p.reports, p.applications, p.imports, p.logs, p.backups]) {
+  for (const dir of [p.root, p.profile, p.cv, path.dirname(p.tracker), p.reports, p.applications, p.imports, p.logs, p.backups, p.runs]) {
     fs.mkdirSync(dir, { recursive: true });
   }
   return p;
