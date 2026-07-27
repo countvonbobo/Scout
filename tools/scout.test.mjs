@@ -333,11 +333,27 @@ test('closed selected adverts are replaced by the next ranked eligible vacancy',
 
 test('a failed ranked scan retains its discovery engine and available orchestration state', async () => {
   const root = scanRoot();
-  enableRankedDiscovery(root);
+  const published = publishSearchProfile({
+    version: 1,
+    status: 'draft',
+    target: { primaryTitles: [{ value: 'Ideal Role', strength: 'strong-preference', provenance: 'explicit' }] },
+    negative: {
+      excludedTitles: [{ value: 'Blocked Role', strength: 'hard-exclusion', provenance: 'explicit' }],
+      excludedEmployers: [{ value: 'Blocked Co', strength: 'hard-exclusion', provenance: 'explicit' }],
+    },
+    compensation: {
+      currency: null, period: 'year', minimum: null, minimumStrength: 'neutral', unknownPolicy: 'include',
+    },
+  }, { publishedAt: '2026-07-26T20:00:00.000Z' });
+  fs.mkdirSync(path.join(root, 'profile', 'search'), { recursive: true });
+  fs.writeFileSync(path.join(root, 'profile', 'search', 'published.json'), `${JSON.stringify(published)}\n`);
   const result = await runScanWith(root, 'codex', 'primary', {
     providerStatusFn: authenticated,
     collectSourcesFn: async () => ({ generatedAt: '2026-07-26T20:00:00Z', queries: [], sources: {
-      ats: { configured: true, status: 'healthy', count: 1, jobs: [{ company: 'Able', title: 'Ideal Role', url: 'https://example.test/failed-ranked', providerId: 'failed-ranked' }] },
+      ats: { configured: true, status: 'healthy', count: 2, jobs: [
+        { company: 'Able', title: 'Ideal Role', url: 'https://example.test/failed-ranked', providerId: 'failed-ranked' },
+        { company: 'Blocked Co', title: 'Blocked Role', url: 'https://example.test/blocked-ranked', providerId: 'blocked-ranked' },
+      ] },
     } }),
     checkLivenessFn: async (items) => ({ live: items, removed: [], summary: { checked: items.length, gone: 0, unverified: 0 } }),
     runStructuredTurnFn: async () => { throw new Error('ranked provider failure'); },
@@ -348,7 +364,12 @@ test('a failed ranked scan retains its discovery engine and available orchestrat
   assert.equal(result.scan.discovery_engine, 'ranked-discovery');
   assert.equal(result.scan.funnel.selected, 1);
   assert.deepEqual(result.scan.selection.map((item) => item.url), ['https://example.test/failed-ranked']);
-  assert.equal(result.scan.discarded.hard_exclusion, 0);
+  assert.equal(result.scan.profile_id, published.id);
+  assert.equal(result.scan.discarded.hard_exclusion, 1);
+  assert.deepEqual(
+    result.scan.explanations.filter((item) => item.deterministic_exclusion).map((item) => item.deterministic_exclusion).sort(),
+    ['excluded-employer', 'excluded-title'],
+  );
   assert.equal(result.scan.adverts_checked, 1);
 });
 

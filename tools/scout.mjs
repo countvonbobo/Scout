@@ -350,13 +350,14 @@ export async function runScanWith(root, provider, mode, {
   let inboxRechecked = 0;
   let verificationScoped = false;
   let discovery = null;
+  let publishedProfile = null;
   let funnel = null;
   let selection = [];
   let discoveryEngine = 'legacy-discovery';
   try {
     onProgress({ phase: 'Collecting current opportunities', current: 2, total: 5 });
     collected = await collectSourcesFn(root, config, { broadened: mode === 'broadened' });
-    const publishedProfile = loadPublishedSearchProfile(root);
+    publishedProfile = loadPublishedSearchProfile(root);
     const tracker = JSON.parse(fs.readFileSync(workspacePaths(root).tracker, 'utf8'));
     if (publishedProfile) {
       discovery = prepareRankedDiscovery({
@@ -465,6 +466,7 @@ export async function runScanWith(root, provider, mode, {
         provider, mode, sources: collected?.sources || {}, queries: collected?.queries || [], candidates,
         assessmentResult: null, policy: config.triage, startedAt, error: error.message,
         dropped, hardExcluded, closedAdverts, livenessSummary, verificationScoped, funnel, selection, discoveryEngine,
+        exclusions: discovery?.exclusions || [], profileId: publishedProfile?.id || null,
         staleInboxEntries, inboxRechecked,
       });
       result = { ok: false, status: 'failed', error: error.message, scan: artifacts.run };
