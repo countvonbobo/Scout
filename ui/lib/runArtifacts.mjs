@@ -9,7 +9,7 @@ import {
 } from './scanLease.mjs';
 
 export const RUN_ARTIFACT_SCHEMA_VERSION = 1;
-export const RUN_MANIFEST_SCHEMA_VERSION = 1;
+export const RUN_MANIFEST_SCHEMA_VERSION = 2;
 
 const MAX_ARTIFACT_BYTES = 16 * 1024;
 const MAX_STABLE_IDS = 128;
@@ -209,10 +209,14 @@ export function projectRunManifest(events) {
   const compatibility = {};
   const completedWork = [];
   const receipts = [];
+  const recoveryDecisions = [];
+  const providerSubstitutions = [];
   let outcome = 'in-progress';
 
   for (const event of events) {
-    if (event.type === 'stage.completed') {
+    if (event.type === 'run.started') {
+      Object.assign(compatibility, event.payload.compatibility);
+    } else if (event.type === 'stage.completed') {
       const work = { sequence: event.sequence, stageId: event.stageId };
       for (const key of ['reference', 'count', 'version', 'artifact']) {
         if (event.payload?.[key] !== undefined) work[key] = event.payload[key];
@@ -225,6 +229,26 @@ export function projectRunManifest(events) {
       if (event.payload?.compatibility) compatibility[event.payload.compatibility.kind] = event.payload.compatibility.value;
     } else if (event.type === 'mutation.receipted') {
       receipts.push({ sequence: event.sequence, stageId: event.stageId, reference: event.payload?.reference, digest: event.payload?.digest });
+    } else if (event.type === 'recovery.stage-decided') {
+      const decision = {
+        sequence: event.sequence,
+        stageId: event.stageId,
+        action: event.payload.action,
+        reason: event.payload.reason,
+      };
+      if (event.payload.artifact) {
+        decision.artifact = event.payload.artifact;
+        addArtifact(artifacts, event.payload.artifact);
+      }
+      recoveryDecisions.push(decision);
+    } else if (event.type === 'recovery.provider-substituted') {
+      providerSubstitutions.push({
+        sequence: event.sequence,
+        previousProvider: event.payload.previousProvider,
+        previousModel: event.payload.previousModel,
+        nextProvider: event.payload.nextProvider,
+        nextModel: event.payload.nextModel,
+      });
     }
   }
 
@@ -238,6 +262,8 @@ export function projectRunManifest(events) {
     completedWork,
     artifacts,
     receipts,
+    recoveryDecisions,
+    providerSubstitutions,
   };
 }
 
@@ -268,6 +294,18 @@ function manifestsMatch(actual, expected) {
   }
 }
 
+function projectPriorRunManifest(events) {
+  const current = projectRunManifest(events);
+  if (current.recoveryDecisions.length || current.providerSubstitutions.length) return null;
+  const {
+    recoveryDecisions: _recoveryDecisions,
+    providerSubstitutions: _providerSubstitutions,
+    ...prior
+  } = current;
+  prior.schemaVersion = 1;
+  return prior;
+}
+
 function validateProjectedArtifacts(run, manifest) {
   for (const artifact of manifest.artifacts) readRunArtifact({ ...artifact, directory: run.directory });
 }
@@ -289,12 +327,19 @@ export function validateManifestAgreement(run, lease) {
     throw new ManifestAgreementError(`manifest cannot be read: ${error.message}`);
   }
   if (manifestsMatch(actual, expected)) return { manifest: expected, rebuilt: false };
-
-  const sequence = actual?.lastValidatedSequence;
-  if (Number.isSafeInteger(sequence) && sequence >= 0 && sequence < state.events.length
-    && manifestsMatch(actual, projectRunManifest(state.events.slice(0, sequence)))) {
+  if (actual?.schemaVersion === 1 && manifestsMatch(actual, projectPriorRunManifest(state.events))) {
     replaceRunManifest(run, expected, lease);
     return { manifest: expected, rebuilt: true };
+  }
+
+  const sequence = actual?.lastValidatedSequence;
+  if (Number.isSafeInteger(sequence) && sequence >= 0 && sequence < state.events.length) {
+    const prefix = state.events.slice(0, sequence);
+    if (manifestsMatch(actual, projectRunManifest(prefix))
+      || (actual?.schemaVersion === 1 && manifestsMatch(actual, projectPriorRunManifest(prefix)))) {
+      replaceRunManifest(run, expected, lease);
+      return { manifest: expected, rebuilt: true };
+    }
   }
   throw new ManifestAgreementError('manifest does not agree with the validated journal');
 }

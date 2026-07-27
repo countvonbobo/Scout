@@ -1,6 +1,12 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { pipeline, applicationSummary, emptyTrackerView } from './pipeline.mjs';
+import {
+  RECOVERABLE_PIPELINE_STAGES,
+  applicationSummary,
+  emptyTrackerView,
+  pipeline,
+  recoveryRequirementsForStage,
+} from './pipeline.mjs';
 import { triage } from './derive.mjs';
 
 const entry = (over) => ({
@@ -121,4 +127,23 @@ test('shortlisted roles report a last-checked date', () => {
   ] };
   const result = pipeline(data, '2026-07-25', {});
   assert.equal(result.shortlist[0].lastChecked, '2026-07-20');
+});
+
+test('recovery stage contracts keep provider provenance out of deterministic stages', () => {
+  assert.deepEqual(RECOVERABLE_PIPELINE_STAGES.map((stage) => stage.id), [
+    'collect', 'normalise', 'deduplicate', 'filter', 'rank', 'select', 'assess', 'tracker', 'report',
+  ]);
+  for (const stageId of ['collect', 'normalise', 'deduplicate', 'filter', 'rank', 'select']) {
+    const required = recoveryRequirementsForStage(stageId);
+    assert.ok(required.includes('pipelineVersion'));
+    assert.ok(!required.includes('provider'));
+    assert.ok(!required.includes('model'));
+  }
+  assert.ok(recoveryRequirementsForStage('rank').includes('rankingVersion'));
+  assert.ok(recoveryRequirementsForStage('assess').includes('provider'));
+  assert.ok(recoveryRequirementsForStage('assess').includes('model'));
+  assert.ok(recoveryRequirementsForStage('assess').includes('promptVersion'));
+  assert.ok(recoveryRequirementsForStage('tracker').includes('targetRevision'));
+  assert.ok(recoveryRequirementsForStage('report').includes('mutationSchemaVersion'));
+  assert.throws(() => recoveryRequirementsForStage('raw-provider-output'), /unknown recovery stage/i);
 });

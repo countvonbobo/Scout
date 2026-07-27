@@ -16,6 +16,12 @@ const SHA256 = /^[a-f0-9]{64}$/;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const WINDOWS_RESERVED_RUN_IDS = new Set(['CON', 'PRN', 'AUX', 'NUL', ...Array.from({ length: 9 }, (_, index) => `COM${index + 1}`), ...Array.from({ length: 9 }, (_, index) => `LPT${index + 1}`)]);
 const EVENT_PAYLOAD_SCHEMAS = Object.freeze({
+  'run.started': Object.freeze({
+    1: Object.freeze({
+      allowed: Object.freeze(new Set(['schemaVersion', 'compatibility'])),
+      required: Object.freeze(new Set(['schemaVersion', 'compatibility'])),
+    }),
+  }),
   'stage.completed': Object.freeze({
     1: Object.freeze({
       allowed: Object.freeze(new Set(['schemaVersion', 'reference', 'count', 'version', 'artifact'])),
@@ -34,10 +40,55 @@ const EVENT_PAYLOAD_SCHEMAS = Object.freeze({
       required: Object.freeze(new Set(['schemaVersion', 'reference', 'digest'])),
     }),
   }),
+  'recovery.stage-decided': Object.freeze({
+    1: Object.freeze({
+      allowed: Object.freeze(new Set(['schemaVersion', 'action', 'reason', 'artifact'])),
+      required: Object.freeze(new Set(['schemaVersion', 'action', 'reason'])),
+    }),
+  }),
+  'recovery.provider-substituted': Object.freeze({
+    1: Object.freeze({
+      allowed: Object.freeze(new Set([
+        'schemaVersion', 'previousProvider', 'previousModel', 'nextProvider', 'nextModel',
+      ])),
+      required: Object.freeze(new Set([
+        'schemaVersion', 'previousProvider', 'previousModel', 'nextProvider', 'nextModel',
+      ])),
+    }),
+  }),
 });
 const REFERENCE_KINDS = new Set(['source', 'vacancy', 'selection', 'stage', 'batch', 'mutation']);
 const VERSION_KINDS = new Set(['provider', 'model', 'pipeline', 'profile', 'configuration', 'prompt', 'schema']);
 const RUN_OUTCOMES = new Set(['complete', 'partial', 'abandoned', 'failed']);
+const RECOVERY_ACTIONS = new Set(['reuse', 'restart']);
+const RECOVERY_REASONS = new Set([
+  'compatible',
+  'artifact-reference-missing',
+  'ranking-version-mismatch',
+  'prompt-version-mismatch',
+  'assessment-schema-version-mismatch',
+  'provider-substituted',
+  'upstream-stage-restarted',
+  'mutation-schema-version-mismatch',
+  'target-revision-mismatch',
+]);
+const RECOVERY_COMPATIBILITY_FIELDS = Object.freeze([
+  'artifactSchemaVersion',
+  'assessmentSchemaVersion',
+  'journalSchemaVersion',
+  'mode',
+  'model',
+  'mutationSchemaVersion',
+  'pipelineVersion',
+  'profileVersion',
+  'promptVersion',
+  'provider',
+  'purpose',
+  'rankingVersion',
+  'schemaVersion',
+  'sourceConfigFingerprint',
+  'targetRevision',
+]);
 
 export class JournalCorruptionError extends Error {
   constructor(message) {
@@ -121,6 +172,27 @@ function validateArtifactReference(value, ErrorType) {
   }
 }
 
+function validateRecoveryCompatibility(value, ErrorType) {
+  const compatibility = requireExactKeys(value, RECOVERY_COMPATIBILITY_FIELDS, 'compatibility', ErrorType);
+  if (compatibility.schemaVersion !== 1) throw new ErrorType('unsupported journal recovery compatibility schema');
+  for (const key of [
+    'artifactSchemaVersion', 'assessmentSchemaVersion', 'journalSchemaVersion', 'mutationSchemaVersion',
+  ]) {
+    if (!Number.isSafeInteger(compatibility[key]) || compatibility[key] < 1) {
+      throw new ErrorType(`journal recovery compatibility ${key} is invalid`);
+    }
+  }
+  for (const key of [
+    'mode', 'model', 'pipelineVersion', 'profileVersion', 'promptVersion',
+    'provider', 'purpose', 'rankingVersion', 'targetRevision',
+  ]) {
+    requireSafeToken(compatibility[key], `recovery compatibility ${key}`, ErrorType);
+  }
+  if (typeof compatibility.sourceConfigFingerprint !== 'string' || !SHA256.test(compatibility.sourceConfigFingerprint)) {
+    throw new ErrorType('journal recovery compatibility source/config fingerprint is invalid');
+  }
+}
+
 function validatePayload(type, payload, ErrorType = TypeError) {
   const value = requirePlainObject(payload, 'payload', ErrorType);
   const schema = EVENT_PAYLOAD_SCHEMAS[type]?.[value.schemaVersion];
@@ -135,9 +207,26 @@ function validatePayload(type, payload, ErrorType = TypeError) {
   if (value.count !== undefined && (!Number.isSafeInteger(value.count) || value.count < 0)) throw new ErrorType('journal payload count must be a non-negative whole number');
   if (value.version !== undefined) validateVersion(value.version, ErrorType);
   if (value.artifact !== undefined) validateArtifactReference(value.artifact, ErrorType);
-  if (value.compatibility !== undefined) validateVersion(value.compatibility, ErrorType);
+  if (value.compatibility !== undefined) {
+    if (type === 'run.started') validateRecoveryCompatibility(value.compatibility, ErrorType);
+    else validateVersion(value.compatibility, ErrorType);
+  }
   if (value.outcome !== undefined && !RUN_OUTCOMES.has(value.outcome)) throw new ErrorType('journal payload outcome is invalid');
   if (value.digest !== undefined && (typeof value.digest !== 'string' || !SHA256.test(value.digest))) throw new ErrorType('journal payload digest is invalid');
+  if (type === 'recovery.stage-decided') {
+    if (!RECOVERY_ACTIONS.has(value.action)) throw new ErrorType('journal recovery action is invalid');
+    if (!RECOVERY_REASONS.has(value.reason)) throw new ErrorType('journal recovery reason is invalid');
+    if (value.action === 'reuse' && value.reason !== 'compatible') throw new ErrorType('journal recovery reuse reason is invalid');
+    if (value.action === 'restart' && value.reason === 'compatible') throw new ErrorType('journal recovery restart reason is invalid');
+  }
+  if (type === 'recovery.provider-substituted') {
+    for (const key of ['previousProvider', 'previousModel', 'nextProvider', 'nextModel']) {
+      requireSafeToken(value[key], `recovery substitution ${key}`, ErrorType);
+    }
+    if (value.previousProvider === value.nextProvider && value.previousModel === value.nextModel) {
+      throw new ErrorType('journal recovery substitution does not change provenance');
+    }
+  }
   let encoded;
   try {
     encoded = stableJson(payload);
@@ -317,6 +406,10 @@ export function validateRunJournal(file) {
       throw corrupt(`journal entry ${index + 1} is invalid JSON`);
     }
     validateEvent(event, { runId, sequence: index + 1, previousHash });
+    if (event.type === 'run.started' && index !== 0) throw corrupt('journal run start must be the first event');
+    if (event.type.startsWith('recovery.') && !events.some((candidate) => candidate.type === 'run.started')) {
+      throw corrupt('journal recovery event requires a versioned run start');
+    }
     if (eventIds.has(event.eventId)) throw corrupt('journal event ID is duplicated');
     if (idempotencyKeys.has(event.idempotencyKey)) throw corrupt('journal idempotency key is duplicated');
     eventIds.add(event.eventId);
@@ -394,6 +487,12 @@ export function appendRunEvent(handle, input, lease) {
     if (existing) {
       if (sameIdempotentInput(existing, { type, stageId, payload: input.payload })) return existing;
       throw new Error(`journal idempotency key conflicts: ${idempotencyKey}`);
+    }
+    if (type === 'run.started' && state.events.length !== 0) {
+      throw new Error('journal run start must be the first event');
+    }
+    if (type.startsWith('recovery.') && !state.events.some((event) => event.type === 'run.started')) {
+      throw new Error('journal recovery event requires a versioned run start');
     }
 
     const event = {

@@ -138,3 +138,28 @@ test('rebuilds from a fully verified artifact written in the original ID-only la
   assert.deepEqual(readRunArtifact({ ...run, ...ref }), value);
   assert.equal(validateManifestAgreement(run, lease).rebuilt, true);
 });
+
+test('rebuilds the prior manifest schema after the additive recovery projection upgrade', () => {
+  const run = openRunJournal(temp(), 'run-1');
+  const artifact = commitRunArtifact(
+    run,
+    { id: 'collect-v1', schemaVersion: 1 },
+    { schemaVersion: 1, stableIds: ['vacancy-1'] },
+    lease,
+  );
+  completed(run, artifact);
+  const current = projectRunManifest(run.events);
+  const {
+    recoveryDecisions: _recoveryDecisions,
+    providerSubstitutions: _providerSubstitutions,
+    ...prior
+  } = current;
+  prior.schemaVersion = 1;
+  fs.writeFileSync(path.join(run.directory, 'manifest.json'), `${canonicalJson(prior)}\n`, 'utf8');
+
+  const result = validateManifestAgreement(run, lease);
+
+  assert.equal(result.rebuilt, true);
+  assert.equal(result.manifest.schemaVersion, 2);
+  assert.deepEqual(JSON.parse(fs.readFileSync(path.join(run.directory, 'manifest.json'), 'utf8')), result.manifest);
+});

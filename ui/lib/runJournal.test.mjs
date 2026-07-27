@@ -226,3 +226,43 @@ test('fails closed when a complete final event has a changed event hash', () => 
 
   assert.throws(() => validateRunJournal(journal.file), JournalCorruptionError);
 });
+
+test('rejects recovery lifecycle events before they can create an invalid journal order', () => {
+  let journal = openRunJournal(temp(), 'run-1');
+  appendRunEvent(journal, collected, lease);
+  assert.throws(() => appendRunEvent(journal, {
+    type: 'run.started',
+    stageId: 'initialise',
+    idempotencyKey: 'late-start-v1',
+    payload: {
+      schemaVersion: 1,
+      compatibility: {
+        schemaVersion: 1,
+        mode: 'primary',
+        purpose: 'scheduled-discovery',
+        profileVersion: 'profile-v1',
+        sourceConfigFingerprint: 'a'.repeat(64),
+        journalSchemaVersion: 1,
+        artifactSchemaVersion: 1,
+        pipelineVersion: 'pipeline-v1',
+        rankingVersion: 'ranking-v1',
+        promptVersion: 'prompt-v1',
+        assessmentSchemaVersion: 1,
+        provider: 'codex',
+        model: 'gpt-5',
+        mutationSchemaVersion: 1,
+        targetRevision: 'tracker-v1',
+      },
+    },
+  }, lease), /first event/i);
+  assert.deepEqual(replayRunJournal(journal.file), [journal.events[0]]);
+
+  journal = openRunJournal(temp(), 'run-1');
+  assert.throws(() => appendRunEvent(journal, {
+    type: 'recovery.stage-decided',
+    stageId: 'collect',
+    idempotencyKey: 'early-recovery-v1',
+    payload: { schemaVersion: 1, action: 'reuse', reason: 'compatible' },
+  }, lease), /run start/i);
+  assert.equal(fs.existsSync(journal.file), false);
+});
