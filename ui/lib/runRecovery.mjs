@@ -433,7 +433,13 @@ function appendDiagnosticRecord(file, identityKey, validateRecord, lease, makeRe
     const pending = makeRecord();
     const existing = state.events.find((event) => event[identityKey] === pending[identityKey]);
     if (existing) {
-      const canonical = ({ eventId: _eventId, recordedAt: _recordedAt, ...record }) => stableJson(record);
+      const canonical = ({
+        eventId: _eventId,
+        recordedAt: _recordedAt,
+        leaseId: _leaseId,
+        fencingGeneration: _fencingGeneration,
+        ...record
+      }) => stableJson(record);
       if (canonical(existing) !== canonical(pending)) {
         throw new Error('recovery diagnostic identity conflicts with a different canonical payload');
       }

@@ -182,14 +182,58 @@ test('atomically invalidates stale work from a version-two recovery start before
         previousProvider: 'codex', previousModel: 'gpt-5',
         nextProvider: 'claude', nextModel: 'sonnet-4',
       },
-      decisions: [{ stageId: 'collect', action: 'restart', reason: 'provider-substituted', artifact }],
+      decisions: [{ stageId: 'collect', action: 'reuse', reason: 'compatible', artifact }],
     },
   }, lease);
 
   const manifest = projectRunManifest(run.events);
-  assert.deepEqual(manifest.completedWork, []);
+  assert.deepEqual(manifest.completedWork.map(({ stageId }) => stageId), ['collect']);
   assert.equal(manifest.compatibility.provider, 'claude');
   assert.equal(manifest.providerSubstitutions.length, 1);
+});
+
+test('rejects hostile atomic plans that relabel provider or version provenance', () => {
+  const cases = [
+    {
+      runId: 'run-hostile-provider',
+      completed: 'assess',
+      next: compatibility({ provider: 'claude', model: 'sonnet-4' }),
+      substitution: null,
+      stageId: 'assess',
+      action: 'reuse',
+      reason: 'compatible',
+    },
+    {
+      runId: 'run-hostile-ranking',
+      completed: 'rank',
+      next: compatibility({ rankingVersion: 'ranking-v5' }),
+      substitution: null,
+      stageId: 'rank',
+      action: 'reuse',
+      reason: 'compatible',
+    },
+  ];
+  for (const hostile of cases) {
+    const root = temp();
+    const run = openRunJournal(root, hostile.runId);
+    const lease = acquireScanLease(root, currentLeaseOwner(), operation(run.runId));
+    appendStarted(run, lease);
+    appendThrough(run, lease, hostile.completed);
+    const artifact = projectRunManifest(run.events).completedWork
+      .find(({ stageId }) => stageId === hostile.stageId).artifact;
+    appendRunEvent(run, {
+      type: 'recovery.started', stageId: 'run', idempotencyKey: 'hostile-atomic-plan',
+      payload: {
+        schemaVersion: 2,
+        compatibility: hostile.next,
+        requestFingerprint: digest('e'),
+        selectionFingerprint: digest('f'),
+        providerSubstitution: hostile.substitution,
+        decisions: [{ stageId: hostile.stageId, action: hostile.action, reason: hostile.reason, artifact }],
+      },
+    }, lease);
+    assert.throws(() => projectRunManifest(run.events), ManifestAgreementError);
+  }
 });
 
 test('replays sparse schema-one completions and old-style recovery before a new lifecycle', () => {
@@ -197,7 +241,7 @@ test('replays sparse schema-one completions and old-style recovery before a new 
   const run = openRunJournal(root, 'run-old-recovery');
   const lease = acquireScanLease(root, currentLeaseOwner(), operation(run.runId));
   appendStarted(run, lease);
-  appendStage(run, lease, 'collect');
+  const collectArtifact = appendStage(run, lease, 'collect');
   const rankArtifact = appendStage(run, lease, 'rank');
   appendRunEvent(run, {
     type: 'recovery.provider-substituted', stageId: 'assess', idempotencyKey: 'old-substitution',
@@ -219,11 +263,18 @@ test('replays sparse schema-one completions and old-style recovery before a new 
     type: 'recovery.started', stageId: 'run', idempotencyKey: 'new-atomic-recovery',
     payload: {
       schemaVersion: 2,
-      compatibility: compatibility({ rankingVersion: 'ranking-v5' }),
+      compatibility: compatibility({
+        rankingVersion: 'ranking-v5',
+        provider: 'claude',
+        model: 'sonnet-4',
+      }),
       requestFingerprint: digest('c'),
       selectionFingerprint: digest('d'),
       providerSubstitution: null,
-      decisions: [{ stageId: 'rank', action: 'restart', reason: 'ranking-version-mismatch', artifact: rankArtifact }],
+      decisions: [
+        { stageId: 'collect', action: 'reuse', reason: 'compatible', artifact: collectArtifact },
+        { stageId: 'rank', action: 'restart', reason: 'ranking-version-mismatch', artifact: rankArtifact },
+      ],
     },
   }, lease);
   assert.deepEqual(projectRunManifest(run.events).completedWork.map(({ stageId }) => stageId), ['collect']);
@@ -622,6 +673,37 @@ test('selection persistence is mandatory and substitution provenance changes its
   assert.notEqual(denied.selectionId, allowed.selectionId);
   assert.equal(denied.candidate, null);
   assert.equal(allowed.candidate.runId, 'run-codex');
+});
+
+test('acknowledges an exact durable selection retry under a successor lease', () => {
+  const root = temp();
+  const candidates = [candidate('run-successor', '2026-07-27T09:00:00.000Z')];
+  let lease = acquireScanLease(root, currentLeaseOwner(), operation('selection-successor'));
+  const first = selectRecoverableRun(candidates, compatibility(), { root, lease });
+  releaseScanLease(lease);
+  lease = acquireScanLease(root, currentLeaseOwner(), operation('selection-successor'));
+  const second = selectRecoverableRun(candidates, compatibility(), { root, lease });
+  const records = fs.readFileSync(path.join(root, '.scout', 'recovery-selections.jsonl'), 'utf8')
+    .trimEnd().split(/\r?\n/);
+
+  assert.equal(second.selectionId, first.selectionId);
+  assert.equal(second.candidate.runId, first.candidate.runId);
+  assert.equal(records.length, 1);
+  assert.notEqual(lease.generation, JSON.parse(records[0]).fencingGeneration);
+
+  const conflicting = JSON.parse(records[0]);
+  conflicting.selectedRunId = null;
+  fs.writeFileSync(
+    path.join(root, '.scout', 'recovery-selections.jsonl'),
+    `${JSON.stringify(conflicting)}\n`,
+    'utf8',
+  );
+  releaseScanLease(lease);
+  lease = acquireScanLease(root, currentLeaseOwner(), operation('selection-successor'));
+  assert.throws(
+    () => selectRecoverableRun(candidates, compatibility(), { root, lease }),
+    /identity conflicts/i,
+  );
 });
 
 test('skips malformed and unsupported candidates durably instead of aborting older compatible selection', () => {

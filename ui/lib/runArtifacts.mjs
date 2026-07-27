@@ -2,7 +2,7 @@ import { createHash } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { atomicWriteFile } from './atomicWrite.mjs';
-import { RECOVERABLE_PIPELINE_STAGES } from './pipeline.mjs';
+import { RECOVERABLE_PIPELINE_STAGES, recoveryRequirementsForStage } from './pipeline.mjs';
 import { validateRunJournal } from './runJournal.mjs';
 import {
   LeaseLostError, assertCurrentFence, assertScanLeaseScope, isScanLease,
@@ -204,6 +204,76 @@ function addArtifact(artifacts, artifact) {
   if (!existing) artifacts.push(value);
 }
 
+const RECOVERY_REASON_FOR_FIELD = Object.freeze({
+  rankingVersion: 'ranking-version-mismatch',
+  promptVersion: 'prompt-version-mismatch',
+  assessmentSchemaVersion: 'assessment-schema-version-mismatch',
+  mutationSchemaVersion: 'mutation-schema-version-mismatch',
+  targetRevision: 'target-revision-mismatch',
+});
+const HARD_RECOVERY_REQUIREMENTS = Object.freeze([
+  'mode',
+  'purpose',
+  'profileVersion',
+  'sourceConfigFingerprint',
+  'journalSchemaVersion',
+  'artifactSchemaVersion',
+  'pipelineVersion',
+]);
+
+function expectedAtomicRecoveryPlan(completedByStage, prior, requested, substitution) {
+  if (HARD_RECOVERY_REQUIREMENTS.some((field) => prior[field] !== requested[field])) {
+    throw new ManifestAgreementError('journal recovery plan changes an incompatible run requirement');
+  }
+  const provenanceChanged = prior.provider !== requested.provider || prior.model !== requested.model;
+  if (provenanceChanged) {
+    const expected = {
+      previousProvider: prior.provider,
+      previousModel: prior.model,
+      nextProvider: requested.provider,
+      nextModel: requested.model,
+    };
+    if (!substitution || stableJson(substitution) !== stableJson(expected)) {
+      throw new ManifestAgreementError('journal recovery plan lacks exact provider substitution provenance');
+    }
+  } else if (substitution !== null) {
+    throw new ManifestAgreementError('journal recovery plan has an unnecessary provider substitution');
+  }
+
+  const stages = [...completedByStage.values()]
+    .sort((left, right) => RECOVERABLE_PIPELINE_STAGES.findIndex(({ id }) => id === left.stageId)
+      - RECOVERABLE_PIPELINE_STAGES.findIndex(({ id }) => id === right.stageId))
+    .map((work) => {
+      let reason = null;
+      if (work.stageId === 'assess' && provenanceChanged) {
+        reason = 'provider-substituted';
+      } else {
+        for (const field of recoveryRequirementsForStage(work.stageId)) {
+          if (prior[field] !== requested[field]) {
+            reason = RECOVERY_REASON_FOR_FIELD[field] ?? `${field}-mismatch`;
+            break;
+          }
+        }
+      }
+      reason ??= work.artifact ? 'compatible' : 'artifact-reference-missing';
+      return {
+        stageId: work.stageId,
+        action: reason === 'compatible' ? 'reuse' : 'restart',
+        reason,
+        ...(work.artifact ? { artifact: work.artifact } : {}),
+      };
+    });
+  const firstRestart = stages.findIndex(({ action }) => action === 'restart');
+  if (firstRestart !== -1) {
+    for (let index = firstRestart + 1; index < stages.length; index += 1) {
+      if (stages[index].action === 'reuse') {
+        stages[index] = { ...stages[index], action: 'restart', reason: 'upstream-stage-restarted' };
+      }
+    }
+  }
+  return stages;
+}
+
 export function projectRunManifest(events) {
   const { runId, lastHash } = assertJournalEvents(events);
   const artifacts = [];
@@ -245,6 +315,18 @@ export function projectRunManifest(events) {
     } else if (event.type === 'mutation.receipted') {
       receipts.push({ sequence: event.sequence, stageId: event.stageId, reference: event.payload?.reference, digest: event.payload?.digest });
     } else if (event.type === 'recovery.started') {
+      const priorCompatibility = structuredClone(compatibility);
+      if (event.payload.schemaVersion === 2) {
+        const expectedPlan = expectedAtomicRecoveryPlan(
+          completedByStage,
+          priorCompatibility,
+          event.payload.compatibility,
+          event.payload.providerSubstitution,
+        );
+        if (stableJson(expectedPlan) !== stableJson(event.payload.decisions)) {
+          throw new ManifestAgreementError('journal atomic recovery plan contradicts compatibility requirements');
+        }
+      }
       activeRecoveryGeneration = event.fencingGeneration;
       activeRecoverySchema = event.payload.schemaVersion;
       Object.assign(compatibility, event.payload.compatibility);
