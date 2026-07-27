@@ -4,7 +4,8 @@
 
 This design implements Gate A2 and the tightly coupled Gate A7 work from
 issue #77. It also incorporates the safe backup-divergence behaviour from
-PR #71, excluding that PR's unrelated tab-order commit.
+PR #71, excluding that PR's unrelated tab-order commit, and resolves open
+issues #72 through #76 in the same milestone.
 
 The work starts from merged PR #78 on `main` at `985ccdf` and lives on
 `agent/recoverable-scan-execution`. It must remain a separate review from the
@@ -21,7 +22,12 @@ The milestone covers:
   perspective;
 - run-centric scan health and UI states;
 - bounded retention, compaction and privacy controls; and
-- safe resolution of disjoint private-backup divergence.
+- safe resolution of disjoint private-backup divergence;
+- canonical, accessible Scout character animation timing and alignment (#72);
+- trustworthy provider model discovery and effective-default display (#73);
+- race-safe chat usage rendering (#74);
+- detected Codex deep-link support with a resumable fallback (#75); and
+- durable provider-health and guided reauthentication workflows (#76).
 
 It does not add search lanes, employer discovery or preference learning.
 
@@ -70,8 +76,12 @@ takeover even if it has not observed the expiry itself.
 Recovery validates canonical hashes, the previous-hash chain, sequence
 monotonicity, schema support and event invariants.
 
-- A partially written, malformed or hash-invalid final line is quarantined and
-  excluded from replay. Earlier valid events remain authoritative.
+- Only a genuinely truncated or syntactically incomplete final append is
+  quarantined and excluded from replay. Earlier valid events remain
+  authoritative.
+- A syntactically complete entry whose canonical payload hash, previous-entry
+  hash or event hash is invalid fails closed, including when it is the final
+  line. Complete-but-invalid data is corruption, not an interrupted append.
 - Corruption before the final entry fails closed. Recovery records a visible
   recovery failure outside the damaged run and does not append to it.
 - A missing, stale or contradictory manifest is rebuilt from the valid journal.
@@ -277,7 +287,9 @@ assessment schema, provider/model and pipeline version.
 
 For each batch:
 
-1. persist the canonical request artifact;
+1. persist a minimal structured request artifact containing stable job
+   references, input digests, schema/prompt/provider/model versions and the
+   bounded parameters needed to reproduce the request;
 2. append the fenced attempt event;
 3. call the provider with a bounded timeout while the independent heartbeat
    continues;
@@ -295,6 +307,13 @@ jobs while recording failures precisely.
 Provider substitution is never silent. Completed pre-assessment stages may be
 reused, but a substitution requires an explicit configured recovery decision,
 new batch identities and new assessment provenance.
+
+The persisted request artifact is a reference record, not a transcript. It
+does not contain CV content, full adverts, full prompts, provider transcripts
+or raw responses. If a future provider integration proves that any such
+content is strictly required for recovery, it needs an explicit protected
+schema, documented purpose, access boundary and retention period before it may
+be persisted.
 
 ## Tracker and report mutations
 
@@ -353,6 +372,78 @@ The UI shows only ahead/behind counts and sanitised affected areas. It never
 shows raw paths. Active and incomplete run state may enter private backup only
 inside Scout's encrypted recovery data, never as plaintext tracked workspace
 files.
+
+## Included open-issue workstreams
+
+The following workstreams are independently testable and releasable, while
+sharing this milestone's reliability, privacy and diagnostics rules.
+
+### Character animation pacing and alignment (#72)
+
+`ui/lib/scoutCharacter.mjs` is the single source of truth for state-specific
+frame count, frame rate and anchoring. The browser runtime consumes that data
+instead of imposing one 16-frame/two-second animation on every state. Calm
+states remain calm, action states may be faster, and reduced-motion mode shows
+a stable representative frame. Common or per-frame anchors keep distinct poses
+centred at both the 44px compact and 112px expanded render sizes. Browser timing
+tests and image comparisons guard against flicker, fractional-cell drift and
+pose jumps.
+
+### Provider model catalogue and effective defaults (#73)
+
+The provider model picker uses a trustworthy provider-specific catalogue and
+shows human-readable available choices with concise trade-off labels. For
+Codex, Scout reads the effective configured model and the catalogue exposed by
+the installed client (`codex debug models` where supported), with a bounded
+bundled fallback rather than inferring availability from ambiguous logs.
+"Provider default" includes the resolved effective model when it can be
+verified. Custom exact IDs remain an escape hatch. A stale or rejected saved
+choice is visibly invalid and cannot silently masquerade as the current
+default.
+
+### Coherent usage summary rendering (#74)
+
+Engine options and usage data update one persistent chat-drawer state model.
+Rendering either result cannot delete the other's region, and responses carry
+the active chat/request generation so late data from a previous chat is
+discarded. Usage copy distinguishes unavailable data, account estimates,
+context-window use and model spend. Deterministic tests exercise both
+completion orders and a chat switch between requests.
+
+### Codex task deep-link detection and fallback (#75)
+
+Scout retains the currently documented `codex://threads/<technical-thread-id>`
+link for local chats, but enables it only after a device-local capability
+check or a bounded launch acknowledgement. A failed or unavailable handler
+produces a plain explanation plus copyable technical task ID and resume
+instructions. Remote sessions explain that the desktop handler must exist on
+the device opening the link. The fallback preserves the exact resumable task
+identity and never claims success merely because an anchor was clicked.
+
+### Provider health and guided reauthentication (#76)
+
+Provider health is durable device-local state with these explicit values:
+`checking`, `ready`, `credentials-present-unverified`, `sign-in-required`,
+`login-in-progress`, `network-unavailable`, `rate-limited`,
+`cli-update-required` and `provider-error`. Checks run at startup, before a
+manual run, during scheduled-job preflight, periodically while scheduled work
+is enabled and after authentication failure or login. A remote authentication
+failure cannot be overwritten by a local credential-presence check.
+
+Scheduled work blocked by provider health creates a persistent deduplicated
+alert and an auditable skipped/blocked scan record; work for unrelated healthy
+providers continues and no provider substitution occurs silently. Explicit
+retry does not automatically resend a missed scan or duplicate mutations.
+
+Guided login is a fixed, owner-only state machine. Codex uses the supported
+`codex login --device-auth` flow and validates with `codex login status` plus
+the provider health signal. Claude uses only the documented fixed
+authentication command and bounded manual-code input required by its flow.
+The implementation has origin/CSRF checks, fixed executable/argument allow
+lists, process/output/time limits, redaction, rate limits and no arbitrary
+stdin. Tokens, codes and raw authentication output never enter journals,
+backups or UI diagnostics. Expired Claude credentials are cleared only through
+an explicit user action, never automatic logout.
 
 ## UI and diagnostics
 
@@ -413,6 +504,18 @@ unnecessary raw provider content and full advert bodies are never journalled.
 Release and privacy audits verify that raw run state is excluded from public
 artifacts.
 
+Storage-pressure thresholds account separately for retained runs, artifacts
+and the queue journal. Scout warns before storage becomes operationally unsafe
+and identifies which records are recovery-critical. It never automatically
+deletes active, queued, partial, failed, unrepaired or recovery-referenced
+state. A reviewed archival/cleanup operation may first validate and atomically
+write an encrypted archive plus compact terminal index, then remove only the
+explicitly selected eligible source data under the retention fence. Queue
+compaction preserves every live request and the terminal evidence required by
+the retention policy. If safe cleanup cannot free enough space, new durable
+work fails closed with a visible storage-pressure reason instead of accepting
+work it cannot journal.
+
 ## Acceptance and fault injection
 
 Tests cover:
@@ -423,7 +526,8 @@ Tests cover:
 - process death during renewal and every pipeline phase;
 - independent heartbeat during a timed provider call;
 - machine restart, PID reuse and wall-clock changes;
-- truncated final journal entry and earlier-entry corruption;
+- genuinely truncated final journal append, complete final-entry hash
+  corruption, and earlier-entry corruption;
 - manifest disagreement and rebuild;
 - unsupported journal/artifact schemas;
 - newest-compatible recovery selection and recorded incompatibility reasons;
@@ -434,10 +538,18 @@ Tests cover:
 - queue deduplication, expiry, staleness, supersession and automatic draining;
 - terminal lease with failed lease-file removal;
 - retention, compaction and privacy bounds;
+- storage-pressure warnings, protected recovery-critical records, reviewed
+  archive/cleanup and queue-journal compaction;
 - safe disjoint backup resolution;
 - refused overlapping, dirty, renamed, deleted and stale-token divergence;
 - backup resolution racing scan mutation;
 - every visible run state in browser acceptance;
+- canonical character timing, reduced motion and 44px/112px alignment (#72);
+- fresh/default/stale/custom provider model choices (#73);
+- both usage/options completion orders and stale chat responses (#74);
+- supported, unavailable, failed and remote Codex deep-link paths (#75);
+- every provider-health transition, secure guided login, blocked scheduled
+  scans, deduplicated alerts and retry behaviour (#76);
 - legacy workspace migration and rollback safety; and
 - full unit, integration, browser, packaging and release audits.
 
