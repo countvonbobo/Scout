@@ -15,12 +15,12 @@ function temp() { const root = fs.mkdtempSync(path.join(os.tmpdir(), 'scout-run-
 const lease = { leaseId: 'lease-1', generation: 1 };
 const collected = {
   type: 'stage.completed', stageId: 'collect', idempotencyKey: 'collect-v1', payload: {
-    schemaVersion: 1, metadata: { provider: 'adzuna' }, counts: { collected: 2 }, stableIds: { source: 'adzuna' },
+    schemaVersion: 1, reference: { kind: 'source', id: 'adzuna' }, count: 2, version: { kind: 'provider', value: 'adzuna' },
   },
 };
 const ranked = {
   type: 'stage.completed', stageId: 'rank', idempotencyKey: 'rank-v1', payload: {
-    schemaVersion: 1, stableIds: { selected: 'vacancy-1' }, counts: { selected: 1 },
+    schemaVersion: 1, reference: { kind: 'selection', id: 'vacancy-1' }, count: 1,
   },
 };
 
@@ -60,7 +60,7 @@ test('returns the committed event for a duplicate idempotency key and rejects a 
 
   assert.deepEqual(appendRunEvent(journal, collected, lease), committed);
   assert.throws(
-    () => appendRunEvent(journal, { ...collected, payload: { ...collected.payload, counts: { collected: 3 } } }, lease),
+    () => appendRunEvent(journal, { ...collected, payload: { ...collected.payload, count: 3 } }, lease),
     /idempotency key conflicts/,
   );
 });
@@ -74,6 +74,22 @@ test('keeps valid events when only the final JSONL append is truncated', () => {
   const validated = validateRunJournal(journal.file);
   assert.equal(validated.events.length, 2);
   assert.equal(validated.truncatedTail, true);
+});
+
+test('fails closed when an incomplete final JSON record already has a newline delimiter', () => {
+  const journal = openRunJournal(temp(), 'run-1');
+  appendRunEvent(journal, collected, lease);
+  fs.appendFileSync(journal.file, '{"schemaVersion":\n', 'utf8');
+  assert.throws(() => validateRunJournal(journal.file), JournalCorruptionError);
+});
+
+test('fails closed when non-JSON whitespace appears in an unterminated final record', () => {
+  const journal = openRunJournal(temp(), 'run-1');
+  appendRunEvent(journal, collected, lease);
+  for (const value of ['{"schemaVersion":\u00a0', '\ufeff{"schemaVersion":']) {
+    fs.writeFileSync(journal.file, `${fs.readFileSync(journal.file, 'utf8').split('\n')[0]}\n${value}`, 'utf8');
+    assert.throws(() => validateRunJournal(journal.file), JournalCorruptionError);
+  }
 });
 
 test('never acknowledges an append while a truncated final record remains unresolved', () => {
@@ -104,17 +120,41 @@ test('rejects malformed unclosed final text rather than treating it as a torn ap
   assert.throws(() => validateRunJournal(journal.file), JournalCorruptionError);
 });
 
-test('rejects raw-content-shaped payloads and oversized metadata at the journal boundary', () => {
+test('rejects caller-defined metadata and secret-shaped bypass fields at the journal boundary', () => {
   const journal = openRunJournal(temp(), 'run-1');
+  for (const property of ['apiKey', 'auth', 'session', 'code']) {
+    assert.throws(() => appendRunEvent(journal, {
+      ...collected, idempotencyKey: `${property}-v1`, payload: { schemaVersion: 1, metadata: { [property]: 'sk-live-secret' } },
+    }, lease), /payload/i);
+  }
   assert.throws(() => appendRunEvent(journal, {
-    ...collected, idempotencyKey: 'secret-v1', payload: { schemaVersion: 1, metadata: { token: 'sk-live-secret' } },
-  }, lease), /payload/i);
+    ...collected, type: 'stage.unreviewed', idempotencyKey: 'unknown-type-v1', payload: collected.payload,
+  }, lease), /event type/i);
   assert.throws(() => appendRunEvent(journal, {
-    ...collected, idempotencyKey: 'content-v1', payload: { schemaVersion: 1, metadata: { note: 'full CV content with descriptive prose' } },
+    ...collected, idempotencyKey: 'unknown-field-v1', payload: { ...collected.payload, note: 'not-allowed' },
   }, lease), /payload/i);
-  assert.throws(() => appendRunEvent(journal, {
-    ...collected, idempotencyKey: 'metadata-v1', payload: { schemaVersion: 1, metadata: { note: 'a'.repeat(129) } },
-  }, lease), /payload/i);
+});
+
+test('accepts only the reviewed stage-completion reference, count, version, and artifact fields', () => {
+  const journal = openRunJournal(temp(), 'run-1');
+  const event = appendRunEvent(journal, {
+    ...collected,
+    idempotencyKey: 'artifact-v1',
+    payload: {
+      schemaVersion: 1,
+      reference: { kind: 'stage', id: 'collect' },
+      count: 2,
+      version: { kind: 'pipeline', value: 'pipeline-v1' },
+      artifact: { id: 'collect-v1', schemaVersion: 1, digest: 'a'.repeat(64) },
+    },
+  }, lease);
+  assert.deepEqual(replayRunJournal(journal.file), [event]);
+});
+
+test('rejects run IDs that are unsafe as Windows directory components', () => {
+  for (const runId of ['run:one', 'run.', 'CON', 'lpt1']) {
+    assert.throws(() => openRunJournal(temp(), runId), /run ID/i);
+  }
 });
 
 test('rejects duplicate event IDs and idempotency keys in otherwise hash-valid replay history', () => {

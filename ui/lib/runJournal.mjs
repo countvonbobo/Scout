@@ -7,12 +7,17 @@ export const RUN_JOURNAL_SCHEMA_VERSION = 1;
 const MAX_PAYLOAD_BYTES = 16 * 1024;
 const MAX_METADATA_STRING_LENGTH = 128;
 const SAFE_TOKEN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
+const SAFE_RUN_ID = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
 const SHA256 = /^[a-f0-9]{64}$/;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
-const SENSITIVE_PROPERTY = /(?:token|secret|password|credential|authorization|cookie|prompt|transcript|advert|cv|content|response|path|email|phone)/i;
-const PAYLOAD_SCHEMA = Object.freeze({
-  1: Object.freeze(new Set(['schemaVersion', 'stableIds', 'counts', 'digests', 'versions', 'artifacts', 'metadata'])),
+const WINDOWS_RESERVED_RUN_IDS = new Set(['CON', 'PRN', 'AUX', 'NUL', ...Array.from({ length: 9 }, (_, index) => `COM${index + 1}`), ...Array.from({ length: 9 }, (_, index) => `LPT${index + 1}`)]);
+const EVENT_PAYLOAD_SCHEMAS = Object.freeze({
+  'stage.completed': Object.freeze({
+    1: Object.freeze(new Set(['schemaVersion', 'reference', 'count', 'version', 'artifact'])),
+  }),
 });
+const REFERENCE_KINDS = new Set(['source', 'vacancy', 'selection', 'stage', 'batch', 'mutation']);
+const VERSION_KINDS = new Set(['provider', 'model', 'pipeline', 'profile', 'configuration', 'prompt', 'schema']);
 
 export class JournalCorruptionError extends Error {
   constructor(message) {
@@ -51,12 +56,6 @@ function requireSafeToken(value, name, ErrorType = TypeError) {
   return token;
 }
 
-function requireSafeProperty(property, name, ErrorType) {
-  if (!SAFE_TOKEN.test(property) || SENSITIVE_PROPERTY.test(property)) {
-    throw new ErrorType(`journal payload ${name} contains an unsafe property`);
-  }
-}
-
 function requirePlainObject(value, name, ErrorType) {
   if (!value || typeof value !== 'object' || Array.isArray(value) || Object.getPrototypeOf(value) !== Object.prototype) {
     throw new ErrorType(`journal payload ${name} must be an object`);
@@ -64,61 +63,55 @@ function requirePlainObject(value, name, ErrorType) {
   return value;
 }
 
-function validateTokenMap(value, name, ErrorType) {
-  for (const [property, token] of Object.entries(requirePlainObject(value, name, ErrorType))) {
-    requireSafeProperty(property, name, ErrorType);
-    try {
-      requireSafeToken(token, `${name}.${property}`, ErrorType);
-    } catch {
-      throw new ErrorType(`journal payload ${name}.${property} must be a bounded identifier`);
-    }
+function requireExactKeys(value, expected, name, ErrorType) {
+  const actual = Object.keys(requirePlainObject(value, name, ErrorType)).sort();
+  if (actual.join(',') !== [...expected].sort().join(',')) throw new ErrorType(`journal payload ${name} is invalid`);
+  return value;
+}
+
+function validateReference(value, ErrorType) {
+  const reference = requireExactKeys(value, ['id', 'kind'], 'reference', ErrorType);
+  if (!REFERENCE_KINDS.has(reference.kind)) throw new ErrorType('journal payload reference kind is invalid');
+  try {
+    requireSafeToken(reference.id, 'reference ID', ErrorType);
+  } catch {
+    throw new ErrorType('journal payload reference ID is invalid');
   }
 }
 
-function validateCountMap(value, ErrorType) {
-  for (const [property, count] of Object.entries(requirePlainObject(value, 'counts', ErrorType))) {
-    requireSafeProperty(property, 'counts', ErrorType);
-    if (!Number.isSafeInteger(count) || count < 0) throw new ErrorType('journal payload counts must contain non-negative whole numbers');
+function validateVersion(value, ErrorType) {
+  const version = requireExactKeys(value, ['kind', 'value'], 'version', ErrorType);
+  if (!VERSION_KINDS.has(version.kind)) throw new ErrorType('journal payload version kind is invalid');
+  try {
+    requireSafeToken(version.value, 'version value', ErrorType);
+  } catch {
+    throw new ErrorType('journal payload version value is invalid');
   }
 }
 
-function validateDigestMap(value, ErrorType) {
-  for (const [property, digest] of Object.entries(requirePlainObject(value, 'digests', ErrorType))) {
-    requireSafeProperty(property, 'digests', ErrorType);
-    if (typeof digest !== 'string' || !SHA256.test(digest)) throw new ErrorType('journal payload digests must contain SHA-256 digests');
+function validateArtifactReference(value, ErrorType) {
+  const artifact = requireExactKeys(value, ['digest', 'id', 'schemaVersion'], 'artifact', ErrorType);
+  try {
+    requireSafeToken(artifact.id, 'artifact ID', ErrorType);
+  } catch {
+    throw new ErrorType('journal payload artifact ID is invalid');
+  }
+  if (!Number.isSafeInteger(artifact.schemaVersion) || artifact.schemaVersion < 1 || typeof artifact.digest !== 'string' || !SHA256.test(artifact.digest)) {
+    throw new ErrorType('journal payload artifact is invalid');
   }
 }
 
-function validateArtifactReferences(value, ErrorType) {
-  if (!Array.isArray(value) || value.length > 32) throw new ErrorType('journal payload artifacts must be a bounded array');
-  for (const artifact of value) {
-    const reference = requirePlainObject(artifact, 'artifact reference', ErrorType);
-    const keys = Object.keys(reference).sort();
-    if (keys.join(',') !== 'digest,id,schemaVersion') throw new ErrorType('journal payload artifact reference is invalid');
-    try {
-      requireSafeToken(reference.id, 'artifact ID', ErrorType);
-    } catch {
-      throw new ErrorType('journal payload artifact reference is invalid');
-    }
-    if (!Number.isSafeInteger(reference.schemaVersion) || reference.schemaVersion < 1 || typeof reference.digest !== 'string' || !SHA256.test(reference.digest)) {
-      throw new ErrorType('journal payload artifact reference is invalid');
-    }
-  }
-}
-
-function validatePayload(payload, ErrorType = TypeError) {
+function validatePayload(type, payload, ErrorType = TypeError) {
   const value = requirePlainObject(payload, 'payload', ErrorType);
-  const allowed = PAYLOAD_SCHEMA[value.schemaVersion];
-  if (!allowed) throw new ErrorType(`unsupported journal payload schema version: ${value.schemaVersion}`);
+  const allowed = EVENT_PAYLOAD_SCHEMAS[type]?.[value.schemaVersion];
+  if (!allowed) throw new ErrorType(`unsupported journal payload schema for event type: ${type}`);
   for (const key of Object.keys(value)) {
     if (!allowed.has(key)) throw new ErrorType(`journal payload property is not allowed: ${key}`);
   }
-  for (const key of ['stableIds', 'versions', 'metadata']) {
-    if (value[key] !== undefined) validateTokenMap(value[key], key, ErrorType);
-  }
-  if (value.counts !== undefined) validateCountMap(value.counts, ErrorType);
-  if (value.digests !== undefined) validateDigestMap(value.digests, ErrorType);
-  if (value.artifacts !== undefined) validateArtifactReferences(value.artifacts, ErrorType);
+  if (value.reference !== undefined) validateReference(value.reference, ErrorType);
+  if (value.count !== undefined && (!Number.isSafeInteger(value.count) || value.count < 0)) throw new ErrorType('journal payload count must be a non-negative whole number');
+  if (value.version !== undefined) validateVersion(value.version, ErrorType);
+  if (value.artifact !== undefined) validateArtifactReference(value.artifact, ErrorType);
   let encoded;
   try {
     encoded = stableJson(payload);
@@ -136,7 +129,7 @@ function envelopeHash(event) {
 
 function isIncompleteJson(value) {
   let index = 0;
-  const skipWhitespace = () => { while (/\s/.test(value[index] || '')) index += 1; };
+  const skipWhitespace = () => { while ([' ', '\t', '\r', '\n'].includes(value[index])) index += 1; };
   const parseString = () => {
     index += 1;
     while (index < value.length) {
@@ -255,7 +248,7 @@ function validateEvent(event, { runId, sequence, previousHash }) {
   if (!event || typeof event !== 'object' || Array.isArray(event)) throw corrupt('journal event must be an object');
   if (event.schemaVersion !== RUN_JOURNAL_SCHEMA_VERSION) throw corrupt(`unsupported journal schema version: ${event.schemaVersion}`);
   if (runId !== null && event.runId !== runId) throw corrupt('journal run ID changed');
-  requireSafeToken(event.runId, 'run ID', JournalCorruptionError);
+  requireRunId(event.runId, JournalCorruptionError);
   if (event.sequence !== sequence) throw corrupt(`journal sequence must be ${sequence}`);
   if (typeof event.eventId !== 'string' || !UUID.test(event.eventId)) throw corrupt('journal event ID is invalid');
   requireSafeToken(event.type, 'event type', JournalCorruptionError);
@@ -264,7 +257,7 @@ function validateEvent(event, { runId, sequence, previousHash }) {
   requireSafeToken(event.leaseId, 'lease ID', JournalCorruptionError);
   if (!Number.isInteger(event.fencingGeneration) || event.fencingGeneration < 1) throw corrupt('journal fencing generation must be a positive integer');
   if (typeof event.recordedAt !== 'string' || Number.isNaN(Date.parse(event.recordedAt)) || !event.recordedAt.endsWith('Z')) throw corrupt('journal recordedAt must be a UTC timestamp');
-  validatePayload(event.payload, JournalCorruptionError);
+  validatePayload(event.type, event.payload, JournalCorruptionError);
   if (event.payloadHash !== sha256(event.payload)) throw corrupt('journal payload hash is invalid');
   if (event.previousHash !== previousHash) throw corrupt('journal previous hash is invalid');
   if (typeof event.eventHash !== 'string' || !/^[a-f0-9]{64}$/.test(event.eventHash)) throw corrupt('journal event hash is invalid');
@@ -275,6 +268,7 @@ export function validateRunJournal(file) {
   if (!fs.existsSync(file)) return { events: [], lastHash: null, truncatedTail: false };
   const contents = fs.readFileSync(file, 'utf8');
   if (!contents) return { events: [], lastHash: null, truncatedTail: false };
+  const finalRecordTerminated = contents.endsWith('\n');
   const lines = contents.split(/\r?\n/);
   if (lines.at(-1) === '') lines.pop();
   const events = [];
@@ -290,7 +284,7 @@ export function validateRunJournal(file) {
     try {
       event = JSON.parse(line);
     } catch {
-      if (finalLine && isIncompleteJson(line)) {
+      if (finalLine && !finalRecordTerminated && isIncompleteJson(line)) {
         truncatedTail = true;
         break;
       }
@@ -312,8 +306,14 @@ export function replayRunJournal(file) {
   return validateRunJournal(file).events;
 }
 
+function requireRunId(runId, ErrorType = TypeError) {
+  const value = requireText(runId, 'run ID', ErrorType);
+  if (!SAFE_RUN_ID.test(value) || WINDOWS_RESERVED_RUN_IDS.has(value.toUpperCase())) throw new ErrorType('journal run ID is invalid');
+  return value;
+}
+
 function safeRunId(runId) {
-  return requireSafeToken(runId, 'run ID');
+  return requireRunId(runId);
 }
 
 export function openRunJournal(root, runId) {
@@ -357,7 +357,7 @@ export function appendRunEvent(handle, input, lease) {
   const type = requireSafeToken(input.type, 'event type');
   const stageId = requireSafeToken(input.stageId, 'stage ID');
   const idempotencyKey = requireSafeToken(input.idempotencyKey, 'idempotency key');
-  validatePayload(input.payload);
+  validatePayload(type, input.payload);
   const leaseId = requireSafeToken(lease?.leaseId, 'lease ID');
   if (!Number.isInteger(lease?.generation) || lease.generation < 1) throw new TypeError('journal lease generation must be a positive integer');
 
