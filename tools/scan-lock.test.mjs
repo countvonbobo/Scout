@@ -17,6 +17,7 @@ test('scan lock acquires atomically and requires its token to release', () => {
   const repo = tempRepo();
   const first = acquireScanLock(repo, { agent: 'codex', mode: 'primary', token: 'one' });
   assert.equal(first.ok, true);
+  assert.equal(fs.existsSync(path.join(repo, '.scout', 'scan-lease.json')), true);
   assert.equal(acquireScanLock(repo, { agent: 'claude', mode: 'second-pass', token: 'two' }).ok, false);
   assert.equal(releaseScanLock(repo, 'wrong').ok, false);
   assert.deepEqual(releaseScanLock(repo, 'one'), { ok: true, released: true });

@@ -3,6 +3,9 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { atomicWriteFile } from './atomicWrite.mjs';
 import { validateRunJournal } from './runJournal.mjs';
+import {
+  LeaseLostError, assertCurrentFence, isScanLease, readScanLease,
+} from './scanLease.mjs';
 
 export const RUN_ARTIFACT_SCHEMA_VERSION = 1;
 export const RUN_MANIFEST_SCHEMA_VERSION = 1;
@@ -98,6 +101,21 @@ function referenceFor(directory, descriptor, value) {
   return ref;
 }
 
+function workspaceRootForRun(run) {
+  return path.resolve(requireRunDirectory(run?.directory), '..', '..', '..');
+}
+
+function commitWithFence(run, lease, commit) {
+  if (isScanLease(lease)) {
+    if (lease.runId !== run?.runId) throw new LeaseLostError('scan lease does not own this run');
+    return assertCurrentFence(lease, commit);
+  }
+  if (readScanLease(workspaceRootForRun(run))) {
+    throw new LeaseLostError('a current scan lease is required to commit an artifact');
+  }
+  return commit();
+}
+
 function directoryForReference(ref, ErrorType = ArtifactIntegrityError) {
   return requireRunDirectory(ref?.directory ?? ref?.run?.directory, ErrorType);
 }
@@ -110,7 +128,7 @@ function validateReference(ref, ErrorType = ArtifactIntegrityError) {
   return descriptor;
 }
 
-export function commitRunArtifact(run, descriptor, value) {
+export function commitRunArtifact(run, descriptor, value, lease) {
   const directory = requireRunDirectory(run?.directory);
   const checked = validateDescriptor(descriptor);
   const encoded = validateArtifactValue(checked, value);
@@ -122,11 +140,13 @@ export function commitRunArtifact(run, descriptor, value) {
     digest: ref.digest,
     value,
   };
-  atomicWriteFile(artifactPath(directory, ref), `${stableJson(stored)}\n`, { mode: 0o600 });
-  // Keep the validation close to the commit boundary: an acknowledged ref is
-  // never returned for an unflushed, malformed, or digest-mismatched artifact.
-  if (encoded !== stableJson(value)) throw new ArtifactIntegrityError('artifact encoding changed during commit');
-  return ref;
+  return commitWithFence(run, lease, () => {
+    atomicWriteFile(artifactPath(directory, ref), `${stableJson(stored)}\n`, { mode: 0o600 });
+    // Keep the validation close to the commit boundary: an acknowledged ref is
+    // never returned for an unflushed, malformed, or digest-mismatched artifact.
+    if (encoded !== stableJson(value)) throw new ArtifactIntegrityError('artifact encoding changed during commit');
+    return ref;
+  });
 }
 
 export function readRunArtifact(ref) {
@@ -233,17 +253,19 @@ function manifestFile(run) {
   return path.join(requireRunDirectory(run?.directory, ManifestAgreementError), 'manifest.json');
 }
 
-export function replaceRunManifest(run, manifest) {
+export function replaceRunManifest(run, manifest, lease) {
   const directory = requireRunDirectory(run?.directory, ManifestAgreementError);
-  const state = validateRunJournal(run?.file);
-  const expected = projectRunManifest(state.events);
-  if (!manifestsMatch(manifest, expected)) {
-    throw new ManifestAgreementError('manifest does not agree with the validated journal');
-  }
-  validateProjectedArtifacts(run, expected);
-  const encoded = stableJson(expected);
-  atomicWriteFile(path.join(directory, 'manifest.json'), `${encoded}\n`, { mode: 0o600 });
-  return expected;
+  return commitWithFence(run, lease, () => {
+    const state = validateRunJournal(run?.file);
+    const expected = projectRunManifest(state.events);
+    if (!manifestsMatch(manifest, expected)) {
+      throw new ManifestAgreementError('manifest does not agree with the validated journal');
+    }
+    validateProjectedArtifacts(run, expected);
+    const encoded = stableJson(expected);
+    atomicWriteFile(path.join(directory, 'manifest.json'), `${encoded}\n`, { mode: 0o600 });
+    return expected;
+  });
 }
 
 function manifestsMatch(actual, expected) {
@@ -258,14 +280,14 @@ function validateProjectedArtifacts(run, manifest) {
   for (const artifact of manifest.artifacts) readRunArtifact({ ...artifact, directory: run.directory });
 }
 
-export function validateManifestAgreement(run) {
+export function validateManifestAgreement(run, lease) {
   if (!run || typeof run !== 'object') throw new ManifestAgreementError('run is required');
   const state = validateRunJournal(run.file);
   const expected = projectRunManifest(state.events);
   validateProjectedArtifacts(run, expected);
   const file = manifestFile(run);
   if (!fs.existsSync(file)) {
-    replaceRunManifest(run, expected);
+    replaceRunManifest(run, expected, lease);
     return { manifest: expected, rebuilt: true };
   }
   let actual;
@@ -279,7 +301,7 @@ export function validateManifestAgreement(run) {
   const sequence = actual?.lastValidatedSequence;
   if (Number.isSafeInteger(sequence) && sequence >= 0 && sequence < state.events.length
     && manifestsMatch(actual, projectRunManifest(state.events.slice(0, sequence)))) {
-    replaceRunManifest(run, expected);
+    replaceRunManifest(run, expected, lease);
     return { manifest: expected, rebuilt: true };
   }
   throw new ManifestAgreementError('manifest does not agree with the validated journal');

@@ -1,6 +1,9 @@
 import { createHash, randomUUID } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
+import {
+  LeaseLostError, assertCurrentFence, isScanLease, readScanLease,
+} from './scanLease.mjs';
 import { workspacePaths } from './workspace.mjs';
 
 export const RUN_JOURNAL_SCHEMA_VERSION = 1;
@@ -383,33 +386,42 @@ export function appendRunEvent(handle, input, lease) {
   const leaseId = requireSafeToken(lease?.leaseId, 'lease ID');
   if (!Number.isInteger(lease?.generation) || lease.generation < 1) throw new TypeError('journal lease generation must be a positive integer');
 
-  const state = validateRunJournal(handle.file);
-  if (state.truncatedTail) throw corrupt('journal has an unresolved truncated final entry');
-  const existing = state.events.find((event) => event.idempotencyKey === idempotencyKey);
-  if (existing) {
-    if (sameIdempotentInput(existing, { type, stageId, payload: input.payload })) return existing;
-    throw new Error(`journal idempotency key conflicts: ${idempotencyKey}`);
-  }
+  const commit = () => {
+    const state = validateRunJournal(handle.file);
+    if (state.truncatedTail) throw corrupt('journal has an unresolved truncated final entry');
+    const existing = state.events.find((event) => event.idempotencyKey === idempotencyKey);
+    if (existing) {
+      if (sameIdempotentInput(existing, { type, stageId, payload: input.payload })) return existing;
+      throw new Error(`journal idempotency key conflicts: ${idempotencyKey}`);
+    }
 
-  const event = {
-    schemaVersion: RUN_JOURNAL_SCHEMA_VERSION,
-    runId: handle.runId,
-    sequence: state.events.length + 1,
-    eventId: randomUUID(),
-    type,
-    recordedAt: new Date().toISOString(),
-    leaseId,
-    fencingGeneration: lease.generation,
-    stageId,
-    idempotencyKey,
-    previousHash: state.lastHash,
-    payloadHash: sha256(input.payload),
-    payload: input.payload,
+    const event = {
+      schemaVersion: RUN_JOURNAL_SCHEMA_VERSION,
+      runId: handle.runId,
+      sequence: state.events.length + 1,
+      eventId: randomUUID(),
+      type,
+      recordedAt: new Date().toISOString(),
+      leaseId,
+      fencingGeneration: lease.generation,
+      stageId,
+      idempotencyKey,
+      previousHash: state.lastHash,
+      payloadHash: sha256(input.payload),
+      payload: input.payload,
+    };
+    event.eventHash = envelopeHash(event);
+    if (state.events.length && !hasFinalDelimiter(handle.file)) appendSynced(handle.file, Buffer.from('\n', 'utf8'));
+    appendSynced(handle.file, Buffer.from(`${stableJson(event)}\n`, 'utf8'));
+    handle.events = [...state.events, event];
+    handle.lastHash = event.eventHash;
+    return event;
   };
-  event.eventHash = envelopeHash(event);
-  if (state.events.length && !hasFinalDelimiter(handle.file)) appendSynced(handle.file, Buffer.from('\n', 'utf8'));
-  appendSynced(handle.file, Buffer.from(`${stableJson(event)}\n`, 'utf8'));
-  handle.events = [...state.events, event];
-  handle.lastHash = event.eventHash;
-  return event;
+
+  if (isScanLease(lease)) {
+    if (lease.runId !== handle.runId) throw new LeaseLostError('scan lease does not own this run');
+    return assertCurrentFence(lease, commit);
+  }
+  if (readScanLease(handle.root)) throw new LeaseLostError('a current scan lease is required to append');
+  return commit();
 }
