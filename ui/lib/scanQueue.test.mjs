@@ -1,11 +1,12 @@
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { test } from 'node:test';
 import { acquireScanLease, currentLeaseOwner, releaseScanLease } from './scanLease.mjs';
 import {
-  claimNextScanRequest, completeScanRequest, enqueueScanRequest, projectScanQueue,
+  claimNextScanRequest, completeScanRequest, enqueueScanRequest, projectScanQueue, recoverOrphanedScanRequest,
 } from './scanQueue.mjs';
 
 function workspace() {
@@ -34,6 +35,14 @@ function request({
     requestedAt, expiresAt, windowAt, lease: activeLease,
   };
 }
+
+function stableJson(value) {
+  if (Array.isArray(value)) return `[${value.map(stableJson).join(',')}]`;
+  if (value && typeof value === 'object') return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${stableJson(value[key])}`).join(',')}}`;
+  return JSON.stringify(value);
+}
+
+function digest(value) { return createHash('sha256').update(stableJson(value)).digest('hex'); }
 
 test('manual requests retain FIFO order and expire exactly 24 hours after request time', () => {
   const root = workspace();
@@ -139,21 +148,21 @@ test('completed scheduling window is skipped and terminal release drains the nex
   try {
     const claimed = claimNextScanRequest(root, compatibility, firstLease, new Date('2026-07-27T08:30:00.000Z'));
     assert.equal(claimed.id, 'manual-first');
-    completeScanRequest(root, claimed.id, 'succeeded', firstLease);
+    completeScanRequest(root, claimed.id, 'succeeded', firstLease, claimed.claim);
   } finally { releaseScanLease(firstLease); }
 
   const secondLease = lease(root, 'second-run');
   try {
     const claimed = claimNextScanRequest(root, compatibility, secondLease, new Date('2026-07-27T08:31:00.000Z'));
     assert.equal(claimed.id, 'manual-second');
-    completeScanRequest(root, claimed.id, 'succeeded', secondLease);
+    completeScanRequest(root, claimed.id, 'succeeded', secondLease, claimed.claim);
   } finally { releaseScanLease(secondLease); }
 
   const scheduledLease = lease(root, 'scheduled-run');
   try {
     const claimed = claimNextScanRequest(root, compatibility, scheduledLease, new Date('2026-07-27T08:32:00.000Z'));
     assert.equal(claimed.id, 'scheduled-covered');
-    completeScanRequest(root, claimed.id, 'succeeded', scheduledLease);
+    completeScanRequest(root, claimed.id, 'succeeded', scheduledLease, claimed.claim);
   } finally { releaseScanLease(scheduledLease); }
 
   const duplicateLease = lease(root, 'duplicate-window');
@@ -182,5 +191,220 @@ test('queue writes require the genuine lease for the same workspace and reject s
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
     fs.rmSync(other, { recursive: true, force: true });
+  }
+});
+
+test('claim retries return one durable lease-bound claim and completion retries acknowledge only its outcome', () => {
+  const root = workspace();
+  const enqueueLease = lease(root, 'enqueue-claims');
+  try {
+    enqueueScanRequest(root, request({ id: 'claim-first', lease: enqueueLease }));
+    enqueueScanRequest(root, request({ id: 'claim-second', requestedAt: '2026-07-27T08:01:00.000Z', expiresAt: '2026-07-28T08:01:00.000Z', lease: enqueueLease }));
+  } finally { releaseScanLease(enqueueLease); }
+  const activeLease = lease(root, 'claim-owner');
+  try {
+    const first = claimNextScanRequest(root, compatibility, activeLease, new Date('2026-07-27T08:30:00.000Z'));
+    const retry = claimNextScanRequest(root, compatibility, activeLease, new Date('2026-07-27T08:31:00.000Z'));
+    assert.equal(first.id, 'claim-first');
+    assert.equal(retry.claim.claimId, first.claim.claimId);
+    assert.equal(projectScanQueue(root).requests.find((item) => item.id === 'claim-second').status, 'queued');
+    assert.equal(completeScanRequest(root, first.id, 'succeeded', activeLease, first.claim).status, 'succeeded');
+    assert.equal(completeScanRequest(root, first.id, 'succeeded', activeLease, first.claim).status, 'succeeded');
+    assert.throws(() => completeScanRequest(root, first.id, 'failed', activeLease, first.claim), /conflict|outcome/i);
+  } finally {
+    releaseScanLease(activeLease);
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('a successor cannot complete an orphaned claim and must recover it under its own fence', () => {
+  const root = workspace();
+  const enqueueLease = lease(root, 'enqueue-orphan');
+  try { enqueueScanRequest(root, request({ id: 'orphaned', lease: enqueueLease })); }
+  finally { releaseScanLease(enqueueLease); }
+  const firstLease = lease(root, 'orphan-owner');
+  const first = claimNextScanRequest(root, compatibility, firstLease, new Date('2026-07-27T08:30:00.000Z'));
+  releaseScanLease(firstLease);
+  const successor = lease(root, 'orphan-successor');
+  try {
+    assert.throws(() => completeScanRequest(root, first.id, 'succeeded', successor, first.claim), /claim|owner|fence/i);
+    assert.throws(() => claimNextScanRequest(root, compatibility, successor, new Date('2026-07-27T08:31:00.000Z')), /recover/i);
+    assert.equal(recoverOrphanedScanRequest(root, first.id, first.claim, successor).status, 'queued');
+    const recovered = claimNextScanRequest(root, compatibility, successor, new Date('2026-07-27T08:32:00.000Z'));
+    assert.equal(recovered.id, first.id);
+  } finally {
+    releaseScanLease(successor);
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('successful-window coverage requires the full compatibility contract', () => {
+  const root = workspace();
+  const firstLease = lease(root, 'window-old');
+  const oldCompatibility = { ...compatibility, profileFingerprint: 'c'.repeat(64) };
+  try {
+    enqueueScanRequest(root, request({ id: 'old-window', requester: 'scheduled', key: 'old-window', windowAt: '2026-07-27T09:00:00.000Z', expiresAt: '2026-07-27T09:00:00.000Z', requestCompatibility: { profileFingerprint: oldCompatibility.profileFingerprint, configFingerprint: config, schemaVersion: 1 }, lease: firstLease }));
+    const claimed = claimNextScanRequest(root, oldCompatibility, firstLease, new Date('2026-07-27T08:30:00.000Z'));
+    completeScanRequest(root, claimed.id, 'succeeded', firstLease, claimed.claim);
+  } finally { releaseScanLease(firstLease); }
+  const nextLease = lease(root, 'window-new');
+  try {
+    enqueueScanRequest(root, request({ id: 'new-window', requester: 'scheduled', key: 'new-window', windowAt: '2026-07-27T09:00:00.000Z', expiresAt: '2026-07-27T09:00:00.000Z', lease: nextLease }));
+    assert.equal(claimNextScanRequest(root, compatibility, nextLease, new Date('2026-07-27T08:31:00.000Z')).id, 'new-window');
+  } finally {
+    releaseScanLease(nextLease);
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('stable request IDs reject conflicting retries and replay rejects duplicate event IDs or invalid equivalence transitions', () => {
+  const root = workspace();
+  const activeLease = lease(root, 'replay-invariants');
+  try {
+    enqueueScanRequest(root, request({ id: 'canonical', key: 'same-work', lease: activeLease }));
+    assert.throws(() => enqueueScanRequest(root, request({ id: 'canonical', key: 'changed-work', lease: activeLease })), /conflict/i);
+    enqueueScanRequest(root, request({ id: 'deduped', key: 'same-work', lease: activeLease }));
+    assert.throws(() => enqueueScanRequest(root, request({ id: 'deduped', key: 'changed-work', lease: activeLease })), /conflict/i);
+    const file = path.join(root, '.scout', 'scan-queue.jsonl');
+    const events = fs.readFileSync(file, 'utf8').trim().split('\n').map(JSON.parse);
+    fs.appendFileSync(file, `${JSON.stringify({ ...events[0], type: 'enqueue', request: { ...events[0].request, id: 'reused-event' } })}\n`, 'utf8');
+    assert.throws(() => projectScanQueue(root), /event ID|invalid/i);
+  } finally {
+    releaseScanLease(activeLease);
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('replay rejects an older scheduled replacement and a deduplication into a terminal request', () => {
+  const root = workspace();
+  const activeLease = lease(root, 'replay-transitions');
+  try {
+    enqueueScanRequest(root, request({ id: 'scheduled-first', requester: 'scheduled', key: 'same-schedule', windowAt: '2026-07-27T09:00:00.000Z', expiresAt: '2026-07-27T09:00:00.000Z', lease: activeLease }));
+    enqueueScanRequest(root, request({ id: 'scheduled-newer', requester: 'scheduled', key: 'same-schedule', requestedAt: '2026-07-27T08:30:00.000Z', windowAt: '2026-07-27T10:00:00.000Z', expiresAt: '2026-07-27T10:00:00.000Z', lease: activeLease }));
+    const file = path.join(root, '.scout', 'scan-queue.jsonl');
+    const events = fs.readFileSync(file, 'utf8').trim().split('\n').map(JSON.parse);
+    const replacement = events.find((event) => event.type === 'scheduled-replaced');
+    replacement.request = { ...replacement.request, requestedAt: '2026-07-27T07:59:00.000Z', windowAt: '2026-07-27T09:00:00.000Z', expiresAt: '2026-07-27T09:00:00.000Z' };
+    replacement.requestDigest = digest(replacement.request);
+    fs.writeFileSync(file, `${events.map(JSON.stringify).join('\n')}\n`, 'utf8');
+    assert.throws(() => projectScanQueue(root), /scheduled replacement/i);
+  } finally {
+    releaseScanLease(activeLease);
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+
+  const secondRoot = workspace();
+  const secondLease = lease(secondRoot, 'terminal-dedup');
+  try {
+    enqueueScanRequest(secondRoot, request({ id: 'terminal-target', key: 'dedup-key', lease: secondLease }));
+    const claimed = claimNextScanRequest(secondRoot, compatibility, secondLease, new Date('2026-07-27T08:30:00.000Z'));
+    completeScanRequest(secondRoot, claimed.id, 'succeeded', secondLease, claimed.claim);
+    const file = path.join(secondRoot, '.scout', 'scan-queue.jsonl');
+    const incoming = request({ id: 'terminal-alias', key: 'dedup-key', lease: secondLease });
+    const { lease: ignored, ...requestOnly } = incoming;
+    void ignored;
+    fs.appendFileSync(file, `${JSON.stringify({ schemaVersion: 2, eventId: '11111111-1111-4111-8111-111111111111', type: 'deduplicated', at: '2026-07-27T08:31:00.000Z', request: requestOnly, requestDigest: digest(requestOnly), requestId: 'terminal-target' })}\n`, 'utf8');
+    assert.throws(() => projectScanQueue(secondRoot), /deduplication/i);
+  } finally {
+    releaseScanLease(secondLease);
+    fs.rmSync(secondRoot, { recursive: true, force: true });
+  }
+});
+
+test('equivalence never aliases a request with a changed compatibility contract', () => {
+  const root = workspace();
+  const activeLease = lease(root, 'compatibility-equivalence');
+  const changed = { profileFingerprint: 'c'.repeat(64), configFingerprint: config, schemaVersion: 1 };
+  try {
+    enqueueScanRequest(root, request({ id: 'old-contract', key: 'same-key', lease: activeLease }));
+    assert.equal(enqueueScanRequest(root, request({ id: 'new-contract', key: 'same-key', requestCompatibility: changed, lease: activeLease })).status, 'enqueued');
+    const current = { ...compatibility, profileFingerprint: changed.profileFingerprint };
+    assert.equal(claimNextScanRequest(root, current, activeLease, new Date('2026-07-27T08:30:00.000Z')).id, 'new-contract');
+  } finally {
+    releaseScanLease(activeLease);
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('replays a version-one journal and preserves queued work when version-two events are appended', () => {
+  const root = workspace();
+  const activeLease = lease(root, 'queue-v1-compat');
+  try {
+    const { lease: ignored, ...legacyRequest } = request({ id: 'legacy-queued', lease: activeLease });
+    void ignored;
+    const file = path.join(root, '.scout', 'scan-queue.jsonl');
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, `${JSON.stringify({ schemaVersion: 1, eventId: '11111111-1111-4111-8111-111111111111', type: 'enqueue', at: '2026-07-27T08:00:00.000Z', request: legacyRequest })}\n`, 'utf8');
+    assert.deepEqual(projectScanQueue(root).ready.map((item) => item.id), ['legacy-queued']);
+    enqueueScanRequest(root, request({ id: 'version-two-queued', key: 'next-key', lease: activeLease }));
+    assert.deepEqual(projectScanQueue(root).ready.map((item) => item.id), ['legacy-queued', 'version-two-queued']);
+  } finally {
+    releaseScanLease(activeLease);
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('claims accept the reviewed scan-lease token grammar for lease IDs', () => {
+  const root = workspace();
+  const activeLease = acquireScanLease(root, currentLeaseOwner(), {
+    kind: 'scan', runId: 'token-lease', provider: 'codex', mode: 'primary', phase: 'queue',
+  }, { leaseId: 'queue.lease:1' });
+  try {
+    enqueueScanRequest(root, request({ id: 'token-request', lease: activeLease }));
+    assert.equal(claimNextScanRequest(root, compatibility, activeLease, new Date('2026-07-27T08:30:00.000Z')).claim.leaseId, 'queue.lease:1');
+  } finally {
+    releaseScanLease(activeLease);
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('replay rejects a claim ID reused by a successor after recovery', () => {
+  const root = workspace();
+  const activeLease = lease(root, 'claim-id-replay');
+  try {
+    enqueueScanRequest(root, request({ id: 'claim-id-target', lease: activeLease }));
+    const claimed = claimNextScanRequest(root, compatibility, activeLease, new Date('2026-07-27T08:30:00.000Z'));
+    const file = path.join(root, '.scout', 'scan-queue.jsonl');
+    fs.appendFileSync(file, `${JSON.stringify({ schemaVersion: 2, eventId: '11111111-1111-4111-8111-111111111111', type: 'claim-recovered', at: '2026-07-27T08:31:00.000Z', requestId: claimed.id, claimId: claimed.claim.claimId })}\n`, 'utf8');
+    fs.appendFileSync(file, `${JSON.stringify({ schemaVersion: 2, eventId: '22222222-2222-4222-8222-222222222222', type: 'claimed', at: '2026-07-27T08:32:00.000Z', requestId: claimed.id, claim: claimed.claim })}\n`, 'utf8');
+    assert.throws(() => projectScanQueue(root), /claim ID/i);
+  } finally {
+    releaseScanLease(activeLease);
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('a legacy claimed request blocks automatic draining until an operator resolves the legacy claim', () => {
+  const root = workspace();
+  const activeLease = lease(root, 'legacy-claim-block');
+  try {
+    const { lease: ignored, ...legacyRequest } = request({ id: 'legacy-active', lease: activeLease });
+    void ignored;
+    const file = path.join(root, '.scout', 'scan-queue.jsonl');
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, `${JSON.stringify({ schemaVersion: 1, eventId: '11111111-1111-4111-8111-111111111111', type: 'enqueue', at: '2026-07-27T08:00:00.000Z', request: legacyRequest })}\n${JSON.stringify({ schemaVersion: 1, eventId: '22222222-2222-4222-8222-222222222222', type: 'claimed', at: '2026-07-27T08:01:00.000Z', requestId: 'legacy-active' })}\n`, 'utf8');
+    assert.throws(() => claimNextScanRequest(root, compatibility, activeLease, new Date('2026-07-27T08:30:00.000Z')), /legacy.*claim|operator/i);
+  } finally {
+    releaseScanLease(activeLease);
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('replay rejects a scheduled replacement whose newer request changes the execution contract', () => {
+  const root = workspace();
+  const activeLease = lease(root, 'replacement-contract');
+  try {
+    enqueueScanRequest(root, request({ id: 'scheduled-contract-old', requester: 'scheduled', key: 'contract-key', windowAt: '2026-07-27T09:00:00.000Z', expiresAt: '2026-07-27T09:00:00.000Z', lease: activeLease }));
+    enqueueScanRequest(root, request({ id: 'scheduled-contract-new', requester: 'scheduled', key: 'contract-key', requestedAt: '2026-07-27T08:30:00.000Z', windowAt: '2026-07-27T10:00:00.000Z', expiresAt: '2026-07-27T10:00:00.000Z', lease: activeLease }));
+    const file = path.join(root, '.scout', 'scan-queue.jsonl');
+    const events = fs.readFileSync(file, 'utf8').trim().split('\n').map(JSON.parse);
+    const replacement = events.find((event) => event.type === 'scheduled-replaced');
+    replacement.request = { ...replacement.request, purpose: 'different-purpose' };
+    replacement.requestDigest = digest(replacement.request);
+    fs.writeFileSync(file, `${events.map(JSON.stringify).join('\n')}\n`, 'utf8');
+    assert.throws(() => projectScanQueue(root), /scheduled replacement/i);
+  } finally {
+    releaseScanLease(activeLease);
+    fs.rmSync(root, { recursive: true, force: true });
   }
 });
