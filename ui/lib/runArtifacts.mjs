@@ -215,7 +215,9 @@ export function projectRunManifest(events) {
   const recoveryAttempts = [];
   const stageIndexes = new Map(RECOVERABLE_PIPELINE_STAGES.map((stage, index) => [stage.id, index]));
   const invalidatedByGeneration = new Map();
+  const plannedByGeneration = new Map();
   let activeRecoveryGeneration = null;
+  let activeRecoverySchema = null;
   let versionedRun = false;
   let outcome = 'in-progress';
 
@@ -231,14 +233,6 @@ export function projectRunManifest(events) {
       if (completedByStage.has(event.stageId)) {
         throw new ManifestAgreementError(`journal completed stage more than once without restart: ${event.stageId}`);
       }
-      if (versionedRun && stageIndex > 0) {
-        const missing = RECOVERABLE_PIPELINE_STAGES
-          .slice(0, stageIndex)
-          .find((stage) => !completedByStage.has(stage.id));
-        if (missing) {
-          throw new ManifestAgreementError(`journal completed ${event.stageId} without current ${missing.id}`);
-        }
-      }
       const work = { sequence: event.sequence, stageId: event.stageId };
       for (const key of ['reference', 'count', 'version', 'artifact']) {
         if (event.payload?.[key] !== undefined) work[key] = event.payload[key];
@@ -252,17 +246,72 @@ export function projectRunManifest(events) {
       receipts.push({ sequence: event.sequence, stageId: event.stageId, reference: event.payload?.reference, digest: event.payload?.digest });
     } else if (event.type === 'recovery.started') {
       activeRecoveryGeneration = event.fencingGeneration;
+      activeRecoverySchema = event.payload.schemaVersion;
       Object.assign(compatibility, event.payload.compatibility);
-      invalidatedByGeneration.set(activeRecoveryGeneration, new Map());
+      const invalidated = new Map();
+      invalidatedByGeneration.set(activeRecoveryGeneration, invalidated);
       recoveryAttempts.push({
         sequence: event.sequence,
         fencingGeneration: event.fencingGeneration,
         requestFingerprint: event.payload.requestFingerprint,
         selectionFingerprint: event.payload.selectionFingerprint,
       });
+      if (activeRecoverySchema === 1) {
+        for (const [stageId, work] of completedByStage) invalidated.set(stageId, work);
+        completedByStage.clear();
+      } else {
+        const plans = new Map(event.payload.decisions.map((decision) => [decision.stageId, decision]));
+        plannedByGeneration.set(activeRecoveryGeneration, plans);
+        if (event.payload.providerSubstitution) {
+          providerSubstitutions.push({ sequence: event.sequence, ...event.payload.providerSubstitution });
+        }
+        for (const planned of event.payload.decisions) {
+          const current = completedByStage.get(planned.stageId);
+          const expected = current ?? invalidated.get(planned.stageId);
+          if (planned.artifact && (!expected?.artifact
+            || stableJson(planned.artifact) !== stableJson(expected.artifact))) {
+            throw new ManifestAgreementError('journal recovery plan artifact does not match current stage');
+          }
+          const decision = {
+            sequence: event.sequence,
+            stageId: planned.stageId,
+            action: planned.action,
+            reason: planned.reason,
+            ...(planned.artifact ? { artifact: planned.artifact } : {}),
+          };
+          if (planned.action === 'reuse') {
+            if (!current) throw new ManifestAgreementError('journal cannot reuse a stage without a current completion');
+          } else {
+            const stageIndex = stageIndexes.get(planned.stageId);
+            if (stageIndex === undefined) throw new ManifestAgreementError('journal restarts an unsupported stage');
+            if (!current && !invalidated.has(planned.stageId)) {
+              throw new ManifestAgreementError('journal cannot restart a stage without a current completion');
+            }
+            for (const stage of RECOVERABLE_PIPELINE_STAGES.slice(stageIndex)) {
+              const removed = completedByStage.get(stage.id);
+              if (removed) {
+                invalidated.set(stage.id, removed);
+                completedByStage.delete(stage.id);
+              }
+            }
+          }
+          recoveryDecisions.push(decision);
+        }
+      }
     } else if (event.type === 'recovery.stage-decided') {
-      if (activeRecoveryGeneration !== event.fencingGeneration) {
-        throw new ManifestAgreementError('journal recovery decision has no matching recovery start');
+      const plans = plannedByGeneration.get(event.fencingGeneration);
+      if (plans) {
+        const planned = plans.get(event.stageId);
+        const confirmation = {
+          stageId: event.stageId,
+          action: event.payload.action,
+          reason: event.payload.reason,
+          ...(event.payload.artifact ? { artifact: event.payload.artifact } : {}),
+        };
+        if (!planned || stableJson(planned) !== stableJson(confirmation)) {
+          throw new ManifestAgreementError('journal recovery confirmation conflicts with its atomic plan');
+        }
+        continue;
       }
       const decision = {
         sequence: event.sequence,
@@ -272,14 +321,15 @@ export function projectRunManifest(events) {
       };
       if (event.payload.artifact) decision.artifact = event.payload.artifact;
       const current = completedByStage.get(event.stageId);
-      const invalidated = invalidatedByGeneration.get(event.fencingGeneration);
+      const invalidated = invalidatedByGeneration.get(event.fencingGeneration) ?? new Map();
       const expected = current ?? invalidated.get(event.stageId);
       if (event.payload.artifact && (!expected?.artifact
         || stableJson(event.payload.artifact) !== stableJson(expected.artifact))) {
         throw new ManifestAgreementError('journal recovery decision artifact does not match current stage');
       }
       if (event.payload.action === 'reuse') {
-        if (!current) throw new ManifestAgreementError('journal cannot reuse a stage without a current completion');
+        if (!current && expected) completedByStage.set(event.stageId, expected);
+        else if (!current) throw new ManifestAgreementError('journal cannot reuse a stage without a current completion');
       } else {
         const stageIndex = stageIndexes.get(event.stageId);
         if (stageIndex === undefined) throw new ManifestAgreementError('journal restarts an unsupported stage');
@@ -297,8 +347,20 @@ export function projectRunManifest(events) {
       }
       recoveryDecisions.push(decision);
     } else if (event.type === 'recovery.provider-substituted') {
-      if (activeRecoveryGeneration !== event.fencingGeneration) {
-        throw new ManifestAgreementError('journal provider substitution has no matching recovery start');
+      const planned = plannedByGeneration.get(event.fencingGeneration);
+      if (planned) {
+        const expected = events.find((candidate) => candidate.type === 'recovery.started'
+          && candidate.fencingGeneration === event.fencingGeneration)?.payload.providerSubstitution;
+        const actual = {
+          previousProvider: event.payload.previousProvider,
+          previousModel: event.payload.previousModel,
+          nextProvider: event.payload.nextProvider,
+          nextModel: event.payload.nextModel,
+        };
+        if (!expected || stableJson(expected) !== stableJson(actual)) {
+          throw new ManifestAgreementError('journal provider confirmation conflicts with its atomic plan');
+        }
+        continue;
       }
       providerSubstitutions.push({
         sequence: event.sequence,
@@ -307,6 +369,8 @@ export function projectRunManifest(events) {
         nextProvider: event.payload.nextProvider,
         nextModel: event.payload.nextModel,
       });
+      compatibility.provider = event.payload.nextProvider;
+      compatibility.model = event.payload.nextModel;
     }
   }
   const completedWork = [...completedByStage.values()]

@@ -55,6 +55,16 @@ const EVENT_PAYLOAD_SCHEMAS = Object.freeze({
         'schemaVersion', 'compatibility', 'requestFingerprint', 'selectionFingerprint',
       ])),
     }),
+    2: Object.freeze({
+      allowed: Object.freeze(new Set([
+        'schemaVersion', 'compatibility', 'requestFingerprint', 'selectionFingerprint',
+        'providerSubstitution', 'decisions',
+      ])),
+      required: Object.freeze(new Set([
+        'schemaVersion', 'compatibility', 'requestFingerprint', 'selectionFingerprint',
+        'providerSubstitution', 'decisions',
+      ])),
+    }),
   }),
   'recovery.provider-substituted': Object.freeze({
     1: Object.freeze({
@@ -243,6 +253,24 @@ function validatePayload(type, payload, ErrorType = TypeError) {
     for (const key of ['requestFingerprint', 'selectionFingerprint']) {
       if (typeof value[key] !== 'string' || !SHA256.test(value[key])) {
         throw new ErrorType(`journal recovery ${key} is invalid`);
+      }
+    }
+    if (value.schemaVersion === 2) {
+      if (value.providerSubstitution !== null) {
+        validatePayload('recovery.provider-substituted', {
+          schemaVersion: 1,
+          ...requirePlainObject(value.providerSubstitution, 'recovery provider substitution', ErrorType),
+        }, ErrorType);
+      }
+      if (!Array.isArray(value.decisions)) throw new ErrorType('journal recovery decisions are invalid');
+      const stages = new Set();
+      for (const decision of value.decisions) {
+        const checked = requirePlainObject(decision, 'recovery decision', ErrorType);
+        const { stageId, ...payload } = checked;
+        requireSafeToken(stageId, 'recovery decision stage ID', ErrorType);
+        if (stages.has(stageId)) throw new ErrorType('journal recovery decision stage is duplicated');
+        stages.add(stageId);
+        validatePayload('recovery.stage-decided', { schemaVersion: 1, ...payload }, ErrorType);
       }
     }
   }

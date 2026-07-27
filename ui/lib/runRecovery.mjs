@@ -275,7 +275,11 @@ export class RecoveryCompatibilityDecision {
   constructor(candidateInput, requestInput) {
     const candidate = checkedCandidate(candidateInput);
     const request = splitRequest(requestInput);
-    const requestFingerprint = compatibilityFingerprint(request.compatibility);
+    const requestValue = {
+      ...request.compatibility,
+      ...(request.providerSubstitution ? { providerSubstitution: request.providerSubstitution } : {}),
+    };
+    const requestFingerprint = createHash('sha256').update(stableJson(requestValue)).digest('hex');
     const candidateFingerprint = createHash('sha256').update(stableJson({
       runId: candidate.runId,
       outcome: candidate.outcome,
@@ -325,10 +329,7 @@ export class RecoveryCompatibilityDecision {
     this.reasons = Object.freeze([...new Set(reasons)]);
     this.stages = Object.freeze(stages);
     this.providerSubstitution = providerSubstitution;
-    this.request = Object.freeze({
-      ...request.compatibility,
-      ...(request.providerSubstitution ? { providerSubstitution: request.providerSubstitution } : {}),
-    });
+    this.request = Object.freeze(requestValue);
     this.requestFingerprint = requestFingerprint;
     this.candidateFingerprint = candidateFingerprint;
     this.selectionFingerprint = createHash('sha256').update(stableJson({
@@ -431,7 +432,13 @@ function appendDiagnosticRecord(file, identityKey, validateRecord, lease, makeRe
     }
     const pending = makeRecord();
     const existing = state.events.find((event) => event[identityKey] === pending[identityKey]);
-    if (existing) return existing;
+    if (existing) {
+      const canonical = ({ eventId: _eventId, recordedAt: _recordedAt, ...record }) => stableJson(record);
+      if (canonical(existing) !== canonical(pending)) {
+        throw new Error('recovery diagnostic identity conflicts with a different canonical payload');
+      }
+      return existing;
+    }
     appendSynced(file, pending);
     return pending;
   }));
@@ -461,13 +468,16 @@ function skippedOutcome(candidate, reasons) {
   return Array.isArray(candidate?.completedWork) && candidate.completedWork.length ? 'partial' : 'abandoned';
 }
 
-function persistSelection(root, lease, ordered, requestFingerprint, selectedRunId, skipped) {
-  assertScanLeaseScope(lease, root, lease.runId);
-  const candidateSetFingerprint = createHash('sha256').update(stableJson(ordered.map((candidate) => ({
+function candidateSetFingerprintFor(ordered) {
+  return createHash('sha256').update(stableJson(ordered.map((candidate) => ({
     runId: candidate.runId,
     updatedAt: candidate.updatedAt,
     digest: createHash('sha256').update(stableJson(candidate.input)).digest('hex'),
   })))).digest('hex');
+}
+
+function persistSelection(root, lease, candidateSetFingerprint, requestFingerprint, selectedRunId, skipped) {
+  assertScanLeaseScope(lease, root, lease.runId);
   const selectionId = createHash('sha256').update(stableJson({
     candidateSetFingerprint,
     requestFingerprint,
@@ -493,21 +503,44 @@ function persistSelection(root, lease, ordered, requestFingerprint, selectedRunI
   return { selectionId: record.selectionId, candidateSetFingerprint };
 }
 
-export function selectRecoverableRun(candidates, request, context = null) {
+export function selectRecoverableRun(candidates, request, context) {
   if (!Array.isArray(candidates)) throw new TypeError('recovery candidates must be an array');
+  if (!context) throw new TypeError('durable recovery selection context is required');
+  exactKeys(context, ['lease', 'root'], 'recovery selection context');
   const checkedRequest = splitRequest(request);
   const requestValue = {
     ...checkedRequest.compatibility,
     ...(checkedRequest.providerSubstitution ? { providerSubstitution: checkedRequest.providerSubstitution } : {}),
   };
-  const requestFingerprint = compatibilityFingerprint(checkedRequest.compatibility);
+  const requestFingerprint = createHash('sha256').update(stableJson(requestValue)).digest('hex');
   const ordered = candidates.map(candidateSortEnvelope).sort((left, right) => (
     right.updatedAt.localeCompare(left.updatedAt) || right.runId.localeCompare(left.runId)
   ));
+  const candidateSetFingerprint = candidateSetFingerprintFor(ordered);
+  const priorState = diagnosticJournalState(selectionFile(context.root), validateSelectionRecord, 'selectionId');
+  const terminal = new Map();
+  for (const record of priorState.events) {
+    if (record.candidateSetFingerprint === candidateSetFingerprint
+      && record.requestFingerprint === requestFingerprint) continue;
+    for (const skipped of record.skipped) {
+      if (['partial', 'abandoned', 'complete', 'failed'].includes(skipped.outcome)) {
+        terminal.set(skipped.runId, skipped.outcome);
+      }
+    }
+  }
   const skipped = [];
   let selected = null;
   for (const envelope of ordered) {
     let decision;
+    const terminalOutcome = terminal.get(envelope.runId);
+    if (terminalOutcome) {
+      skipped.push(Object.freeze({
+        runId: envelope.runId,
+        outcome: terminalOutcome,
+        reasons: Object.freeze([`terminal-${terminalOutcome}`]),
+      }));
+      continue;
+    }
     try {
       decision = new RecoveryCompatibilityDecision(envelope.input, requestValue);
     } catch (error) {
@@ -529,18 +562,14 @@ export function selectRecoverableRun(candidates, request, context = null) {
       reasons: decision.reasons,
     }));
   }
-  let durable = {};
-  if (context) {
-    exactKeys(context, ['lease', 'root'], 'recovery selection context');
-    durable = persistSelection(
-      context.root,
-      context.lease,
-      ordered,
-      requestFingerprint,
-      selected?.candidate?.runId ?? null,
-      skipped,
-    );
-  }
+  const durable = persistSelection(
+    context.root,
+    context.lease,
+    candidateSetFingerprint,
+    requestFingerprint,
+    selected?.candidate?.runId ?? null,
+    skipped,
+  );
   return Object.freeze({
     candidate: selected?.candidate ?? null,
     decision: selected?.decision ?? null,
@@ -756,10 +785,22 @@ export function recoverRun(root, targetRunId, lease, selectedDecision) {
     stageId: 'run',
     idempotencyKey: `recovery-started-${lease.generation}`,
     payload: {
-      schemaVersion: 1,
+      schemaVersion: 2,
       compatibility,
       requestFingerprint: decision.requestFingerprint,
       selectionFingerprint: decision.selectionFingerprint,
+      providerSubstitution: decision.providerSubstitution ? {
+        previousProvider: decision.providerSubstitution.fromProvider,
+        previousModel: decision.providerSubstitution.fromModel,
+        nextProvider: decision.providerSubstitution.toProvider,
+        nextModel: decision.providerSubstitution.toModel,
+      } : null,
+      decisions: decision.stages.map((stage) => ({
+        stageId: stage.stageId,
+        action: stage.action,
+        reason: stage.reason,
+        ...(stage.artifact ? { artifact: stage.artifact } : {}),
+      })),
     },
   }, lease);
 

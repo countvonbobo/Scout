@@ -151,6 +151,84 @@ function substitutionRequest(contract, from) {
   };
 }
 
+function durableSelection(root, candidates, request) {
+  const selectionLease = acquireScanLease(
+    root,
+    currentLeaseOwner(),
+    operation(candidates[0]?.runId ?? 'selection-none', { phase: 'select-recovery' }),
+  );
+  try {
+    return selectRecoverableRun(candidates, request, { root, lease: selectionLease });
+  } finally {
+    releaseScanLease(selectionLease);
+  }
+}
+
+test('atomically invalidates stale work from a version-two recovery start before confirmations', () => {
+  const root = temp();
+  const run = openRunJournal(root, 'run-atomic-start');
+  const lease = acquireScanLease(root, currentLeaseOwner(), operation(run.runId));
+  appendStarted(run, lease);
+  const artifact = appendStage(run, lease, 'collect');
+  const next = compatibility({ provider: 'claude', model: 'sonnet-4' });
+  appendRunEvent(run, {
+    type: 'recovery.started', stageId: 'run', idempotencyKey: 'recovery-started-atomic',
+    payload: {
+      schemaVersion: 2,
+      compatibility: next,
+      requestFingerprint: digest('a'),
+      selectionFingerprint: digest('b'),
+      providerSubstitution: {
+        previousProvider: 'codex', previousModel: 'gpt-5',
+        nextProvider: 'claude', nextModel: 'sonnet-4',
+      },
+      decisions: [{ stageId: 'collect', action: 'restart', reason: 'provider-substituted', artifact }],
+    },
+  }, lease);
+
+  const manifest = projectRunManifest(run.events);
+  assert.deepEqual(manifest.completedWork, []);
+  assert.equal(manifest.compatibility.provider, 'claude');
+  assert.equal(manifest.providerSubstitutions.length, 1);
+});
+
+test('replays sparse schema-one completions and old-style recovery before a new lifecycle', () => {
+  const root = temp();
+  const run = openRunJournal(root, 'run-old-recovery');
+  const lease = acquireScanLease(root, currentLeaseOwner(), operation(run.runId));
+  appendStarted(run, lease);
+  appendStage(run, lease, 'collect');
+  const rankArtifact = appendStage(run, lease, 'rank');
+  appendRunEvent(run, {
+    type: 'recovery.provider-substituted', stageId: 'assess', idempotencyKey: 'old-substitution',
+    payload: {
+      schemaVersion: 1, previousProvider: 'codex', previousModel: 'gpt-5',
+      nextProvider: 'claude', nextModel: 'sonnet-4',
+    },
+  }, lease);
+  appendRunEvent(run, {
+    type: 'recovery.stage-decided', stageId: 'rank', idempotencyKey: 'old-rank-reuse',
+    payload: { schemaVersion: 1, action: 'reuse', reason: 'compatible', artifact: rankArtifact },
+  }, lease);
+
+  const manifest = projectRunManifest(run.events);
+  assert.deepEqual(manifest.completedWork.map(({ stageId }) => stageId), ['collect', 'rank']);
+  assert.equal(manifest.providerSubstitutions.length, 1);
+
+  appendRunEvent(run, {
+    type: 'recovery.started', stageId: 'run', idempotencyKey: 'new-atomic-recovery',
+    payload: {
+      schemaVersion: 2,
+      compatibility: compatibility({ rankingVersion: 'ranking-v5' }),
+      requestFingerprint: digest('c'),
+      selectionFingerprint: digest('d'),
+      providerSubstitution: null,
+      decisions: [{ stageId: 'rank', action: 'restart', reason: 'ranking-version-mismatch', artifact: rankArtifact }],
+    },
+  }, lease);
+  assert.deepEqual(projectRunManifest(run.events).completedWork.map(({ stageId }) => stageId), ['collect']);
+});
+
 test('compatibility fingerprints are canonical and reject unreviewed or raw fields', () => {
   const left = compatibility();
   const right = Object.fromEntries(Object.entries(left).reverse());
@@ -170,7 +248,7 @@ test('selects the newest recoverable run and records why newer incomplete runs w
     }),
   ];
 
-  const result = selectRecoverableRun(candidates, compatibility());
+  const result = durableSelection(temp(), candidates, compatibility());
 
   assert.equal(result.candidate.runId, 'run-selected');
   assert.deepEqual(result.skipped, [{
@@ -251,7 +329,7 @@ test('keeps partial and abandoned candidates immutable while selecting an older 
   const partialBefore = structuredClone(partial);
   const abandonedBefore = structuredClone(abandoned);
 
-  const result = selectRecoverableRun([
+  const result = durableSelection(temp(), [
     candidate('run-compatible', '2026-07-27T10:00:00.000Z'),
     abandoned,
     partial,
@@ -281,7 +359,7 @@ test('validates the journal before rebuilding the manifest and journals explicit
     compatibility({ provider: 'claude', model: 'sonnet-4' }),
     compatibility(),
   );
-  const selected = selectRecoverableRun([recoveryCandidate(run, initial)], request);
+  const selected = durableSelection(root, [recoveryCandidate(run, initial)], request);
   lease = acquireScanLease(root, currentLeaseOwner(), operation(runId, {
     provider: 'claude',
     model: 'sonnet-4',
@@ -309,6 +387,13 @@ test('validates the journal before rebuilding the manifest and journals explicit
     },
   );
   assert.deepEqual(projectRunManifest(events), recovered.manifest);
+  const startIndex = events.findIndex((event) => event.type === 'recovery.started');
+  for (let end = startIndex + 1; end <= events.length; end += 1) {
+    const interrupted = projectRunManifest(events.slice(0, end));
+    assert.equal(interrupted.compatibility.provider, 'claude');
+    assert.ok(!interrupted.completedWork.some((stage) => stage.stageId === 'assess'));
+    assert.equal(interrupted.providerSubstitutions.length, 1);
+  }
 });
 
 test('recoverRun preserves the exact selected request and invalidates every affected downstream completion', () => {
@@ -328,7 +413,7 @@ test('recoverRun preserves the exact selected request and invalidates every affe
     mutationSchemaVersion: 2,
     targetRevision: 'tracker-rev-8',
   });
-  const selected = selectRecoverableRun([recoveryCandidate(run, initial)], request);
+  const selected = durableSelection(root, [recoveryCandidate(run, initial)], request);
   assert.equal(selected.decision.stages.find((stage) => stage.stageId === 'rank').action, 'restart');
 
   lease = acquireScanLease(root, currentLeaseOwner(), operation(runId));
@@ -358,7 +443,7 @@ test('restart invalidation survives provider switches and a replacement completi
   releaseScanLease(lease);
 
   let request = substitutionRequest(claude, codex);
-  let selected = selectRecoverableRun([recoveryCandidate(run, manifest)], request);
+  let selected = durableSelection(root, [recoveryCandidate(run, manifest)], request);
   lease = acquireScanLease(root, currentLeaseOwner(), operation(runId, {
     provider: 'claude', model: 'sonnet-4', phase: 'provider-substitution',
   }));
@@ -368,7 +453,7 @@ test('restart invalidation survives provider switches and a replacement completi
   releaseScanLease(lease);
 
   request = substitutionRequest(codex, claude);
-  selected = selectRecoverableRun([recoveryCandidate(run, manifest)], request);
+  selected = durableSelection(root, [recoveryCandidate(run, manifest)], request);
   assert.equal(selected.decision.recoverable, true);
   lease = acquireScanLease(root, currentLeaseOwner(), operation(runId, {
     provider: 'codex', model: 'gpt-5', phase: 'provider-substitution',
@@ -378,7 +463,7 @@ test('restart invalidation survives provider switches and a replacement completi
   releaseScanLease(lease);
 
   request = substitutionRequest(claude, codex);
-  selected = selectRecoverableRun([recoveryCandidate(run, manifest)], request);
+  selected = durableSelection(root, [recoveryCandidate(run, manifest)], request);
   lease = acquireScanLease(root, currentLeaseOwner(), operation(runId, {
     provider: 'claude', model: 'sonnet-4', phase: 'provider-substitution',
   }));
@@ -388,7 +473,7 @@ test('restart invalidation survives provider switches and a replacement completi
   assert.equal(manifest.completedWork.filter((stage) => stage.stageId === 'assess').length, 1);
   releaseScanLease(lease);
 
-  selected = selectRecoverableRun([recoveryCandidate(run, manifest)], claude);
+  selected = durableSelection(root, [recoveryCandidate(run, manifest)], claude);
   lease = acquireScanLease(root, currentLeaseOwner(), operation(runId, {
     provider: 'claude', model: 'sonnet-4',
   }));
@@ -501,6 +586,42 @@ test('durably records skipped candidates and immutable partial or abandoned outc
     { runId: 'run-partial-work', outcome: 'partial', reasons: ['pipeline-version-mismatch'] },
     { runId: 'run-no-work', outcome: 'abandoned', reasons: ['profile-version-mismatch'] },
   ]);
+
+  const later = selectRecoverableRun(candidates, compatibility({
+    pipelineVersion: 'old-pipeline',
+  }), { root, lease });
+  assert.notEqual(later.candidate?.runId, 'run-partial-work');
+  assert.deepEqual(
+    later.skipped.find(({ runId }) => runId === 'run-partial-work'),
+    { runId: 'run-partial-work', outcome: 'partial', reasons: ['terminal-partial'] },
+  );
+
+  records[0].selectedRunId = null;
+  fs.writeFileSync(
+    path.join(root, '.scout', 'recovery-selections.jsonl'),
+    `${JSON.stringify(records[0])}\n`,
+    'utf8',
+  );
+  assert.throws(
+    () => selectRecoverableRun(candidates, compatibility(), { root, lease }),
+    /identity conflicts/i,
+  );
+});
+
+test('selection persistence is mandatory and substitution provenance changes its identity', () => {
+  const root = temp();
+  const lease = acquireScanLease(root, currentLeaseOwner(), operation('selection-substitution'));
+  const codex = compatibility();
+  const claude = compatibility({ provider: 'claude', model: 'sonnet-4' });
+  const candidates = [candidate('run-codex', '2026-07-27T09:00:00.000Z')];
+
+  assert.throws(() => selectRecoverableRun(candidates, claude), /durable.*context/i);
+  const allowed = selectRecoverableRun(candidates, substitutionRequest(claude, codex), { root, lease });
+  const denied = selectRecoverableRun(candidates, claude, { root, lease });
+
+  assert.notEqual(denied.selectionId, allowed.selectionId);
+  assert.equal(denied.candidate, null);
+  assert.equal(allowed.candidate.runId, 'run-codex');
 });
 
 test('skips malformed and unsupported candidates durably instead of aborting older compatible selection', () => {
