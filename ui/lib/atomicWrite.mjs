@@ -25,6 +25,16 @@ export function atomicWriteFile(file, value, {
     fileSystem.closeSync(descriptor);
     descriptor = undefined;
     fileSystem.renameSync(temporary, file);
+    const directoryDescriptor = fileSystem.openSync(directory, 'r');
+    try {
+      fileSystem.fsyncSync(directoryDescriptor);
+    } catch (error) {
+      // Windows does not expose POSIX directory fsync. The file itself was
+      // flushed before replacement; surface every other platform failure.
+      if (process.platform !== 'win32' || !['EPERM', 'EINVAL', 'EISDIR'].includes(error?.code)) throw error;
+    } finally {
+      fileSystem.closeSync(directoryDescriptor);
+    }
   } catch (error) {
     if (descriptor !== undefined) {
       try { fileSystem.closeSync(descriptor); } catch {}

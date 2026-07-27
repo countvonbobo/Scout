@@ -15,9 +15,16 @@ const EVENT_PAYLOAD_SCHEMAS = Object.freeze({
   'stage.completed': Object.freeze({
     1: Object.freeze(new Set(['schemaVersion', 'reference', 'count', 'version', 'artifact'])),
   }),
+  'run.completed': Object.freeze({
+    1: Object.freeze(new Set(['schemaVersion', 'outcome', 'compatibility'])),
+  }),
+  'mutation.receipted': Object.freeze({
+    1: Object.freeze(new Set(['schemaVersion', 'reference', 'digest'])),
+  }),
 });
 const REFERENCE_KINDS = new Set(['source', 'vacancy', 'selection', 'stage', 'batch', 'mutation']);
 const VERSION_KINDS = new Set(['provider', 'model', 'pipeline', 'profile', 'configuration', 'prompt', 'schema']);
+const RUN_OUTCOMES = new Set(['complete', 'partial', 'abandoned', 'failed']);
 
 export class JournalCorruptionError extends Error {
   constructor(message) {
@@ -112,6 +119,9 @@ function validatePayload(type, payload, ErrorType = TypeError) {
   if (value.count !== undefined && (!Number.isSafeInteger(value.count) || value.count < 0)) throw new ErrorType('journal payload count must be a non-negative whole number');
   if (value.version !== undefined) validateVersion(value.version, ErrorType);
   if (value.artifact !== undefined) validateArtifactReference(value.artifact, ErrorType);
+  if (value.compatibility !== undefined) validateVersion(value.compatibility, ErrorType);
+  if (value.outcome !== undefined && !RUN_OUTCOMES.has(value.outcome)) throw new ErrorType('journal payload outcome is invalid');
+  if (value.digest !== undefined && (typeof value.digest !== 'string' || !SHA256.test(value.digest))) throw new ErrorType('journal payload digest is invalid');
   let encoded;
   try {
     encoded = stableJson(payload);

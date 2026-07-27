@@ -151,6 +151,24 @@ test('accepts only the reviewed stage-completion reference, count, version, and 
   assert.deepEqual(replayRunJournal(journal.file), [event]);
 });
 
+test('accepts only reviewed terminal outcome and mutation receipt event payloads', () => {
+  const journal = openRunJournal(temp(), 'run-1');
+  const terminal = appendRunEvent(journal, {
+    type: 'run.completed', stageId: 'finalise', idempotencyKey: 'run-complete-v1',
+    payload: { schemaVersion: 1, outcome: 'complete', compatibility: { kind: 'profile', value: 'profile-v1' } },
+  }, lease);
+  const receipt = appendRunEvent(journal, {
+    type: 'mutation.receipted', stageId: 'tracker', idempotencyKey: 'tracker-v1',
+    payload: { schemaVersion: 1, reference: { kind: 'mutation', id: 'tracker-v1' }, digest: 'a'.repeat(64) },
+  }, lease);
+
+  assert.deepEqual(replayRunJournal(journal.file), [terminal, receipt]);
+  assert.throws(() => appendRunEvent(journal, {
+    type: 'run.completed', stageId: 'finalise', idempotencyKey: 'run-complete-v2',
+    payload: { schemaVersion: 1, outcome: 'complete', compatibility: { kind: 'profile', value: 'profile-v1' }, note: 'raw content' },
+  }, lease), /payload/i);
+});
+
 test('rejects run IDs that are unsafe as Windows directory components', () => {
   for (const runId of ['run:one', 'run.', 'CON', 'lpt1']) {
     assert.throws(() => openRunJournal(temp(), runId), /run ID/i);
