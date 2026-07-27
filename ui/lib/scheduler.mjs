@@ -169,6 +169,17 @@ export function nextScheduledRun(time, now = new Date(), timezone = null, days =
   return null;
 }
 
+// A delayed native scheduler invocation must not revive a scheduled request
+// indefinitely: it is valid until its next configured window, capped at 12h.
+export function scheduledRequestExpiry(requestedAt, nextWindowAt) {
+  const requested = new Date(requestedAt);
+  const window = new Date(nextWindowAt);
+  if (Number.isNaN(requested.getTime()) || Number.isNaN(window.getTime()) || window <= requested) {
+    throw new TypeError('scheduled request times must be ordered ISO timestamps');
+  }
+  return new Date(Math.min(requested.getTime() + 12 * 60 * 60 * 1000, window.getTime())).toISOString();
+}
+
 export function scheduleSummary(config = {}, scanHealth = null, tasks = [], now = new Date()) {
   const jobs = config.schedule?.jobs || [];
   const taskList = Array.isArray(tasks) ? tasks : jobs.map(() => tasks);
