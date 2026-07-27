@@ -169,6 +169,17 @@ test('accepts only reviewed terminal outcome and mutation receipt event payloads
   }, lease), /payload/i);
 });
 
+test('rejects terminal and receipt events when projection-required fields are absent', () => {
+  const journal = openRunJournal(temp(), 'run-1');
+
+  assert.throws(() => appendRunEvent(journal, {
+    type: 'run.completed', stageId: 'finalise', idempotencyKey: 'missing-outcome-v1', payload: { schemaVersion: 1 },
+  }, lease), /payload/i);
+  assert.throws(() => appendRunEvent(journal, {
+    type: 'mutation.receipted', stageId: 'tracker', idempotencyKey: 'missing-receipt-v1', payload: { schemaVersion: 1 },
+  }, lease), /payload/i);
+});
+
 test('rejects run IDs that are unsafe as Windows directory components', () => {
   for (const runId of ['run:one', 'run.', 'CON', 'lpt1']) {
     assert.throws(() => openRunJournal(temp(), runId), /run ID/i);

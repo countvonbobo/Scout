@@ -94,7 +94,31 @@ test('rejects a manifest that claims an artifact not referenced by the journal',
   completed(run, artifact);
   const manifest = projectRunManifest(run.events);
   manifest.artifacts.push({ id: 'not-journalled', schemaVersion: 1, digest: 'b'.repeat(64) });
-  replaceRunManifest(run, manifest);
+  fs.writeFileSync(path.join(run.directory, 'manifest.json'), `${JSON.stringify(manifest)}\n`, 'utf8');
 
   assert.throws(() => validateManifestAgreement(run), ManifestAgreementError);
+});
+
+test('rejects raw or invented manifest content before it can be stored', () => {
+  const run = openRunJournal(temp(), 'run-1');
+
+  for (const manifest of [
+    { rawCv: 'private content' },
+    { schemaVersion: 1, runId: 'run-1', artifacts: [{ id: 'invented', schemaVersion: 1, digest: 'a'.repeat(64) }] },
+  ]) {
+    assert.throws(() => replaceRunManifest(run, manifest), ManifestAgreementError);
+  }
+  assert.equal(fs.existsSync(path.join(run.directory, 'manifest.json')), false);
+});
+
+test('keeps a journalled artifact readable when a later commit uses its ID with a different digest', () => {
+  const run = openRunJournal(temp(), 'run-1');
+  const firstValue = { schemaVersion: 1, stableIds: ['vacancy-1'] };
+  const first = commitRunArtifact(run, { id: 'collect-v1', schemaVersion: 1 }, firstValue);
+  completed(run, first);
+  const second = commitRunArtifact(run, { id: 'collect-v1', schemaVersion: 1 }, { schemaVersion: 1, stableIds: ['vacancy-2'] });
+
+  assert.notEqual(second.digest, first.digest);
+  assert.deepEqual(readRunArtifact(first), firstValue);
+  assert.equal(validateManifestAgreement(run).rebuilt, true);
 });

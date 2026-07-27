@@ -13,13 +13,22 @@ const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-
 const WINDOWS_RESERVED_RUN_IDS = new Set(['CON', 'PRN', 'AUX', 'NUL', ...Array.from({ length: 9 }, (_, index) => `COM${index + 1}`), ...Array.from({ length: 9 }, (_, index) => `LPT${index + 1}`)]);
 const EVENT_PAYLOAD_SCHEMAS = Object.freeze({
   'stage.completed': Object.freeze({
-    1: Object.freeze(new Set(['schemaVersion', 'reference', 'count', 'version', 'artifact'])),
+    1: Object.freeze({
+      allowed: Object.freeze(new Set(['schemaVersion', 'reference', 'count', 'version', 'artifact'])),
+      required: Object.freeze(new Set(['schemaVersion'])),
+    }),
   }),
   'run.completed': Object.freeze({
-    1: Object.freeze(new Set(['schemaVersion', 'outcome', 'compatibility'])),
+    1: Object.freeze({
+      allowed: Object.freeze(new Set(['schemaVersion', 'outcome', 'compatibility'])),
+      required: Object.freeze(new Set(['schemaVersion', 'outcome'])),
+    }),
   }),
   'mutation.receipted': Object.freeze({
-    1: Object.freeze(new Set(['schemaVersion', 'reference', 'digest'])),
+    1: Object.freeze({
+      allowed: Object.freeze(new Set(['schemaVersion', 'reference', 'digest'])),
+      required: Object.freeze(new Set(['schemaVersion', 'reference', 'digest'])),
+    }),
   }),
 });
 const REFERENCE_KINDS = new Set(['source', 'vacancy', 'selection', 'stage', 'batch', 'mutation']);
@@ -110,10 +119,13 @@ function validateArtifactReference(value, ErrorType) {
 
 function validatePayload(type, payload, ErrorType = TypeError) {
   const value = requirePlainObject(payload, 'payload', ErrorType);
-  const allowed = EVENT_PAYLOAD_SCHEMAS[type]?.[value.schemaVersion];
-  if (!allowed) throw new ErrorType(`unsupported journal payload schema for event type: ${type}`);
+  const schema = EVENT_PAYLOAD_SCHEMAS[type]?.[value.schemaVersion];
+  if (!schema) throw new ErrorType(`unsupported journal payload schema for event type: ${type}`);
   for (const key of Object.keys(value)) {
-    if (!allowed.has(key)) throw new ErrorType(`journal payload property is not allowed: ${key}`);
+    if (!schema.allowed.has(key)) throw new ErrorType(`journal payload property is not allowed: ${key}`);
+  }
+  for (const key of schema.required) {
+    if (value[key] === undefined) throw new ErrorType(`journal payload property is required: ${key}`);
   }
   if (value.reference !== undefined) validateReference(value.reference, ErrorType);
   if (value.count !== undefined && (!Number.isSafeInteger(value.count) || value.count < 0)) throw new ErrorType('journal payload count must be a non-negative whole number');

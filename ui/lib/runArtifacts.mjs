@@ -80,10 +80,12 @@ function validateDescriptor(descriptor, ErrorType = TypeError) {
   };
 }
 
-function artifactPath(directory, id) {
-  // A digest-derived filename keeps valid journal IDs portable across Windows
-  // and POSIX filesystems without accepting a caller-controlled path segment.
-  return path.join(directory, 'artifacts', `${createHash('sha256').update(id).digest('hex')}.json`);
+function artifactPath(directory, ref) {
+  // The immutable key includes all identity fields. It keeps valid journal IDs
+  // portable across Windows and POSIX filesystems without accepting a
+  // caller-controlled path segment or replacing an earlier digest.
+  const key = stableJson({ id: ref.id, schemaVersion: ref.schemaVersion, digest: ref.digest });
+  return path.join(directory, 'artifacts', `${createHash('sha256').update(key).digest('hex')}.json`);
 }
 
 function referenceFor(directory, descriptor, value) {
@@ -116,7 +118,7 @@ export function commitRunArtifact(run, descriptor, value) {
     digest: ref.digest,
     value,
   };
-  atomicWriteFile(artifactPath(directory, ref.id), `${stableJson(stored)}\n`, { mode: 0o600 });
+  atomicWriteFile(artifactPath(directory, ref), `${stableJson(stored)}\n`, { mode: 0o600 });
   // Keep the validation close to the commit boundary: an acknowledged ref is
   // never returned for an unflushed, malformed, or digest-mismatched artifact.
   if (encoded !== stableJson(value)) throw new ArtifactIntegrityError('artifact encoding changed during commit');
@@ -126,7 +128,7 @@ export function commitRunArtifact(run, descriptor, value) {
 export function readRunArtifact(ref) {
   const descriptor = validateReference(ref);
   const directory = directoryForReference(ref);
-  const file = artifactPath(directory, descriptor.id);
+  const file = artifactPath(directory, ref);
   let stored;
   try {
     stored = JSON.parse(fs.readFileSync(file, 'utf8'));
@@ -218,10 +220,15 @@ function manifestFile(run) {
 
 export function replaceRunManifest(run, manifest) {
   const directory = requireRunDirectory(run?.directory, ManifestAgreementError);
-  if (!manifest || typeof manifest !== 'object' || Array.isArray(manifest)) throw new ManifestAgreementError('manifest is invalid');
-  const encoded = stableJson(manifest);
+  const state = validateRunJournal(run?.file);
+  const expected = projectRunManifest(state.events);
+  if (!manifestsMatch(manifest, expected)) {
+    throw new ManifestAgreementError('manifest does not agree with the validated journal');
+  }
+  validateProjectedArtifacts(run, expected);
+  const encoded = stableJson(expected);
   atomicWriteFile(path.join(directory, 'manifest.json'), `${encoded}\n`, { mode: 0o600 });
-  return manifest;
+  return expected;
 }
 
 function manifestsMatch(actual, expected) {
