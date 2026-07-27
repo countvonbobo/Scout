@@ -4,7 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { afterEach, test } from 'node:test';
 import {
-  CURRENT_WORKSPACE_SCHEMA, backupWorkspace, defaultWorkspaceRoot, mergeWorkspaceDefaults, migrateWorkspace, resolveWorkspaceRoot,
+  CURRENT_WORKSPACE_SCHEMA, backupWorkspace, defaultWorkspaceRoot, ensureWorkspaceDirectories, mergeWorkspaceDefaults, migrateWorkspace, resolveWorkspaceRoot,
   modelForProvider, syncManagedInstructions, validateWorkspaceConfig, workspacePaths,
 } from './workspace.mjs';
 
@@ -44,6 +44,12 @@ test('workspace paths reserve private per-run journal directories without changi
   const paths = workspacePaths(root);
   assert.equal(paths.runs, path.join(root, '.scout', 'runs'));
   assert.equal(paths.scanRuns, path.join(root, 'data', 'scan-runs.jsonl'));
+});
+
+test('workspace provisioning creates the private per-run journal directory', () => {
+  const root = temp();
+  const paths = ensureWorkspaceDirectories(root);
+  assert.equal(fs.statSync(paths.runs).isDirectory(), true);
 });
 
 test('search-profile migration backups use a distinct reviewable label', () => {
