@@ -7,6 +7,7 @@ import {
   currentLeaseOwner,
   releaseScanLease,
   startLeaseHeartbeat,
+  synchronousFenceCallback,
 } from '../scanLease.mjs';
 import { commitRunArtifact } from '../runArtifacts.mjs';
 import { appendRunEvent, openRunJournal } from '../runJournal.mjs';
@@ -107,10 +108,11 @@ if (command === 'race-acquire') {
 } else if (command === 'hold-guard') {
   const [ready, stop, acquiredAt] = args;
   const guard = path.join(root, '.scout', 'scan-lease.guard');
+  const guardId = `guard-${process.pid}`;
   fs.mkdirSync(guard, { recursive: true });
-  fs.writeFileSync(path.join(guard, 'owner.json'), `${JSON.stringify({
+  fs.writeFileSync(path.join(guard, `${guardId}.json`), `${JSON.stringify({
     schemaVersion: 1,
-    guardId: `guard-${process.pid}`,
+    guardId,
     owner: currentLeaseOwner(),
     acquiredAt,
   })}\n`, 'utf8');
@@ -172,13 +174,13 @@ if (command === 'race-acquire') {
     },
   });
   if (!lease) throw new Error('recovery holder could not acquire');
-  assertCurrentFence(lease, () => {
+  assertCurrentFence(lease, synchronousFenceCallback(() => {
     if (fs.existsSync(active)) fs.writeFileSync(overlap, '', 'utf8');
     fs.writeFileSync(active, '', 'utf8');
     fs.writeFileSync(entered, '', 'utf8');
     while (!fs.existsSync(release)) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 5);
     fs.rmSync(active, { force: true });
-  });
+  }));
   releaseScanLease(lease);
   write({ acquired: true });
 } else if (command === 'legacy-acquire') {
@@ -187,6 +189,35 @@ if (command === 'race-acquire') {
 } else if (command === 'legacy-release') {
   const [token] = args;
   write(releaseScanLock(root, token));
+} else if (command === 'legacy-lock-owner') {
+  const [ready, stop, startedAt, token] = args;
+  const record = {
+    agent: 'codex',
+    mode: 'primary',
+    token,
+    startedAt,
+    owner: currentLeaseOwner(),
+  };
+  fs.writeFileSync(path.join(root, '.scout-scan.lock'), `${JSON.stringify(record)}\n`, {
+    encoding: 'utf8',
+    flag: 'wx',
+  });
+  fs.writeFileSync(ready, '', 'utf8');
+  if (stop !== '-') await waitFor(stop);
+  write({ created: true, owner: record.owner });
+} else if (command === 'legacy-lock-create') {
+  const [startedAt, token] = args;
+  const record = {
+    agent: 'codex',
+    mode: 'primary',
+    token,
+    startedAt,
+  };
+  fs.writeFileSync(path.join(root, '.scout-scan.lock'), `${JSON.stringify(record)}\n`, {
+    encoding: 'utf8',
+    flag: 'wx',
+  });
+  write({ created: true });
 } else if (command === 'plain-write-after-signal') {
   const [ready, proceed, runId] = args;
   const run = openRunJournal(root, runId);

@@ -7,7 +7,8 @@ import { fileURLToPath } from 'node:url';
 import { afterEach, test } from 'node:test';
 import {
   LeaseLostError, acquireScanLease, assertCurrentFence, currentLeaseOwner, readScanLease,
-  releaseScanLease, renewScanLease, startLeaseHeartbeat,
+  releaseScanLease, releaseScanLeaseByToken, renewScanLease, startLeaseHeartbeat,
+  synchronousFenceCallback,
 } from './scanLease.mjs';
 import { appendRunEvent, openRunJournal } from './runJournal.mjs';
 import {
@@ -131,8 +132,10 @@ test('a reused PID with a different process-start identity cannot preserve a dea
   const root = temp();
   const guard = path.join(root, '.scout', 'scan-lease.guard');
   fs.mkdirSync(guard, { recursive: true });
+  const old = new Date(Date.now() - 31_000);
+  fs.utimesSync(guard, old, old);
   const actual = currentLeaseOwner();
-  fs.writeFileSync(path.join(guard, 'owner.json'), `${JSON.stringify({
+  fs.writeFileSync(path.join(guard, 'guard-reused-pid.json'), `${JSON.stringify({
     schemaVersion: 1,
     guardId: 'guard-reused-pid',
     owner: { ...actual, processStart: `${actual.processStart}-reused` },
@@ -150,7 +153,7 @@ test('a dead guard older than 30 seconds is atomically quarantined', async () =>
   const root = temp();
   const guard = path.join(root, '.scout', 'scan-lease.guard');
   fs.mkdirSync(guard, { recursive: true });
-  fs.writeFileSync(path.join(guard, 'owner.json'), `${JSON.stringify({
+  fs.writeFileSync(path.join(guard, 'guard-dead-process.json'), `${JSON.stringify({
     schemaVersion: 1,
     guardId: 'guard-dead-process',
     owner: { host: os.hostname(), pid: 999_999_999, processStart: 'dead-process' },
@@ -164,52 +167,47 @@ test('a dead guard older than 30 seconds is atomically quarantined', async () =>
   assert.equal(fs.existsSync(path.join(root, '.scout', 'scan-lease.json')), true);
 });
 
-test('recovery arbitration cleans its exact claim when a stale observer already moved it', () => {
+test('recovery arbitration removes its identity marker and leaves no fixed cleanup target', () => {
   const root = temp();
   const scout = path.join(root, '.scout');
   const guard = path.join(scout, 'scan-lease.guard');
   fs.mkdirSync(guard, { recursive: true });
-  fs.writeFileSync(path.join(guard, 'owner.json'), `${JSON.stringify({
+  fs.writeFileSync(path.join(guard, 'dead-arbitration-guard.json'), `${JSON.stringify({
     schemaVersion: 1,
     guardId: 'dead-arbitration-guard',
     owner: { host: os.hostname(), pid: 999_999_999, processStart: 'dead-process' },
     acquiredAt: new Date(Date.now() - 31_000).toISOString(),
   })}\n`, 'utf8');
-  const lease = acquireScanLease(root, currentLeaseOwner(), operation('run-arbitration-moved'), {
-    _testHooks: {
-      afterGuardRecoveryRename() {
-        fs.renameSync(
-          path.join(scout, 'scan-lease.recovery-claim'),
-          path.join(scout, 'scan-lease.recovery-claim.cleanup'),
-        );
-      },
-    },
-  });
-  assert.equal(lease?.runId, 'run-arbitration-moved');
+  const lease = acquireScanLease(root, currentLeaseOwner(), operation('run-arbitration-identity'));
+  assert.equal(lease?.runId, 'run-arbitration-identity');
+  assert.equal(fs.existsSync(path.join(scout, 'scan-lease.recovery-claim')), false);
   assert.equal(fs.existsSync(path.join(scout, 'scan-lease.recovery-claim.cleanup')), false);
   releaseScanLease(lease);
 });
 
-test('same-owner retry recovers exhausted recovery-arbitration cleanup removal', () => {
+test('recovery-arbitration cleanup failure is recovered in the background', async () => {
   const root = temp();
   const scout = path.join(root, '.scout');
   const guard = path.join(scout, 'scan-lease.guard');
   fs.mkdirSync(guard, { recursive: true });
-  fs.writeFileSync(path.join(guard, 'owner.json'), `${JSON.stringify({
+  fs.writeFileSync(path.join(guard, 'dead-arbitration-cleanup.json'), `${JSON.stringify({
     schemaVersion: 1,
     guardId: 'dead-arbitration-cleanup',
     owner: { host: os.hostname(), pid: 999_999_999, processStart: 'dead-process' },
     acquiredAt: new Date(Date.now() - 31_000).toISOString(),
   })}\n`, 'utf8');
-  const injected = injectedGuardFileSystem({ failRecoveryRemove: 4 });
+  const injected = injectedGuardFileSystem({ failRecoveryMarkerUnlink: 4 });
   assert.throws(() => acquireScanLease(
     root,
     currentLeaseOwner(),
     operation('run-arbitration-cleanup-failure'),
     { fileSystem: injected.fileSystem },
-  ), /injected recovery cleanup removal failure/);
-  assert.equal(injected.state.recoveryRemoves, 4);
-  assert.equal(fs.existsSync(path.join(scout, 'scan-lease.recovery-claim.cleanup')), true);
+  ), /injected recovery marker cleanup failure/);
+  assert.equal(injected.state.recoveryMarkerUnlinks, 4);
+  await waitUntil(
+    () => !fs.existsSync(path.join(scout, 'scan-lease.recovery-claim')),
+    'recovery-arbitration cleanup did not recover in the background',
+  );
   const recovered = acquireScanLease(
     root,
     currentLeaseOwner(),
@@ -217,6 +215,51 @@ test('same-owner retry recovers exhausted recovery-arbitration cleanup removal',
     { fileSystem: injected.fileSystem },
   );
   assert.equal(recovered?.runId, 'run-arbitration-cleanup-recovered');
+  releaseScanLease(recovered);
+});
+
+test('failed recovery-arbitration publication leaves no visible or private claim', () => {
+  const root = temp();
+  const scout = path.join(root, '.scout');
+  const guard = path.join(scout, 'scan-lease.guard');
+  fs.mkdirSync(guard, { recursive: true });
+  fs.writeFileSync(path.join(guard, 'dead-arbitration-publication.json'), `${JSON.stringify({
+    schemaVersion: 1,
+    guardId: 'dead-arbitration-publication',
+    owner: { host: os.hostname(), pid: 999_999_999, processStart: 'dead-process' },
+    acquiredAt: new Date(Date.now() - 31_000).toISOString(),
+  })}\n`, 'utf8');
+  let failed = false;
+  const fileSystem = new Proxy(fs, {
+    get(target, property) {
+      if (property === 'symlinkSync') return (source, destination, type) => {
+        if (!failed && String(destination).endsWith('scan-lease.recovery-claim')) {
+          failed = true;
+          throw Object.assign(new Error('injected arbitration publication failure'), { code: 'EIO' });
+        }
+        return target.symlinkSync(source, destination, type);
+      };
+      const value = target[property];
+      return typeof value === 'function' ? value.bind(target) : value;
+    },
+  });
+  assert.throws(() => acquireScanLease(
+    root,
+    currentLeaseOwner(),
+    operation('run-arbitration-publication-failure'),
+    { fileSystem },
+  ), /injected arbitration publication failure/);
+  assert.equal(fs.existsSync(path.join(scout, 'scan-lease.recovery-claim')), false);
+  assert.deepEqual(
+    fs.readdirSync(scout).filter((entry) => entry.startsWith('scan-lease.recovery-claim.candidate.')),
+    [],
+  );
+  const recovered = acquireScanLease(
+    root,
+    currentLeaseOwner(),
+    operation('run-after-arbitration-publication-failure'),
+  );
+  assert.equal(recovered?.runId, 'run-after-arbitration-publication-failure');
   releaseScanLease(recovered);
 });
 
@@ -240,12 +283,125 @@ test('a live guard is never quarantined even when its wall-clock timestamp is ol
   await holder.result;
 });
 
+test('a live previous-version owner.json guard remains protected during upgrade', () => {
+  const root = temp();
+  const guard = path.join(root, '.scout', 'scan-lease.guard');
+  fs.mkdirSync(guard, { recursive: true });
+  fs.writeFileSync(path.join(guard, 'owner.json'), `${JSON.stringify({
+    schemaVersion: 1,
+    guardId: 'previous-version-live-guard',
+    owner: currentLeaseOwner(),
+    acquiredAt: new Date(Date.now() - 31_000).toISOString(),
+  })}\n`, 'utf8');
+  const old = new Date(Date.now() - 31_000);
+  fs.utimesSync(guard, old, old);
+
+  const contender = acquireScanLease(
+    root,
+    currentLeaseOwner(),
+    operation('run-during-guard-upgrade'),
+    { guardAcquireTimeoutMs: 50 },
+  );
+  assert.equal(contender, null);
+  assert.equal(fs.existsSync(guard), true);
+  assert.equal(fs.existsSync(path.join(guard, 'owner.json')), true);
+});
+
+test('a delayed guard creator cannot publish into a live successor directory', () => {
+  const root = temp();
+  const guard = path.join(root, '.scout', 'scan-lease.guard');
+  const successorId = 'initialization-race-successor';
+  let injected = false;
+  const installSuccessor = () => {
+    fs.mkdirSync(guard);
+    fs.writeFileSync(path.join(guard, `${successorId}.json`), `${JSON.stringify({
+      schemaVersion: 1,
+      guardId: successorId,
+      owner: currentLeaseOwner(),
+      acquiredAt: new Date().toISOString(),
+    })}\n`, 'utf8');
+    injected = true;
+  };
+  const fileSystem = new Proxy(fs, {
+    get(target, property) {
+      if (property === 'mkdirSync') return (directory, options) => {
+        const result = target.mkdirSync(directory, options);
+        if (!injected && path.resolve(String(directory)) === path.resolve(guard)) {
+          const displaced = `${guard}.displaced-initializer`;
+          target.renameSync(guard, displaced);
+          installSuccessor();
+        }
+        return result;
+      };
+      if (property === 'symlinkSync') return (source, destination, type) => {
+        if (!injected && path.resolve(String(destination)) === path.resolve(guard)) {
+          installSuccessor();
+        }
+        return target.symlinkSync(source, destination, type);
+      };
+      const value = target[property];
+      return typeof value === 'function' ? value.bind(target) : value;
+    },
+  });
+
+  const contender = acquireScanLease(
+    root,
+    currentLeaseOwner(),
+    operation('run-delayed-initializer'),
+    { fileSystem, guardAcquireTimeoutMs: 50 },
+  );
+  assert.equal(injected, true);
+  assert.equal(contender, null);
+  assert.deepEqual(fs.readdirSync(guard), [`${successorId}.json`]);
+  assert.equal(readScanLease(root), null);
+});
+
+test('guard publication never replaces an empty previous-version initializer', () => {
+  const root = temp();
+  const guard = path.join(root, '.scout', 'scan-lease.guard');
+  fs.mkdirSync(guard, { recursive: true });
+  const old = new Date(Date.now() - 31_000);
+  fs.utimesSync(guard, old, old);
+  let simulatedPosixReplacement = false;
+  const fileSystem = new Proxy(fs, {
+    get(target, property) {
+      if (property === 'renameSync') return (source, destination) => {
+        if (String(source).includes('scan-lease.guard.candidate.')
+          && path.resolve(String(destination)) === path.resolve(guard)) {
+          target.rmdirSync(guard);
+          simulatedPosixReplacement = true;
+        }
+        return target.renameSync(source, destination);
+      };
+      const value = target[property];
+      return typeof value === 'function' ? value.bind(target) : value;
+    },
+  });
+
+  const contender = acquireScanLease(
+    root,
+    currentLeaseOwner(),
+    operation('run-empty-initializer-race'),
+    { fileSystem, guardAcquireTimeoutMs: 50 },
+  );
+  assert.equal(contender, null);
+  assert.equal(simulatedPosixReplacement, false);
+  assert.deepEqual(fs.readdirSync(guard), []);
+  fs.writeFileSync(path.join(guard, 'owner.json'), `${JSON.stringify({
+    schemaVersion: 1,
+    guardId: 'resumed-previous-version-initializer',
+    owner: currentLeaseOwner(),
+    acquiredAt: new Date().toISOString(),
+  })}\n`, 'utf8');
+  assert.equal(readScanLease(root), null);
+});
+
 test('a delayed stale recoverer and a third gap contender cannot overlap a live successor', async () => {
   const root = temp();
   const scout = path.join(root, '.scout');
   const guard = path.join(scout, 'scan-lease.guard');
   fs.mkdirSync(guard, { recursive: true });
-  fs.writeFileSync(path.join(guard, 'owner.json'), `${JSON.stringify({
+  fs.writeFileSync(path.join(guard, 'dead-guard.json'), `${JSON.stringify({
     schemaVersion: 1,
     guardId: 'dead-guard',
     owner: { host: os.hostname(), pid: 999_999_999, processStart: 'dead-process' },
@@ -380,12 +536,156 @@ test('legacy acquisition and token-authorised release work in distinct processes
   assert.equal(readScanLease(root), null);
 });
 
-test('an active old lock blocks direct lease acquisition during upgrade', () => {
+test('fenced activation never creates a cross-version legacy sentinel', () => {
   const root = temp();
+  const lease = acquireScanLease(root, currentLeaseOwner(), operation('run-no-sentinel'));
+  assert.ok(lease);
+  assert.equal(fs.existsSync(path.join(root, '.scout-scan.lock')), false);
+  renewScanLease(lease);
+  assert.equal(fs.existsSync(path.join(root, '.scout-scan.lock')), false);
+  releaseScanLease(lease);
+});
+
+test('an unexpired legacy lock blocks migration without changing its bytes', async () => {
+  const root = temp();
+  const ready = path.join(root, 'legacy-ready');
+  const stop = path.join(root, 'legacy-stop');
+  const startedAt = '2026-07-27T10:00:00.000Z';
+  const legacy = child([
+    'legacy-lock-owner', root, ready, stop, startedAt, 'legacy-active',
+  ]);
+  await waitUntil(() => fs.existsSync(ready), 'legacy owner did not publish its lock');
+  const file = path.join(root, '.scout-scan.lock');
+  const before = fs.readFileSync(file, 'utf8');
+  try {
+    assert.throws(() => acquireScanLease(root, currentLeaseOwner(), operation('run-upgrade'), {
+      wallNow: () => Date.parse('2026-07-27T10:30:00.000Z'),
+    }), /stop old Scout.*retry/i);
+    assert.equal(fs.readFileSync(file, 'utf8'), before);
+    assert.equal(fs.existsSync(path.join(root, '.scout', 'scan-lease-generation.json')), false);
+  } finally {
+    fs.writeFileSync(stop, '', 'utf8');
+    await legacy.result;
+  }
+});
+
+test('an expired legacy lock still blocks while its exact owner is live', async () => {
+  const root = temp();
+  const ready = path.join(root, 'legacy-ready');
+  const stop = path.join(root, 'legacy-stop');
+  const legacy = child([
+    'legacy-lock-owner', root, ready, stop,
+    '2026-07-27T07:00:00.000Z', 'legacy-live-expired',
+  ]);
+  await waitUntil(() => fs.existsSync(ready), 'legacy owner did not publish its lock');
+  try {
+    assert.throws(() => acquireScanLease(root, currentLeaseOwner(), operation('run-live-upgrade'), {
+      wallNow: () => Date.parse('2026-07-27T10:00:01.000Z'),
+    }), /stop old Scout.*retry/i);
+  } finally {
+    fs.writeFileSync(stop, '', 'utf8');
+    await legacy.result;
+  }
+});
+
+test('an expired legacy lock with a stopped exact owner migrates once and records the decision', async () => {
+  const root = temp();
+  const ready = path.join(root, 'legacy-ready');
+  const stopped = await child([
+    'legacy-lock-owner', root, ready, '-',
+    '2026-07-27T07:00:00.000Z', 'legacy-stopped-expired',
+  ]).result;
+  assert.equal(stopped.created, true);
+
+  const lease = acquireScanLease(root, currentLeaseOwner(), operation('run-migrated'), {
+    wallNow: () => Date.parse('2026-07-27T10:00:01.000Z'),
+  });
+  assert.equal(lease?.generation, 1);
+  assert.equal(fs.existsSync(path.join(root, '.scout-scan.lock')), false);
+  const migration = JSON.parse(fs.readFileSync(
+    path.join(root, '.scout', 'scan-lease-migration.json'),
+    'utf8',
+  ));
+  assert.equal(migration.decision, 'expired-stopped-owner');
+  assert.equal(migration.firstGeneration, 1);
+  assert.equal(migration.legacyLock.token, 'legacy-stopped-expired');
+  assert.deepEqual(migration.legacyLock.owner, stopped.owner);
+  releaseScanLease(lease);
+});
+
+test('a pre-activation failure keeps the legacy lock unchanged and resumes its recorded decision', async () => {
+  const root = temp();
+  const ready = path.join(root, 'legacy-ready');
+  await child([
+    'legacy-lock-owner', root, ready, '-',
+    '2026-07-27T07:00:00.000Z', 'legacy-resumable',
+  ]).result;
+  const legacyFile = path.join(root, '.scout-scan.lock');
+  const generationFile = path.join(root, '.scout', 'scan-lease-generation.json');
+  const migrationFile = path.join(root, '.scout', 'scan-lease-migration.json');
+  const before = fs.readFileSync(legacyFile, 'utf8');
+  const injected = new Error('injected pre-activation failure');
+
+  assert.throws(() => acquireScanLease(root, currentLeaseOwner(), operation('run-interrupted'), {
+    wallNow: () => Date.parse('2026-07-27T10:00:01.000Z'),
+    _testHooks: {
+      afterMigrationDecision() {
+        assert.equal(fs.existsSync(migrationFile), true);
+        assert.equal(fs.existsSync(generationFile), false);
+        throw injected;
+      },
+    },
+  }), (error) => error === injected);
+  assert.equal(fs.readFileSync(legacyFile, 'utf8'), before);
+
+  const lease = acquireScanLease(root, currentLeaseOwner(), operation('run-resumed'), {
+    wallNow: () => Date.parse('2026-07-27T10:00:02.000Z'),
+  });
+  assert.equal(lease?.generation, 1);
+  assert.equal(fs.existsSync(legacyFile), false);
+  releaseScanLease(lease);
+});
+
+test('legacy evidence appearing after an interrupted fresh decision blocks with operator guidance', () => {
+  const root = temp();
+  const injected = new Error('injected fresh pre-activation failure');
+  assert.throws(() => acquireScanLease(root, currentLeaseOwner(), operation('run-fresh-interrupted'), {
+    _testHooks: {
+      afterMigrationDecision() {
+        throw injected;
+      },
+    },
+  }), (error) => error === injected);
+  assert.equal(
+    fs.existsSync(path.join(root, '.scout', 'scan-lease-generation.json')),
+    false,
+  );
   fs.writeFileSync(path.join(root, '.scout-scan.lock'), `${JSON.stringify({
-    agent: 'codex', mode: 'primary', token: 'old-token', startedAt: new Date().toISOString(),
+    agent: 'old-codex',
+    mode: 'primary',
+    token: 'legacy-after-fresh-decision',
+    startedAt: new Date().toISOString(),
   })}\n`, 'utf8');
-  assert.equal(acquireScanLease(root, currentLeaseOwner(), operation('run-upgrade')), null);
+  assert.throws(
+    () => acquireScanLease(root, currentLeaseOwner(), operation('run-fresh-conflict')),
+    /cannot verify.*stop old Scout.*remove.*retry/i,
+  );
+});
+
+test('an expired ownerless legacy lock is unverifiable and fails closed', () => {
+  const root = temp();
+  const file = path.join(root, '.scout-scan.lock');
+  fs.writeFileSync(file, `${JSON.stringify({
+    agent: 'codex',
+    mode: 'primary',
+    token: 'legacy-ownerless',
+    startedAt: '2026-07-27T07:00:00.000Z',
+  })}\n`, 'utf8');
+  const before = fs.readFileSync(file, 'utf8');
+  assert.throws(() => acquireScanLease(root, currentLeaseOwner(), operation('run-unverifiable'), {
+    wallNow: () => Date.parse('2026-07-27T10:00:01.000Z'),
+  }), /cannot verify.*stop old Scout.*remove.*retry/i);
+  assert.equal(fs.readFileSync(file, 'utf8'), before);
 });
 
 test('the legacy adapter cannot bypass a direct lease takeover margin', () => {
@@ -401,10 +701,10 @@ test('the legacy adapter cannot bypass a direct lease takeover margin', () => {
   assert.equal(tooEarly.ok, false);
 });
 
-test('an exact prior-v1 lease shape is migrated with the safe direct takeover margin', () => {
+test('an exact prior-v1 lease shape retains the safe direct takeover margin without a sentinel', () => {
   const root = temp();
   const start = Date.parse('2026-07-27T10:00:00.000Z');
-  const priorLease = acquireScanLease(root, currentLeaseOwner(), operation('run-prior-v1'), {
+  acquireScanLease(root, currentLeaseOwner(), operation('run-prior-v1'), {
     wallNow: () => start, leaseDurationMs: 90_000, takeoverMarginMs: 15_000,
   });
   const file = path.join(root, '.scout', 'scan-lease.json');
@@ -417,15 +717,7 @@ test('an exact prior-v1 lease shape is migrated with the safe direct takeover ma
   assert.equal(acquireScanLease(root, currentLeaseOwner(), operation('run-prior-too-early'), {
     wallNow: () => start + 104_999, leaseDurationMs: 90_000,
   }), null);
-  const rebuiltSentinel = JSON.parse(
-    fs.readFileSync(path.join(root, '.scout-scan.lock'), 'utf8'),
-  );
-  assert.equal(rebuiltSentinel.token, priorLease.leaseId);
-  assert.equal(rebuiltSentinel.fencedLease, true);
-  assert.throws(
-    () => fs.openSync(path.join(root, '.scout-scan.lock'), 'wx'),
-    (error) => error?.code === 'EEXIST',
-  );
+  assert.equal(fs.existsSync(path.join(root, '.scout-scan.lock')), false);
   const recovered = acquireScanLease(root, currentLeaseOwner(), operation('run-prior-recovered'), {
     wallNow: () => start + 105_000, leaseDurationMs: 90_000,
   });
@@ -433,51 +725,33 @@ test('an exact prior-v1 lease shape is migrated with the safe direct takeover ma
   releaseScanLease(recovered);
 });
 
-test('renewal refreshes the legacy sentinel seen by pre-upgrade binaries', () => {
+test('a legacy lock created after fenced activation is rejected as a downgrade', async () => {
   const root = temp();
-  let wall = Date.parse('2026-07-27T10:00:00.000Z');
-  let monotonic = 0;
-  const lease = acquireScanLease(root, currentLeaseOwner(), operation('run-long-direct'), {
-    wallNow: () => wall, monotonicNow: () => monotonic, leaseDurationMs: 3 * 60 * 60 * 1000,
-  });
-  const sentinel = path.join(root, '.scout-scan.lock');
-  assert.equal(JSON.parse(fs.readFileSync(sentinel, 'utf8')).startedAt, new Date(wall).toISOString());
-  wall += 90 * 60 * 1000;
-  monotonic += 90 * 60 * 1000;
-  renewScanLease(lease);
-  assert.equal(JSON.parse(fs.readFileSync(sentinel, 'utf8')).startedAt, new Date(wall).toISOString());
+  const lease = acquireScanLease(root, currentLeaseOwner(), operation('run-activate'));
   releaseScanLease(lease);
+  await child([
+    'legacy-lock-create', root, new Date().toISOString(), 'legacy-downgrade',
+  ]).result;
+  assert.throws(
+    () => acquireScanLease(root, currentLeaseOwner(), operation('run-after-downgrade')),
+    /downgrade.*coexistence|coexistence.*downgrade/i,
+  );
+  assert.equal(readScanLease(root), null);
 });
 
-test('a takeover crash after sentinel replacement is reconciled to the durable fence', () => {
+test('a legacy lock appearing beside an active fenced lease stops commits and renewal', async () => {
   const root = temp();
-  const start = Date.parse('2026-07-27T10:00:00.000Z');
-  const original = acquireScanLease(root, currentLeaseOwner(), operation('run-original'), {
-    wallNow: () => start, leaseDurationMs: 1_000, takeoverMarginMs: 0,
-    leaseId: 'original-token',
-  });
-  const crash = new Error('injected crash before successor lease replacement');
-  assert.throws(() => acquireScanLease(root, currentLeaseOwner(), operation('run-crashed-successor'), {
-    wallNow: () => start + 1_001, leaseDurationMs: 1_000, takeoverMarginMs: 0,
-    leaseId: 'crashed-successor-token',
-    _testHooks: {
-      beforeLeaseReplace(kind) {
-        if (kind === 'acquire') throw crash;
-      },
-    },
-  }), (error) => error === crash);
-  assert.equal(readScanLease(root).leaseId, original.leaseId);
-  assert.equal(
-    JSON.parse(fs.readFileSync(path.join(root, '.scout-scan.lock'), 'utf8')).token,
-    'crashed-successor-token',
-  );
-
-  const recovered = acquireScanLease(root, currentLeaseOwner(), operation('run-recovered-successor'), {
-    wallNow: () => start + 1_001, leaseDurationMs: 1_000, takeoverMarginMs: 0,
-    leaseId: 'recovered-successor-token',
-  });
-  assert.equal(recovered?.leaseId, 'recovered-successor-token');
-  releaseScanLease(recovered);
+  const lease = acquireScanLease(root, currentLeaseOwner(), operation('run-coexistence'));
+  fs.rmSync(path.join(root, '.scout-scan.lock'), { force: true });
+  await child([
+    'legacy-lock-create', root, new Date().toISOString(), 'legacy-coexistence',
+  ]).result;
+  let committed = false;
+  assert.throws(() => assertCurrentFence(lease, synchronousFenceCallback(() => {
+    committed = true;
+  })), /coexistence/i);
+  assert.equal(committed, false);
+  assert.throws(() => renewScanLease(lease), /coexistence/i);
 });
 
 test('a forward wall jump triggers heartbeat renewal while monotonic time remains active', () => {
@@ -513,9 +787,11 @@ test('a backward wall jump cannot postpone the monotonic renewal deadline', () =
   });
   wall -= 3_600_000;
   monotonic = 89_999;
-  assert.doesNotThrow(() => assertCurrentFence(lease, () => true));
+  assert.doesNotThrow(() => assertCurrentFence(lease, synchronousFenceCallback(() => true)));
   monotonic = 90_000;
-  assert.throws(() => assertCurrentFence(lease, () => true), LeaseLostError);
+  assert.throws(() => assertCurrentFence(
+    lease, synchronousFenceCallback(() => true),
+  ), LeaseLostError);
 });
 
 test('heartbeat rebases the active deadline when its monotonic clock has a distinct origin', () => {
@@ -532,11 +808,13 @@ test('heartbeat rebases the active deadline when its monotonic clock has a disti
     setTimeoutFn: (callback) => { timers.push(callback); return timers.length; },
     clearTimeoutFn: () => {},
   });
-  assert.doesNotThrow(() => assertCurrentFence(lease, () => true));
+  assert.doesNotThrow(() => assertCurrentFence(lease, synchronousFenceCallback(() => true)));
   heartbeatMonotonic += 89_999;
-  assert.doesNotThrow(() => assertCurrentFence(lease, () => true));
+  assert.doesNotThrow(() => assertCurrentFence(lease, synchronousFenceCallback(() => true)));
   heartbeatMonotonic += 1;
-  assert.throws(() => assertCurrentFence(lease, () => true), LeaseLostError);
+  assert.throws(() => assertCurrentFence(
+    lease, synchronousFenceCallback(() => true),
+  ), LeaseLostError);
   heartbeat.stop();
 });
 
@@ -607,12 +885,12 @@ test('heartbeat retries a transient guard-acquisition failure before monotonic e
   const timers = [];
   const fileSystem = new Proxy(fs, {
     get(target, property) {
-      if (property === 'mkdirSync') return (directory, ...args) => {
-        if (armed && String(directory).endsWith('scan-lease.guard') && failures > 0) {
+      if (property === 'symlinkSync') return (source, destination, type) => {
+        if (armed && String(destination).endsWith('scan-lease.guard') && failures > 0) {
           failures -= 1;
           throw Object.assign(new Error('injected guard failure'), { code: 'EBUSY' });
         }
-        return target.mkdirSync(directory, ...args);
+        return target.symlinkSync(source, destination, type);
       };
       const value = target[property];
       return typeof value === 'function' ? value.bind(target) : value;
@@ -673,7 +951,7 @@ test('remote-host stale ownership is preserved when liveness cannot be verified'
   const root = temp();
   const guard = path.join(root, '.scout', 'scan-lease.guard');
   fs.mkdirSync(guard, { recursive: true });
-  fs.writeFileSync(path.join(guard, 'owner.json'), `${JSON.stringify({
+  fs.writeFileSync(path.join(guard, 'remote-live-unknown.json'), `${JSON.stringify({
     schemaVersion: 1,
     guardId: 'remote-live-unknown',
     owner: { host: 'REMOTE-HOST', pid: 999_999_999, processStart: 'remote-process' },
@@ -685,41 +963,43 @@ test('remote-host stale ownership is preserved when liveness cannot be verified'
 });
 
 function injectedGuardFileSystem({
-  failCleanupRead = 0, failCleanupRemove = 0, failCleanupRename = 0,
-  failRecoveryRemove = 0,
+  failMarkerUnlink = 0,
+  failDirectoryRemove = 0,
+  failRecoveryMarkerUnlink = 0,
 } = {}) {
   const state = {
-    reads: 0, removes: 0, renames: 0, recoveryRemoves: 0,
+    markerUnlinks: 0,
+    directoryRemoves: 0,
+    recoveryMarkerUnlinks: 0,
+    markerFailuresRemaining: failMarkerUnlink,
+    directoryFailuresRemaining: failDirectoryRemove,
+    recoveryMarkerFailuresRemaining: failRecoveryMarkerUnlink,
   };
   const fileSystem = new Proxy(fs, {
     get(target, property) {
-      if (property === 'readFileSync') return (file, ...args) => {
-        if (String(file).includes('scan-lease.guard.cleanup') && state.reads < failCleanupRead) {
-          state.reads += 1;
-          throw Object.assign(new Error('injected cleanup read failure'), { code: 'EIO' });
+      if (property === 'unlinkSync') return (file) => {
+        if (String(file).includes('scan-lease.recovery-claim')
+          && state.recoveryMarkerFailuresRemaining > 0) {
+          state.recoveryMarkerUnlinks += 1;
+          state.recoveryMarkerFailuresRemaining -= 1;
+          throw Object.assign(new Error('injected recovery marker cleanup failure'), { code: 'EBUSY' });
         }
-        return target.readFileSync(file, ...args);
+        if (String(file).includes('scan-lease.guard')
+          && state.markerFailuresRemaining > 0) {
+          state.markerUnlinks += 1;
+          state.markerFailuresRemaining -= 1;
+          throw Object.assign(new Error('injected guard marker cleanup failure'), { code: 'EBUSY' });
+        }
+        return target.unlinkSync(file);
       };
-      if (property === 'rmSync') return (file, ...args) => {
-        if (String(file).includes('scan-lease.recovery-claim.cleanup')
-          && state.recoveryRemoves < failRecoveryRemove) {
-          state.recoveryRemoves += 1;
-          throw Object.assign(new Error('injected recovery cleanup removal failure'), { code: 'EBUSY' });
+      if (property === 'rmdirSync') return (directory) => {
+        if (String(directory).includes('scan-lease.guard')
+          && state.directoryFailuresRemaining > 0) {
+          state.directoryRemoves += 1;
+          state.directoryFailuresRemaining -= 1;
+          throw Object.assign(new Error('injected guard directory cleanup failure'), { code: 'EBUSY' });
         }
-        if (String(file).includes('scan-lease.guard.cleanup') && state.removes < failCleanupRemove) {
-          state.removes += 1;
-          throw Object.assign(new Error('injected cleanup remove failure'), { code: 'EBUSY' });
-        }
-        return target.rmSync(file, ...args);
-      };
-      if (property === 'renameSync') return (source, destination) => {
-        if (String(source).endsWith('scan-lease.guard')
-          && String(destination).endsWith('scan-lease.guard.cleanup')
-          && state.renames < failCleanupRename) {
-          state.renames += 1;
-          throw Object.assign(new Error('injected cleanup rename failure'), { code: 'EBUSY' });
-        }
-        return target.renameSync(source, destination);
+        return target.rmdirSync(directory);
       };
       const value = target[property];
       return typeof value === 'function' ? value.bind(target) : value;
@@ -728,62 +1008,186 @@ function injectedGuardFileSystem({
   return { fileSystem, state };
 }
 
+function stalePendingCleanupFileSystem(root) {
+  const guard = path.join(root, '.scout', 'scan-lease.guard');
+  const successorId = 'live-successor-guard';
+  const state = {
+    failedOwnMarkerUnlinks: 0,
+    successorMoved: false,
+    successorRemoved: false,
+  };
+  const fileSystem = new Proxy(fs, {
+    get(target, property) {
+      if (property === 'unlinkSync') return (file) => {
+        if (String(file).includes('scan-lease.guard.candidate.')
+          && !String(file).endsWith(`${successorId}.json`)
+          && state.failedOwnMarkerUnlinks < 4) {
+          state.failedOwnMarkerUnlinks += 1;
+          throw Object.assign(new Error('injected identity-marker cleanup failure'), { code: 'EBUSY' });
+        }
+        return target.unlinkSync(file);
+      };
+      if (property === 'renameSync') return (source, destination) => {
+        if (path.resolve(String(source)) === path.resolve(guard)) {
+          state.successorMoved = true;
+        }
+        return target.renameSync(source, destination);
+      };
+      if (property === 'rmSync') return (directory, options) => {
+        if (path.resolve(String(directory)) === path.resolve(guard)
+          && target.existsSync(path.join(guard, `${successorId}.json`))) {
+          state.successorRemoved = true;
+        }
+        return target.rmSync(directory, options);
+      };
+      const value = target[property];
+      return typeof value === 'function' ? value.bind(target) : value;
+    },
+  });
+  return { fileSystem, state, successorId };
+}
+
+test('failed post-publication withdrawal is recovered in the background', async () => {
+  const root = temp();
+  const scout = path.join(root, '.scout');
+  const guard = path.join(scout, 'scan-lease.guard');
+  const recovery = `${guard}.recovery`;
+  let recoveryInjected = false;
+  let unlinkFailures = 0;
+  const fileSystem = new Proxy(fs, {
+    get(target, property) {
+      if (property === 'symlinkSync') return (source, destination, type) => {
+        const result = target.symlinkSync(source, destination, type);
+        if (!recoveryInjected && path.resolve(String(destination)) === path.resolve(guard)) {
+          target.mkdirSync(recovery);
+          recoveryInjected = true;
+        }
+        return result;
+      };
+      if (property === 'unlinkSync') return (file) => {
+        if (path.resolve(String(file)) === path.resolve(guard) && unlinkFailures < 4) {
+          unlinkFailures += 1;
+          throw Object.assign(new Error('injected withdrawal unlink failure'), { code: 'EBUSY' });
+        }
+        return target.unlinkSync(file);
+      };
+      const value = target[property];
+      return typeof value === 'function' ? value.bind(target) : value;
+    },
+  });
+
+  assert.throws(() => acquireScanLease(
+    root,
+    currentLeaseOwner(),
+    operation('run-withdrawal-cleanup-failure'),
+    { fileSystem },
+  ), /injected withdrawal unlink failure/);
+  assert.equal(unlinkFailures, 4);
+  fs.rmdirSync(recovery);
+  await waitUntil(
+    () => !fs.existsSync(guard)
+      && fs.readdirSync(scout)
+        .every((entry) => !entry.startsWith('scan-lease.guard.candidate.')),
+    'post-publication withdrawal did not recover in the background',
+  );
+});
+
+test('a stale pending cleanup ID never moves or exposes a live successor guard', () => {
+  const root = temp();
+  const injected = stalePendingCleanupFileSystem(root);
+  const lease = acquireScanLease(root, currentLeaseOwner(), operation('run-stale-cleanup'), {
+    fileSystem: injected.fileSystem, guardAcquireTimeoutMs: 100,
+  });
+  assert.equal(injected.state.failedOwnMarkerUnlinks, 4);
+  const guard = path.join(root, '.scout', 'scan-lease.guard');
+  fs.rmSync(guard, { recursive: true, force: true });
+  fs.mkdirSync(guard);
+  fs.writeFileSync(path.join(guard, `${injected.successorId}.json`), `${JSON.stringify({
+    schemaVersion: 1,
+    guardId: injected.successorId,
+    owner: currentLeaseOwner(),
+    acquiredAt: new Date().toISOString(),
+  })}\n`, 'utf8');
+  assert.throws(() => assertCurrentFence(
+    lease, synchronousFenceCallback(() => true),
+  ), LeaseLostError);
+  assert.equal(injected.state.successorMoved, false);
+  assert.equal(injected.state.successorRemoved, false);
+  assert.equal(fs.existsSync(path.join(guard, `${injected.successorId}.json`)), true);
+});
+
 test('bounded same-owner cleanup recovers transient metadata and removal failures', () => {
   const root = temp();
-  const injected = injectedGuardFileSystem({ failCleanupRead: 1, failCleanupRemove: 1 });
+  const injected = injectedGuardFileSystem({
+    failMarkerUnlink: 1,
+    failDirectoryRemove: 1,
+  });
   const lease = acquireScanLease(root, currentLeaseOwner(), operation('run-cleanup'), {
     fileSystem: injected.fileSystem,
   });
-  assert.equal(injected.state.reads, 1);
-  assert.equal(injected.state.removes, 1);
+  assert.equal(injected.state.markerUnlinks, 1);
+  assert.equal(injected.state.directoryRemoves, 1);
   assert.equal(fs.existsSync(path.join(root, '.scout', 'scan-lease.guard')), false);
   releaseScanLease(lease);
 });
 
 test('cleanup preserves the original guarded-action error after a transient failure', () => {
   const root = temp();
-  const injected = injectedGuardFileSystem({ failCleanupRemove: 1 });
+  const injected = injectedGuardFileSystem({ failDirectoryRemove: 1 });
   const lease = acquireScanLease(root, currentLeaseOwner(), operation('run-cleanup-error'), {
     fileSystem: injected.fileSystem,
   });
   const expected = new Error('guarded action failed');
-  assert.throws(() => assertCurrentFence(lease, () => { throw expected; }), (error) => error === expected);
-  assert.equal(injected.state.removes, 1);
+  assert.throws(() => assertCurrentFence(
+    lease,
+    synchronousFenceCallback(() => { throw expected; }),
+  ), (error) => error === expected);
+  assert.equal(injected.state.directoryRemoves, 1);
   assert.equal(fs.existsSync(path.join(root, '.scout', 'scan-lease.guard')), false);
   releaseScanLease(lease);
 });
 
 test('a committed action retains its result and the same owner recovers an exhausted cleanup claim', () => {
   const root = temp();
-  const injected = injectedGuardFileSystem({ failCleanupRemove: 4 });
+  const injected = injectedGuardFileSystem({ failDirectoryRemove: 4 });
   const lease = acquireScanLease(root, currentLeaseOwner(), operation('run-cleanup-recovery'), {
     fileSystem: injected.fileSystem,
   });
   assert.equal(lease.runId, 'run-cleanup-recovery');
-  assert.equal(injected.state.removes, 4);
-  assert.equal(fs.existsSync(path.join(root, '.scout', 'scan-lease.guard.cleanup')), true);
-  assert.doesNotThrow(() => assertCurrentFence(lease, () => true));
-  assert.equal(fs.existsSync(path.join(root, '.scout', 'scan-lease.guard.cleanup')), false);
+  assert.equal(injected.state.directoryRemoves, 4);
+  assert.equal(fs.existsSync(path.join(root, '.scout', 'scan-lease.guard')), false);
+  assert.equal(
+    fs.readdirSync(path.join(root, '.scout'))
+      .filter((entry) => entry.startsWith('scan-lease.guard.candidate.')).length,
+    1,
+  );
+  assert.doesNotThrow(() => assertCurrentFence(lease, synchronousFenceCallback(() => true)));
+  assert.equal(fs.existsSync(path.join(root, '.scout', 'scan-lease.guard')), false);
+  assert.deepEqual(
+    fs.readdirSync(path.join(root, '.scout'))
+      .filter((entry) => entry.startsWith('scan-lease.guard.candidate.')),
+    [],
+  );
   releaseScanLease(lease);
 });
 
-test('the same lease runtime recovers after cleanup rename retries are exhausted', () => {
+test('the same lease runtime recovers after marker-unlink retries are exhausted', () => {
   const root = temp();
-  const injected = injectedGuardFileSystem({ failCleanupRename: 4 });
+  const injected = injectedGuardFileSystem({ failMarkerUnlink: 4 });
   const lease = acquireScanLease(root, currentLeaseOwner(), operation('run-cleanup-rename'), {
     fileSystem: injected.fileSystem,
   });
   assert.equal(lease.runId, 'run-cleanup-rename');
-  assert.equal(injected.state.renames, 4);
+  assert.equal(injected.state.markerUnlinks, 4);
   assert.equal(fs.existsSync(path.join(root, '.scout', 'scan-lease.guard')), true);
-  assert.doesNotThrow(() => assertCurrentFence(lease, () => true));
+  assert.doesNotThrow(() => assertCurrentFence(lease, synchronousFenceCallback(() => true)));
   assert.equal(fs.existsSync(path.join(root, '.scout', 'scan-lease.guard')), false);
   releaseScanLease(lease);
 });
 
-test('cleanup rename exhaustion preserves a throwing action and remains recoverable', () => {
-  const injected = injectedGuardFileSystem({ failCleanupRename: 4 });
-  const expected = new Error('guarded action failed before rename cleanup');
+test('marker-unlink exhaustion preserves a throwing action and remains recoverable', async () => {
+  const injected = injectedGuardFileSystem({ failMarkerUnlink: 4 });
+  const expected = new Error('guarded action failed before marker cleanup');
   const failingRoot = temp();
   assert.throws(() => acquireScanLease(
     failingRoot,
@@ -794,7 +1198,11 @@ test('cleanup rename exhaustion preserves a throwing action and remains recovera
       _testHooks: { beforeGuardedAction() { throw expected; } },
     },
   ), (error) => error === expected);
-  assert.equal(injected.state.renames, 4);
+  assert.equal(injected.state.markerUnlinks, 4);
+  await waitUntil(
+    () => !fs.existsSync(path.join(failingRoot, '.scout', 'scan-lease.guard')),
+    'failed action guard cleanup did not recover in the background',
+  );
   const recovered = acquireScanLease(
     failingRoot,
     currentLeaseOwner(),
@@ -805,11 +1213,33 @@ test('cleanup rename exhaustion preserves a throwing action and remains recovera
   releaseScanLease(recovered);
 });
 
+test('terminal release reports cleanup failure and recovers without another lease operation', async () => {
+  const root = temp();
+  const injected = injectedGuardFileSystem();
+  const lease = acquireScanLease(root, currentLeaseOwner(), operation('run-terminal-cleanup'), {
+    fileSystem: injected.fileSystem,
+  });
+  injected.state.markerFailuresRemaining = 4;
+  assert.throws(() => releaseScanLease(lease), /cleanup/i);
+  await waitUntil(
+    () => !fs.existsSync(path.join(root, '.scout', 'scan-lease.guard')),
+    'terminal cleanup did not recover without another lease operation',
+  );
+  const successor = acquireScanLease(
+    root,
+    currentLeaseOwner(),
+    operation('run-after-terminal-cleanup'),
+    { fileSystem: injected.fileSystem },
+  );
+  assert.equal(successor?.runId, 'run-after-terminal-cleanup');
+  releaseScanLease(successor);
+});
+
 test('guard metadata with unknown fields is not trusted for stale quarantine', async () => {
   const root = temp();
   const guard = path.join(root, '.scout', 'scan-lease.guard');
   fs.mkdirSync(guard, { recursive: true });
-  fs.writeFileSync(path.join(guard, 'owner.json'), `${JSON.stringify({
+  fs.writeFileSync(path.join(guard, 'guard-extra-field.json'), `${JSON.stringify({
     schemaVersion: 1,
     guardId: 'guard-extra-field',
     owner: { host: os.hostname(), pid: 999_999_999, processStart: 'dead-process' },
@@ -833,6 +1263,23 @@ test('fenced commit requires a callback and rejects async callbacks before side 
   releaseScanLease(lease);
 });
 
+test('a promise-returning normal callback is rejected before its side effect starts', async () => {
+  const root = temp();
+  const lease = acquireScanLease(root, currentLeaseOwner(), operation('run-promise-callback'));
+  const output = path.join(root, 'async-side-effect');
+  let started = false;
+  let pending;
+  assert.throws(() => assertCurrentFence(lease, () => {
+    started = true;
+    pending = fs.promises.writeFile(output, 'must-not-run', 'utf8');
+    return pending;
+  }), /synchronous/i);
+  if (pending) await pending;
+  assert.equal(started, false);
+  assert.equal(fs.existsSync(output), false);
+  releaseScanLease(lease);
+});
+
 test('a fenced commit propagates its own EEXIST error without retrying the commit', () => {
   const root = temp();
   const lease = acquireScanLease(root, currentLeaseOwner(), {
@@ -841,10 +1288,10 @@ test('a fenced commit propagates its own EEXIST error without retrying the commi
   let calls = 0;
   const expected = Object.assign(new Error('target already exists'), { code: 'EEXIST' });
 
-  assert.throws(() => assertCurrentFence(lease, () => {
+  assert.throws(() => assertCurrentFence(lease, synchronousFenceCallback(() => {
     calls += 1;
     throw expected;
-  }), (error) => error === expected);
+  })), (error) => error === expected);
   assert.equal(calls, 1);
   releaseScanLease(lease);
 });

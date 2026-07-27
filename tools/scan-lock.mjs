@@ -4,8 +4,10 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { isMainModule } from '../ui/lib/mainModule.mjs';
 import {
+  LeaseMigrationError,
   acquireScanLease,
   currentLeaseOwner,
+  isFencedLeaseActivated,
   readScanLease,
   releaseScanLeaseByToken,
 } from '../ui/lib/scanLease.mjs';
@@ -21,19 +23,17 @@ export function scanLockPath(repoRoot) {
 export function readScanLock(repoRoot) {
   try {
     const legacyFile = scanLockPath(repoRoot);
+    const lease = readScanLease(repoRoot);
     if (fs.existsSync(legacyFile)) {
-      const legacy = JSON.parse(fs.readFileSync(legacyFile, 'utf8'));
-      if (legacy.fencedLease === true) {
-        const lease = readScanLease(repoRoot);
-        if (lease) {
-          return {
-            agent: lease.operation.provider ?? lease.operation.kind,
-            mode: lease.operation.mode ?? lease.operation.kind,
-            token: lease.leaseId,
-            startedAt: lease.acquiredAt,
-          };
-        }
+      if (isFencedLeaseActivated(repoRoot)) {
+        return {
+          invalid: true,
+          reason: 'downgrade-coexistence',
+          message: 'Legacy Scout downgrade/coexistence detected after fenced lease activation. '
+            + 'Stop old Scout, remove .scout-scan.lock only after confirming it stopped, and retry.',
+        };
       }
+      const legacy = JSON.parse(fs.readFileSync(legacyFile, 'utf8'));
       return {
         agent: legacy.agent,
         mode: legacy.mode,
@@ -41,7 +41,6 @@ export function readScanLock(repoRoot) {
         startedAt: legacy.startedAt,
       };
     }
-    const lease = readScanLease(repoRoot);
     if (!lease) return null;
     return {
       agent: lease.operation.provider ?? lease.operation.kind,
@@ -63,18 +62,31 @@ export function acquireScanLock(repoRoot, {
 } = {}) {
   if (!agent || !mode) throw new Error('agent and mode are required');
   const previous = readScanLock(repoRoot);
-  const lease = acquireScanLease(repoRoot, currentLeaseOwner(), {
-    kind: 'scan',
-    runId: `legacy-${crypto.randomUUID()}`,
-    provider: agent,
-    mode,
-    phase: 'legacy',
-  }, {
-    now,
-    leaseDurationMs: staleAfterMs,
-    takeoverMarginMs: 0,
-    leaseId: token,
-  });
+  let lease;
+  try {
+    lease = acquireScanLease(repoRoot, currentLeaseOwner(), {
+      kind: 'scan',
+      runId: `legacy-${crypto.randomUUID()}`,
+      provider: agent,
+      mode,
+      phase: 'legacy',
+    }, {
+      now,
+      leaseDurationMs: staleAfterMs,
+      takeoverMarginMs: 0,
+      leaseId: token,
+    });
+  } catch (error) {
+    if (error instanceof LeaseMigrationError) {
+      return {
+        ok: false,
+        reason: 'migration-blocked',
+        message: error.message,
+        lock: readScanLock(repoRoot),
+      };
+    }
+    throw error;
+  }
   if (!lease) return { ok: false, reason: 'active', lock: readScanLock(repoRoot) };
   return {
     ok: true,
@@ -86,13 +98,29 @@ export function acquireScanLock(repoRoot, {
 export function releaseScanLock(repoRoot, token) {
   const current = readScanLock(repoRoot);
   if (!current) return { ok: true, released: false };
+  if (current.reason === 'downgrade-coexistence') {
+    return {
+      ok: false,
+      reason: 'migration-blocked',
+      message: current.message,
+      lock: current,
+    };
+  }
   if (!token || current.token !== token) return { ok: false, reason: 'token-mismatch', lock: current };
   try {
     if (!releaseScanLeaseByToken(repoRoot, token)) {
       return { ok: false, reason: 'token-mismatch', lock: readScanLock(repoRoot) };
     }
     return { ok: true, released: true };
-  } catch {
+  } catch (error) {
+    if (error instanceof LeaseMigrationError) {
+      return {
+        ok: false,
+        reason: 'migration-blocked',
+        message: error.message,
+        lock: readScanLock(repoRoot),
+      };
+    }
     return { ok: false, reason: 'token-mismatch', lock: readScanLock(repoRoot) };
   }
 }

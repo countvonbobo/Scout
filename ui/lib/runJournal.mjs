@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import {
   LeaseLostError, assertCurrentFence, assertScanLeaseScope, isScanLease,
+  synchronousFenceCallback,
 } from './scanLease.mjs';
 import { workspacePaths } from './workspace.mjs';
 
@@ -420,5 +421,5 @@ export function appendRunEvent(handle, input, lease) {
 
   if (!isScanLease(lease)) throw new LeaseLostError('a genuine current scan lease is required to append');
   assertScanLeaseScope(lease, handle.root, handle.runId, handle.directory, handle.file);
-  return assertCurrentFence(lease, commit);
+  return assertCurrentFence(lease, synchronousFenceCallback(commit));
 }
