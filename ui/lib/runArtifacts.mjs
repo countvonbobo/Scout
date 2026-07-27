@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { atomicWriteFile } from './atomicWrite.mjs';
+import { RECOVERABLE_PIPELINE_STAGES } from './pipeline.mjs';
 import { validateRunJournal } from './runJournal.mjs';
 import {
   LeaseLostError, assertCurrentFence, assertScanLeaseScope, isScanLease,
@@ -9,7 +10,7 @@ import {
 } from './scanLease.mjs';
 
 export const RUN_ARTIFACT_SCHEMA_VERSION = 1;
-export const RUN_MANIFEST_SCHEMA_VERSION = 2;
+export const RUN_MANIFEST_SCHEMA_VERSION = 3;
 
 const MAX_ARTIFACT_BYTES = 16 * 1024;
 const MAX_STABLE_IDS = 128;
@@ -207,41 +208,98 @@ export function projectRunManifest(events) {
   const { runId, lastHash } = assertJournalEvents(events);
   const artifacts = [];
   const compatibility = {};
-  const completedWork = [];
+  const completedByStage = new Map();
   const receipts = [];
   const recoveryDecisions = [];
   const providerSubstitutions = [];
+  const recoveryAttempts = [];
+  const stageIndexes = new Map(RECOVERABLE_PIPELINE_STAGES.map((stage, index) => [stage.id, index]));
+  const invalidatedByGeneration = new Map();
+  let activeRecoveryGeneration = null;
+  let versionedRun = false;
   let outcome = 'in-progress';
 
   for (const event of events) {
     if (event.type === 'run.started') {
+      versionedRun = true;
       Object.assign(compatibility, event.payload.compatibility);
     } else if (event.type === 'stage.completed') {
+      const stageIndex = stageIndexes.get(event.stageId);
+      if (versionedRun && stageIndex === undefined) {
+        throw new ManifestAgreementError(`journal completed an unsupported recovery stage: ${event.stageId}`);
+      }
+      if (completedByStage.has(event.stageId)) {
+        throw new ManifestAgreementError(`journal completed stage more than once without restart: ${event.stageId}`);
+      }
+      if (versionedRun && stageIndex > 0) {
+        const missing = RECOVERABLE_PIPELINE_STAGES
+          .slice(0, stageIndex)
+          .find((stage) => !completedByStage.has(stage.id));
+        if (missing) {
+          throw new ManifestAgreementError(`journal completed ${event.stageId} without current ${missing.id}`);
+        }
+      }
       const work = { sequence: event.sequence, stageId: event.stageId };
       for (const key of ['reference', 'count', 'version', 'artifact']) {
         if (event.payload?.[key] !== undefined) work[key] = event.payload[key];
       }
-      completedWork.push(work);
+      completedByStage.set(event.stageId, work);
       if (event.payload?.version) compatibility[event.payload.version.kind] = event.payload.version.value;
-      addArtifact(artifacts, event.payload?.artifact);
     } else if (event.type === 'run.completed') {
       outcome = event.payload?.outcome;
       if (event.payload?.compatibility) compatibility[event.payload.compatibility.kind] = event.payload.compatibility.value;
     } else if (event.type === 'mutation.receipted') {
       receipts.push({ sequence: event.sequence, stageId: event.stageId, reference: event.payload?.reference, digest: event.payload?.digest });
+    } else if (event.type === 'recovery.started') {
+      activeRecoveryGeneration = event.fencingGeneration;
+      Object.assign(compatibility, event.payload.compatibility);
+      invalidatedByGeneration.set(activeRecoveryGeneration, new Map());
+      recoveryAttempts.push({
+        sequence: event.sequence,
+        fencingGeneration: event.fencingGeneration,
+        requestFingerprint: event.payload.requestFingerprint,
+        selectionFingerprint: event.payload.selectionFingerprint,
+      });
     } else if (event.type === 'recovery.stage-decided') {
+      if (activeRecoveryGeneration !== event.fencingGeneration) {
+        throw new ManifestAgreementError('journal recovery decision has no matching recovery start');
+      }
       const decision = {
         sequence: event.sequence,
         stageId: event.stageId,
         action: event.payload.action,
         reason: event.payload.reason,
       };
-      if (event.payload.artifact) {
-        decision.artifact = event.payload.artifact;
-        addArtifact(artifacts, event.payload.artifact);
+      if (event.payload.artifact) decision.artifact = event.payload.artifact;
+      const current = completedByStage.get(event.stageId);
+      const invalidated = invalidatedByGeneration.get(event.fencingGeneration);
+      const expected = current ?? invalidated.get(event.stageId);
+      if (event.payload.artifact && (!expected?.artifact
+        || stableJson(event.payload.artifact) !== stableJson(expected.artifact))) {
+        throw new ManifestAgreementError('journal recovery decision artifact does not match current stage');
+      }
+      if (event.payload.action === 'reuse') {
+        if (!current) throw new ManifestAgreementError('journal cannot reuse a stage without a current completion');
+      } else {
+        const stageIndex = stageIndexes.get(event.stageId);
+        if (stageIndex === undefined) throw new ManifestAgreementError('journal restarts an unsupported stage');
+        if (current) {
+          for (const stage of RECOVERABLE_PIPELINE_STAGES.slice(stageIndex)) {
+            const removed = completedByStage.get(stage.id);
+            if (removed) {
+              invalidated.set(stage.id, removed);
+              completedByStage.delete(stage.id);
+            }
+          }
+        } else if (!invalidated.has(event.stageId)) {
+          throw new ManifestAgreementError('journal cannot restart a stage without a current completion');
+        }
       }
       recoveryDecisions.push(decision);
     } else if (event.type === 'recovery.provider-substituted') {
+      if (activeRecoveryGeneration !== event.fencingGeneration) {
+        throw new ManifestAgreementError('journal provider substitution has no matching recovery start');
+      }
       providerSubstitutions.push({
         sequence: event.sequence,
         previousProvider: event.payload.previousProvider,
@@ -251,6 +309,12 @@ export function projectRunManifest(events) {
       });
     }
   }
+  const completedWork = [...completedByStage.values()]
+    .sort((left, right) => (
+      (stageIndexes.get(left.stageId) ?? Number.MAX_SAFE_INTEGER)
+      - (stageIndexes.get(right.stageId) ?? Number.MAX_SAFE_INTEGER)
+    ));
+  for (const work of completedWork) addArtifact(artifacts, work.artifact);
 
   return {
     schemaVersion: RUN_MANIFEST_SCHEMA_VERSION,
@@ -264,6 +328,7 @@ export function projectRunManifest(events) {
     receipts,
     recoveryDecisions,
     providerSubstitutions,
+    recoveryAttempts,
   };
 }
 
@@ -294,18 +359,6 @@ function manifestsMatch(actual, expected) {
   }
 }
 
-function projectPriorRunManifest(events) {
-  const current = projectRunManifest(events);
-  if (current.recoveryDecisions.length || current.providerSubstitutions.length) return null;
-  const {
-    recoveryDecisions: _recoveryDecisions,
-    providerSubstitutions: _providerSubstitutions,
-    ...prior
-  } = current;
-  prior.schemaVersion = 1;
-  return prior;
-}
-
 function validateProjectedArtifacts(run, manifest) {
   for (const artifact of manifest.artifacts) readRunArtifact({ ...artifact, directory: run.directory });
 }
@@ -323,23 +376,11 @@ export function validateManifestAgreement(run, lease) {
   let actual;
   try {
     actual = JSON.parse(fs.readFileSync(file, 'utf8'));
-  } catch (error) {
-    throw new ManifestAgreementError(`manifest cannot be read: ${error.message}`);
-  }
-  if (manifestsMatch(actual, expected)) return { manifest: expected, rebuilt: false };
-  if (actual?.schemaVersion === 1 && manifestsMatch(actual, projectPriorRunManifest(state.events))) {
+  } catch {
     replaceRunManifest(run, expected, lease);
     return { manifest: expected, rebuilt: true };
   }
-
-  const sequence = actual?.lastValidatedSequence;
-  if (Number.isSafeInteger(sequence) && sequence >= 0 && sequence < state.events.length) {
-    const prefix = state.events.slice(0, sequence);
-    if (manifestsMatch(actual, projectRunManifest(prefix))
-      || (actual?.schemaVersion === 1 && manifestsMatch(actual, projectPriorRunManifest(prefix)))) {
-      replaceRunManifest(run, expected, lease);
-      return { manifest: expected, rebuilt: true };
-    }
-  }
-  throw new ManifestAgreementError('manifest does not agree with the validated journal');
+  if (manifestsMatch(actual, expected)) return { manifest: expected, rebuilt: false };
+  replaceRunManifest(run, expected, lease);
+  return { manifest: expected, rebuilt: true };
 }

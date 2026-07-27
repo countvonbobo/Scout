@@ -13,6 +13,7 @@ import {
   JournalCorruptionError,
   RUN_JOURNAL_SCHEMA_VERSION,
   appendRunEvent,
+  isIncompleteJson,
   openRunJournal,
   validateRunJournal,
 } from './runJournal.mjs';
@@ -75,6 +76,29 @@ const FAILURE_REASONS = new Set([
   'provider-substitution-required',
 ]);
 const MAX_QUARANTINED_TAIL_BYTES = 32 * 1024;
+const DIAGNOSTIC_SCHEMA_VERSION = 1;
+const SELECTION_REASONS = new Set([
+  ...Object.values(REASON_FOR_FIELD),
+  'compatibility-missing',
+  'compatibility-schema-unsupported',
+  'journal-schema-unsupported',
+  'artifact-schema-unsupported',
+  'completed-stage-unsupported',
+  'candidate-malformed',
+  'explicit-provider-substitution-required',
+  'terminal-complete',
+  'terminal-partial',
+  'terminal-abandoned',
+  'terminal-failed',
+]);
+
+class CandidateSkipError extends TypeError {
+  constructor(reason, message) {
+    super(message);
+    this.name = 'CandidateSkipError';
+    this.reason = reason;
+  }
+}
 
 function stableJson(value) {
   if (value === null || typeof value === 'boolean' || typeof value === 'string') return JSON.stringify(value);
@@ -106,9 +130,20 @@ function runId(value) {
   return value;
 }
 
-function checkedCompatibility(input) {
-  exactKeys(input, COMPATIBILITY_FIELDS, 'recovery compatibility schema');
-  if (input.schemaVersion !== COMPATIBILITY_SCHEMA_VERSION) throw new TypeError('unsupported recovery compatibility schema');
+function checkedCompatibility(input, { candidate = false } = {}) {
+  try {
+    exactKeys(input, COMPATIBILITY_FIELDS, 'recovery compatibility schema');
+  } catch (error) {
+    if (candidate && (input === null || input === undefined)) {
+      throw new CandidateSkipError('compatibility-missing', 'recovery compatibility is missing');
+    }
+    if (candidate) throw new CandidateSkipError('compatibility-missing', error.message);
+    throw error;
+  }
+  if (input.schemaVersion !== COMPATIBILITY_SCHEMA_VERSION) {
+    if (candidate) throw new CandidateSkipError('compatibility-schema-unsupported', 'unsupported recovery compatibility schema');
+    throw new TypeError('unsupported recovery compatibility schema');
+  }
   for (const field of [
     'artifactSchemaVersion', 'assessmentSchemaVersion', 'journalSchemaVersion', 'mutationSchemaVersion',
   ]) {
@@ -122,6 +157,14 @@ function checkedCompatibility(input) {
   ]) token(input[field], `recovery compatibility ${field}`);
   if (typeof input.sourceConfigFingerprint !== 'string' || !SHA256.test(input.sourceConfigFingerprint)) {
     throw new TypeError('recovery compatibility source/config fingerprint is invalid');
+  }
+  if (input.journalSchemaVersion !== RUN_JOURNAL_SCHEMA_VERSION) {
+    if (candidate) throw new CandidateSkipError('journal-schema-unsupported', 'candidate journal schema is unsupported');
+    throw new TypeError('requested journal schema is unsupported');
+  }
+  if (input.artifactSchemaVersion !== RUN_ARTIFACT_SCHEMA_VERSION) {
+    if (candidate) throw new CandidateSkipError('artifact-schema-unsupported', 'candidate artifact schema is unsupported');
+    throw new TypeError('requested artifact schema is unsupported');
   }
   return structuredClone(input);
 }
@@ -154,21 +197,36 @@ function checkedProviderSubstitution(value, request) {
 }
 
 function checkedCandidate(input) {
-  if (!input || typeof input !== 'object' || Array.isArray(input)) throw new TypeError('recovery candidate is invalid');
+  if (!input || typeof input !== 'object' || Array.isArray(input)) {
+    throw new CandidateSkipError('candidate-malformed', 'recovery candidate is invalid');
+  }
   const updated = new Date(input.updatedAt);
   if (Number.isNaN(updated.getTime()) || updated.toISOString() !== input.updatedAt) {
-    throw new TypeError('recovery candidate updated time is invalid');
+    throw new CandidateSkipError('candidate-malformed', 'recovery candidate updated time is invalid');
   }
   if (!['in-progress', ...TERMINAL_OUTCOMES].includes(input.outcome)) {
-    throw new TypeError('recovery candidate outcome is invalid');
+    throw new CandidateSkipError('candidate-malformed', 'recovery candidate outcome is invalid');
   }
-  if (!Array.isArray(input.completedWork)) throw new TypeError('recovery candidate completed work is invalid');
+  if (!Array.isArray(input.completedWork)) {
+    throw new CandidateSkipError('candidate-malformed', 'recovery candidate completed work is invalid');
+  }
+  let checkedRunId;
+  try {
+    checkedRunId = runId(input.runId);
+  } catch (error) {
+    throw new CandidateSkipError('candidate-malformed', error.message);
+  }
+  for (const work of input.completedWork) {
+    if (!RECOVERABLE_PIPELINE_STAGES.some((stage) => stage.id === work?.stageId)) {
+      throw new CandidateSkipError('completed-stage-unsupported', 'candidate contains an unsupported completed stage');
+    }
+  }
   return {
     original: input,
-    runId: runId(input.runId),
+    runId: checkedRunId,
     updatedAt: input.updatedAt,
     outcome: input.outcome,
-    compatibility: checkedCompatibility(input.compatibility),
+    compatibility: checkedCompatibility(input.compatibility, { candidate: true }),
     completedWork: structuredClone(input.completedWork),
   };
 }
@@ -217,6 +275,13 @@ export class RecoveryCompatibilityDecision {
   constructor(candidateInput, requestInput) {
     const candidate = checkedCandidate(candidateInput);
     const request = splitRequest(requestInput);
+    const requestFingerprint = compatibilityFingerprint(request.compatibility);
+    const candidateFingerprint = createHash('sha256').update(stableJson({
+      runId: candidate.runId,
+      outcome: candidate.outcome,
+      compatibility: candidate.compatibility,
+      completedWork: candidate.completedWork,
+    })).digest('hex');
     const reasons = [];
     const terminal = TERMINAL_OUTCOMES.has(candidate.outcome);
     if (terminal) reasons.push(`terminal-${candidate.outcome}`);
@@ -235,8 +300,6 @@ export class RecoveryCompatibilityDecision {
       } else {
         reasons.push('explicit-provider-substitution-required');
       }
-    } else if (request.providerSubstitution) {
-      throw new TypeError('provider substitution was supplied without a provenance change');
     }
 
     const stages = cascadeStageRestarts(candidate.completedWork.map((work) => {
@@ -262,6 +325,16 @@ export class RecoveryCompatibilityDecision {
     this.reasons = Object.freeze([...new Set(reasons)]);
     this.stages = Object.freeze(stages);
     this.providerSubstitution = providerSubstitution;
+    this.request = Object.freeze({
+      ...request.compatibility,
+      ...(request.providerSubstitution ? { providerSubstitution: request.providerSubstitution } : {}),
+    });
+    this.requestFingerprint = requestFingerprint;
+    this.candidateFingerprint = candidateFingerprint;
+    this.selectionFingerprint = createHash('sha256').update(stableJson({
+      candidateFingerprint,
+      requestFingerprint,
+    })).digest('hex');
     Object.freeze(this);
   }
 }
@@ -271,24 +344,209 @@ export function compatibilityFingerprint(input) {
   return createHash('sha256').update(stableJson(checked)).digest('hex');
 }
 
-export function selectRecoverableRun(candidates, request) {
+function diagnosticJournalState(file, validateRecord, identityKey) {
+  if (!fs.existsSync(file)) return { events: [], truncatedTail: false, prefix: '' };
+  const contents = fs.readFileSync(file, 'utf8');
+  if (!contents) return { events: [], truncatedTail: false, prefix: '' };
+  const terminated = contents.endsWith('\n');
+  const lines = contents.split(/\r?\n/);
+  if (lines.at(-1) === '') lines.pop();
+  const events = [];
+  const identities = new Set();
+  let prefix = '';
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index];
+    const final = index === lines.length - 1;
+    let event;
+    try {
+      event = JSON.parse(line);
+    } catch {
+      if (final && !terminated && Buffer.byteLength(line, 'utf8') <= MAX_QUARANTINED_TAIL_BYTES
+        && isIncompleteJson(line)) {
+        return { events, truncatedTail: true, prefix };
+      }
+      throw new Error('recovery diagnostic journal is corrupt');
+    }
+    validateRecord(event);
+    if (identities.has(event[identityKey])) throw new Error('recovery diagnostic identity is duplicated');
+    identities.add(event[identityKey]);
+    events.push(event);
+    prefix += `${line}\n`;
+  }
+  return { events, truncatedTail: false, prefix };
+}
+
+function validateFingerprint(value, label) {
+  if (typeof value !== 'string' || !SHA256.test(value)) throw new Error(`${label} is invalid`);
+}
+
+function validateSelectionRecord(record) {
+  exactKeys(record, [
+    'candidateSetFingerprint', 'eventId', 'fencingGeneration', 'leaseId', 'recordedAt',
+    'requestFingerprint', 'schemaVersion', 'selectedRunId', 'selectionId', 'skipped',
+  ], 'recovery selection record');
+  if (record.schemaVersion !== DIAGNOSTIC_SCHEMA_VERSION) throw new Error('recovery selection schema is unsupported');
+  validateFingerprint(record.selectionId, 'recovery selection ID');
+  validateFingerprint(record.candidateSetFingerprint, 'recovery candidate-set fingerprint');
+  validateFingerprint(record.requestFingerprint, 'recovery request fingerprint');
+  token(record.eventId, 'recovery selection event ID');
+  token(record.leaseId, 'recovery selection lease ID');
+  if (!Number.isSafeInteger(record.fencingGeneration) || record.fencingGeneration < 1) {
+    throw new Error('recovery selection fencing generation is invalid');
+  }
+  if (Number.isNaN(Date.parse(record.recordedAt)) || !record.recordedAt.endsWith('Z')) {
+    throw new Error('recovery selection timestamp is invalid');
+  }
+  if (record.selectedRunId !== null) runId(record.selectedRunId);
+  if (!Array.isArray(record.skipped)) throw new Error('recovery selection skips are invalid');
+  for (const skipped of record.skipped) {
+    exactKeys(skipped, ['outcome', 'reasons', 'runId'], 'recovery selection skip');
+    runId(skipped.runId);
+    if (!['partial', 'abandoned', 'complete', 'failed'].includes(skipped.outcome)) {
+      throw new Error('recovery selection skip outcome is invalid');
+    }
+    if (!Array.isArray(skipped.reasons) || !skipped.reasons.length
+      || skipped.reasons.some((reason) => !SELECTION_REASONS.has(reason))) {
+      throw new Error('recovery selection skip reasons are invalid');
+    }
+  }
+}
+
+function repairDiagnosticTail(file, state) {
+  if (!state.truncatedTail) return;
+  const contents = fs.readFileSync(file, 'utf8');
+  const tail = contents.slice(state.prefix.length);
+  const digest = createHash('sha256').update(tail).digest('hex');
+  const quarantine = `${file}.truncated.${digest}`;
+  if (!fs.existsSync(quarantine)) atomicWriteFile(quarantine, tail, { mode: 0o600 });
+  atomicWriteFile(file, state.prefix, { mode: 0o600 });
+}
+
+function appendDiagnosticRecord(file, identityKey, validateRecord, lease, makeRecord) {
+  return assertCurrentFence(lease, synchronousFenceCallback(() => {
+    let state = diagnosticJournalState(file, validateRecord, identityKey);
+    if (state.truncatedTail) {
+      repairDiagnosticTail(file, state);
+      state = diagnosticJournalState(file, validateRecord, identityKey);
+    }
+    const pending = makeRecord();
+    const existing = state.events.find((event) => event[identityKey] === pending[identityKey]);
+    if (existing) return existing;
+    appendSynced(file, pending);
+    return pending;
+  }));
+}
+
+function selectionFile(root) {
+  return path.join(path.resolve(root), '.scout', 'recovery-selections.jsonl');
+}
+
+function candidateSortEnvelope(input, index) {
+  const parsed = new Date(input?.updatedAt);
+  const updatedAt = !Number.isNaN(parsed.getTime()) && parsed.toISOString() === input?.updatedAt
+    ? input.updatedAt : '';
+  let identifier;
+  try {
+    identifier = runId(input?.runId);
+  } catch {
+    identifier = `invalid-${createHash('sha256').update(String(index)).digest('hex').slice(0, 16)}`;
+  }
+  return { input, index, updatedAt, runId: identifier };
+}
+
+function skippedOutcome(candidate, reasons) {
+  if (['partial', 'abandoned'].includes(candidate?.outcome)) return candidate.outcome;
+  if (candidate?.outcome === 'complete') return 'complete';
+  if (candidate?.outcome === 'failed') return 'failed';
+  return Array.isArray(candidate?.completedWork) && candidate.completedWork.length ? 'partial' : 'abandoned';
+}
+
+function persistSelection(root, lease, ordered, requestFingerprint, selectedRunId, skipped) {
+  assertScanLeaseScope(lease, root, lease.runId);
+  const candidateSetFingerprint = createHash('sha256').update(stableJson(ordered.map((candidate) => ({
+    runId: candidate.runId,
+    updatedAt: candidate.updatedAt,
+    digest: createHash('sha256').update(stableJson(candidate.input)).digest('hex'),
+  })))).digest('hex');
+  const selectionId = createHash('sha256').update(stableJson({
+    candidateSetFingerprint,
+    requestFingerprint,
+  })).digest('hex');
+  const record = appendDiagnosticRecord(
+    selectionFile(root),
+    'selectionId',
+    validateSelectionRecord,
+    lease,
+    () => ({
+      schemaVersion: DIAGNOSTIC_SCHEMA_VERSION,
+      eventId: randomUUID(),
+      selectionId,
+      recordedAt: new Date().toISOString(),
+      leaseId: lease.leaseId,
+      fencingGeneration: lease.generation,
+      requestFingerprint,
+      candidateSetFingerprint,
+      selectedRunId,
+      skipped,
+    }),
+  );
+  return { selectionId: record.selectionId, candidateSetFingerprint };
+}
+
+export function selectRecoverableRun(candidates, request, context = null) {
   if (!Array.isArray(candidates)) throw new TypeError('recovery candidates must be an array');
-  const ordered = candidates.map(checkedCandidate).sort((left, right) => (
+  const checkedRequest = splitRequest(request);
+  const requestValue = {
+    ...checkedRequest.compatibility,
+    ...(checkedRequest.providerSubstitution ? { providerSubstitution: checkedRequest.providerSubstitution } : {}),
+  };
+  const requestFingerprint = compatibilityFingerprint(checkedRequest.compatibility);
+  const ordered = candidates.map(candidateSortEnvelope).sort((left, right) => (
     right.updatedAt.localeCompare(left.updatedAt) || right.runId.localeCompare(left.runId)
   ));
   const skipped = [];
-  for (const candidate of ordered) {
-    const decision = new RecoveryCompatibilityDecision(candidate.original, request);
-    if (decision.recoverable) {
-      return Object.freeze({
-        candidate: candidate.original,
-        decision,
-        skipped: Object.freeze(skipped),
-      });
+  let selected = null;
+  for (const envelope of ordered) {
+    let decision;
+    try {
+      decision = new RecoveryCompatibilityDecision(envelope.input, requestValue);
+    } catch (error) {
+      const reason = error instanceof CandidateSkipError ? error.reason : 'candidate-malformed';
+      skipped.push(Object.freeze({
+        runId: envelope.runId,
+        outcome: skippedOutcome(envelope.input, [reason]),
+        reasons: Object.freeze([reason]),
+      }));
+      continue;
     }
-    skipped.push(Object.freeze({ runId: candidate.runId, reasons: decision.reasons }));
+    if (decision.recoverable) {
+      selected = { candidate: envelope.input, decision };
+      break;
+    }
+    skipped.push(Object.freeze({
+      runId: envelope.runId,
+      outcome: skippedOutcome(envelope.input, decision.reasons),
+      reasons: decision.reasons,
+    }));
   }
-  return Object.freeze({ candidate: null, decision: null, skipped: Object.freeze(skipped) });
+  let durable = {};
+  if (context) {
+    exactKeys(context, ['lease', 'root'], 'recovery selection context');
+    durable = persistSelection(
+      context.root,
+      context.lease,
+      ordered,
+      requestFingerprint,
+      selected?.candidate?.runId ?? null,
+      skipped,
+    );
+  }
+  return Object.freeze({
+    candidate: selected?.candidate ?? null,
+    decision: selected?.decision ?? null,
+    skipped: Object.freeze(skipped),
+    ...durable,
+  });
 }
 
 function failureFile(root) {
@@ -312,25 +570,57 @@ function appendSynced(file, value) {
   }
 }
 
-function recordRecoveryFailure(root, targetRunId, lease, reason) {
+function validateFailureRecord(record) {
+  exactKeys(record, [
+    'eventId', 'failureId', 'fencingGeneration', 'leaseId', 'reason', 'recordedAt',
+    'requestFingerprint', 'runId', 'schemaVersion',
+  ], 'recovery failure record');
+  if (record.schemaVersion !== DIAGNOSTIC_SCHEMA_VERSION) throw new Error('recovery failure schema is unsupported');
+  token(record.eventId, 'recovery failure event ID');
+  validateFingerprint(record.failureId, 'recovery failure ID');
+  runId(record.runId);
+  token(record.leaseId, 'recovery failure lease ID');
+  if (!Number.isSafeInteger(record.fencingGeneration) || record.fencingGeneration < 1) {
+    throw new Error('recovery failure fencing generation is invalid');
+  }
+  if (Number.isNaN(Date.parse(record.recordedAt)) || !record.recordedAt.endsWith('Z')) {
+    throw new Error('recovery failure timestamp is invalid');
+  }
+  validateFingerprint(record.requestFingerprint, 'recovery failure request fingerprint');
+  if (!FAILURE_REASONS.has(record.reason)) throw new Error('recovery failure reason is invalid');
+}
+
+function recordRecoveryFailure(root, targetRunId, lease, reason, requestFingerprint) {
   if (!FAILURE_REASONS.has(reason)) throw new TypeError('recovery failure reason is invalid');
+  validateFingerprint(requestFingerprint, 'recovery failure request fingerprint');
+  const failureId = createHash('sha256').update(stableJson({
+    runId: targetRunId,
+    fencingGeneration: lease.generation,
+    requestFingerprint,
+    reason,
+  })).digest('hex');
   const failure = {
-    schemaVersion: 1,
+    schemaVersion: DIAGNOSTIC_SCHEMA_VERSION,
     eventId: randomUUID(),
+    failureId,
     runId: targetRunId,
     recordedAt: new Date().toISOString(),
     leaseId: lease.leaseId,
     fencingGeneration: lease.generation,
+    requestFingerprint,
     reason,
   };
-  return assertCurrentFence(lease, synchronousFenceCallback(() => {
-    appendSynced(failureFile(root), failure);
-    return failure;
-  }));
+  return appendDiagnosticRecord(
+    failureFile(root),
+    'failureId',
+    validateFailureRecord,
+    lease,
+    () => failure,
+  );
 }
 
-function failRecovery(root, targetRunId, lease, reason, message, cause) {
-  recordRecoveryFailure(root, targetRunId, lease, reason);
+function failRecovery(root, targetRunId, lease, reason, requestFingerprint, message, cause) {
+  recordRecoveryFailure(root, targetRunId, lease, reason, requestFingerprint);
   const error = new Error(message, { cause });
   error.name = 'RunRecoveryError';
   throw error;
@@ -371,30 +661,6 @@ function quarantineTruncatedTail(run, lease) {
   }));
 }
 
-function recoveryRequest(root, compatibility, lease) {
-  const current = readScanLease(root);
-  if (!current || current.leaseId !== lease.leaseId || current.generation !== lease.generation) {
-    throw new Error('scan lease is no longer current');
-  }
-  const request = {
-    ...compatibility,
-    mode: current.operation.mode ?? compatibility.mode,
-    provider: current.operation.provider ?? compatibility.provider,
-    model: current.operation.model ?? compatibility.model,
-  };
-  if (request.provider !== compatibility.provider || request.model !== compatibility.model) {
-    if (current.operation.phase !== 'provider-substitution') return request;
-    request.providerSubstitution = {
-      allowed: true,
-      fromProvider: compatibility.provider,
-      fromModel: compatibility.model,
-      toProvider: request.provider,
-      toModel: request.model,
-    };
-  }
-  return request;
-}
-
 function withArtifactDirectory(stage, directory) {
   if (!stage.artifact) return stage;
   const artifact = { ...stage.artifact };
@@ -402,21 +668,27 @@ function withArtifactDirectory(stage, directory) {
   return Object.freeze({ ...stage, artifact });
 }
 
-export function recoverRun(root, targetRunId, lease) {
+export function recoverRun(root, targetRunId, lease, selectedDecision) {
   targetRunId = runId(targetRunId);
   assertScanLeaseScope(lease, root, targetRunId);
+  if (!(selectedDecision instanceof RecoveryCompatibilityDecision)
+    || selectedDecision.runId !== targetRunId
+    || !selectedDecision.recoverable) {
+    throw new TypeError('recovery requires the exact recoverable selection decision');
+  }
+  const requestFingerprint = selectedDecision.requestFingerprint;
   let run;
   try {
     run = openRunJournal(root, targetRunId);
     quarantineTruncatedTail(run, lease);
   } catch (error) {
     if (error instanceof JournalCorruptionError) {
-      return failRecovery(root, targetRunId, lease, 'journal-damaged', 'run journal is damaged; recovery failed closed', error);
+      return failRecovery(root, targetRunId, lease, 'journal-damaged', requestFingerprint, 'run journal is damaged; recovery failed closed', error);
     }
     throw error;
   }
   if (!run.events.length) {
-    return failRecovery(root, targetRunId, lease, 'journal-damaged', 'run journal is damaged or missing; recovery failed closed');
+    return failRecovery(root, targetRunId, lease, 'journal-damaged', requestFingerprint, 'run journal is damaged or missing; recovery failed closed');
   }
 
   let agreement;
@@ -424,23 +696,22 @@ export function recoverRun(root, targetRunId, lease) {
     agreement = validateManifestAgreement(run, lease);
   } catch (error) {
     if (error instanceof JournalCorruptionError) {
-      return failRecovery(root, targetRunId, lease, 'journal-damaged', 'run journal is damaged; recovery failed closed', error);
+      return failRecovery(root, targetRunId, lease, 'journal-damaged', requestFingerprint, 'run journal is damaged; recovery failed closed', error);
     }
     if (error instanceof ManifestAgreementError || error instanceof ArtifactIntegrityError) {
-      return failRecovery(root, targetRunId, lease, 'manifest-damaged', 'run manifest or artifact is damaged; recovery failed closed', error);
+      return failRecovery(root, targetRunId, lease, 'manifest-damaged', requestFingerprint, 'run manifest or artifact is damaged; recovery failed closed', error);
     }
     throw error;
   }
 
   const { manifest } = agreement;
   if (!manifest.compatibility?.schemaVersion) {
-    return failRecovery(root, targetRunId, lease, 'compatibility-missing', 'run has no supported recovery compatibility contract');
+    return failRecovery(root, targetRunId, lease, 'compatibility-missing', requestFingerprint, 'run has no supported recovery compatibility contract');
   }
   if (TERMINAL_OUTCOMES.has(manifest.outcome)) {
     throw new Error(`terminal ${manifest.outcome} run is immutable and cannot be recovered`);
   }
 
-  const request = recoveryRequest(root, manifest.compatibility, lease);
   const candidate = {
     runId: targetRunId,
     updatedAt: run.events.at(-1).recordedAt,
@@ -448,7 +719,10 @@ export function recoverRun(root, targetRunId, lease) {
     compatibility: manifest.compatibility,
     completedWork: manifest.completedWork,
   };
-  const decision = new RecoveryCompatibilityDecision(candidate, request);
+  const decision = new RecoveryCompatibilityDecision(candidate, selectedDecision.request);
+  if (decision.selectionFingerprint !== selectedDecision.selectionFingerprint) {
+    throw new Error('recovery candidate changed after selection; select the run again');
+  }
   if (!decision.recoverable) {
     if (decision.reasons.includes('explicit-provider-substitution-required')) {
       return failRecovery(
@@ -456,11 +730,38 @@ export function recoverRun(root, targetRunId, lease) {
         targetRunId,
         lease,
         'provider-substitution-required',
+        requestFingerprint,
         'provider or model substitution requires an explicit recovery decision',
       );
     }
     throw new Error(`run is not recoverable: ${decision.reasons.join(', ')}`);
   }
+
+  const current = readScanLease(root);
+  if (!current || current.leaseId !== lease.leaseId || current.generation !== lease.generation) {
+    throw new Error('scan lease is no longer current');
+  }
+  if ((current.operation.mode ?? decision.request.mode) !== decision.request.mode
+    || (current.operation.provider ?? decision.request.provider) !== decision.request.provider
+    || (current.operation.model ?? decision.request.model) !== decision.request.model) {
+    throw new Error('scan lease operation does not match the selected recovery request');
+  }
+  if (decision.providerSubstitution && current.operation.phase !== 'provider-substitution') {
+    throw new Error('scan lease does not authorize provider substitution');
+  }
+
+  const { providerSubstitution: _providerSubstitution, ...compatibility } = decision.request;
+  appendRunEvent(run, {
+    type: 'recovery.started',
+    stageId: 'run',
+    idempotencyKey: `recovery-started-${lease.generation}`,
+    payload: {
+      schemaVersion: 1,
+      compatibility,
+      requestFingerprint: decision.requestFingerprint,
+      selectionFingerprint: decision.selectionFingerprint,
+    },
+  }, lease);
 
   if (decision.providerSubstitution) {
     appendRunEvent(run, {

@@ -90,7 +90,7 @@ test('rebuilds a missing manifest entirely from journalled completion, compatibi
   assert.deepEqual(JSON.parse(fs.readFileSync(path.join(run.directory, 'manifest.json'), 'utf8')), expected);
 });
 
-test('rejects a manifest that claims an artifact not referenced by the journal', () => {
+test('rebuilds a contradictory manifest from the valid journal without trusting invented work', () => {
   const run = openRunJournal(temp(), 'run-1');
   const artifact = commitRunArtifact(run, { id: 'collect-v1', schemaVersion: 1 }, { schemaVersion: 1, stableIds: [] }, lease);
   completed(run, artifact);
@@ -98,7 +98,22 @@ test('rejects a manifest that claims an artifact not referenced by the journal',
   manifest.artifacts.push({ id: 'not-journalled', schemaVersion: 1, digest: 'b'.repeat(64) });
   fs.writeFileSync(path.join(run.directory, 'manifest.json'), `${JSON.stringify(manifest)}\n`, 'utf8');
 
-  assert.throws(() => validateManifestAgreement(run, lease), ManifestAgreementError);
+  const rebuilt = validateManifestAgreement(run, lease);
+  assert.equal(rebuilt.rebuilt, true);
+  assert.deepEqual(rebuilt.manifest, projectRunManifest(run.events));
+  assert.ok(!rebuilt.manifest.artifacts.some((item) => item.id === 'not-journalled'));
+});
+
+test('rebuilds an unreadable derived manifest after journal validation', () => {
+  const run = openRunJournal(temp(), 'run-1');
+  const artifact = commitRunArtifact(run, { id: 'collect-v1', schemaVersion: 1 }, { schemaVersion: 1, stableIds: [] }, lease);
+  completed(run, artifact);
+  fs.writeFileSync(path.join(run.directory, 'manifest.json'), '{"schemaVersion":', 'utf8');
+
+  const rebuilt = validateManifestAgreement(run, lease);
+
+  assert.equal(rebuilt.rebuilt, true);
+  assert.deepEqual(rebuilt.manifest, projectRunManifest(run.events));
 });
 
 test('rejects raw or invented manifest content before it can be stored', () => {
@@ -160,6 +175,6 @@ test('rebuilds the prior manifest schema after the additive recovery projection 
   const result = validateManifestAgreement(run, lease);
 
   assert.equal(result.rebuilt, true);
-  assert.equal(result.manifest.schemaVersion, 2);
+  assert.equal(result.manifest.schemaVersion, 3);
   assert.deepEqual(JSON.parse(fs.readFileSync(path.join(run.directory, 'manifest.json'), 'utf8')), result.manifest);
 });

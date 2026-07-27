@@ -46,6 +46,16 @@ const EVENT_PAYLOAD_SCHEMAS = Object.freeze({
       required: Object.freeze(new Set(['schemaVersion', 'action', 'reason'])),
     }),
   }),
+  'recovery.started': Object.freeze({
+    1: Object.freeze({
+      allowed: Object.freeze(new Set([
+        'schemaVersion', 'compatibility', 'requestFingerprint', 'selectionFingerprint',
+      ])),
+      required: Object.freeze(new Set([
+        'schemaVersion', 'compatibility', 'requestFingerprint', 'selectionFingerprint',
+      ])),
+    }),
+  }),
   'recovery.provider-substituted': Object.freeze({
     1: Object.freeze({
       allowed: Object.freeze(new Set([
@@ -208,7 +218,9 @@ function validatePayload(type, payload, ErrorType = TypeError) {
   if (value.version !== undefined) validateVersion(value.version, ErrorType);
   if (value.artifact !== undefined) validateArtifactReference(value.artifact, ErrorType);
   if (value.compatibility !== undefined) {
-    if (type === 'run.started') validateRecoveryCompatibility(value.compatibility, ErrorType);
+    if (type === 'run.started' || type === 'recovery.started') {
+      validateRecoveryCompatibility(value.compatibility, ErrorType);
+    }
     else validateVersion(value.compatibility, ErrorType);
   }
   if (value.outcome !== undefined && !RUN_OUTCOMES.has(value.outcome)) throw new ErrorType('journal payload outcome is invalid');
@@ -227,6 +239,13 @@ function validatePayload(type, payload, ErrorType = TypeError) {
       throw new ErrorType('journal recovery substitution does not change provenance');
     }
   }
+  if (type === 'recovery.started') {
+    for (const key of ['requestFingerprint', 'selectionFingerprint']) {
+      if (typeof value[key] !== 'string' || !SHA256.test(value[key])) {
+        throw new ErrorType(`journal recovery ${key} is invalid`);
+      }
+    }
+  }
   let encoded;
   try {
     encoded = stableJson(payload);
@@ -242,7 +261,7 @@ function envelopeHash(event) {
   return sha256(envelope);
 }
 
-function isIncompleteJson(value) {
+export function isIncompleteJson(value) {
   let index = 0;
   const skipWhitespace = () => { while ([' ', '\t', '\r', '\n'].includes(value[index])) index += 1; };
   const parseString = () => {
