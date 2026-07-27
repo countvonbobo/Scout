@@ -24,6 +24,11 @@
 - Never silently substitute providers or models.
 - Never automatically delete recovery-critical active, queued, partial, failed, unrepaired or recovery-referenced state.
 - Port only PR #71's safe backup-divergence behavior; do not cherry-pick its unrelated tab-order change.
+- Lease migration is one-way: an active legacy lock blocks until expiry, the
+  old Scout process must be stopped before upgrade, fenced generations become
+  authoritative after activation, and new Scout refuses downgrade or
+  coexistence with an older binary. Do not continuously refresh a legacy
+  sentinel across old and new binaries.
 - Preserve existing workspace formats additively and keep all 649 baseline tests passing.
 
 ---
@@ -124,7 +129,13 @@ Run: `git add ui/lib/runArtifacts.mjs ui/lib/runArtifacts.test.mjs ui/lib/atomic
 
 - [ ] **Step 1: Write failing process-race tests**
 
-Launch separate Node processes against one temp workspace and assert one simultaneous winner, heartbeat defeats takeover, expiry allocates generation +1, stale generation cannot append, PID reuse is distinguished by process-start identity, and a dead 30-second guard is quarantined safely.
+Launch separate Node processes against one temp workspace and assert one
+simultaneous winner, heartbeat defeats takeover, expiry allocates generation
++1, stale generation cannot append, PID reuse is distinguished by
+process-start identity, and a dead 30-second guard is quarantined safely. Add
+fixtures for an active/unexpired legacy lock, an expired lock with stopped
+owner, attempted old/new coexistence and attempted downgrade after fenced
+activation.
 
 - [ ] **Step 2: Prove the tests fail**
 
@@ -133,12 +144,21 @@ Expected: FAIL because the fenced lease API is absent.
 
 - [ ] **Step 3: Implement guard and lease**
 
-Use atomic directory creation for every acquire/renew/takeover/release operation, atomic JSON replacement while holding the guard, monotonic local renewal scheduling, wall-clock restart validation, 90/15/15 timing defaults, and a heartbeat independent of provider promises. Keep the legacy lock adapter until migration.
+Use atomic directory creation for every acquire/renew/takeover/release
+operation, atomic JSON replacement while holding the guard, monotonic local
+renewal scheduling, wall-clock restart validation, 90/15/15 timing defaults,
+and a heartbeat independent of provider promises. Implement a one-way legacy
+adapter: preserve an active legacy lock until expiry, require its owner process
+to be stopped, journal/record the migration decision, then activate the fenced
+generation as authoritative. After activation, reject legacy lock creation,
+downgrade and old/new coexistence with a clear operator error. Do not create or
+continuously refresh a cross-version legacy sentinel.
 
 - [ ] **Step 4: Verify**
 
 Run: `node --test ui/lib/scanLease.test.mjs tools/scan-lock.test.mjs`
-Expected: PASS with competing-process tests.
+Expected: PASS with competing-process, migration, downgrade and coexistence
+tests.
 
 - [ ] **Step 5: Commit**
 

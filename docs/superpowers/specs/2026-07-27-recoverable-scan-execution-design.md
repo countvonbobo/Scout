@@ -482,6 +482,19 @@ Migration is additive and idempotent.
 - Existing tracker, reports and scheduled jobs remain unchanged.
 - An active legacy lock continues to block until its existing expiry rule is
   satisfied. A safely expired legacy lock may migrate into a recovery event.
+- Lease migration is a one-way boundary. The old Scout process must be stopped
+  before upgrading; new Scout does not attempt continuous sentinel refresh or
+  simultaneous operation with an older binary.
+- Before activating the first fenced lease, Scout checks for legacy process and
+  lock evidence. A live, unverifiable or unexpired legacy owner blocks
+  activation with a clear operator message explaining how to stop the old
+  process and retry.
+- Once fenced lease state has been activated, its generation record is
+  authoritative. An older binary or legacy-lock attempt is detected as a
+  downgrade/coexistence conflict and new Scout refuses to run rather than
+  refreshing, overwriting or racing the legacy sentinel.
+- Migration never rewrites an active legacy lock and never maintains a
+  timestamp bridge between old and new lock formats.
 - Migration failure leaves old workspace data readable and unchanged.
 - Manifest rebuild and queue migration can be rerun.
 
@@ -551,6 +564,8 @@ Tests cover:
 - every provider-health transition, secure guided login, blocked scheduled
   scans, deduplicated alerts and retry behaviour (#76);
 - legacy workspace migration and rollback safety; and
+- active/unexpired legacy-lock blocking, stopped-process one-way migration,
+  downgrade detection and explicit old/new coexistence refusal; and
 - full unit, integration, browser, packaging and release audits.
 
 The milestone is complete only when stale processes cannot commit, completed
