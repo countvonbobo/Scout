@@ -35,8 +35,8 @@ test.beforeEach(async ({ page }) => {
 });
 
 test('zero-keeper results remain visible and expose the complete sanitised audit', async ({ page }) => {
-  await expect(page.locator('#scan-status')).toHaveText(/40 reviewed · 0 kept/);
-  await expect(page.getByText('40 reviewed, 0 kept').first()).toBeVisible();
+  await expect(page.locator('#scan-status')).toHaveText(/40 assessed · 0 kept/);
+  await expect(page.getByText('40 assessed, 0 kept').first()).toBeVisible();
   await expect(page.getByText(/16 mandatory gates/).first()).toBeVisible();
   await expect(page.getByText(/automatic broader discovery pass/)).toBeVisible();
   await page.getByRole('button', { name: 'Review this scan' }).first().click();

@@ -48,6 +48,12 @@ test('profile review names every decision area and keeps unconfirmed inferences 
   assert.match(html, /Publish this reviewed profile/);
 });
 
+test('profile review renders safely before profile state loads', () => {
+  const html = searchProfileReviewHtml(null);
+  assert.match(html, /No complete draft is available yet/);
+  assert.match(html, /Not yet published/);
+});
+
 test('splitList accepts comma and newline separated settings', () => {
   assert.deepEqual(splitList('Robotics, climate tech\nHealthcare,  '), [
     'Robotics', 'climate tech', 'Healthcare',

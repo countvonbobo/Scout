@@ -180,6 +180,7 @@ function profileRuleText(profile, section, field, strengths) {
 }
 
 export function searchProfileReviewHtml(state = {}) {
+  state ||= {};
   const draft = state.draft || null;
   const published = state.published || null;
   const compensation = draft?.compensation || {};
