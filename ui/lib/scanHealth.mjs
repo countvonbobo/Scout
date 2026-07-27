@@ -93,6 +93,9 @@ export function scanHealthFromText(text, today) {
 
 function publicFunnel(value) {
   if (!value || typeof value !== 'object') return null;
-  const names = ['sourceRecords', 'uniqueVacancies', 'deterministicallyExcluded', 'eligible', 'ranked', 'selected', 'assessed', 'assessmentFailed'];
+  const names = [
+    'sourceRecords', 'sourceErrors', 'failedSourceRecords', 'uniqueVacancies',
+    'deterministicallyExcluded', 'eligible', 'ranked', 'selected', 'assessed', 'assessmentFailed',
+  ];
   return Object.fromEntries(names.filter((name) => Number.isFinite(Number(value[name]))).map((name) => [name, Number(value[name])]));
 }

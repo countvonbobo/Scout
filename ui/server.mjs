@@ -39,7 +39,9 @@ import {
   releaseTrackerMutationLock, TrackerRevisionConflictError,
 } from './lib/trackerPersistence.mjs';
 import { loadEnv, saveEnv } from './lib/env.mjs';
-import { loadPublishedSearchProfile, profileFingerprint, publishSearchProfile, validateSearchProfile } from './lib/searchProfile.mjs';
+import {
+  loadPublishedSearchProfile, migrateSearchProfile, profileFingerprint, publishSearchProfile, validateSearchProfile,
+} from './lib/searchProfile.mjs';
 import {
   loadWorkspaceConfig, migrateWorkspace, resolveWorkspaceRoot, seedWorkspace, syncManagedInstructions,
   workspacePaths, writeWorkspaceConfig,
@@ -79,6 +81,16 @@ if (fs.existsSync(TRACKER) && path.resolve(APP_ROOT) !== path.resolve(WORKSPACE_
 }
 
 function workspaceInitialised() { return fs.existsSync(TRACKER) && fs.existsSync(WORKSPACE.config); }
+
+function stageSearchProfileReview() {
+  if (!workspaceInitialised()) return null;
+  const config = loadWorkspaceConfig(WORKSPACE_ROOT);
+  const readiness = setupReadiness(WORKSPACE_ROOT, config, {}, readTracker());
+  if (!(readiness.checks.preferences && readiness.checks.evidence && readiness.checks.approved)) return null;
+  return migrateSearchProfile(WORKSPACE_ROOT);
+}
+
+stageSearchProfileReview();
 
 function queueCheckpoint(reason, { includeDevicePreferences = false } = {}) {
   const options = includeDevicePreferences && process.platform === 'win32'
@@ -173,7 +185,10 @@ function publicLatestScan() {
   })).slice(0, 80) : [];
   const boundedContribution = (item) => typeof item === 'string' ? item.slice(0, 100) : ({ code: String(item?.code || '').slice(0, 100), score: Number.isFinite(Number(item?.score)) ? Number(item.score) : null });
   const boundedFunnel = (value) => {
-    const names = ['sourceRecords', 'uniqueVacancies', 'deterministicallyExcluded', 'eligible', 'ranked', 'selected', 'assessed', 'assessmentFailed'];
+    const names = [
+      'sourceRecords', 'sourceErrors', 'failedSourceRecords', 'uniqueVacancies',
+      'deterministicallyExcluded', 'eligible', 'ranked', 'selected', 'assessed', 'assessmentFailed',
+    ];
     return value && typeof value === 'object' ? Object.fromEntries(names.filter((name) => Number.isFinite(Number(value[name]))).map((name) => [name, Number(value[name])])) : null;
   };
   const boundedSelectionSummary = (value) => value && typeof value === 'object' ? Object.fromEntries(['selected', 'assessed', 'assessmentFailed'].filter((name) => Number.isFinite(Number(value[name]))).map((name) => [name, Number(value[name])])) : null;
@@ -446,6 +461,7 @@ async function handleRead(req, res, url) {
         pendingSetupSections: [],
       });
     }
+    stageSearchProfileReview();
     const config = loadWorkspaceConfig(WORKSPACE_ROOT);
     const providers = await providerDetection.detect();
     const env = loadEnv(WORKSPACE_ROOT);
@@ -678,6 +694,7 @@ function readDraftSearchProfile() {
 }
 
 function readSearchProfileState() {
+  stageSearchProfileReview();
   const draft = readDraftSearchProfile();
   return {
     rawPresent: fs.existsSync(WORKSPACE.searchProfileRaw),

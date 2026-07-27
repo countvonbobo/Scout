@@ -94,6 +94,20 @@ function scoreRules(vacancy, name, sourceName, mode, rules) {
   };
 }
 
+export function compareCompensation(amount, preference) {
+  if (preference?.minimum === null || preference?.minimum === undefined) return 'not-configured';
+  const comparable = amount
+    && Number.isFinite(amount.minimum)
+    && amount.currency && preference.currency
+    && amount.period && preference.period
+    && amount.rateType && preference.rateType
+    && normalise(amount.currency) === normalise(preference.currency)
+    && normalise(amount.period) === normalise(preference.period)
+    && normalise(amount.rateType) === normalise(preference.rateType);
+  if (!comparable) return 'unknown';
+  return amount.minimum >= preference.minimum ? 'meets-minimum' : 'below-minimum';
+}
+
 function compensationDimension(vacancy, profile) {
   const preference = profile?.compensation || {};
   const weight = STRENGTH_WEIGHT[preference.minimumStrength] || 0;
@@ -103,21 +117,14 @@ function compensationDimension(vacancy, profile) {
   }
   const source = field(vacancy, 'compensation');
   const amount = valueOf(source);
-  const comparable = amount && preference.minimum !== null && preference.minimum !== undefined
-    && amount.currency && preference.currency && amount.period && preference.period
-    && amount.rateType && preference.rateType
-    && normalise(amount.currency) === normalise(preference.currency)
-    && normalise(amount.period) === normalise(preference.period)
-    && normalise(amount.rateType) === normalise(preference.rateType);
-  const knownComparable = Boolean(comparable);
-  const offeredMinimum = knownComparable && Number.isFinite(amount.minimum) ? amount.minimum : null;
-  const meetsMinimum = offeredMinimum !== null && offeredMinimum >= preference.minimum;
-  const belowMinimum = offeredMinimum !== null && offeredMinimum < preference.minimum;
+  const comparison = compareCompensation(amount, preference);
+  const knownComparable = comparison === 'meets-minimum' || comparison === 'below-minimum';
+  const meetsMinimum = comparison === 'meets-minimum';
+  const belowMinimum = comparison === 'below-minimum';
   const unknownPenalty = !knownComparable && preference.unknownPolicy === 'penalise' ? maximum * 0.25 : 0;
   const rawScore = weight > 0 ? (meetsMinimum ? weight : -unknownPenalty) : (belowMinimum ? weight : -unknownPenalty);
   const score = Object.is(rawScore, -0) ? 0 : rawScore;
   const rule = { value: `${preference.currency || 'unknown'} ${preference.period || 'unknown'} ${preference.rateType || 'unknown'} ${preference.minimum}`, strength: preference.minimumStrength };
-  const comparison = knownComparable ? (meetsMinimum ? 'meets-minimum' : 'below-minimum') : 'unknown';
   return {
     name: 'compensation', score, maximum, confidence: knownComparable ? 1 : 0, confidenceWeight: Math.abs(weight),
     evidence: [{ vacancy: amount || null, rule: preference.minimum, comparison }],

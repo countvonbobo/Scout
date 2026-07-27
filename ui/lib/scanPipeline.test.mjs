@@ -40,6 +40,114 @@ test('ranked discovery is independent of source and portal order', () => {
   assert.deepEqual(forward.candidates.map((item) => item.candidateId), ['candidate-001', 'candidate-002']);
 });
 
+test('ranked discovery excludes zero-score unrelated vacancies below the configured relevance threshold', () => {
+  const profile = {
+    version: 1, status: 'published', id: 'profile-123456789abc',
+    target: { primaryTitles: [{ value: 'Ideal Role', strength: 'strong-preference', provenance: 'explicit' }] },
+    negative: {},
+    compensation: {
+      currency: null, period: 'year', minimum: null, minimumStrength: 'neutral', unknownPolicy: 'include',
+    },
+  };
+  const result = prepareRankedDiscovery({
+    sources: { ats: { count: 2, jobs: [
+      { company: 'Strong', title: 'Ideal Role', url: 'https://example.test/strong', providerId: 'strong' },
+      { company: 'Noise', title: 'Unrelated Role', url: 'https://example.test/noise', providerId: 'noise' },
+    ] } },
+    profile,
+    tracker: { opportunities: [] },
+    runId: 'scan-threshold',
+    limit: 60,
+    relevanceThreshold: 40,
+  });
+
+  assert.deepEqual(result.selection.selected.map((item) => item.role), ['Ideal Role']);
+  assert.equal(result.funnel.ranked, 2);
+  assert.equal(result.funnel.aboveThreshold, 1);
+  assert.equal(result.funnel.selected, 1);
+});
+
+test('deterministic exclusion accounting counts unique vacancies while retaining every rule explanation', () => {
+  const profile = {
+    version: 1, status: 'published', id: 'profile-123456789abc',
+    target: {},
+    negative: {
+      excludedTitles: [{ value: 'Blocked Role', strength: 'hard-exclusion', provenance: 'explicit' }],
+      excludedEmployers: [{ value: 'Blocked Co', strength: 'hard-exclusion', provenance: 'explicit' }],
+    },
+    compensation: {
+      currency: null, period: 'year', minimum: null, minimumStrength: 'neutral', unknownPolicy: 'include',
+    },
+  };
+  const result = prepareRankedDiscovery({
+    sources: { ats: { count: 1, jobs: [{
+      company: 'Blocked Co', title: 'Blocked Role', url: 'https://example.test/blocked', providerId: 'blocked',
+    }] } },
+    profile,
+    tracker: { opportunities: [] },
+    runId: 'scan-exclusions',
+  });
+
+  assert.equal(result.funnel.deterministicallyExcluded, 1);
+  assert.equal(result.exclusions.length, 2);
+  assert.deepEqual(result.exclusions.map((item) => item.code).sort(), ['excluded-employer', 'excluded-title']);
+
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'scout-unique-exclusion-accounting-'));
+  fs.mkdirSync(path.join(root, 'data'), { recursive: true });
+  fs.writeFileSync(path.join(root, 'data', 'opportunities.json'), '{"updated":"2026-07-27","opportunities":[]}\n');
+  const artifacts = writeScanArtifacts(root, {
+    provider: 'codex',
+    mode: 'primary',
+    sources: { ats: { configured: true, status: 'healthy', count: 1 } },
+    candidates: [],
+    assessmentResult: null,
+    policy: {},
+    startedAt: '2026-07-27T09:00:00Z',
+    hardExcluded: result.exclusions,
+    exclusions: result.exclusions,
+    funnel: result.funnel,
+    discoveryEngine: 'ranked-discovery',
+    profileId: profile.id,
+  });
+  assert.equal(artifacts.run.discarded.hard_exclusion, 1);
+  assert.equal(artifacts.run.explanations.length, 2);
+});
+
+test('explicit provider compensation remains comparable through ranked discovery', () => {
+  const profile = {
+    version: 1, status: 'published', id: 'profile-123456789abc',
+    target: {},
+    negative: {},
+    compensation: {
+      currency: 'GBP', period: 'year', rateType: 'salary',
+      minimum: 60000, minimumStrength: 'strong-preference', unknownPolicy: 'exclude',
+    },
+  };
+  const result = prepareRankedDiscovery({
+    sources: { adzuna: { count: 1, jobs: [{
+      company: 'Comparable Co',
+      title: 'Comparable Role',
+      url: 'https://example.test/comparable',
+      providerId: 'comparable',
+      salaryMin: 65000,
+      salaryMax: 70000,
+      salaryCurrency: 'GBP',
+      salaryPeriod: 'year',
+      salaryRateType: 'salary',
+    }] } },
+    profile,
+    tracker: { opportunities: [] },
+    runId: 'scan-compensation',
+    relevanceThreshold: 1,
+  });
+
+  assert.equal(result.exclusions.length, 0);
+  assert.equal(result.selection.selected.length, 1);
+  const dimension = result.ranked[0].dimensions.find((item) => item.name === 'compensation');
+  assert.equal(dimension.evidence[0].comparison, 'meets-minimum');
+  assert.equal(result.ranked[0].preRankScore, 100);
+});
+
 test('the assessment boundary receives only structured-filter eligible vacancies', () => {
   const candidate = { vacancyId: 'vacancy-001', title: { value: 'Software Engineer', provenance: 'explicit-source' }, description: 'Perform coding.' };
   const profile = {

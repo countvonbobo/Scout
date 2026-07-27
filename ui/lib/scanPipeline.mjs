@@ -150,13 +150,23 @@ export function assessmentCandidatesForSelection(selected) {
 }
 
 function observationInputs(sources) {
-  return Object.entries(sources || {}).sort(([left], [right]) => compareText(left, right)).flatMap(([sourceName, source]) => (
-    [...(source?.jobs || [])].map((job) => normaliseObservation(job, {
+  const observations = [];
+  const funnelSources = {};
+  for (const [sourceName, source] of Object.entries(sources || {}).sort(([left], [right]) => compareText(left, right))) {
+    const jobs = [...(source?.jobs || [])];
+    const normalised = jobs.map((job) => normaliseObservation(job, {
       sourceName: job?.source || sourceName,
       fetchedAt: source?.fetchedAt || source?.generatedAt || null,
       laneId: job?.laneId || job?.source || source?.laneId || sourceName,
-    })).filter(Boolean)
-  ));
+    })).filter(Boolean);
+    observations.push(...normalised);
+    funnelSources[sourceName] = {
+      ...source,
+      jobs,
+      failedRecords: jobs.length - normalised.length,
+    };
+  }
+  return { observations, funnelSources };
 }
 
 // The deterministic discovery boundary deliberately evaluates every
@@ -165,21 +175,30 @@ function observationInputs(sources) {
 // response order cannot leak into provider-facing identities.
 export function prepareRankedDiscovery({
   sources, profile, tracker = { opportunities: [] }, runId = '', limit = DEFAULT_CANDIDATE_LIMIT,
+  relevanceThreshold,
 } = {}) {
   if (!profile || profile.status !== 'published') throw new Error('ranked discovery requires a published search profile');
-  const initialFunnel = createDiscoveryFunnel(sources);
-  const observations = observationInputs(sources);
+  const input = observationInputs(sources);
+  const observations = input.observations;
+  const initialFunnel = createDiscoveryFunnel(input.funnelSources);
   const canonical = canonicaliseObservations(observations);
   const vacancies = canonical.vacancies.map(assessmentVacancy);
   const filtered = filterVacancies(vacancies, profile);
   const ranked = rankVacancies(filtered.eligible, profile, tracker?.opportunities || []);
-  const selection = selectVacancies(ranked, { limit, seed: runId });
+  const configuredThreshold = Number(relevanceThreshold ?? profile?.selection?.relevanceThreshold ?? 1);
+  const threshold = Number.isFinite(configuredThreshold) ? Math.max(Number.EPSILON, configuredThreshold) : 1;
+  const selection = selectVacancies(ranked, {
+    limit,
+    threshold,
+    exploration: Number(profile?.selection?.exploration || 0),
+    seed: runId,
+  });
   const funnel = assertDiscoveryFunnel(advanceDiscoveryFunnel(initialFunnel, 'selection', {
-    parsed: initialFunnel.sourceRecords - initialFunnel.failedSourceRecords,
+    parsed: initialFunnel.sourceRecords,
     normalised: observations.length,
     duplicateObservations: canonical.duplicateObservations,
     uniqueVacancies: vacancies.length,
-    deterministicallyExcluded: vacancies.length - filtered.eligible.length,
+    deterministicallyExcluded: new Set(filtered.excluded.map((item) => String(item.vacancyId))).size,
     eligible: filtered.eligible.length,
     ranked: ranked.length,
     aboveThreshold: ranked.length - selection.belowCutoff.length,
@@ -563,7 +582,9 @@ export function writeScanArtifacts(root, {
       ...merged.discarded,
       // Applied deterministically before the assessment turn rather than by
       // the provider, so they are counted here instead.
-      hard_exclusion: merged.discarded.hard_exclusion + hardExcluded.length,
+      hard_exclusion: merged.discarded.hard_exclusion + new Set(hardExcluded.map((item, index) => (
+        String(item?.vacancyId || item?.candidateId || item?.canonicalUrl || `excluded-${index}`)
+      ))).size,
       advert_closed: closedAdverts.length,
     },
     candidates_dropped: dropped.total, candidates_dropped_by_source: dropped.perSource,

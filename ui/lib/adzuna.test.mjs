@@ -39,6 +39,7 @@ test('fetchAdzuna normalises jobs, locale/currency, and per-query counts', async
   assert.equal(result.jobs.length, 1);
   assert.equal(result.jobs[0].company, 'Example Studio');
   assert.equal(result.jobs[0].salary, '\u00a360,000-\u00a370,000');
+  assert.equal(result.jobs[0].salaryRateType, 'salary');
   assert.equal(result.jobs[0].postedDate, '2026-07-09');
   assert.equal(result.jobs[0].providerId, 'adzuna-123');
   assert.equal(result.jobs[0].sourceRecordId, 'adzuna-123');

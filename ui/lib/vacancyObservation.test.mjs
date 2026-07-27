@@ -53,11 +53,13 @@ test('normalisation parses explicit structured source fields without AI inferenc
   const observation = normaliseObservation({
     providerId: 'job-3', title: 'Senior Engineer', company: 'Acme', url: 'https://jobs.example/3',
     location: 'Leeds', workingType: 'Remote', employmentType: 'Contract',
-    salaryMin: 60000, salaryMax: 70000, salaryCurrency: 'GBP', salaryPeriod: 'year',
+    salaryMin: 60000, salaryMax: 70000, salaryCurrency: 'GBP', salaryPeriod: 'year', salaryRateType: 'salary',
     postedDate: '2026-07-01', description: 'Role',
   }, { sourceName: 'fixture', fetchedAt: NOW, laneId: 'lane-1' });
 
-  assert.deepEqual(observation.compensation.value, { minimum: 60000, maximum: 70000, currency: 'GBP', period: 'year' });
+  assert.deepEqual(observation.compensation.value, {
+    minimum: 60000, maximum: 70000, currency: 'GBP', period: 'year', rateType: 'salary',
+  });
   assert.equal(observation.compensation.provenance, 'explicit-source');
   assert.equal(observation.seniority.value, 'senior');
   assert.equal(observation.seniority.provenance, 'deterministic-extraction');

@@ -72,6 +72,45 @@ test('unconfirmed target hard rules do not exclude', () => {
   assert.deepEqual(result, { eligible: [softwareJob], excluded: [] });
 });
 
+test('unconfirmed inferred mandatory rules remain non-blocking', () => {
+  const result = filterVacancies([softwareJob], profile({
+    primaryTitles: [rule('Data Engineer', 'mandatory', 'unconfirmed-inference')],
+  }));
+
+  assert.deepEqual(result, { eligible: [softwareJob], excluded: [] });
+});
+
+test('multiple mandatory accepted values for one field are alternatives', () => {
+  const result = filterVacancies([softwareJob], profile({
+    primaryTitles: [
+      rule('Data Engineer', 'mandatory'),
+      rule('Software Engineer', 'mandatory'),
+    ],
+  }));
+
+  assert.deepEqual(result, { eligible: [softwareJob], excluded: [] });
+});
+
+test('exclude unknown compensation policy rejects non-comparable supplied values', () => {
+  const incompatible = {
+    ...softwareJob,
+    compensation: {
+      value: { minimum: 90000, maximum: 100000, currency: 'USD', period: 'year', rateType: 'salary' },
+      provenance: 'explicit-source',
+    },
+  };
+  const result = filterVacancies([incompatible], {
+    ...profile({ salaryUnknownPolicy: 'exclude', minimum: 60000 }),
+    compensation: {
+      currency: 'GBP', period: 'year', rateType: 'salary',
+      minimum: 60000, minimumStrength: 'strong-preference', unknownPolicy: 'exclude',
+    },
+  });
+
+  assert.equal(result.eligible.length, 0);
+  assert.equal(result.excluded[0].code, 'compensation-non-comparable');
+});
+
 test('structured title and employer rules read compacted runtime candidate fields', () => {
   const candidate = { vacancyId: 'runtime-001', company: 'Acme', role: 'Software Engineer', workingType: 'permanent', description: '' };
   const title = filterVacancies([candidate], profile({ primaryTitles: [rule('Data Engineer', 'mandatory')] }));

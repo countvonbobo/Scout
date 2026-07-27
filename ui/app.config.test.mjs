@@ -260,9 +260,9 @@ test('reports shows scan health above dated reports', async () => {
 
 test('scan health labels distinguish selection from successful assessment', () => {
   const { scout } = loadScout();
-  scout.state.data = { scanHealth: { funnel: { sourceRecords: 2532, uniqueVacancies: 120, deterministicallyExcluded: 40, eligible: 80, ranked: 80, selected: 60, assessed: 59, assessmentFailed: 1 } } };
+  scout.state.data = { scanHealth: { funnel: { sourceRecords: 2532, sourceErrors: 2, failedSourceRecords: 3, uniqueVacancies: 120, deterministicallyExcluded: 40, eligible: 80, ranked: 80, selected: 60, assessed: 59, assessmentFailed: 1 } } };
   const html = scout.scanHealthCard();
-  for (const label of ['Source records returned', 'Unique vacancies after deduplication', 'Excluded by confirmed rules', 'Eligible and ranked', 'Selected for detailed assessment', 'Successfully assessed', 'Assessment failed']) assert.match(html, new RegExp(label));
+  for (const label of ['Source records returned', 'Source or portal errors', 'Records not normalised', 'Unique vacancies after deduplication', 'Excluded by confirmed rules', 'Eligible and ranked', 'Selected for detailed assessment', 'Successfully assessed', 'Assessment failed']) assert.match(html, new RegExp(label));
   assert.doesNotMatch(html, /vacancies checked/i);
 });
 

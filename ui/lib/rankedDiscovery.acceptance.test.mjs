@@ -43,6 +43,7 @@ function sourceJob({ vacancyId, title, arrangement, compensation = null }) {
     salaryMax: compensation.minimum + 10,
     salaryCurrency: compensation.currency,
     salaryPeriod: compensation.period,
+    salaryRateType: compensation.rateType,
   });
   return job;
 }

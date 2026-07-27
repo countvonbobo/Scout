@@ -464,7 +464,8 @@ const Scout = {
     const reportDate = String(health?.lastRunAt || '').slice(0, 10);
     const funnel = health?.funnel;
     const funnelRows = funnel ? [
-      ['Source records returned', funnel.sourceRecords], ['Unique vacancies after deduplication', funnel.uniqueVacancies],
+      ['Source records returned', funnel.sourceRecords], ['Source or portal errors', funnel.sourceErrors],
+      ['Records not normalised', funnel.failedSourceRecords], ['Unique vacancies after deduplication', funnel.uniqueVacancies],
       ['Excluded by confirmed rules', funnel.deterministicallyExcluded], ['Eligible and ranked', funnel.ranked],
       ['Selected for detailed assessment', funnel.selected], ['Successfully assessed', funnel.assessed], ['Assessment failed', funnel.assessmentFailed],
     ].filter(([, value]) => Number.isFinite(Number(value))).map(([label, value]) => `<li>${this.esc(label)}: <b>${this.esc(value)}</b></li>`).join('') : '';

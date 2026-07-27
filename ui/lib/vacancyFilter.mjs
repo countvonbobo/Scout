@@ -1,3 +1,5 @@
+import { compareCompensation } from './vacancyRank.mjs';
+
 function valueOf(value) {
   return value && typeof value === 'object' && Object.hasOwn(value, 'value') ? value.value : value;
 }
@@ -33,6 +35,12 @@ function hardRule(rule) {
   return rule?.strength === 'hard-exclusion' && ['explicit', 'confirmed-inference'].includes(rule?.provenance);
 }
 
+function blockingStructuredRule(rule) {
+  if (rule?.provenance === 'unconfirmed-inference') return false;
+  if (rule?.strength === 'mandatory') return true;
+  return hardRule(rule);
+}
+
 function exclusion(vacancy, profile, code, rule, evidence, sourceConfidence, overrideable) {
   return {
     vacancyId: vacancy?.vacancyId || vacancy?.candidateId || vacancy?.canonicalUrl || 'unknown-vacancy',
@@ -66,16 +74,15 @@ function fieldValue(vacancy, field) {
 function structuredExclusions(vacancy, profile) {
   const found = [];
   for (const [listName, [field, name]] of Object.entries(POSITIVE_FIELDS)) {
-    for (const rule of profile?.target?.[listName] || []) {
-      if (!['mandatory', 'hard-exclusion'].includes(rule?.strength)) continue;
-      if (rule?.strength === 'hard-exclusion' && !hardRule(rule)) continue;
-      const source = fieldValue(vacancy, field);
-      const actual = valueOf(source);
-      if (actual === null || actual === undefined || actual === '') continue;
-      if (!exactMatches(actual, rule.value)) {
-        found.push(exclusion(vacancy, profile, `mandatory-${name}-unmet`, rule,
-          { vacancy: actual, rule: rule.value }, confidence(source), true));
-      }
+    const rules = (profile?.target?.[listName] || []).filter(blockingStructuredRule);
+    if (!rules.length) continue;
+    const source = fieldValue(vacancy, field);
+    const actual = valueOf(source);
+    if (actual === null || actual === undefined || actual === '') continue;
+    if (rules.some((rule) => exactMatches(actual, rule.value))) continue;
+    for (const rule of rules) {
+      found.push(exclusion(vacancy, profile, `mandatory-${name}-unmet`, rule,
+        { vacancy: actual, rule: rule.value }, confidence(source), true));
     }
   }
   for (const [listName, [field, code]] of Object.entries(NEGATIVE_FIELDS)) {
@@ -103,10 +110,25 @@ function responsibilityExclusions(vacancy, profile) {
 function compensationExclusions(vacancy, profile) {
   const source = vacancy?.compensation;
   const amount = valueOf(source);
-  if (amount !== null && amount !== undefined && amount !== '') return [];
   if (profile?.compensation?.unknownPolicy !== 'exclude') return [];
-  return [exclusion(vacancy, profile, 'compensation-unknown', null,
-    { vacancy: null, rule: 'unknown compensation policy: exclude' }, confidence(source), true)];
+  const missing = amount === null || amount === undefined || amount === '';
+  if (missing) {
+    return [exclusion(vacancy, profile, 'compensation-unknown', null,
+      {
+        vacancy: null,
+        rule: 'unknown compensation policy: exclude',
+        comparison: 'unknown',
+      }, confidence(source), true)];
+  }
+  if (profile?.compensation?.minimum === null || profile?.compensation?.minimum === undefined) return [];
+  const comparison = compareCompensation(amount, profile.compensation);
+  if (comparison !== 'unknown') return [];
+  return [exclusion(vacancy, profile, 'compensation-non-comparable', null,
+    {
+      vacancy: amount,
+      rule: 'unknown compensation policy: exclude',
+      comparison,
+    }, confidence(source), true)];
 }
 
 export function filterVacancies(vacancies, profile) {

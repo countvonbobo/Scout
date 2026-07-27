@@ -89,6 +89,7 @@ function normalise(hit, options) {
     salaryMax: v5.yearly_max_compensation ?? null,
     salaryCurrency: v5.listed_compensation_currency || null,
     salaryPeriod: 'year',
+    salaryRateType: 'salary',
     location: v5.formatted_workplace_location || '',
     workingType: v5.workplace_type || '',
     postedDate: (v5.estimated_publish_date || '').slice(0, 10) || null,

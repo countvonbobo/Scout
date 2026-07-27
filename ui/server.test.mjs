@@ -81,6 +81,28 @@ function profileDraft() {
 test('search-profile routes review a complete draft and publish only the current confirmed version', async () => {
   seedWorkspace(APP_ROOT, testWorkspace);
   const paths = workspacePaths(WORKSPACE_ROOT);
+  const legacyConfig = loadWorkspaceConfig(WORKSPACE_ROOT);
+  legacyConfig.profile.displayName = 'Synthetic Person';
+  legacyConfig.search.roleFamilies = ['Researcher'];
+  legacyConfig.search.locations = ['Remote'];
+  writeWorkspaceConfig(WORKSPACE_ROOT, legacyConfig);
+
+  const incompleteStatus = await request({ method: 'GET', path: '/api/setup/status' });
+  assert.equal(incompleteStatus.status, 200);
+  assert.equal(fs.existsSync(paths.searchProfileDraft), false);
+
+  fs.writeFileSync(paths.profileContext, 'Synthetic search-profile evidence. '.repeat(8), 'utf8');
+  fs.writeFileSync(path.join(paths.profile, 'calibration.md'), 'Synthetic calibration evidence. '.repeat(5), 'utf8');
+  fs.writeFileSync(path.join(paths.cv, 'master-cv.md'), 'Synthetic CV evidence. '.repeat(25), 'utf8');
+  fs.mkdirSync(path.join(WORKSPACE_ROOT, '.scout', 'onboarding'), { recursive: true });
+  fs.writeFileSync(path.join(WORKSPACE_ROOT, '.scout', 'onboarding', 'activated.json'), '{"approved":true}\n', 'utf8');
+  const setupStatus = await request({ method: 'GET', path: '/api/setup/status' });
+  assert.equal(setupStatus.status, 200);
+  const migrated = await request({ method: 'GET', path: '/api/search-profile' });
+  assert.equal(migrated.status, 200);
+  assert.equal(JSON.parse(migrated.text).draft?.status, 'draft');
+  assert.equal(fs.existsSync(paths.searchProfilePublished), false);
+
   const draft = profileDraft();
   fs.mkdirSync(path.dirname(paths.searchProfileDraft), { recursive: true });
   fs.writeFileSync(paths.searchProfileRaw, '{"source":"migration"}\n');
@@ -544,12 +566,15 @@ test('latest scan API exposes reconciled metrics and bounded explanations only',
   fs.writeFileSync(path.join(testWorkspace, 'data', 'scan-runs.jsonl'), `${JSON.stringify({
     schemaVersion: 4, timestamp: '2026-07-26T10:00:00.000Z', agent: 'codex', mode: 'primary', errors: [],
     profile_id: 'profile-123456789abc', discovery_engine: 'ranked-discovery',
-    funnel: { sourceRecords: 2532, uniqueVacancies: 120, deterministicallyExcluded: 40, eligible: 80, ranked: 80, selected: 60, assessed: 59, assessmentFailed: 1 },
+    funnel: { sourceRecords: 2532, sourceErrors: 2, failedSourceRecords: 3, uniqueVacancies: 120, deterministicallyExcluded: 40, eligible: 80, ranked: 80, selected: 60, assessed: 59, assessmentFailed: 1 },
     explanations: [{ vacancy_id: 'vacancy-1', pre_rank: { score: 82, positive: [{ code: 'title', score: 4, raw: 'private payload' }], negative: [{ code: 'negative', score: -1, path: 'C:\\private' }] }, selection_reason: 'score-band', assessment_status: 'assessed', source: 'ats', sourceUrl: 'https://example.test/job', raw: 'private payload', path: 'C:\\private' }],
   })}\n`);
   const response = await request({ path: '/api/scans/latest' });
   assert.equal(response.status, 200);
   assert.match(response.text, /Source records|2532|profile-123456789abc|vacancy-1/);
+  const latest = JSON.parse(response.text).scan;
+  assert.equal(latest.funnel.sourceErrors, 2);
+  assert.equal(latest.funnel.failedSourceRecords, 3);
   assert.doesNotMatch(response.text, /private payload|C:\\private/);
 });
 

@@ -16,7 +16,7 @@ import {
   assessmentCandidatesForSelection, compactCandidates, DEFAULT_CANDIDATE_LIMIT, inboxRecheckCandidates, prepareRankedDiscovery, promptCandidate,
   SCAN_ASSESSMENT_SCHEMA, validateAssessments, verificationCandidates, writeScanArtifacts,
 } from '../ui/lib/scanPipeline.mjs';
-import { loadPublishedSearchProfile } from '../ui/lib/searchProfile.mjs';
+import { loadPublishedSearchProfile, migrateSearchProfile } from '../ui/lib/searchProfile.mjs';
 import { partitionLiveCandidates } from '../ui/lib/advertLiveness.mjs';
 import { isMainModule } from '../ui/lib/mainModule.mjs';
 import { runCvQuality } from '../ui/lib/cvQuality.mjs';
@@ -152,12 +152,22 @@ export function assertScanReady(root, provider, { providerStatusFn = providerSta
   const selected = config.ai?.provider;
   const providers = Object.fromEntries([...new Set([selected, provider].filter(Boolean))].map((name) => [name, providerStatusFn(name)]));
   const readiness = setupReadiness(root, config, providers, tracker);
+  if (readiness.checks.preferences && readiness.checks.evidence && readiness.checks.approved) {
+    migrateSearchProfile(root);
+  }
   const requestedProviderReady = Boolean(providers[provider]?.installed && providers[provider]?.authenticated
     && providers[provider]?.capabilities?.structuredOutput !== false);
   readiness.checks.requestedProvider = requestedProviderReady;
   readiness.ready = readiness.ready && requestedProviderReady;
+  const publishedProfile = loadPublishedSearchProfile(root);
+  const profileReady = Boolean(publishedProfile || readiness.established);
+  readiness.checks.searchProfile = profileReady;
+  readiness.ready = readiness.ready && profileReady;
   if (!readiness.ready) {
     const missing = Object.entries(readiness.checks).filter(([, ready]) => !ready).map(([name]) => name);
+    if (missing.length === 1 && missing[0] === 'searchProfile') {
+      throw new Error('scan requires publishing the staged search profile after review');
+    }
     throw new Error(`scan requires complete approved evidence and an authenticated provider; fix: ${missing.join(', ')}`);
   }
   return readiness;
@@ -352,6 +362,7 @@ export async function runScanWith(root, provider, mode, {
       discovery = prepareRankedDiscovery({
         sources: collected.sources, profile: publishedProfile, tracker, runId: `${startedAt}-${provider}-${mode}`,
         limit: DEFAULT_CANDIDATE_LIMIT,
+        relevanceThreshold: config.search?.relevanceThreshold ?? config.triage?.checkScore,
       });
       hardExcluded = discovery.exclusions;
       discoveryEngine = 'ranked-discovery';

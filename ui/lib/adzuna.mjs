@@ -60,6 +60,7 @@ function normalise(item, options) {
     salaryMax: item.salary_max ?? null,
     salaryCurrency: options.currency || null,
     salaryPeriod: 'year',
+    salaryRateType: 'salary',
     location: item.location?.display_name || '',
     workingType: '',
     postedDate: (item.created || '').slice(0, 10) || null,

@@ -81,9 +81,14 @@ export function validateSearchProfile(profile) {
   validateRuleLists(profile.target, 'search profile.target');
   validateRuleLists(profile.negative, 'search profile.negative');
 
-  const { currency, period, minimum, minimumStrength, unknownPolicy } = profile.compensation;
+  const {
+    currency, period, rateType, minimum, minimumStrength, unknownPolicy,
+  } = profile.compensation;
   if (currency !== null && (typeof currency !== 'string' || !currency.trim())) throw new Error('search profile.compensation.currency must be a currency or null');
   if (typeof period !== 'string' || !period.trim()) throw new Error('search profile.compensation.period is required');
+  if (rateType !== undefined && rateType !== null && (typeof rateType !== 'string' || !rateType.trim())) {
+    throw new Error('search profile.compensation.rateType must be a rate type or null');
+  }
   if (minimum !== null && (!Number.isFinite(minimum) || minimum < 0)) throw new Error('search profile.compensation.minimum must be a non-negative number or null');
   requireEnum(minimumStrength, PREFERENCE_STRENGTHS, 'search profile.compensation.minimumStrength');
   if (minimumStrength === 'hard-exclusion') throw new Error('search profile.compensation hard exclusion requires a rule provenance');
@@ -126,6 +131,7 @@ export function draftProfileFromLegacy(config = {}, context = '') {
     compensation: {
       currency: typeof config.currency === 'string' && config.currency.trim() ? config.currency : null,
       period: 'year',
+      rateType: minimum === null ? null : 'salary',
       minimum,
       minimumStrength: minimum === null ? 'neutral' : 'strong-preference',
       unknownPolicy: 'include',

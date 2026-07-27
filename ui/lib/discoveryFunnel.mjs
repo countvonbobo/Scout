@@ -1,10 +1,10 @@
 const STAGES = Object.freeze([
-  'sourceRecords', 'failedSourceRecords', 'parsed', 'normalised',
+  'sourceRecords', 'sourceErrors', 'failedSourceRecords', 'parsed', 'normalised',
   'duplicateObservations', 'uniqueVacancies', 'deterministicallyExcluded',
   'eligible', 'ranked', 'aboveThreshold', 'selected', 'assessed',
   'assessmentFailed', 'added', 'updated', 'unchanged', 'closed',
 ]);
-const SOURCE_DERIVED_STAGES = new Set(['sourceRecords', 'failedSourceRecords']);
+const SOURCE_DERIVED_STAGES = new Set(['sourceRecords', 'sourceErrors', 'failedSourceRecords']);
 
 function freeze(value) {
   if (value && typeof value === 'object' && !Object.isFrozen(value)) {
@@ -15,10 +15,16 @@ function freeze(value) {
 }
 
 function sourceCount(result) {
-  return Number(result?.count ?? 0);
+  const count = Array.isArray(result?.jobs) ? result.jobs.length : Number(result?.count ?? 0);
+  return Number.isFinite(count) ? Math.max(0, count) : 0;
 }
 
 function failedRecordCount(result) {
+  const count = Number(result?.failedRecords ?? 0);
+  return Number.isFinite(count) ? Math.max(0, count) : 0;
+}
+
+function sourceErrorCount(result) {
   return Array.isArray(result?.errors) ? result.errors.length : 0;
 }
 
@@ -26,10 +32,12 @@ export function createDiscoveryFunnel(sourceResults = {}) {
   const bySource = Object.fromEntries(Object.entries(sourceResults).map(([source, result]) => [source, {
     count: sourceCount(result),
     failedRecords: failedRecordCount(result),
+    sourceErrors: sourceErrorCount(result),
   }]));
   const funnel = Object.fromEntries(STAGES.map((stage) => [stage, 0]));
   funnel.sourceRecords = Object.values(bySource).reduce((total, source) => total + source.count, 0);
   funnel.failedSourceRecords = Object.values(bySource).reduce((total, source) => total + source.failedRecords, 0);
+  funnel.sourceErrors = Object.values(bySource).reduce((total, source) => total + source.sourceErrors, 0);
   funnel.bySource = bySource;
   return freeze(funnel);
 }
@@ -46,11 +54,15 @@ export function assertDiscoveryFunnel(value) {
   const sources = Object.values(value.bySource);
   const sourceRecords = sources.reduce((total, source) => total + Number(source.count), 0);
   const failedSourceRecords = sources.reduce((total, source) => total + Number(source.failedRecords), 0);
-  if (value.sourceRecords !== sourceRecords || value.failedSourceRecords !== failedSourceRecords) {
+  const sourceErrors = sources.reduce((total, source) => total + Number(source.sourceErrors), 0);
+  if (value.sourceRecords !== sourceRecords || value.failedSourceRecords !== failedSourceRecords || value.sourceErrors !== sourceErrors) {
     throw new Error('source record totals must equal the source-level counts');
   }
-  if (value.parsed !== value.sourceRecords - value.failedSourceRecords) {
-    throw new Error('parsed must equal source records minus failed source records');
+  if (value.parsed !== value.sourceRecords) {
+    throw new Error('parsed must equal source records');
+  }
+  if (value.normalised + value.failedSourceRecords !== value.parsed) {
+    throw new Error('normalised plus failed source records must equal parsed');
   }
   if (value.normalised !== value.duplicateObservations + value.uniqueVacancies) {
     throw new Error('normalised must equal duplicate observations plus unique vacancies');

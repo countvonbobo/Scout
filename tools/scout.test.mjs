@@ -3,7 +3,9 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
-import { broadenSearchQueries, collectScanSources, migrateLegacyWorkspace, runScanWith, shouldAutoBroaden } from './scout.mjs';
+import {
+  assertScanReady, broadenSearchQueries, collectScanSources, migrateLegacyWorkspace, runScanWith, shouldAutoBroaden,
+} from './scout.mjs';
 import { DEFAULT_WORKSPACE_CONFIG, writeWorkspaceConfig } from '../ui/lib/workspace.mjs';
 import { publishSearchProfile } from '../ui/lib/searchProfile.mjs';
 
@@ -24,6 +26,30 @@ function publishedRankingProfile() {
     negative: {},
     compensation: { currency: null, period: 'year', minimum: null, minimumStrength: 'neutral', unknownPolicy: 'include' },
   }, { publishedAt: '2026-07-26T20:00:00.000Z' });
+}
+
+function readyScanRoot({ opportunities = [] } = {}) {
+  const root = scanRoot();
+  const config = structuredClone(DEFAULT_WORKSPACE_CONFIG);
+  config.ai.provider = 'codex';
+  config.profile.displayName = 'Synthetic Person';
+  config.search = {
+    ...config.search,
+    roleFamilies: ['Synthetic Engineer'],
+    locations: ['Remote'],
+    exclusions: [],
+    salaryMinimum: null,
+  };
+  writeWorkspaceConfig(root, config);
+  fs.mkdirSync(path.join(root, 'profile'), { recursive: true });
+  fs.mkdirSync(path.join(root, 'cv'), { recursive: true });
+  fs.mkdirSync(path.join(root, '.scout', 'onboarding'), { recursive: true });
+  fs.writeFileSync(path.join(root, 'profile', 'context.md'), 'Synthetic profile evidence. '.repeat(12));
+  fs.writeFileSync(path.join(root, 'profile', 'calibration.md'), 'Synthetic calibration evidence. '.repeat(8));
+  fs.writeFileSync(path.join(root, 'cv', 'master-cv.md'), 'Synthetic CV evidence. '.repeat(30));
+  fs.writeFileSync(path.join(root, '.scout', 'onboarding', 'activated.json'), '{"approved":true}\n');
+  fs.writeFileSync(path.join(root, 'data', 'opportunities.json'), `${JSON.stringify({ updated: '2026-07-27', opportunities })}\n`);
+  return root;
 }
 
 function enableRankedDiscovery(root) {
@@ -154,6 +180,52 @@ test('runtime scan skips AI for a healthy empty source result and needs no Git r
   assert.equal(fs.existsSync(path.join(root, '.git')), false);
 });
 
+test('fresh scan readiness stages a reviewable search-profile draft and requires publication', () => {
+  const root = readyScanRoot();
+
+  assert.throws(
+    () => assertScanReady(root, 'codex', { providerStatusFn: authenticated }),
+    /publish.*search profile/i,
+  );
+  const draft = JSON.parse(fs.readFileSync(path.join(root, 'profile', 'search', 'draft.json'), 'utf8'));
+  assert.equal(draft.status, 'draft');
+  assert.equal(draft.target.primaryTitles[0].value, 'Synthetic Engineer');
+  assert.equal(fs.existsSync(path.join(root, 'profile', 'search', 'published.json')), false);
+});
+
+test('incomplete scan readiness does not freeze a premature migration draft', () => {
+  const root = scanRoot();
+  const config = structuredClone(DEFAULT_WORKSPACE_CONFIG);
+  config.ai.provider = 'codex';
+  config.profile.displayName = 'Synthetic Person';
+  config.search = {
+    ...config.search,
+    roleFamilies: ['Synthetic Engineer'],
+    locations: ['Remote'],
+    exclusions: [],
+    salaryMinimum: null,
+  };
+  writeWorkspaceConfig(root, config);
+
+  assert.throws(
+    () => assertScanReady(root, 'codex', { providerStatusFn: authenticated }),
+    /complete approved evidence/i,
+  );
+  assert.equal(fs.existsSync(path.join(root, 'profile', 'search', 'draft.json')), false);
+});
+
+test('grandfathered established workspaces stage migration but retain legacy discovery compatibility', () => {
+  const root = readyScanRoot({
+    opportunities: [{ id: 'existing-role', company: 'Synthetic Co', role: 'Synthetic Engineer', status: 'watch' }],
+  });
+
+  const readiness = assertScanReady(root, 'codex', { providerStatusFn: authenticated });
+
+  assert.equal(readiness.established, true);
+  assert.equal(fs.existsSync(path.join(root, 'profile', 'search', 'draft.json')), true);
+  assert.equal(fs.existsSync(path.join(root, 'profile', 'search', 'published.json')), false);
+});
+
 test('runtime scan filters from the published profile before provider assessment', async () => {
   const root = scanRoot();
   const published = publishSearchProfile({
@@ -202,7 +274,7 @@ test('runtime selection is independent of source and portal order', async () => 
   assert.deepEqual(selectedUrls[0], selectedUrls[1]);
 });
 
-test('runtime ranks all unique jobs before selecting sixty', async () => {
+test('runtime ranks every unique job but does not pad assessment with zero-score jobs', async () => {
   const root = scanRoot();
   enableRankedDiscovery(root);
   const lateStrongUrl = 'https://example.test/jobs/late-strong';
@@ -219,8 +291,8 @@ test('runtime ranks all unique jobs before selecting sixty', async () => {
   assert.equal(result.ok, true);
   assert.equal(result.scan.funnel.uniqueVacancies, 2500);
   assert.equal(result.scan.funnel.ranked, result.scan.funnel.eligible);
-  assert.equal(result.scan.funnel.selected, 60);
-  assert.ok(candidates.some((item) => item.url === lateStrongUrl));
+  assert.equal(result.scan.funnel.selected, 1);
+  assert.deepEqual(candidates.map((item) => item.url), [lateStrongUrl]);
 });
 
 test('closed selected adverts are replaced by the next ranked eligible vacancy', async () => {

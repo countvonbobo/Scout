@@ -12,35 +12,51 @@ test('funnel reconciles every observation before assessment selection', () => {
     hiring_cafe: { count: 30, errors: ['one malformed row'] },
   });
   const complete = advanceDiscoveryFunnel(funnel, 'selection', {
-    parsed: 129, normalised: 128, duplicateObservations: 8,
+    parsed: 130, normalised: 130, duplicateObservations: 10,
     uniqueVacancies: 120, deterministicallyExcluded: 20,
     eligible: 100, ranked: 100, aboveThreshold: 75, selected: 60,
   });
   assert.equal(assertDiscoveryFunnel(complete).selected, 60);
 });
 
-test('funnel preserves source-level observation and failure counts', () => {
+test('funnel records source errors separately from failed records', () => {
   const funnel = createDiscoveryFunnel({
     first: { count: 3, errors: ['failed record'] },
     second: { count: 2, errors: [] },
   });
 
   assert.equal(funnel.sourceRecords, 5);
-  assert.equal(funnel.failedSourceRecords, 1);
+  assert.equal(funnel.sourceErrors, 1);
+  assert.equal(funnel.failedSourceRecords, 0);
   assert.deepEqual(funnel.bySource, {
-    first: { count: 3, failedRecords: 1 },
-    second: { count: 2, failedRecords: 0 },
+    first: { count: 3, failedRecords: 0, sourceErrors: 1 },
+    second: { count: 2, failedRecords: 0, sourceErrors: 0 },
   });
 });
 
-test('funnel rejects source counts that do not reconcile with parsed records', () => {
+test('unavailable and degraded sources never create negative observation counts', () => {
   const funnel = advanceDiscoveryFunnel(createDiscoveryFunnel({
-    source: { count: 2, errors: ['malformed record'] },
+    unavailable: { status: 'unavailable', count: 0, errors: ['portal unavailable'] },
+    degraded: { status: 'degraded', count: 1, errors: ['another portal unavailable'] },
   }), 'selection', {
-    sourceRecords: 0, failedSourceRecords: 0,
+    parsed: 1, normalised: 1, duplicateObservations: 0,
+    uniqueVacancies: 1, deterministicallyExcluded: 0,
+    eligible: 1, ranked: 1, aboveThreshold: 1, selected: 1,
   });
 
-  assert.throws(() => assertDiscoveryFunnel(funnel), /parsed must equal source records minus failed source records/);
+  assert.equal(assertDiscoveryFunnel(funnel).normalised, 1);
+  assert.equal(funnel.sourceErrors, 2);
+  assert.equal(funnel.failedSourceRecords, 0);
+});
+
+test('funnel rejects source counts that do not reconcile with normalised records', () => {
+  const funnel = advanceDiscoveryFunnel(createDiscoveryFunnel({
+    source: { count: 2, failedRecords: 1, errors: ['portal warning'] },
+  }), 'selection', {
+    parsed: 2, normalised: 2,
+  });
+
+  assert.throws(() => assertDiscoveryFunnel(funnel), /normalised plus failed source records must equal parsed/);
 });
 
 test('funnel advances without mutating the previous snapshot', () => {

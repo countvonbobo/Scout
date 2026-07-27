@@ -37,6 +37,7 @@ test('fetchHiringCafe normalises hits and skips expired ones', async () => {
   assert.equal(result.count, 1);
   assert.equal(result.jobs.length, 1);
   assert.equal(result.jobs[0].salary, 'GBP 60,000-75,000');
+  assert.equal(result.jobs[0].salaryRateType, 'salary');
   assert.equal(result.jobs[0].providerId, 'hiring-cafe-123');
   assert.equal(result.jobs[0].sourceRecordId, 'hiring-cafe-123');
   assert.deepEqual(result.sources, { 'product designer': 1 });

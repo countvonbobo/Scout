@@ -57,8 +57,15 @@ function compensation(job, warnings) {
   const maximum = text(job.salaryMax) !== null && Number.isFinite(Number(job.salaryMax)) ? Number(job.salaryMax) : null;
   const currency = text(job.salaryCurrency);
   const period = text(job.salaryPeriod);
+  const rateType = text(job.salaryRateType || job.compensationRateType || job.rateType);
   if (minimum !== null || maximum !== null) {
-    return field({ minimum, maximum, currency, period: period?.toLowerCase() || null }, 'explicit-source');
+    return field({
+      minimum,
+      maximum,
+      currency,
+      period: period?.toLowerCase() || null,
+      rateType: rateType?.toLowerCase() || null,
+    }, 'explicit-source');
   }
   if (text(job.salary)) {
     warnings.push('ambiguous compensation was left unknown');
