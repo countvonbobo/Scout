@@ -88,6 +88,10 @@ function artifactPath(directory, ref) {
   return path.join(directory, 'artifacts', `${createHash('sha256').update(key).digest('hex')}.json`);
 }
 
+function legacyArtifactPath(directory, ref) {
+  return path.join(directory, 'artifacts', `${createHash('sha256').update(ref.id).digest('hex')}.json`);
+}
+
 function referenceFor(directory, descriptor, value) {
   const ref = { id: descriptor.id, schemaVersion: descriptor.schemaVersion, digest: sha256(value) };
   Object.defineProperty(ref, 'directory', { value: directory, enumerable: false });
@@ -129,9 +133,20 @@ export function readRunArtifact(ref) {
   const descriptor = validateReference(ref);
   const directory = directoryForReference(ref);
   const file = artifactPath(directory, ref);
+  let contents;
+  try {
+    contents = fs.readFileSync(file, 'utf8');
+  } catch (error) {
+    if (error?.code !== 'ENOENT') throw new ArtifactIntegrityError(`artifact cannot be read: ${error.message}`);
+    try {
+      contents = fs.readFileSync(legacyArtifactPath(directory, ref), 'utf8');
+    } catch (legacyError) {
+      throw new ArtifactIntegrityError(`artifact cannot be read: ${legacyError.message}`);
+    }
+  }
   let stored;
   try {
-    stored = JSON.parse(fs.readFileSync(file, 'utf8'));
+    stored = JSON.parse(contents);
   } catch (error) {
     throw new ArtifactIntegrityError(`artifact cannot be read: ${error.message}`);
   }

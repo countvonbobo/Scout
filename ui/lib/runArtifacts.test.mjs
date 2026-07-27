@@ -122,3 +122,17 @@ test('keeps a journalled artifact readable when a later commit uses its ID with 
   assert.deepEqual(readRunArtifact(first), firstValue);
   assert.equal(validateManifestAgreement(run).rebuilt, true);
 });
+
+test('rebuilds from a fully verified artifact written in the original ID-only layout', () => {
+  const run = openRunJournal(temp(), 'run-1');
+  const value = { schemaVersion: 1, stableIds: ['vacancy-1'] };
+  const ref = { id: 'collect-v1', schemaVersion: 1, digest: sha256(value) };
+  const legacyFile = path.join(run.directory, 'artifacts', `${createHash('sha256').update(ref.id).digest('hex')}.json`);
+  const legacyEnvelope = { storageSchemaVersion: 1, id: ref.id, schemaVersion: 1, digest: ref.digest, value };
+  fs.mkdirSync(path.dirname(legacyFile), { recursive: true });
+  fs.writeFileSync(legacyFile, `${canonicalJson(legacyEnvelope)}\n`, 'utf8');
+  completed(run, ref);
+
+  assert.deepEqual(readRunArtifact({ ...run, ...ref }), value);
+  assert.equal(validateManifestAgreement(run).rebuilt, true);
+});
