@@ -82,10 +82,20 @@ export function scanHealthFromText(text, today) {
     candidatesFound: last.candidates_found ?? last.candidatesFound ?? last.candidate_count ?? null,
     keepersAdded: last.keepers_added ?? last.keepersAdded ?? last.keeper_count ?? null,
     discarded: last.discarded || last.discarded_reasons || {},
+    funnel: publicFunnel(last.funnel),
     reviewedAvailable: Array.isArray(last.reviewed) && last.reviewed.length > 0,
     errors: runErrors,
     sourceHealth: normaliseSourceHealth(last),
     runs: parsed.runs.length,
     parseErrors: parsed.errors,
   };
+}
+
+function publicFunnel(value) {
+  if (!value || typeof value !== 'object') return null;
+  const names = [
+    'sourceRecords', 'sourceErrors', 'failedSourceRecords', 'uniqueVacancies',
+    'deterministicallyExcluded', 'eligible', 'ranked', 'selected', 'assessed', 'assessmentFailed',
+  ];
+  return Object.fromEntries(names.filter((name) => Number.isFinite(Number(value[name]))).map((name) => [name, Number(value[name])]));
 }

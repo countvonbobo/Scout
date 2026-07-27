@@ -253,9 +253,17 @@ test('reports shows scan health above dated reports', async () => {
   await scout.renderReports();
   const html = doc.getElementById('tab-reports').innerHTML;
   assert.match(html, /Scan health/);
-  assert.match(html, /12 reviewed, 2 kept/);
+  assert.match(html, /12 assessed, 2 kept/);
   assert.match(html, /ATS: healthy \(12\)/);
   assert.match(html, /Report date/);
+});
+
+test('scan health labels distinguish selection from successful assessment', () => {
+  const { scout } = loadScout();
+  scout.state.data = { scanHealth: { funnel: { sourceRecords: 2532, sourceErrors: 2, failedSourceRecords: 3, uniqueVacancies: 120, deterministicallyExcluded: 40, eligible: 80, ranked: 80, selected: 60, assessed: 59, assessmentFailed: 1 } } };
+  const html = scout.scanHealthCard();
+  for (const label of ['Source records returned', 'Source or portal errors', 'Records not normalised', 'Unique vacancies after deduplication', 'Excluded by confirmed rules', 'Eligible and ranked', 'Selected for detailed assessment', 'Successfully assessed', 'Assessment failed']) assert.match(html, new RegExp(label));
+  assert.doesNotMatch(html, /vacancies checked/i);
 });
 
 test('renderJobs lists only new jobs, highest score first, with tags and actions', () => {

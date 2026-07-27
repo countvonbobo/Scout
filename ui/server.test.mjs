@@ -12,7 +12,8 @@ const testWorkspace = fs.mkdtempSync(path.join(os.tmpdir(), 'scout-server-test-'
 process.env.SCOUT_WORKSPACE = testWorkspace;
 process.env.SCOUT_DEVICE_SETTINGS = path.join(testWorkspace, 'device-settings.json');
 const { APP_ROOT, APP_VERSION, UI_BUILD_ID, WORKSPACE_ROOT, createServer, operations, providerDetection, restartControl, shutdownControl } = await import('./server.mjs');
-const { seedWorkspace, loadWorkspaceConfig, writeWorkspaceConfig } = await import('./lib/workspace.mjs');
+const { seedWorkspace, loadWorkspaceConfig, workspacePaths, writeWorkspaceConfig } = await import('./lib/workspace.mjs');
+const { profileFingerprint } = await import('./lib/searchProfile.mjs');
 const { acquireScanLock, releaseScanLock } = await import('../tools/scan-lock.mjs');
 
 let server;
@@ -51,6 +52,104 @@ function request({ method = 'GET', path = '/', headers = {}, body = '' }) {
     } else req.end(body);
   });
 }
+
+const JSON_HEADERS = () => {
+  const host = `127.0.0.1:${port}`;
+  return { host, origin: `http://${host}`, 'content-type': 'application/json' };
+};
+
+function profileDraft() {
+  return {
+    version: 1,
+    status: 'draft',
+    target: {
+      primaryTitles: [{ value: 'Researcher', strength: 'mandatory', provenance: 'explicit' }],
+      locations: [{ value: 'Remote', strength: 'strong-preference', provenance: 'explicit' }],
+      sectors: [{ value: 'Public interest', strength: 'nice-to-have', provenance: 'unconfirmed-inference' }],
+    },
+    negative: {
+      excludedTitles: [{ value: 'Commission-only', strength: 'hard-exclusion', provenance: 'explicit' }],
+      excludedResponsibilities: [],
+    },
+    compensation: {
+      currency: 'GBP', period: 'year', minimum: 60000,
+      minimumStrength: 'strong-preference', unknownPolicy: 'include',
+    },
+  };
+}
+
+test('search-profile routes review a complete draft and publish only the current confirmed version', async () => {
+  seedWorkspace(APP_ROOT, testWorkspace);
+  const paths = workspacePaths(WORKSPACE_ROOT);
+  const legacyConfig = loadWorkspaceConfig(WORKSPACE_ROOT);
+  legacyConfig.profile.displayName = 'Synthetic Person';
+  legacyConfig.search.roleFamilies = ['Researcher'];
+  legacyConfig.search.locations = ['Remote'];
+  writeWorkspaceConfig(WORKSPACE_ROOT, legacyConfig);
+
+  const incompleteStatus = await request({ method: 'GET', path: '/api/setup/status' });
+  assert.equal(incompleteStatus.status, 200);
+  assert.equal(fs.existsSync(paths.searchProfileDraft), false);
+
+  fs.writeFileSync(paths.profileContext, 'Synthetic search-profile evidence. '.repeat(8), 'utf8');
+  fs.writeFileSync(path.join(paths.profile, 'calibration.md'), 'Synthetic calibration evidence. '.repeat(5), 'utf8');
+  fs.writeFileSync(path.join(paths.cv, 'master-cv.md'), 'Synthetic CV evidence. '.repeat(25), 'utf8');
+  fs.mkdirSync(path.join(WORKSPACE_ROOT, '.scout', 'onboarding'), { recursive: true });
+  fs.writeFileSync(path.join(WORKSPACE_ROOT, '.scout', 'onboarding', 'activated.json'), '{"approved":true}\n', 'utf8');
+  const setupStatus = await request({ method: 'GET', path: '/api/setup/status' });
+  assert.equal(setupStatus.status, 200);
+  const migrated = await request({ method: 'GET', path: '/api/search-profile' });
+  assert.equal(migrated.status, 200);
+  assert.equal(JSON.parse(migrated.text).draft?.status, 'draft');
+  assert.equal(fs.existsSync(paths.searchProfilePublished), false);
+
+  const draft = profileDraft();
+  fs.mkdirSync(path.dirname(paths.searchProfileDraft), { recursive: true });
+  fs.writeFileSync(paths.searchProfileRaw, '{"source":"migration"}\n');
+  fs.writeFileSync(paths.searchProfileDraft, `${JSON.stringify(draft)}\n`);
+  const revision = profileFingerprint(draft);
+
+  const reviewed = await request({ method: 'GET', path: '/api/search-profile' });
+  assert.equal(reviewed.status, 200);
+  assert.deepEqual(JSON.parse(reviewed.text), {
+    rawPresent: true, draft, published: null, draftRevision: revision,
+  });
+
+  const partial = await request({
+    method: 'PUT', path: '/api/search-profile/draft', headers: JSON_HEADERS(),
+    body: JSON.stringify({ draft: { status: 'draft' }, revision }),
+  });
+  assert.equal(partial.status, 400);
+
+  const saved = await request({
+    method: 'PUT', path: '/api/search-profile/draft', headers: JSON_HEADERS(),
+    body: JSON.stringify({ draft, revision }),
+  });
+  assert.equal(saved.status, 200);
+  assert.equal(JSON.parse(saved.text).draftRevision, revision);
+
+  const unconfirmed = await request({
+    method: 'POST', path: '/api/search-profile/publish', headers: JSON_HEADERS(),
+    body: JSON.stringify({ revision, confirmed: false }),
+  });
+  assert.equal(unconfirmed.status, 409);
+
+  const stale = await request({
+    method: 'POST', path: '/api/search-profile/publish', headers: JSON_HEADERS(),
+    body: JSON.stringify({ revision: 'stale', confirmed: true }),
+  });
+  assert.equal(stale.status, 409);
+
+  const published = await request({
+    method: 'POST', path: '/api/search-profile/publish', headers: JSON_HEADERS(),
+    body: JSON.stringify({ revision, confirmed: true }),
+  });
+  assert.equal(published.status, 200);
+  const result = JSON.parse(published.text);
+  assert.match(result.published.id, /^profile-[a-f0-9]{12}$/);
+  assert.deepEqual(JSON.parse(fs.readFileSync(paths.searchProfilePublished, 'utf8')), result.published);
+  assert.equal(loadWorkspaceConfig(WORKSPACE_ROOT).searchProfile.publishedId, result.published.id);
+});
 
 test('local server rejects a non-loopback Host header', async () => {
   const response = await request({ headers: { host: 'attacker.example' } });
@@ -460,6 +559,32 @@ test('latest scan API exposes only bounded review fields and scan health omits r
   assert.doesNotMatch(text, /private query|full advert|private evidence|provider prompt/);
   const health = await request({ path: '/api/scan-health' });
   assert.doesNotMatch(health.text, /private query/);
+});
+
+test('latest scan API exposes reconciled metrics and bounded explanations only', async () => {
+  fs.mkdirSync(path.join(testWorkspace, 'data'), { recursive: true });
+  fs.writeFileSync(path.join(testWorkspace, 'data', 'scan-runs.jsonl'), `${JSON.stringify({
+    schemaVersion: 4, timestamp: '2026-07-26T10:00:00.000Z', agent: 'codex', mode: 'primary', errors: [],
+    profile_id: 'profile-123456789abc', discovery_engine: 'ranked-discovery',
+    funnel: { sourceRecords: 2532, sourceErrors: 2, failedSourceRecords: 3, uniqueVacancies: 120, deterministicallyExcluded: 40, eligible: 80, ranked: 80, selected: 60, assessed: 59, assessmentFailed: 1 },
+    explanations: [{ vacancy_id: 'vacancy-1', pre_rank: { score: 82, positive: [{ code: 'title', score: 4, raw: 'private payload' }], negative: [{ code: 'negative', score: -1, path: 'C:\\private' }] }, selection_reason: 'score-band', assessment_status: 'assessed', source: 'ats', sourceUrl: 'https://example.test/job', raw: 'private payload', path: 'C:\\private' }],
+  })}\n`);
+  const response = await request({ path: '/api/scans/latest' });
+  assert.equal(response.status, 200);
+  assert.match(response.text, /Source records|2532|profile-123456789abc|vacancy-1/);
+  const latest = JSON.parse(response.text).scan;
+  assert.equal(latest.funnel.sourceErrors, 2);
+  assert.equal(latest.funnel.failedSourceRecords, 3);
+  assert.doesNotMatch(response.text, /private payload|C:\\private/);
+});
+
+test('latest scan API bounds source URLs in persisted explanation records', async () => {
+  fs.mkdirSync(path.join(testWorkspace, 'data'), { recursive: true });
+  const oversizedUrl = `https://example.test/job?${'x'.repeat(5000)}`;
+  fs.writeFileSync(path.join(testWorkspace, 'data', 'scan-runs.jsonl'), `${JSON.stringify({ timestamp: '2026-07-26T10:00:00.000Z', explanations: [{ vacancy_id: 'vacancy-1', pre_rank: {}, assessment_status: 'assessed', source: 'ats', sourceUrl: oversizedUrl }] })}\n`);
+  const response = await request({ path: '/api/scans/latest' });
+  const { scan } = JSON.parse(response.text);
+  assert.equal(scan.explanations[0].sourceUrl, null);
 });
 
 test('legacy CV downloads require a hash-bound explicit override', async () => {

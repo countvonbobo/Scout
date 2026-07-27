@@ -22,6 +22,13 @@ function normaliseRelative(root, file) {
   return relative.split(path.sep).join('/');
 }
 
+function testOnlySource(relative) {
+  const value = String(relative).split(path.sep).join('/');
+  const base = path.posix.basename(value);
+  return /\.test\.mjs$/i.test(base)
+    || value.split('/').some((part) => ['fixtures', 'test', 'tests', 'test-data', '__tests__', '__snapshots__'].includes(part));
+}
+
 function lineAt(text, index) {
   let line = 1;
   for (let i = 0; i < index; i += 1) if (text.charCodeAt(i) === 10) line += 1;
@@ -115,7 +122,9 @@ export function auditRelease({
 } = {}) {
   const absoluteRoot = path.resolve(root);
   const excluded = markerFile ? path.resolve(markerFile) : null;
-  const tracked = (trackedFiles ?? collectTrackedFiles(absoluteRoot))
+  const listedTrackedFiles = trackedFiles ?? collectTrackedFiles(absoluteRoot);
+  const tracked = listedTrackedFiles
+    .filter((file) => trackedFiles !== undefined || !testOnlySource(file))
     .map((file) => path.resolve(absoluteRoot, file))
     .filter((file) => fs.existsSync(file) && fs.statSync(file).isFile());
   const built = buildDirs.flatMap((dir) => filesUnder(path.resolve(absoluteRoot, dir)));

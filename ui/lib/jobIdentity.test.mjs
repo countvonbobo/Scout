@@ -14,9 +14,25 @@ test('cross-provider copies of one role match by normalised evidence', () => {
   assert.equal(sameUnderlyingJob(first, second), true);
 });
 
+test('location identity retains country tokens without a country-specific default', () => {
+  assert.deepEqual(jobIdentity({ location: 'London, United Kingdom' }).locationTokens, ['london', 'united', 'kingdom']);
+  assert.deepEqual(jobIdentity({ location: 'Toronto, Canada' }).locationTokens, ['toronto', 'canada']);
+});
+
+test('a city-only location matches the same city with additional geography only', () => {
+  const common = { company: 'Acme', title: 'Platform Engineer', description: 'Build reliable Kubernetes services with AWS observability and mentor engineers.' };
+  assert.equal(sameUnderlyingJob({ ...common, location: 'London' }, { ...common, location: 'London, Greater London, United Kingdom' }), true);
+  assert.equal(sameUnderlyingJob({ ...common, location: 'London' }, { ...common, location: 'Manchester, Greater Manchester, United Kingdom' }), false);
+});
+
 test('different provider IDs from one source protect distinct openings', () => {
   const common = { company: 'Acme', title: 'Software Engineer', location: 'London', source: 'ats-greenhouse', description: 'Build the same platform services.' };
   assert.equal(sameUnderlyingJob({ ...common, providerId: '1', url: 'https://x.test/1' }, { ...common, providerId: '2', url: 'https://x.test/2' }), false);
+});
+
+test('different IDs from one provider stay distinct even when their canonical URLs match', () => {
+  const common = { company: 'Acme', title: 'Software Engineer', location: 'London', source: 'ats-greenhouse', url: 'https://careers.acme.test/jobs/engineer', description: 'Build the same platform services.' };
+  assert.equal(sameUnderlyingJob({ ...common, providerId: '1' }, { ...common, providerId: '2' }), false);
 });
 
 test('different locations and seniority remain separate', () => {

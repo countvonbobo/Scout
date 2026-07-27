@@ -17,6 +17,7 @@ async function getJson(url, fetchImpl) {
 function normalise(job, portal, fields) {
   return {
     providerId: String(fields.providerId || ''),
+    sourceRecordId: fields.providerId ? `ats-${portal.ats}:${portal.token}:${fields.providerId}` : '',
     title: fields.title || '',
     company: portal.name,
     description: fields.description || '',
@@ -24,6 +25,7 @@ function normalise(job, portal, fields) {
     salary: fields.salary || null,
     location: fields.location || '',
     workingType: fields.workingType || '',
+    employmentType: fields.employmentType || '',
     postedDate: fields.postedDate || null,
     source: `ats-${portal.ats}`,
     portal: { name: portal.name, ats: portal.ats, token: portal.token },
@@ -52,7 +54,7 @@ export async function fetchLever(portal, fetchImpl = globalThis.fetch) {
     description: stripHtml(job.descriptionPlain || job.description),
     url: job.hostedUrl,
     location: job.categories?.location,
-    workingType: job.categories?.commitment,
+    employmentType: job.categories?.commitment,
   }));
 }
 
@@ -64,7 +66,7 @@ export async function fetchAshby(portal, fetchImpl = globalThis.fetch) {
     description: stripHtml(job.descriptionPlain || job.descriptionHtml),
     url: job.jobUrl,
     location: job.location,
-    workingType: job.employmentType,
+    employmentType: job.employmentType,
     postedDate: (job.publishedDate || '').slice(0, 10) || null,
   }));
 }

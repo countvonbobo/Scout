@@ -7,6 +7,13 @@ import {
   advertMateriallyChanged, invalidateJobIdentity, jobIdentity, mergeSourceReferences, sameUnderlyingJob, sourceReferencesOf,
 } from './jobIdentity.mjs';
 import { isVerifiable } from './statusGroups.mjs';
+import { canonicaliseObservations } from './vacancyCanonical.mjs';
+import { createDiscoveryFunnel, advanceDiscoveryFunnel, assertDiscoveryFunnel } from './discoveryFunnel.mjs';
+import { filterVacancies } from './vacancyFilter.mjs';
+import { normaliseObservation } from './vacancyObservation.mjs';
+import { rankVacancies } from './vacancyRank.mjs';
+import { selectVacancies } from './vacancySelect.mjs';
+export { filterVacancies } from './vacancyFilter.mjs';
 
 const EMPTY_DISCARDED = Object.freeze({ hard_exclusion: 0, mandatory_unmet: 0, below_threshold: 0, provider_discarded: 0 });
 const REVIEW_REASON_LIMIT = 3;
@@ -18,7 +25,7 @@ function boundedText(value, maximum = 220) {
 function safeSourceUrl(value) {
   try {
     const parsed = new URL(String(value || ''));
-    return ['http:', 'https:'].includes(parsed.protocol) ? parsed.href : null;
+    return ['http:', 'https:'].includes(parsed.protocol) && parsed.href.length <= 2048 ? parsed.href : null;
   } catch { return null; }
 }
 
@@ -69,6 +76,164 @@ function mandatorySignals(description, requirements) {
     .slice(0, 12).map((text, index) => ({ id: `mandatory-${String(index + 1).padStart(2, '0')}`, text: text.slice(0, 300) }));
 }
 
+function boundedContributions(contributions, positive) {
+  return (contributions || []).filter((item) => (positive ? Number(item?.score) > 0 : Number(item?.score) < 0))
+    .sort((left, right) => Math.abs(Number(right.score)) - Math.abs(Number(left.score))).slice(0, 3)
+    .map((item) => ({ code: boundedText(item.profileRuleId, 100), score: Number(item.score) }));
+}
+
+function boundedExplanation(candidate, { assessmentStatus, selectionReason = null, deterministicExclusion = null } = {}) {
+  const preRank = candidate?.preRank || { score: candidate?.preRankScore, positive: boundedContributions(candidate?.contributions, true), negative: boundedContributions(candidate?.contributions, false) };
+  const compact = (items) => (items || []).map((item) => typeof item === 'string' ? boundedText(item, 100) : { code: boundedText(item?.code, 100), score: Number(item?.score) }).slice(0, 3);
+  return {
+    vacancy_id: boundedText(candidate?.vacancyId || candidate?.candidateId, 160),
+    pre_rank: { score: Number.isFinite(Number(preRank?.score)) ? Number(preRank.score) : null, positive: compact(preRank?.positive), negative: compact(preRank?.negative) },
+    selection_reason: selectionReason ? boundedText(selectionReason, 100) : null,
+    deterministic_exclusion: deterministicExclusion ? boundedText(deterministicExclusion, 100) : null,
+    assessment_status: assessmentStatus, source: boundedText(candidate?.source, 80), sourceUrl: safeSourceUrl(candidate?.url),
+  };
+}
+
+function valueOf(value) {
+  return value && typeof value === 'object' && Object.hasOwn(value, 'value') ? value.value : value;
+}
+
+function compareText(left, right) {
+  const a = String(left);
+  const b = String(right);
+  return a < b ? -1 : a > b ? 1 : 0;
+}
+
+function sourceReferences(vacancy) {
+  return (vacancy?.sourceReferences || []).map((reference) => ({
+    source: reference.source || reference.sourceName || '',
+    providerId: reference.providerId || reference.sourceRecordId || '',
+    url: reference.url || reference.sourceUrl || '',
+  }));
+}
+
+function assessmentVacancy(vacancy) {
+  const observation = vacancy?.observations?.[0] || {};
+  const references = sourceReferences(vacancy);
+  const url = vacancy?.canonicalUrl || observation.sourceUrl || references[0]?.url || '';
+  return {
+    ...vacancy,
+    company: valueOf(vacancy?.employer) || '',
+    role: valueOf(vacancy?.title) || '',
+    url,
+    location: valueOf(vacancy?.location) || '',
+    workingType: valueOf(vacancy?.workingPattern) || '',
+    salary: valueOf(vacancy?.compensation) || null,
+    postedDate: vacancy?.postedAt || null,
+    source: observation.source || references[0]?.source || '',
+    providerId: observation.sourceRecordId || references[0]?.providerId || '',
+    sourceReferences: references,
+    sources: [...new Set([url, ...references.map((reference) => reference.url)].filter(Boolean))],
+    duplicateCount: Math.max(1, Number(vacancy?.observations?.length || 1)),
+    tags: [],
+    requirements: '',
+  };
+}
+
+function candidateFromSelected(vacancy, index) {
+  const candidate = assessmentVacancy(vacancy);
+  return {
+    ...candidate,
+    candidateId: `candidate-${String(index + 1).padStart(3, '0')}`,
+    description: String(candidate.description || '').slice(0, 1200),
+    mandatorySignals: mandatorySignals(candidate.description, candidate.requirements),
+  };
+}
+
+export function assessmentCandidatesForSelection(selected) {
+  return (selected || []).map(candidateFromSelected);
+}
+
+function observationInputs(sources) {
+  const observations = [];
+  const funnelSources = {};
+  for (const [sourceName, source] of Object.entries(sources || {}).sort(([left], [right]) => compareText(left, right))) {
+    const jobs = [...(source?.jobs || [])];
+    const normalised = jobs.map((job) => normaliseObservation(job, {
+      sourceName: job?.source || sourceName,
+      fetchedAt: source?.fetchedAt || source?.generatedAt || null,
+      laneId: job?.laneId || job?.source || source?.laneId || sourceName,
+    })).filter(Boolean);
+    observations.push(...normalised);
+    funnelSources[sourceName] = {
+      ...source,
+      jobs,
+      failedRecords: jobs.length - normalised.length,
+    };
+  }
+  return { observations, funnelSources };
+}
+
+// The deterministic discovery boundary deliberately evaluates every
+// normalised, canonical vacancy before it applies the bounded assessment set.
+// Candidate identifiers are generated only after selection, so a source's
+// response order cannot leak into provider-facing identities.
+export function prepareRankedDiscovery({
+  sources, profile, tracker = { opportunities: [] }, runId = '', limit = DEFAULT_CANDIDATE_LIMIT,
+  relevanceThreshold,
+} = {}) {
+  if (!profile || profile.status !== 'published') throw new Error('ranked discovery requires a published search profile');
+  const input = observationInputs(sources);
+  const observations = input.observations;
+  const initialFunnel = createDiscoveryFunnel(input.funnelSources);
+  const canonical = canonicaliseObservations(observations);
+  const vacancies = canonical.vacancies.map(assessmentVacancy);
+  const filtered = filterVacancies(vacancies, profile);
+  const ranked = rankVacancies(filtered.eligible, profile, tracker?.opportunities || []);
+  const configuredThreshold = Number(relevanceThreshold ?? profile?.selection?.relevanceThreshold ?? 1);
+  const threshold = Number.isFinite(configuredThreshold) ? Math.max(Number.EPSILON, configuredThreshold) : 1;
+  const selection = selectVacancies(ranked, {
+    limit,
+    threshold,
+    exploration: Number(profile?.selection?.exploration || 0),
+    seed: runId,
+  });
+  const funnel = assertDiscoveryFunnel(advanceDiscoveryFunnel(initialFunnel, 'selection', {
+    parsed: initialFunnel.sourceRecords,
+    normalised: observations.length,
+    duplicateObservations: canonical.duplicateObservations,
+    uniqueVacancies: vacancies.length,
+    deterministicallyExcluded: new Set(filtered.excluded.map((item) => String(item.vacancyId))).size,
+    eligible: filtered.eligible.length,
+    ranked: ranked.length,
+    aboveThreshold: ranked.length - selection.belowCutoff.length,
+    selected: selection.selected.length,
+  }));
+  const vacancyById = new Map(vacancies.map((vacancy) => [String(vacancy.vacancyId || vacancy.canonicalUrl), vacancy]));
+  const exclusions = filtered.excluded.map((item) => {
+    const vacancy = vacancyById.get(String(item.vacancyId));
+    return { ...item, source: vacancy?.source || '', url: vacancy?.url || vacancy?.canonicalUrl || '' };
+  });
+  return {
+    observations,
+    vacancies,
+    exclusions,
+    ranked,
+    selection,
+    funnel,
+    candidates: assessmentCandidatesForSelection(selection.selected),
+  };
+}
+
+// Deprecated: retained only for beta.22 compatibility consumers. Ranked
+// discovery uses filterVacancies() and never performs whole-prose matching.
+export function applyHardExclusions(candidates, exclusions = []) {
+  const terms = (exclusions || []).map((value) => String(value || '').trim().toLowerCase()).filter(Boolean);
+  const kept = [];
+  const excluded = [];
+  for (const candidate of candidates || []) {
+    const matches = terms.filter((term) => String(candidate?.description || '').toLowerCase().includes(term));
+    if (matches.length) excluded.push({ ...candidate, hardExclusionMatches: matches });
+    else kept.push(candidate);
+  }
+  return { candidates: kept, excluded };
+}
+
 export const DEFAULT_CANDIDATE_LIMIT = 60;
 
 // Fields the assessment prompt actually reads. Everything else stays in the
@@ -78,34 +243,6 @@ const PROMPT_CANDIDATE_FIELDS = [
   'candidateId', 'company', 'role', 'url', 'location', 'salary', 'workingType',
   'postedDate', 'source', 'tags', 'description', 'mandatorySignals',
 ];
-
-function hardExclusionMatchesFor(candidate, terms) {
-  const haystack = `${candidate?.company || ''}
-${candidate?.role || ''}
-${candidate?.description || ''}`.toLowerCase();
-  return terms.filter((term) => haystack.includes(term.toLowerCase()));
-}
-
-// Hard exclusions are the user's stated dealbreakers, so a candidate matching
-// one can never be kept. Applying them in code before the assessment turn is
-// both cheaper and more reliable than asking the model to do it, and the run
-// record already reports a hard_exclusion discard count.
-export function applyHardExclusions(candidates, exclusions = []) {
-  const terms = (exclusions || []).map((value) => String(value || '').trim()).filter(Boolean);
-  if (!terms.length) return { kept: candidates, excluded: [] };
-  const kept = [];
-  const excluded = [];
-  for (const candidate of candidates) {
-    // Exactly the haystack and matching rule applyTrustedExclusions uses after
-    // assessment, so this can only remove candidates that would have been
-    // discarded anyway. Diverging here would silently change which roles a
-    // scan reports, rather than only what it costs.
-    const matched = hardExclusionMatchesFor(candidate, terms);
-    if (matched.length) excluded.push({ ...candidate, hardExclusionMatches: matched });
-    else kept.push(candidate);
-  }
-  return { kept, excluded };
-}
 
 // `second-pass` previously changed nothing but the artifact label: the second
 // provider re-collected every source and re-scored every candidate, so two
@@ -376,21 +513,6 @@ function mergeTracker(existing, candidates, assessments, policy, date) {
   return { tracker: existing, keepersAdded, keepersUpdated, discarded, reviewed };
 }
 
-function applyTrustedExclusions(candidates, assessmentResult, exclusions = []) {
-  if (!assessmentResult) return null;
-  const byId = new Map(candidates.map((candidate) => [candidate.candidateId, candidate]));
-  const terms = exclusions.map((term) => String(term || '').trim()).filter(Boolean);
-  return {
-    ...assessmentResult,
-    assessments: assessmentResult.assessments.map((assessment) => {
-      const candidate = byId.get(assessment.candidateId);
-      const haystack = `${candidate?.company || ''}\n${candidate?.role || ''}\n${candidate?.description || ''}`.toLowerCase();
-      const matches = terms.filter((term) => haystack.includes(term.toLowerCase()));
-      return { ...assessment, hardExclusionMatches: [...new Set([...(assessment.hardExclusionMatches || []), ...matches])] };
-    }),
-  };
-}
-
 function reportText({ date, degraded, source_health, kept, discarded, reviewed, errors }) {
   const coverage = Object.entries(source_health).map(([name, value]) => `- ${name}: ${value.configured === false ? 'not configured' : value.status} (${value.count ?? 'unknown'})${value.reason ? ` — ${value.reason}` : ''}`).join('\n');
   const actions = kept.filter((item) => item.eligibility?.status === 'eligible').map((item) => `- **${item.company} — ${item.role}** (${item.score}) — ${item.sources?.[0] || ''}`).join('\n') || '- None.';
@@ -424,10 +546,10 @@ export function validateWrittenScanArtifacts(root, expectedRun) {
 }
 
 export function writeScanArtifacts(root, {
-  provider, mode, sources, queries = [], candidates, assessmentResult, policy, exclusions = [], startedAt,
-  error = null, skipped = false, dropped = { perSource: {}, total: 0 }, hardExcluded = [], closedAdverts = [],
+  provider, mode, sources, queries = [], candidates, assessmentResult, policy, startedAt,
+  error = null, skipped = false, dropped = { perSource: {}, total: 0 }, hardExcluded = [], closedAdverts = [], exclusions = [],
   livenessSummary = { checked: 0, gone: 0, unverified: 0 }, verificationScoped = false,
-  staleInboxEntries = [], inboxRechecked = 0,
+  staleInboxEntries = [], inboxRechecked = 0, funnel = null, selection = [], discoveryEngine = 'legacy-discovery', profileId = null,
 }) {
   const paths = workspacePaths(root);
   const timestamp = new Date().toISOString();
@@ -438,13 +560,20 @@ export function writeScanArtifacts(root, {
   const errors = [...(error ? [error] : []), ...(configuredSources.length ? [] : ['no job sources are configured'])];
   const degraded = configuredFailures.length > 0 || errors.length > 0;
   const existing = JSON.parse(fs.readFileSync(paths.tracker, 'utf8'));
-  const trustedAssessments = applyTrustedExclusions(candidates, assessmentResult, exclusions);
-  const merged = trustedAssessments
-    ? mergeTracker(existing, candidates, trustedAssessments.assessments, policy, date)
+  const merged = assessmentResult
+    ? mergeTracker(existing, candidates, assessmentResult.assessments, policy, date)
     : { tracker: existing, keepersAdded: 0, keepersUpdated: 0, discarded: { ...EMPTY_DISCARDED }, reviewed: [] };
   const inboxArchived = archiveStaleInboxEntries(merged.tracker, staleInboxEntries, date);
+  const reconciledFunnel = funnel && error ? { ...funnel, assessed: Number(assessmentResult?.assessments?.length || 0), assessmentFailed: Math.max(0, Number(funnel.selected || candidates.length) - Number(assessmentResult?.assessments?.length || 0)) } : funnel;
+  const assessedIds = new Set((assessmentResult?.assessments || []).map((item) => item.candidateId));
+  const selectionByVacancy = new Map((selection || []).map((item) => [String(item?.vacancyId || ''), item]));
+  const explanations = [
+    ...candidates.map((candidate) => boundedExplanation(candidate, { assessmentStatus: assessedIds.has(candidate.candidateId) ? 'assessed' : 'assessment-failed', selectionReason: selectionByVacancy.get(String(candidate.vacancyId || ''))?.reason || candidate.selectionReason || 'selected' })),
+    ...exclusions.map((item) => boundedExplanation(item, { assessmentStatus: 'not-selected', deterministicExclusion: item.code || item.exclusionCode })),
+  ].slice(0, 180);
+  const selection_summary = reconciledFunnel ? { selected: Number(reconciledFunnel.selected || 0), assessed: Number(reconciledFunnel.assessed || 0), assessmentFailed: Number(reconciledFunnel.assessmentFailed || 0) } : null;
   const run = {
-    schemaVersion: 3, timestamp, started_at: startedAt, agent: provider, mode, degraded, skipped,
+    schemaVersion: 4, timestamp, started_at: startedAt, agent: provider, mode, degraded, skipped,
     sources_checked: Object.entries(health).filter(([, item]) => item.configured !== false).map(([name]) => name),
     queries_checked: [...queries], candidates_found: candidates.length, keepers_added: merged.keepersAdded,
     duplicates_collapsed: candidates.reduce((total, candidate) => total + Math.max(0, Number(candidate.duplicateCount || 1) - 1), 0),
@@ -453,13 +582,20 @@ export function writeScanArtifacts(root, {
       ...merged.discarded,
       // Applied deterministically before the assessment turn rather than by
       // the provider, so they are counted here instead.
-      hard_exclusion: merged.discarded.hard_exclusion + hardExcluded.length,
+      hard_exclusion: merged.discarded.hard_exclusion + new Set(hardExcluded.map((item, index) => (
+        String(item?.vacancyId || item?.candidateId || item?.canonicalUrl || `excluded-${index}`)
+      ))).size,
       advert_closed: closedAdverts.length,
     },
     candidates_dropped: dropped.total, candidates_dropped_by_source: dropped.perSource,
     adverts_checked: livenessSummary.checked, adverts_closed: livenessSummary.gone,
     adverts_unverified: livenessSummary.unverified, verification_scoped: verificationScoped,
     inbox_rechecked: inboxRechecked, inbox_archived: inboxArchived,
+    profile_id: profileId, discovery_engine: discoveryEngine,
+    ...(reconciledFunnel ? { funnel: reconciledFunnel } : {}),
+    ...(selection_summary ? { selection_summary } : {}),
+    ...(selection.length ? { selection } : {}),
+    ...(explanations.length ? { explanations } : {}),
     reviewed: merged.reviewed, errors, source_health: health,
   };
   const earlierRuns = fs.existsSync(paths.scanRuns)

@@ -4,8 +4,8 @@ import os from 'node:os';
 import path from 'node:path';
 import { test } from 'node:test';
 import {
-  applyHardExclusions, compactCandidates, DEFAULT_CANDIDATE_LIMIT, gateAssessment, inboxRecheckCandidates, promptCandidate,
-  validateAssessments, validateWrittenScanArtifacts, verificationCandidates, writeScanArtifacts,
+  compactCandidates, DEFAULT_CANDIDATE_LIMIT, gateAssessment, inboxRecheckCandidates, prepareRankedDiscovery, promptCandidate,
+  filterVacancies, validateAssessments, validateWrittenScanArtifacts, verificationCandidates, writeScanArtifacts,
 } from './scanPipeline.mjs';
 
 const dimensions = [{ name: 'Fit', score: 90, maximum: 100, evidence: 'Advert and profile' }];
@@ -20,6 +20,144 @@ test('candidate input is deduplicated, capped and descriptions are bounded', () 
   const { candidates: result } = compactCandidates({ one: { jobs: [job, job] } }, 40);
   assert.equal(result.length, 1);
   assert.equal(result[0].description.length, 1200);
+});
+
+test('ranked discovery is independent of source and portal order', () => {
+  const profile = {
+    version: 1, status: 'published', id: 'profile-123456789abc',
+    target: { primaryTitles: [{ value: 'Ideal Role', strength: 'strong-preference', provenance: 'explicit' }] },
+    negative: {}, compensation: { currency: null, period: 'year', minimum: null, minimumStrength: 'neutral', unknownPolicy: 'include' },
+  };
+  const job = (company) => ({ company, title: 'Ideal Role', url: `https://example.test/${company.toLowerCase()}`, providerId: company.toLowerCase() });
+  const options = { profile, tracker: { opportunities: [] }, runId: 'scan-1', limit: 60 };
+  const forward = prepareRankedDiscovery({ sources: {
+    'ats-a': { count: 1, jobs: [job('Able')] }, 'ats-b': { count: 1, jobs: [job('Baker')] },
+  }, ...options });
+  const reverse = prepareRankedDiscovery({ sources: {
+    'ats-b': { count: 1, jobs: [job('Baker')] }, 'ats-a': { count: 1, jobs: [job('Able')] },
+  }, ...options });
+  assert.deepEqual(forward.selection.selected.map((item) => item.url), reverse.selection.selected.map((item) => item.url));
+  assert.deepEqual(forward.candidates.map((item) => item.candidateId), ['candidate-001', 'candidate-002']);
+});
+
+test('ranked discovery excludes zero-score unrelated vacancies below the configured relevance threshold', () => {
+  const profile = {
+    version: 1, status: 'published', id: 'profile-123456789abc',
+    target: { primaryTitles: [{ value: 'Ideal Role', strength: 'strong-preference', provenance: 'explicit' }] },
+    negative: {},
+    compensation: {
+      currency: null, period: 'year', minimum: null, minimumStrength: 'neutral', unknownPolicy: 'include',
+    },
+  };
+  const result = prepareRankedDiscovery({
+    sources: { ats: { count: 2, jobs: [
+      { company: 'Strong', title: 'Ideal Role', url: 'https://example.test/strong', providerId: 'strong' },
+      { company: 'Noise', title: 'Unrelated Role', url: 'https://example.test/noise', providerId: 'noise' },
+    ] } },
+    profile,
+    tracker: { opportunities: [] },
+    runId: 'scan-threshold',
+    limit: 60,
+    relevanceThreshold: 40,
+  });
+
+  assert.deepEqual(result.selection.selected.map((item) => item.role), ['Ideal Role']);
+  assert.equal(result.funnel.ranked, 2);
+  assert.equal(result.funnel.aboveThreshold, 1);
+  assert.equal(result.funnel.selected, 1);
+});
+
+test('deterministic exclusion accounting counts unique vacancies while retaining every rule explanation', () => {
+  const profile = {
+    version: 1, status: 'published', id: 'profile-123456789abc',
+    target: {},
+    negative: {
+      excludedTitles: [{ value: 'Blocked Role', strength: 'hard-exclusion', provenance: 'explicit' }],
+      excludedEmployers: [{ value: 'Blocked Co', strength: 'hard-exclusion', provenance: 'explicit' }],
+    },
+    compensation: {
+      currency: null, period: 'year', minimum: null, minimumStrength: 'neutral', unknownPolicy: 'include',
+    },
+  };
+  const result = prepareRankedDiscovery({
+    sources: { ats: { count: 1, jobs: [{
+      company: 'Blocked Co', title: 'Blocked Role', url: 'https://example.test/blocked', providerId: 'blocked',
+    }] } },
+    profile,
+    tracker: { opportunities: [] },
+    runId: 'scan-exclusions',
+  });
+
+  assert.equal(result.funnel.deterministicallyExcluded, 1);
+  assert.equal(result.exclusions.length, 2);
+  assert.deepEqual(result.exclusions.map((item) => item.code).sort(), ['excluded-employer', 'excluded-title']);
+
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'scout-unique-exclusion-accounting-'));
+  fs.mkdirSync(path.join(root, 'data'), { recursive: true });
+  fs.writeFileSync(path.join(root, 'data', 'opportunities.json'), '{"updated":"2026-07-27","opportunities":[]}\n');
+  const artifacts = writeScanArtifacts(root, {
+    provider: 'codex',
+    mode: 'primary',
+    sources: { ats: { configured: true, status: 'healthy', count: 1 } },
+    candidates: [],
+    assessmentResult: null,
+    policy: {},
+    startedAt: '2026-07-27T09:00:00Z',
+    hardExcluded: result.exclusions,
+    exclusions: result.exclusions,
+    funnel: result.funnel,
+    discoveryEngine: 'ranked-discovery',
+    profileId: profile.id,
+  });
+  assert.equal(artifacts.run.discarded.hard_exclusion, 1);
+  assert.equal(artifacts.run.explanations.length, 2);
+});
+
+test('explicit provider compensation remains comparable through ranked discovery', () => {
+  const profile = {
+    version: 1, status: 'published', id: 'profile-123456789abc',
+    target: {},
+    negative: {},
+    compensation: {
+      currency: 'GBP', period: 'year', rateType: 'salary',
+      minimum: 60000, minimumStrength: 'strong-preference', unknownPolicy: 'exclude',
+    },
+  };
+  const result = prepareRankedDiscovery({
+    sources: { adzuna: { count: 1, jobs: [{
+      company: 'Comparable Co',
+      title: 'Comparable Role',
+      url: 'https://example.test/comparable',
+      providerId: 'comparable',
+      salaryMin: 65000,
+      salaryMax: 70000,
+      salaryCurrency: 'GBP',
+      salaryPeriod: 'year',
+      salaryRateType: 'salary',
+    }] } },
+    profile,
+    tracker: { opportunities: [] },
+    runId: 'scan-compensation',
+    relevanceThreshold: 1,
+  });
+
+  assert.equal(result.exclusions.length, 0);
+  assert.equal(result.selection.selected.length, 1);
+  const dimension = result.ranked[0].dimensions.find((item) => item.name === 'compensation');
+  assert.equal(dimension.evidence[0].comparison, 'meets-minimum');
+  assert.equal(result.ranked[0].preRankScore, 100);
+});
+
+test('the assessment boundary receives only structured-filter eligible vacancies', () => {
+  const candidate = { vacancyId: 'vacancy-001', title: { value: 'Software Engineer', provenance: 'explicit-source' }, description: 'Perform coding.' };
+  const profile = {
+    id: 'profile-filter0001', version: 1,
+    target: {}, negative: { excludedResponsibilities: [{ value: 'coding', strength: 'hard-exclusion', provenance: 'confirmed-inference' }] },
+    compensation: { unknownPolicy: 'include', minimum: null },
+  };
+  const result = filterVacancies([candidate], profile);
+  assert.equal(result.eligible.length, 0);
+  assert.equal(result.excluded[0].code, 'excluded-responsibility');
 });
 
 test('candidate input collapses the same cross-provider role and preserves every source', () => {
@@ -102,7 +240,7 @@ test('runtime writes canonical scan records and preserves user tracker state', (
     sources: { hiring_cafe: { configured: true, status: 'healthy', count: 1, jobs: [] } },
     assessmentResult: { assessments: [assessment('met')] }, policy: { actionScore: 70, checkScore: 55 },
   });
-  assert.equal(artifacts.run.schemaVersion, 3);
+  assert.equal(artifacts.run.schemaVersion, 4);
   assert.deepEqual(artifacts.run.sources_checked, ['hiring_cafe']);
   assert.deepEqual(artifacts.run.queries_checked, ['engineer']);
   assert.equal(artifacts.run.candidates_found, 1);
@@ -114,6 +252,48 @@ test('runtime writes canonical scan records and preserves user tracker state', (
   assert.deepEqual(saved.log, [{ date: '2026-07-01', event: 'replied', note: '' }]);
   assert.equal(saved.eligibility.status, 'eligible');
   assert.equal(validateWrittenScanArtifacts(root, artifacts.run).run.agent, 'codex');
+});
+
+test('scan artifact exposes a reconciled funnel without claiming all jobs were assessed', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'scout-ranked-scan-artifact-'));
+  fs.mkdirSync(path.join(root, 'data'), { recursive: true });
+  fs.writeFileSync(path.join(root, 'data', 'opportunities.json'), '{"updated":"2026-07-01","opportunities":[]}\n');
+  const candidates = Array.from({ length: 60 }, (_, index) => ({
+    candidateId: `candidate-${String(index + 1).padStart(3, '0')}`, company: `Company ${index + 1}`,
+    role: 'Engineer', url: `https://example.test/jobs/${index + 1}`, source: 'ats',
+    preRank: { vacancyId: `vacancy-${index + 1}`, score: 80, positive: ['title'], negative: [] },
+    selectionReason: 'score-band',
+  }));
+  const artifacts = writeScanArtifacts(root, {
+    provider: 'codex', mode: 'primary', sources: { ats: { configured: true, status: 'healthy', count: 2532 } },
+    candidates, assessmentResult: { assessments: candidates.slice(0, 59).map((candidate) => ({ ...assessment('met'), candidateId: candidate.candidateId })) },
+    policy: {}, startedAt: '2026-07-26T09:00:00Z', profileId: 'profile-123456789abc', discoveryEngine: 'ranked-discovery',
+    funnel: { sourceRecords: 2532, uniqueVacancies: 120, deterministicallyExcluded: 60, eligible: 60, ranked: 60, aboveThreshold: 60, selected: 60, assessed: 59, assessmentFailed: 1 },
+    selection: [{ vacancyId: 'vacancy-1', score: 80, selectionReason: 'score-band', source: 'ats', sourceUrl: 'https://example.test/jobs/1' }],
+    exclusions: [{ vacancyId: 'vacancy-excluded', exclusionCode: 'confirmed-location', source: 'ats', sourceUrl: 'https://example.test/excluded' }],
+  });
+  assert.equal(artifacts.run.funnel.sourceRecords, 2532);
+  assert.equal(artifacts.run.funnel.selected, 60);
+  assert.equal(artifacts.run.funnel.assessed, 59);
+  assert.equal(artifacts.run.funnel.assessmentFailed, 1);
+  assert.equal(artifacts.run.candidates_found, 60);
+  assert.equal(artifacts.run.profile_id, 'profile-123456789abc');
+  assert.equal(artifacts.run.selection_summary.selected, 60);
+  assert.deepEqual(Object.keys(artifacts.run.explanations[0]).sort(), ['assessment_status', 'deterministic_exclusion', 'pre_rank', 'selection_reason', 'source', 'sourceUrl', 'vacancy_id'].sort());
+  assert.doesNotMatch(JSON.stringify(artifacts.run), /description|profileEvidence/);
+});
+
+test('failed assessment reconciles selected candidates as assessment failures', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'scout-failed-ranked-scan-'));
+  fs.mkdirSync(path.join(root, 'data'), { recursive: true });
+  fs.writeFileSync(path.join(root, 'data', 'opportunities.json'), '{"updated":"2026-07-01","opportunities":[]}\n');
+  const artifacts = writeScanArtifacts(root, {
+    provider: 'codex', mode: 'primary', sources: {}, candidates: [{ candidateId: 'candidate-001', vacancyId: 'vacancy-1', company: 'A', role: 'Engineer', url: 'https://example.test/job', source: 'ats' }],
+    assessmentResult: null, policy: {}, startedAt: '2026-07-26T09:00:00Z', error: 'provider failed',
+    funnel: { selected: 1, assessed: 0, assessmentFailed: 0 },
+  });
+  assert.equal(artifacts.run.funnel.assessmentFailed, 1);
+  assert.equal(artifacts.run.selection_summary.assessmentFailed, 1);
 });
 
 test('forty zero-keeper candidates produce a bounded sanitised audit without tracker padding', () => {
@@ -203,20 +383,6 @@ test('zero configured sources is degraded and still produces a truthful empty ru
   assert.equal(artifacts.run.candidates_found, 0);
 });
 
-test('trusted runtime applies configured hard exclusions even when provider omits them', () => {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'scout-exclusion-scan-'));
-  fs.mkdirSync(path.join(root, 'data'), { recursive: true });
-  fs.writeFileSync(path.join(root, 'data', 'opportunities.json'), '{"updated":"2026-07-01","opportunities":[]}\n');
-  const candidates = [{ candidateId: 'candidate-001', company: 'BetCo', role: 'Engineer', url: 'https://example.test/job', source: 'ats', description: 'Gambling platform' }];
-  const artifacts = writeScanArtifacts(root, {
-    provider: 'codex', mode: 'primary', sources: { ats: { configured: true, status: 'healthy', count: 1 } },
-    candidates, assessmentResult: { assessments: [assessment('met')] }, policy: { actionScore: 70, checkScore: 55 },
-    exclusions: ['gambling'], startedAt: '2026-07-14T10:00:00Z',
-  });
-  assert.equal(artifacts.tracker.opportunities.length, 0);
-  assert.equal(artifacts.run.discarded.hard_exclusion, 1);
-});
-
 // Distinct company names, so the identity rules treat these as separate jobs.
 const WORDS = ['Alder', 'Birch', 'Cedar', 'Dahlia', 'Elm', 'Fern', 'Ginkgo', 'Hazel', 'Iris', 'Juniper'];
 const uniqueName = (prefix, index) => `${prefix}-${WORDS[index % WORDS.length]}${Math.floor(index / WORDS.length)}`;
@@ -253,23 +419,6 @@ test('a scan that fits reports nothing dropped and keeps stable candidate ids', 
   assert.deepEqual(candidates.map((candidate) => candidate.candidateId), [
     'candidate-001', 'candidate-002', 'candidate-003', 'candidate-004', 'candidate-005',
   ]);
-});
-
-test('hard exclusions are applied before any provider turn', () => {
-  const { candidates } = compactCandidates({ one: { jobs: [
-    { company: 'Acme', title: 'Engineer', url: 'https://x.test/1', description: 'Extensive travel is required.' },
-    { company: 'Beta', title: 'Engineer', url: 'https://x.test/2', description: 'Fully remote role.' },
-    { company: 'Gamma', title: 'Gambling Product Engineer', url: 'https://x.test/3', description: 'Casino products.' },
-  ] } });
-  const result = applyHardExclusions(candidates, ['extensive travel', 'gambling']);
-  assert.deepEqual(result.kept.map((item) => item.company), ['Beta']);
-  assert.deepEqual(result.excluded.map((item) => item.hardExclusionMatches), [['extensive travel'], ['gambling']]);
-  assert.equal(applyHardExclusions(candidates, []).kept.length, candidates.length);
-  assert.equal(applyHardExclusions(candidates, ['', '   ']).kept.length, candidates.length);
-  // Tags are deliberately not searched: the post-assessment trusted pass looks
-  // only at company, role and description, and the two must agree.
-  const tagged = [{ company: 'Acme', role: 'Engineer', description: 'Remote role.', tags: ['gambling'] }];
-  assert.equal(applyHardExclusions(tagged, ['gambling']).kept.length, 1);
 });
 
 test('the prompt payload drops fields the model never reads', () => {

@@ -3,11 +3,24 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
+import { fileURLToPath } from 'node:url';
+import { RELEASE_FILES } from './build-release.mjs';
 import { auditRelease, loadMarkers, main } from './release-audit.mjs';
 
 function fixture() {
   return fs.mkdtempSync(path.join(os.tmpdir(), 'scout-release-audit-'));
 }
+
+const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+const RANKED_DISCOVERY_SOURCES = [
+  'ui/lib/searchProfile.mjs', 'ui/lib/vacancyObservation.mjs', 'ui/lib/vacancyCanonical.mjs',
+  'ui/lib/vacancyFilter.mjs', 'ui/lib/vacancyRank.mjs', 'ui/lib/vacancySelect.mjs',
+  'ui/lib/discoveryFunnel.mjs', 'ui/lib/scanPipeline.mjs',
+];
+const FIXTURE_TITLES = [
+  'Software Developer', 'Hospital Administrator', 'Hospitality Worker',
+  'Commercial Solicitor', 'Mechanical Engineering Graduate', 'Retail Manager',
+];
 
 test('passes clean tracked files and build output', () => {
   const root = fixture();
@@ -75,4 +88,21 @@ test('stage mode scans an exported tree without requiring Git metadata', () => {
     process.stdout.write = originalWrite;
   }
   assert.match(writes.join(''), /Release audit passed/);
+});
+
+test('ranked discovery production sources stay neutral and release bundles omit raw observation caches', () => {
+  const productionText = RANKED_DISCOVERY_SOURCES
+    .map((relative) => fs.readFileSync(path.join(ROOT, relative), 'utf8')).join('\n');
+
+  for (const title of FIXTURE_TITLES) assert.doesNotMatch(productionText, new RegExp(title, 'i'));
+  assert.doesNotMatch(productionText, /oliver/i);
+  assert.equal(RELEASE_FILES.some(({ source }) => source === 'profile' || source.startsWith('profile/')), false);
+  assert.equal(RELEASE_FILES.some(({ source }) => source === 'data' || source.startsWith('data/')), false);
+});
+
+test('default audit evaluates releasable sources without treating test lock tokens as credentials', () => {
+  const result = auditRelease({ root: ROOT, buildDirs: [] });
+
+  assert.equal(result.ok, true);
+  assert.equal(result.findings.some(({ file }) => file.endsWith('.test.mjs')), false);
 });

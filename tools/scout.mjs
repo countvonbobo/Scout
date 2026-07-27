@@ -13,9 +13,10 @@ import { assertSafeModel, providerStatus } from '../ui/lib/providers.mjs';
 import { setupReadiness } from '../ui/lib/setupReadiness.mjs';
 import { runStructuredTurn } from '../ui/lib/structuredTurn.mjs';
 import {
-  applyHardExclusions, compactCandidates, DEFAULT_CANDIDATE_LIMIT, inboxRecheckCandidates, promptCandidate,
+  assessmentCandidatesForSelection, compactCandidates, DEFAULT_CANDIDATE_LIMIT, inboxRecheckCandidates, prepareRankedDiscovery, promptCandidate,
   SCAN_ASSESSMENT_SCHEMA, validateAssessments, verificationCandidates, writeScanArtifacts,
 } from '../ui/lib/scanPipeline.mjs';
+import { loadPublishedSearchProfile, migrateSearchProfile } from '../ui/lib/searchProfile.mjs';
 import { partitionLiveCandidates } from '../ui/lib/advertLiveness.mjs';
 import { isMainModule } from '../ui/lib/mainModule.mjs';
 import { runCvQuality } from '../ui/lib/cvQuality.mjs';
@@ -151,12 +152,22 @@ export function assertScanReady(root, provider, { providerStatusFn = providerSta
   const selected = config.ai?.provider;
   const providers = Object.fromEntries([...new Set([selected, provider].filter(Boolean))].map((name) => [name, providerStatusFn(name)]));
   const readiness = setupReadiness(root, config, providers, tracker);
+  if (readiness.checks.preferences && readiness.checks.evidence && readiness.checks.approved) {
+    migrateSearchProfile(root);
+  }
   const requestedProviderReady = Boolean(providers[provider]?.installed && providers[provider]?.authenticated
     && providers[provider]?.capabilities?.structuredOutput !== false);
   readiness.checks.requestedProvider = requestedProviderReady;
   readiness.ready = readiness.ready && requestedProviderReady;
+  const publishedProfile = loadPublishedSearchProfile(root);
+  const profileReady = Boolean(publishedProfile || readiness.established);
+  readiness.checks.searchProfile = profileReady;
+  readiness.ready = readiness.ready && profileReady;
   if (!readiness.ready) {
     const missing = Object.entries(readiness.checks).filter(([, ready]) => !ready).map(([name]) => name);
+    if (missing.length === 1 && missing[0] === 'searchProfile') {
+      throw new Error('scan requires publishing the staged search profile after review');
+    }
     throw new Error(`scan requires complete approved evidence and an authenticated provider; fix: ${missing.join(', ')}`);
   }
   return readiness;
@@ -258,6 +269,52 @@ function buildScanContext(paths, config, candidates) {
   return context;
 }
 
+function vacancyKey(vacancy) {
+  return String(vacancy?.vacancyId || vacancy?.canonicalUrl || vacancy?.url || '');
+}
+
+function addLivenessSummary(total, summary = {}) {
+  return {
+    checked: total.checked + Number(summary.checked || 0),
+    gone: total.gone + Number(summary.gone || 0),
+    unverified: total.unverified + Number(summary.unverified || 0),
+  };
+}
+
+async function selectLiveRankedVacancies(discovery, inbox, checkLivenessFn) {
+  const selected = [...discovery.selection.selected];
+  const belowCutoff = new Set(discovery.selection.belowCutoff.map(vacancyKey));
+  const attempted = new Set(selected.map(vacancyKey));
+  const live = [];
+  const closed = [];
+  let summary = { checked: 0, gone: 0, unverified: 0 };
+
+  const check = async (vacancies, extra = []) => {
+    const rankedCandidates = assessmentCandidatesForSelection(vacancies).map((candidate, index) => ({
+      ...candidate,
+      _rankedVacancy: vacancies[index],
+    }));
+    const result = await checkLivenessFn([...rankedCandidates, ...extra]);
+    summary = addLivenessSummary(summary, result.summary);
+    live.push(...result.live.filter((candidate) => candidate._rankedVacancy).map((candidate) => candidate._rankedVacancy));
+    closed.push(...result.removed.filter((candidate) => candidate._rankedVacancy));
+    return result;
+  };
+
+  const initial = await check(selected, inbox.checkable);
+  const staleInboxEntries = [
+    ...inbox.missingSource,
+    ...initial.removed.filter((candidate) => candidate._inboxRecheck),
+  ];
+  while (live.length < selected.length) {
+    const next = discovery.ranked.find((vacancy) => !belowCutoff.has(vacancyKey(vacancy)) && !attempted.has(vacancyKey(vacancy)));
+    if (!next) break;
+    attempted.add(vacancyKey(next));
+    await check([next]);
+  }
+  return { selected: live, closed, staleInboxEntries, summary };
+}
+
 export async function runScanWith(root, provider, mode, {
   providerStatusFn = providerStatus, collectSourcesFn = collectScanSources,
   runStructuredTurnFn = runStructuredTurn, acquireLockFn = acquireScanLock, releaseLockFn = releaseScanLock,
@@ -278,7 +335,7 @@ export async function runScanWith(root, provider, mode, {
   if (!lock.ok) {
     const artifacts = writeScanArtifacts(root, {
       provider, mode, sources: {}, candidates: [], assessmentResult: null, policy: config.triage,
-      exclusions: config.search?.exclusions || [], startedAt, error: 'another scan is already running', skipped: true,
+      startedAt, error: 'another scan is already running', skipped: true,
     });
     return { ok: false, status: 'skipped', error: 'another scan is already running', lock: lock.lock, scan: artifacts.run };
   }
@@ -292,42 +349,77 @@ export async function runScanWith(root, provider, mode, {
   let staleInboxEntries = [];
   let inboxRechecked = 0;
   let verificationScoped = false;
+  let discovery = null;
+  let publishedProfile = null;
+  let funnel = null;
+  let selection = [];
+  let discoveryEngine = 'legacy-discovery';
   try {
     onProgress({ phase: 'Collecting current opportunities', current: 2, total: 5 });
     collected = await collectSourcesFn(root, config, { broadened: mode === 'broadened' });
-    const compacted = compactCandidates(collected.sources, DEFAULT_CANDIDATE_LIMIT);
-    dropped = compacted.dropped;
-
-    // Everything below runs before the assessment turn, so each candidate it
-    // removes is one the provider is never asked to score.
-    const afterExclusions = applyHardExclusions(compacted.candidates, config.search?.exclusions || []);
-    hardExcluded = afterExclusions.excluded;
-    if (mode === 'second-pass') {
-      const tracker = JSON.parse(fs.readFileSync(workspacePaths(root).tracker, 'utf8'));
-      const verification = verificationCandidates(afterExclusions.kept, tracker, new Date().toISOString().slice(0, 10), config.triage);
-      afterExclusions.kept = verification.candidates;
-      verificationScoped = verification.verified;
-    }
+    publishedProfile = loadPublishedSearchProfile(root);
     const tracker = JSON.parse(fs.readFileSync(workspacePaths(root).tracker, 'utf8'));
-    const inboxRecheck = inboxRecheckCandidates(tracker, afterExclusions.kept);
-    inboxRechecked = inboxRecheck.checkable.length + inboxRecheck.missingSource.length;
-    onProgress({ phase: `Checking ${afterExclusions.kept.length + inboxRecheck.checkable.length} adverts are still open`, current: 2, total: 5 });
-    const liveness = await checkLivenessFn([...afterExclusions.kept, ...inboxRecheck.checkable]);
-    closedAdverts = liveness.removed.filter((candidate) => !candidate._inboxRecheck);
-    staleInboxEntries = [
-      ...inboxRecheck.missingSource,
-      ...liveness.removed.filter((candidate) => candidate._inboxRecheck),
-    ];
-    livenessSummary = liveness.summary;
-    candidates = liveness.live.filter((candidate) => !candidate._inboxRecheck).map((candidate, index) => ({
-      ...candidate,
-      candidateId: `candidate-${String(index + 1).padStart(3, '0')}`,
-    }));
+    if (publishedProfile) {
+      discovery = prepareRankedDiscovery({
+        sources: collected.sources, profile: publishedProfile, tracker, runId: `${startedAt}-${provider}-${mode}`,
+        limit: DEFAULT_CANDIDATE_LIMIT,
+        relevanceThreshold: config.search?.relevanceThreshold ?? config.triage?.checkScore,
+      });
+      hardExcluded = discovery.exclusions;
+      discoveryEngine = 'ranked-discovery';
+      const provisional = assessmentCandidatesForSelection(discovery.selection.selected);
+      const inboxRecheck = inboxRecheckCandidates(tracker, provisional);
+      inboxRechecked = inboxRecheck.checkable.length + inboxRecheck.missingSource.length;
+      onProgress({ phase: `Checking ${provisional.length + inboxRecheck.checkable.length} adverts are still open`, current: 2, total: 5 });
+      const liveness = await selectLiveRankedVacancies(discovery, inboxRecheck, checkLivenessFn);
+      closedAdverts = liveness.closed;
+      staleInboxEntries = liveness.staleInboxEntries;
+      livenessSummary = liveness.summary;
+      let selectedVacancies = liveness.selected;
+      if (mode === 'second-pass') {
+        const verification = verificationCandidates(
+          assessmentCandidatesForSelection(selectedVacancies), tracker, new Date().toISOString().slice(0, 10), config.triage,
+        );
+        const selectedIds = new Set(verification.candidates.map((candidate) => candidate.vacancyId));
+        selectedVacancies = selectedVacancies.filter((vacancy) => selectedIds.has(vacancy.vacancyId));
+        verificationScoped = verification.verified;
+      }
+      candidates = assessmentCandidatesForSelection(selectedVacancies);
+      selection = candidates.map((candidate) => ({ url: candidate.url, vacancyId: candidate.vacancyId, preRankScore: candidate.preRankScore, reason: discovery.selection.reasons.find((item) => item.vacancyId === candidate.vacancyId)?.reason || 'deterministic-rank' }));
+      funnel = { ...discovery.funnel, selected: candidates.length };
+    } else {
+      // beta.22 compatibility for migrated and grandfathered workspaces. A
+      // workspace without a published profile never enters ranked discovery.
+      const compacted = compactCandidates(collected.sources, DEFAULT_CANDIDATE_LIMIT);
+      dropped = compacted.dropped;
+      const inboxRecheck = inboxRecheckCandidates(tracker, compacted.candidates);
+      inboxRechecked = inboxRecheck.checkable.length + inboxRecheck.missingSource.length;
+      onProgress({ phase: `Checking ${compacted.candidates.length + inboxRecheck.checkable.length} adverts are still open`, current: 2, total: 5 });
+      const liveness = await checkLivenessFn([...compacted.candidates, ...inboxRecheck.checkable]);
+      closedAdverts = liveness.removed.filter((candidate) => !candidate._inboxRecheck);
+      staleInboxEntries = [
+        ...inboxRecheck.missingSource,
+        ...liveness.removed.filter((candidate) => candidate._inboxRecheck),
+      ];
+      livenessSummary = liveness.summary;
+      candidates = liveness.live.filter((candidate) => !candidate._inboxRecheck).map((candidate, index) => ({
+        ...candidate,
+        candidateId: `candidate-${String(index + 1).padStart(3, '0')}`,
+      }));
+      if (mode === 'second-pass') {
+        const verification = verificationCandidates(candidates, tracker, new Date().toISOString().slice(0, 10), config.triage);
+        candidates = verification.candidates.map((candidate, index) => ({
+          ...candidate,
+          candidateId: `candidate-${String(index + 1).padStart(3, '0')}`,
+        }));
+        verificationScoped = verification.verified;
+      }
+    }
 
     const bundleDir = path.join(root, '.scout', 'scan-input');
     fs.mkdirSync(bundleDir, { recursive: true });
     const bundleFile = path.join(bundleDir, `${startedAt.replace(/[:.]/g, '-')}-${provider}-${mode}.json`);
-    fs.writeFileSync(bundleFile, `${JSON.stringify({ generatedAt: collected.generatedAt, queries: collected.queries, sources: Object.fromEntries(Object.entries(collected.sources).map(([name, value]) => [name, { ...value, jobs: undefined }])), dropped, livenessSummary, hardExcluded: hardExcluded.map((item) => ({ url: item.url, matches: item.hardExclusionMatches })), closedAdverts: closedAdverts.map((item) => ({ url: item.url, reason: item.liveness?.reason })), candidates }, null, 2)}\n`, 'utf8');
+    fs.writeFileSync(bundleFile, `${JSON.stringify({ generatedAt: collected.generatedAt, queries: collected.queries, sources: Object.fromEntries(Object.entries(collected.sources).map(([name, value]) => [name, { ...value, jobs: undefined }])), discoveryEngine, dropped, livenessSummary, hardExcluded: hardExcluded.map((item) => ({ vacancyId: item.vacancyId, code: item.code })), closedAdverts: closedAdverts.map((item) => ({ url: item.url, reason: item.liveness?.reason })), candidates }, null, 2)}\n`, 'utf8');
     let assessmentResult = null;
     let usage = {};
     if (candidates.length) {
@@ -350,11 +442,20 @@ export async function runScanWith(root, provider, mode, {
       assessmentResult = turn.value;
       usage = turn.usage;
     }
+    if (funnel) {
+      funnel = {
+        ...funnel,
+        selected: candidates.length,
+        assessed: assessmentResult?.assessments?.length || 0,
+        assessmentFailed: Math.max(0, candidates.length - (assessmentResult?.assessments?.length || 0)),
+        closed: closedAdverts.length,
+      };
+    }
     onProgress({ phase: 'Writing tracker and report', current: 4, total: 5 });
     const artifacts = writeScanArtifacts(root, {
       provider, mode, sources: collected.sources, queries: collected.queries, candidates, assessmentResult,
-      policy: config.triage, exclusions: config.search?.exclusions || [], startedAt,
-      dropped, hardExcluded, closedAdverts, livenessSummary, verificationScoped,
+      policy: config.triage, startedAt,
+      dropped, hardExcluded, closedAdverts, exclusions: discovery?.exclusions || [], livenessSummary, verificationScoped, funnel, selection, discoveryEngine, profileId: publishedProfile?.id || null,
       staleInboxEntries, inboxRechecked,
     });
     result = { ok: true, status: artifacts.run.degraded ? 'degraded' : candidates.length ? 'completed' : 'healthy-empty', scan: artifacts.run, usage };
@@ -363,7 +464,10 @@ export async function runScanWith(root, provider, mode, {
     try {
       const artifacts = writeScanArtifacts(root, {
         provider, mode, sources: collected?.sources || {}, queries: collected?.queries || [], candidates,
-        assessmentResult: null, policy: config.triage, exclusions: config.search?.exclusions || [], startedAt, error: error.message,
+        assessmentResult: null, policy: config.triage, startedAt, error: error.message,
+        dropped, hardExcluded, closedAdverts, livenessSummary, verificationScoped, funnel, selection, discoveryEngine,
+        exclusions: discovery?.exclusions || [], profileId: publishedProfile?.id || null,
+        staleInboxEntries, inboxRechecked,
       });
       result = { ok: false, status: 'failed', error: error.message, scan: artifacts.run };
     } catch {

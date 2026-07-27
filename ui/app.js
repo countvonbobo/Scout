@@ -371,7 +371,7 @@ const Scout = {
     const status = document.getElementById('scan-status');
     if (status) {
       status.textContent = h?.lastRunAt
-        ? `Last scan: ${Number(h.candidatesFound || 0)} reviewed · ${Number(h.keepersAdded || 0)} kept`
+        ? `Last scan: ${Number(h.funnel?.assessed ?? h.candidatesFound ?? 0)} assessed · ${Number(h.keepersAdded || 0)} kept`
         : 'No scan completed yet';
       status.dataset.action = h?.lastRunAt ? 'open-scan-result' : '';
       status.tabIndex = h?.lastRunAt ? 0 : -1;
@@ -447,7 +447,7 @@ const Scout = {
     const broadened = scan.automaticBroadened ? ' after an automatic broader discovery pass' : '';
     return `<div class="card scan-result-card">
       <div class="top"><b>Latest scan result</b><span class="chip">${this.esc(scan.degraded ? 'degraded' : 'complete')}</span></div>
-      <p><strong>${this.esc(scan.candidatesFound)} reviewed, ${this.esc(scan.keepersAdded)} kept</strong>${this.discardBreakdown(scan) ? ` — ${this.esc(this.discardBreakdown(scan))}` : ''}${this.esc(broadened)}.</p>
+      <p><strong>${this.esc(scan.funnel?.assessed ?? scan.candidatesFound)} assessed, ${this.esc(scan.keepersAdded)} kept</strong>${this.discardBreakdown(scan) ? ` — ${this.esc(this.discardBreakdown(scan))}` : ''}${this.esc(broadened)}.</p>
       <p class="meta">Zero keepers can be a valid result: Scout keeps approved gates in force even when it broadens discovery.</p>
       <div class="controls"><button class="act" data-action="open-scan-result">Review this scan</button>${scan.reportDate ? `<button class="act" data-action="open-scan-report" data-date="${this.esc(scan.reportDate)}">Open dated report</button>` : ''}</div>
     </div>`;
@@ -462,10 +462,18 @@ const Scout = {
       ? `<div class="source-health">${health.sourceHealth.map((source) => `<span class="chip source-${this.esc(source.status)}" title="${this.esc(source.reason || '')}">${this.esc(source.name)}: ${this.esc(source.status)}${source.count === null ? '' : ` (${this.esc(source.count)})`}</span>`).join('')}</div>`
       : '<div class="meta">No per-source health was recorded for this run.</div>';
     const reportDate = String(health?.lastRunAt || '').slice(0, 10);
+    const funnel = health?.funnel;
+    const funnelRows = funnel ? [
+      ['Source records returned', funnel.sourceRecords], ['Source or portal errors', funnel.sourceErrors],
+      ['Records not normalised', funnel.failedSourceRecords], ['Unique vacancies after deduplication', funnel.uniqueVacancies],
+      ['Excluded by confirmed rules', funnel.deterministicallyExcluded], ['Eligible and ranked', funnel.ranked],
+      ['Selected for detailed assessment', funnel.selected], ['Successfully assessed', funnel.assessed], ['Assessment failed', funnel.assessmentFailed],
+    ].filter(([, value]) => Number.isFinite(Number(value))).map(([label, value]) => `<li>${this.esc(label)}: <b>${this.esc(value)}</b></li>`).join('') : '';
     return `<div class="card">
       <div class="top"><b>Scan health</b><span class="chip">${this.esc(healthText)}</span></div>
-      <p><strong>${this.esc(Number(health?.candidatesFound || 0))} reviewed, ${this.esc(Number(health?.keepersAdded || 0))} kept</strong>${this.discardBreakdown(health) ? ` — ${this.esc(this.discardBreakdown(health))}` : ''}. Zero keepers can be a valid result when strict gates exclude every candidate.</p>
+      <p><strong>${this.esc(Number(health?.funnel?.assessed ?? health?.candidatesFound ?? 0))} assessed, ${this.esc(Number(health?.keepersAdded || 0))} kept</strong>${this.discardBreakdown(health) ? ` — ${this.esc(this.discardBreakdown(health))}` : ''}. Zero keepers can be a valid result when strict gates exclude every candidate.</p>
       <div class="meta">last run: ${this.esc(health?.lastRunAt || 'never')}</div>
+      ${funnelRows ? `<ul class="meta">${funnelRows}</ul>` : ''}
       ${sourceHealth}
       <p><button class="act" data-action="open-scan-result">Review this scan</button> ${/^\d{4}-\d{2}-\d{2}$/.test(reportDate) ? `<button class="act" data-action="open-scan-report" data-date="${this.esc(reportDate)}">Review dated report</button>` : ''}</p>
     </div>`;
@@ -933,7 +941,7 @@ const Scout = {
     }).join('');
     const overlay = document.getElementById('scan-result-overlay');
     document.getElementById('scan-result-body').innerHTML = `
-      <p><strong>${this.esc(scan.candidatesFound)} reviewed, ${this.esc(scan.keepersAdded)} kept</strong>${this.discardBreakdown(scan) ? ` — ${this.esc(this.discardBreakdown(scan))}` : ''}.</p>
+      <p><strong>${this.esc(scan.funnel?.assessed ?? scan.candidatesFound)} assessed, ${this.esc(scan.keepersAdded)} kept</strong>${this.discardBreakdown(scan) ? ` — ${this.esc(this.discardBreakdown(scan))}` : ''}.</p>
       ${scan.automaticBroadened ? '<div class="setup-callout"><strong>Discovery widened automatically</strong><p>Scout ran one broader query pass but kept every approved salary, location, commute, exclusion and evidence gate.</p></div>' : ''}
       ${groups || '<p class="meta">This older scan contains aggregate totals only. Run a new scan for candidate-level explanations.</p>'}
       <div class="controls">${scan.reportDate ? `<button class="act" data-action="open-scan-report" data-date="${this.esc(scan.reportDate)}">Open dated report</button>` : ''}<button class="act" data-action="close-scan-result">Close</button></div>`;

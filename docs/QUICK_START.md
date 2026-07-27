@@ -68,6 +68,8 @@ The first-run wizard accepts selectable-text PDF, DOCX, Markdown and plain text 
 
 Complete the setup questions for your role families, sectors, locations, minimum salary, commute preferences, exclusions and preferred writing tone. Scout then makes one schema-constrained proposal from those fields and the imported evidence. Review or discard the five staged files before activation. See [AI Setup](AI_SETUP.md) for details or [Configuration](CONFIGURATION.md) for manual editing.
 
+Review the complete search-profile draft and explicitly publish it before ranked discovery starts. Scout stages the draft automatically once setup preferences and profile evidence exist. A published profile is immutable for a scan: it records the approved rules, their strength and how unknown source facts should be handled. A fresh workspace cannot scan until you publish. If you upgrade an established older workspace that already has tracked opportunities, Scout creates an unpublished review draft from its existing preferences and temporarily continues the explicitly marked legacy discovery path until you publish it. A migration preserves your tracker, reports, applications and profile prose; it does not turn inferred preferences into hard exclusions. Unconfirmed inferred mandatory values remain non-blocking, and multiple accepted mandatory values for one field mean “any of these”, not “all of these”.
+
 Setup, Settings, CV options and side drawers keep keyboard focus inside the active dialog and return it to the control that opened the dialog. Press **Escape** to close an optional dialog or drawer. Mandatory first-run setup remains open until its required action is complete.
 
 Scout uses these approved answers, the imported CV and generated search lanes to find and score jobs. It does not inspect unrelated Codex/Claude conversations or automatically infer a career from previous AI usage.
@@ -101,7 +103,9 @@ Scout starts the first supervised scan automatically when the required setup ans
 & $ScoutNode $ScoutCli scan --provider codex --mode primary
 ```
 
-Use `claude` instead if selected. Review the dated report and tracker changes. Confirm that exclusions, salary handling and locations behave as intended before relying on results.
+Use `claude` instead if selected. Review the dated report and tracker changes. For a published profile, scan health shows source records, source/portal errors separately from failed records, unique vacancies after deduplication, unique confirmed-rule exclusions, the eligible ranked pool, the above-threshold detailed-assessment set and any assessment failures. Zero-score unrelated vacancies are not added merely to fill the assessment budget. Compensation is compared only when currency, period and rate type agree; an `exclude` unknown policy rejects both missing and non-comparable compensation. The selected set is bounded; a scan does not claim that every discovered vacancy received a provider assessment. Confirm that exclusions, salary handling and locations behave as intended before relying on results.
+
+Scout can only rank jobs returned by your configured sources. Missing or ambiguous advert facts remain unknown, and Scout does not yet add employers outside those sources or learn new hard rules from feedback.
 
 If the supervised primary scan keeps zero roles, Scout automatically performs one broader discovery pass. It widens source queries, not your approved gates: salary, hard exclusions, location/commute, mandatory evidence and scoring remain in force. The completed result stays visible as “reviewed / kept”; **Review this scan** shows concise reasons for every discarded candidate without adding weak roles to the tracker.
 

@@ -40,6 +40,9 @@ import {
 } from './lib/trackerPersistence.mjs';
 import { loadEnv, saveEnv } from './lib/env.mjs';
 import {
+  loadPublishedSearchProfile, migrateSearchProfile, profileFingerprint, publishSearchProfile, validateSearchProfile,
+} from './lib/searchProfile.mjs';
+import {
   loadWorkspaceConfig, migrateWorkspace, resolveWorkspaceRoot, seedWorkspace, syncManagedInstructions,
   workspacePaths, writeWorkspaceConfig,
 } from './lib/workspace.mjs';
@@ -78,6 +81,16 @@ if (fs.existsSync(TRACKER) && path.resolve(APP_ROOT) !== path.resolve(WORKSPACE_
 }
 
 function workspaceInitialised() { return fs.existsSync(TRACKER) && fs.existsSync(WORKSPACE.config); }
+
+function stageSearchProfileReview() {
+  if (!workspaceInitialised()) return null;
+  const config = loadWorkspaceConfig(WORKSPACE_ROOT);
+  const readiness = setupReadiness(WORKSPACE_ROOT, config, {}, readTracker());
+  if (!(readiness.checks.preferences && readiness.checks.evidence && readiness.checks.approved)) return null;
+  return migrateSearchProfile(WORKSPACE_ROOT);
+}
+
+stageSearchProfileReview();
 
 function queueCheckpoint(reason, { includeDevicePreferences = false } = {}) {
   const options = includeDevicePreferences && process.platform === 'win32'
@@ -157,21 +170,46 @@ function readScanRecords() {
 function publicLatestScan() {
   const run = readScanRecords().at(-1);
   if (!run) return null;
+  const safePublicUrl = (value) => {
+    const url = String(value || '');
+    return /^https?:\/\//i.test(url) && url.length <= 2048 ? url : null;
+  };
   const reviewed = Array.isArray(run.reviewed) ? run.reviewed.map((item) => ({
     company: String(item?.company || '').slice(0, 120), role: String(item?.role || '').slice(0, 160),
     source: String(item?.source || '').slice(0, 80),
-    sourceUrl: /^https?:\/\//i.test(String(item?.sourceUrl || '')) ? String(item.sourceUrl) : null,
+    sourceUrl: safePublicUrl(item?.sourceUrl),
     categoryId: item?.categoryId ? String(item.categoryId).slice(0, 80) : null,
     outcome: ['kept', 'hard_exclusion', 'mandatory_unmet', 'below_threshold', 'provider_discarded'].includes(item?.outcome) ? item.outcome : 'provider_discarded',
     score: Number.isFinite(Number(item?.score)) ? Number(item.score) : null,
     reasons: (Array.isArray(item?.reasons) ? item.reasons : []).map((reason) => String(reason).slice(0, 220)).slice(0, 3),
   })).slice(0, 80) : [];
+  const boundedContribution = (item) => typeof item === 'string' ? item.slice(0, 100) : ({ code: String(item?.code || '').slice(0, 100), score: Number.isFinite(Number(item?.score)) ? Number(item.score) : null });
+  const boundedFunnel = (value) => {
+    const names = [
+      'sourceRecords', 'sourceErrors', 'failedSourceRecords', 'uniqueVacancies',
+      'deterministicallyExcluded', 'eligible', 'ranked', 'selected', 'assessed', 'assessmentFailed',
+    ];
+    return value && typeof value === 'object' ? Object.fromEntries(names.filter((name) => Number.isFinite(Number(value[name]))).map((name) => [name, Number(value[name])])) : null;
+  };
+  const boundedSelectionSummary = (value) => value && typeof value === 'object' ? Object.fromEntries(['selected', 'assessed', 'assessmentFailed'].filter((name) => Number.isFinite(Number(value[name]))).map((name) => [name, Number(value[name])])) : null;
+  const explanations = Array.isArray(run.explanations) ? run.explanations.map((item) => ({
+    vacancyId: String(item?.vacancy_id || '').slice(0, 160),
+    preRank: { score: Number.isFinite(Number(item?.pre_rank?.score)) ? Number(item.pre_rank.score) : null,
+      positive: (Array.isArray(item?.pre_rank?.positive) ? item.pre_rank.positive : []).slice(0, 3).map(boundedContribution), negative: (Array.isArray(item?.pre_rank?.negative) ? item.pre_rank.negative : []).slice(0, 3).map(boundedContribution) },
+    selectionReason: item?.selection_reason ? String(item.selection_reason).slice(0, 100) : null,
+    deterministicExclusion: item?.deterministic_exclusion ? String(item.deterministic_exclusion).slice(0, 100) : null,
+    assessmentStatus: ['assessed', 'assessment-failed', 'not-selected'].includes(item?.assessment_status) ? item.assessment_status : 'not-selected',
+    source: String(item?.source || '').slice(0, 80), sourceUrl: safePublicUrl(item?.sourceUrl),
+  })).slice(0, 180) : [];
   return {
     schemaVersion: Number(run.schemaVersion || 1), runAt: run.timestamp || null,
     provider: run.agent || null, mode: run.mode || null, degraded: Boolean(run.degraded),
     candidatesFound: Number(run.candidates_found || 0), keepersAdded: Number(run.keepers_added || 0),
     keepersUpdated: Number(run.keepers_updated || 0), discarded: run.discarded || {},
     sourceHealth: run.source_health || {}, reportDate: String(run.timestamp || '').slice(0, 10) || null,
+    profileId: run.profile_id ? String(run.profile_id).slice(0, 80) : null,
+    discoveryEngine: run.discovery_engine ? String(run.discovery_engine).slice(0, 80) : null,
+    funnel: boundedFunnel(run.funnel), selectionSummary: boundedSelectionSummary(run.selection_summary), explanations,
     automaticBroadened: run.mode === 'broadened', reviewed,
   };
 }
@@ -289,6 +327,7 @@ export function requestAccess(req, url, settings = loadDeviceSettings()) {
   }
 
   const requiresJson = url.pathname.startsWith('/api/chat/')
+    || url.pathname.startsWith('/api/search-profile')
     || url.pathname.startsWith('/api/sync/')
     || url.pathname.startsWith('/api/workspace/')
     || url.pathname.startsWith('/api/remote-access/')
@@ -422,6 +461,7 @@ async function handleRead(req, res, url) {
         pendingSetupSections: [],
       });
     }
+    stageSearchProfileReview();
     const config = loadWorkspaceConfig(WORKSPACE_ROOT);
     const providers = await providerDetection.detect();
     const env = loadEnv(WORKSPACE_ROOT);
@@ -453,6 +493,10 @@ async function handleRead(req, res, url) {
   }
   if (req.method === 'GET' && url.pathname === '/api/setup/proposal') {
     try { return sendJson(res, 200, { proposal: readOnboardingProposal(WORKSPACE_ROOT) }); }
+    catch (e) { return sendJson(res, 400, { error: e.message }); }
+  }
+  if (req.method === 'GET' && url.pathname === '/api/search-profile') {
+    try { return sendJson(res, 200, readSearchProfileState()); }
     catch (e) { return sendJson(res, 400, { error: e.message }); }
   }
   if (req.method === 'GET' && url.pathname === '/api/app-info') {
@@ -641,6 +685,86 @@ function replyJson(res, status, obj) {
 function parseBody(body) {
   try { return JSON.parse(body || '{}'); } catch { return null; }
 }
+
+function readDraftSearchProfile() {
+  if (!fs.existsSync(WORKSPACE.searchProfileDraft)) return null;
+  const draft = validateSearchProfile(JSON.parse(fs.readFileSync(WORKSPACE.searchProfileDraft, 'utf8')));
+  if (draft.status !== 'draft') throw new Error('search profile draft must have draft status');
+  return draft;
+}
+
+function readSearchProfileState() {
+  stageSearchProfileReview();
+  const draft = readDraftSearchProfile();
+  return {
+    rawPresent: fs.existsSync(WORKSPACE.searchProfileRaw),
+    draft,
+    published: loadPublishedSearchProfile(WORKSPACE_ROOT),
+    draftRevision: draft ? profileFingerprint(draft) : null,
+  };
+}
+
+function currentDraftForRevision(revision) {
+  const draft = readDraftSearchProfile();
+  const currentRevision = draft ? profileFingerprint(draft) : null;
+  if (revision !== currentRevision) {
+    const error = new Error('The search-profile draft changed while this page was open. Refresh and retry.');
+    error.currentRevision = currentRevision;
+    throw error;
+  }
+  return draft;
+}
+
+function replySearchProfileConflict(res, error) {
+  return replyJson(res, 409, {
+    conflict: true, currentRevision: error.currentRevision,
+    error: error.message,
+  });
+}
+
+routes['PUT /api/search-profile/draft'] = (req, res, body) => {
+  const value = parseBody(body);
+  if (!value || !Object.hasOwn(value, 'draft') || !Object.hasOwn(value, 'revision')) {
+    return replyJson(res, 400, { error: 'complete draft and current revision are required' });
+  }
+  try {
+    currentDraftForRevision(value.revision);
+    const draft = validateSearchProfile(value.draft);
+    if (draft.status !== 'draft') throw new Error('search profile draft must have draft status');
+    atomicWriteFile(WORKSPACE.searchProfileDraft, `${JSON.stringify(draft, null, 2)}\n`);
+    const state = readSearchProfileState();
+    void queueCheckpoint('ui: save search profile draft');
+    return replyJson(res, 200, { ok: true, draft: state.draft, draftRevision: state.draftRevision });
+  } catch (e) {
+    if (Object.hasOwn(e, 'currentRevision')) return replySearchProfileConflict(res, e);
+    return replyJson(res, 400, { error: e.message });
+  }
+};
+
+routes['POST /api/search-profile/publish'] = (req, res, body) => {
+  const value = parseBody(body);
+  if (!value) return replyJson(res, 400, { error: 'bad json' });
+  try {
+    const draft = currentDraftForRevision(value.revision);
+    if (value.confirmed !== true) {
+      const error = new Error('Explicit confirmation is required before publishing this search profile.');
+      error.currentRevision = profileFingerprint(draft);
+      throw error;
+    }
+    const published = publishSearchProfile(draft);
+    atomicWriteFile(WORKSPACE.searchProfilePublished, `${JSON.stringify(published, null, 2)}\n`);
+    const config = loadWorkspaceConfig(WORKSPACE_ROOT);
+    writeWorkspaceConfig(WORKSPACE_ROOT, {
+      ...config,
+      searchProfile: { ...(config.searchProfile || {}), publishedId: published.id },
+    });
+    void queueCheckpoint('ui: publish search profile');
+    return replyJson(res, 200, { ok: true, published });
+  } catch (e) {
+    if (Object.hasOwn(e, 'currentRevision')) return replySearchProfileConflict(res, e);
+    return replyJson(res, 400, { error: e.message });
+  }
+};
 
 routes['POST /api/workspace/create'] = (req, res, body) => {
   const b = parseBody(body); if (!b) return replyJson(res, 400, { error: 'bad json' });
