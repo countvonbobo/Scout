@@ -105,6 +105,67 @@ test('local-only checkpoints never contact a Git remote', async () => {
   fs.rmSync(f.base, { recursive: true, force: true });
 });
 
+test('runtime sync remains asynchronous while a Git mutation is pending', async () => {
+  const f = fixture();
+  git(f.root, 'init');
+  let commitStarted = false;
+  let releaseCommit;
+  const commitGate = new Promise((resolve) => { releaseCommit = resolve; });
+  let timerFired = false;
+  setTimeout(() => { timerFired = true; }, 5);
+  const spawnAsync = async (command, args, options) => {
+    if (args[0] === 'commit') {
+      commitStarted = true;
+      await commitGate;
+    }
+    return spawnSync(command, args, options);
+  };
+
+  const sync = runWorkspaceSync(f.root, 'asynchronous runtime checkpoint', { spawnAsync });
+  await new Promise((resolve) => setTimeout(resolve, 25));
+  const observed = { commitStarted, timerFired };
+  releaseCommit();
+  const result = await sync;
+
+  assert.deepEqual(observed, { commitStarted: true, timerFired: true });
+  assert.equal(result.state, 'disabled');
+  fs.rmSync(f.base, { recursive: true, force: true });
+});
+
+test('runtime sync command timeout returns bounded needs-attention state', async () => {
+  const f = fixture();
+  git(f.root, 'init');
+  const spawnAsync = async (command, args, options) => {
+    if (args[0] === 'commit') return new Promise(() => {});
+    return spawnSync(command, args, options);
+  };
+
+  const result = await runWorkspaceSync(f.root, 'timed runtime checkpoint', {
+    commandTimeoutMs: 20,
+    spawnAsync,
+  });
+
+  assert.equal(result.state, 'needs-attention');
+  assert.equal(result.pending, true);
+  assert.doesNotMatch(JSON.stringify(result), /workspace\.json|opportunities\.json/);
+  fs.rmSync(f.base, { recursive: true, force: true });
+});
+
+test('a stale runtime sync fence prevents the first local mutation', async () => {
+  const f = fixture();
+  git(f.root, 'init');
+
+  await assert.rejects(() => runWorkspaceSync(f.root, 'stale fenced checkpoint', {
+    assertFence() {
+      throw new Error('synthetic stale sync fence');
+    },
+  }), /synthetic stale sync fence/);
+
+  assert.equal(git(f.root, 'log', '--all', '--oneline'), '');
+  assert.match(git(f.root, 'status', '--porcelain'), /workspace\.json/);
+  fs.rmSync(f.base, { recursive: true, force: true });
+});
+
 test('a workspace nested under another checkout never checkpoints the parent repository', async () => {
   const parent = fs.mkdtempSync(path.join(os.tmpdir(), 'scout-parent-repo-'));
   git(parent, 'init');

@@ -8,7 +8,8 @@ import {
 const QUEUE_SCHEMA_VERSION = 4;
 const REPLAYABLE_QUEUE_SCHEMA_VERSIONS = new Set([2, 3, QUEUE_SCHEMA_VERSION]);
 const REQUESTERS = new Set(['manual', 'scheduled']);
-const OUTCOMES = new Set(['succeeded', 'failed', 'skipped', 'stale']);
+const SUCCESS_OUTCOMES = new Set(['succeeded', 'succeeded-pending', 'succeeded-partial']);
+const OUTCOMES = new Set([...SUCCESS_OUTCOMES, 'failed', 'skipped', 'stale']);
 const REQUEST_ID = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
 const REQUEST_KEY = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 const PURPOSE = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
@@ -101,7 +102,13 @@ function checkedCompatibility(input) {
   return input;
 }
 
-function checkedOutcome(outcome) { if (!OUTCOMES.has(outcome)) throw new TypeError('scan queue outcome is invalid'); return outcome; }
+function checkedOutcome(outcome, schemaVersion = QUEUE_SCHEMA_VERSION) {
+  if (!OUTCOMES.has(outcome)
+    || (schemaVersion < QUEUE_SCHEMA_VERSION && outcome !== 'succeeded' && SUCCESS_OUTCOMES.has(outcome))) {
+    throw new TypeError('scan queue outcome is invalid');
+  }
+  return outcome;
+}
 
 function checkedClaim(claim) {
   exactKeys(claim, ['claimId', 'generation', 'leaseId', 'owner', 'runId'], 'scan queue claim');
@@ -167,7 +174,7 @@ function checkedEvent(record) {
   if (!REQUEST_ID.test(record.requestId || '')) throw new Error('scan queue journal event contains an invalid request ID');
   if (record.type === 'claimed') return { ...record, claim: checkedClaim(record.claim) };
   if (record.type === 'claim-recovered' && !REQUEST_ID.test(record.claimId || '')) throw new Error('scan queue recovery event is invalid');
-  if (record.type === 'completed') { if (!REQUEST_ID.test(record.claimId || '')) throw new Error('scan queue completion claim is invalid'); checkedOutcome(record.outcome); }
+  if (record.type === 'completed') { if (!REQUEST_ID.test(record.claimId || '')) throw new Error('scan queue completion claim is invalid'); checkedOutcome(record.outcome, record.schemaVersion); }
   return record;
 }
 
@@ -191,7 +198,7 @@ function checkedLegacyEvent(record) {
     const { lease: ignored, request } = checkedRequest({ ...record.request, lease: {} }); void ignored; return { ...record, request, legacy: true };
   }
   for (const field of ['requestId', 'incomingRequestId', 'supersededRequestId']) if (field in record && !REQUEST_ID.test(record[field] || '')) throw new Error('legacy scan queue journal request ID is invalid');
-  if (record.type === 'completed') checkedOutcome(record.outcome);
+  if (record.type === 'completed') checkedOutcome(record.outcome, record.schemaVersion);
   return { ...record, legacy: true };
 }
 
@@ -285,7 +292,7 @@ function windowKey(item) {
   ].join('|');
 }
 function pending(items, compatibility, now) {
-  const terminal = []; const completedWindows = new Set(items.filter((item) => item.status === 'succeeded' && item.windowAt).map(windowKey));
+  const terminal = []; const completedWindows = new Set(items.filter((item) => SUCCESS_OUTCOMES.has(item.status) && item.windowAt).map(windowKey));
   for (const item of items) {
     if (item.status !== 'queued') continue;
     if (new Date(item.expiresAt) <= now) terminal.push({ type: 'expired', requestId: item.id });

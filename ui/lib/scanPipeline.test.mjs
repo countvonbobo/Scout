@@ -1331,6 +1331,76 @@ test('semantic artifacts provide bounded readable assessment facts without compl
   }
 });
 
+test('credential-shaped semantic values are redacted while operators and accountability remain exact', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'scout-safe-semantic-clauses-'));
+  const profile = {
+    version: 1, status: 'published', id: 'profile-safe-semantic-clauses',
+    target: {
+      primaryTitles: [{ value: 'Platform Engineer', strength: 'strong-preference', provenance: 'explicit' }],
+    },
+    negative: {},
+    compensation: { currency: null, period: 'year', minimum: null, minimumStrength: 'neutral', unknownPolicy: 'include' },
+  };
+  const privateValues = [
+    'hunter2',
+    'PRIVATE_BEARER',
+    'PRIVATE_TOKEN',
+    'eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJwcml2YXRlIn0.PRIVATE_SIGNATURE',
+    'credential-user',
+    'credential-pass',
+  ];
+  try {
+    const result = await runScanPipeline({
+      root,
+      compatibility: RECOVERY_COMPATIBILITY,
+      stages: createRankedDiscoveryStages({
+        collect: async () => ({
+          generatedAt: '2026-07-28T09:00:00.000Z',
+          queries: [],
+          sources: {
+            ats: {
+              configured: true,
+              status: 'healthy',
+              count: 1,
+              jobs: [{
+                company: 'Safe Evidence Co',
+                title: 'Platform Engineer',
+                url: 'https://example.test/jobs/safe-evidence',
+                description: 'Accountability for incident response. Non-technical applicants required.',
+                requirements: [
+                  'password: hunter2',
+                  'Authorization: Bearer PRIVATE_BEARER',
+                  'api_token=PRIVATE_TOKEN',
+                  'JWT eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJwcml2YXRlIn0.PRIVATE_SIGNATURE required',
+                  'credential URL https://credential-user:credential-pass@example.test/private is required',
+                ].join('; '),
+              }],
+            },
+          },
+        }),
+        profile,
+      }),
+    });
+
+    const candidate = assessmentCandidatesForSelection(result.stageOutputs.select.selection.selected)[0];
+    assert.match(candidate.description, /Advert responsibility: accountability incident response\./);
+    assert.ok(candidate.mandatorySignals.some((signal) => /non technical applicants/.test(signal.text)));
+    assert.equal(
+      candidate.mandatorySignals.filter((signal) => /sensitive requirement redacted/.test(signal.text)).length,
+      5,
+    );
+    const artifactDirectory = path.join(root, '.scout', 'runs', result.runId, 'artifacts');
+    const persisted = fs.readdirSync(artifactDirectory)
+      .map((name) => fs.readFileSync(path.join(artifactDirectory, name), 'utf8'))
+      .join('\n');
+    for (const value of privateValues) {
+      assert.doesNotMatch(persisted, new RegExp(value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+    }
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test('semantic recovery preserves a hard exclusion found after the old advert prefix bound', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'scout-semantic-late-exclusion-'));
   const profile = {
@@ -1566,6 +1636,107 @@ test('post-success backup failure preserves the successful scan and reports pend
       reason: 'backup-failed',
     }]);
     assert.doesNotMatch(JSON.stringify(result), /PRIVATE_BACKUP_TRANSPORT_FAILURE/);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('a malformed mutation receipt preserves scan success and reports backup pending', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'scout-malformed-receipt-'));
+  let hookCalls = 0;
+  try {
+    const result = await runScanPipeline({
+      root,
+      compatibility: RECOVERY_COMPATIBILITY,
+      stages: durableStageHarness(new Map()),
+      finalize: async () => ({
+        schemaVersion: 1,
+        result: { ok: true },
+        mutationReceipt: {
+          schemaVersion: 1,
+          id: 'scan-tracker-report',
+          digest: 'not-a-sha256-digest',
+        },
+      }),
+      postTerminalSuccess: async () => {
+        hookCalls += 1;
+        return { status: 'complete' };
+      },
+    });
+
+    assert.equal(result.outcome, 'complete');
+    assert.equal(hookCalls, 0);
+    assert.deepEqual(result.failures, [{
+      code: 'backup-pending',
+      stage: 'post-success',
+      reason: 'mutation-receipt-invalid',
+    }]);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('an explicit pending post-success result preserves scan success', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'scout-explicit-backup-pending-'));
+  try {
+    const result = await runScanPipeline({
+      root,
+      compatibility: RECOVERY_COMPATIBILITY,
+      stages: durableStageHarness(new Map()),
+      finalize: async () => ({
+        schemaVersion: 1,
+        result: { ok: true },
+        mutationReceipt: {
+          schemaVersion: 1,
+          id: 'scan-tracker-report',
+          digest: 'a'.repeat(64),
+        },
+      }),
+      postTerminalSuccess: async () => ({
+        status: 'pending',
+        reason: 'backup-offline',
+      }),
+    });
+
+    assert.equal(result.outcome, 'complete');
+    assert.deepEqual(result.failures, [{
+      code: 'backup-pending',
+      stage: 'post-success',
+      reason: 'backup-offline',
+    }]);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('an explicit partial post-success result preserves scan success', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'scout-explicit-backup-partial-'));
+  try {
+    const result = await runScanPipeline({
+      root,
+      compatibility: RECOVERY_COMPATIBILITY,
+      stages: durableStageHarness(new Map()),
+      finalize: async () => ({
+        schemaVersion: 1,
+        result: { ok: true },
+        mutationReceipt: {
+          schemaVersion: 1,
+          id: 'scan-tracker-report',
+          digest: 'b'.repeat(64),
+        },
+      }),
+      postTerminalSuccess: async () => ({
+        status: 'partial',
+        reason: 'backup-needs-attention',
+      }),
+    });
+
+    assert.equal(result.outcome, 'complete');
+    assert.deepEqual(result.failures, [{
+      code: 'backup-partial',
+      stage: 'post-success',
+      reason: 'backup-needs-attention',
+    }]);
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }

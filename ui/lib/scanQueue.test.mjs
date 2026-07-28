@@ -314,6 +314,61 @@ test('direct scheduled success covers only the exact queued job window and execu
   }
 });
 
+test('pending and partial backup outcomes remain durable logical successes for window coverage', () => {
+  for (const outcome of ['succeeded-pending', 'succeeded-partial']) {
+    const root = workspace();
+    const activeLease = lease(root, `queue-${outcome}`);
+    const execution = {
+      schemaVersion: 2,
+      provider: 'codex',
+      mode: 'primary',
+      model: null,
+      scheduleId: 'morning-job',
+      logicalWindowId: '2026-07-27T06:30:00.000Z',
+      compatibilityFingerprint: 'd'.repeat(64),
+    };
+    try {
+      enqueueScanRequest(root, request({
+        id: `${outcome}-completed`,
+        key: `${outcome}-completed`,
+        requester: 'scheduled',
+        requestedAt: '2026-07-27T08:01:00.000Z',
+        windowAt: '2026-07-27T20:00:00.000Z',
+        expiresAt: '2026-07-27T20:00:00.000Z',
+        execution,
+        lease: activeLease,
+      }));
+      enqueueScanRequest(root, request({
+        id: `${outcome}-covered`,
+        key: `${outcome}-covered`,
+        requester: 'scheduled',
+        requestedAt: '2026-07-27T08:00:00.000Z',
+        windowAt: '2026-07-27T20:00:00.000Z',
+        expiresAt: '2026-07-27T20:00:00.000Z',
+        execution,
+        lease: activeLease,
+      }));
+
+      const claimed = claimNextScanRequest(root, compatibility, activeLease, new Date('2026-07-27T08:02:00.000Z'));
+      assert.equal(completeScanRequest(root, claimed.id, outcome, activeLease, claimed.claim).status, outcome);
+      assert.equal(
+        claimNextScanRequest(root, compatibility, activeLease, new Date('2026-07-27T08:03:00.000Z')),
+        null,
+      );
+      assert.deepEqual(
+        projectScanQueue(root).requests.map((item) => [item.id, item.status]),
+        [
+          [`${outcome}-completed`, outcome],
+          [`${outcome}-covered`, 'skipped'],
+        ],
+      );
+    } finally {
+      releaseScanLease(activeLease);
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  }
+});
+
 test('claim rejects expired or stale profile, configuration, purpose and schema requests with durable terminal events', () => {
   const cases = [
     ['expired', request({ id: 'expired', requestedAt: '2026-07-26T08:00:00.000Z', expiresAt: '2026-07-27T08:00:00.000Z' }), compatibility, 'expired'],

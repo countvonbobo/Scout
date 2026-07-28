@@ -15,7 +15,7 @@ import { setupReadiness } from '../ui/lib/setupReadiness.mjs';
 import { runStructuredTurn } from '../ui/lib/structuredTurn.mjs';
 import {
   assessmentCandidatesForSelection, compactCandidates, createRankedDiscoveryStages, DEFAULT_CANDIDATE_LIMIT,
-  inboxRecheckCandidates, promptCandidate, runScanPipeline, SCAN_ASSESSMENT_SCHEMA, validateAssessments,
+  durableScanProjection, inboxRecheckCandidates, promptCandidate, runScanPipeline, SCAN_ASSESSMENT_SCHEMA, validateAssessments,
   verificationCandidates, writeScanArtifacts,
 } from '../ui/lib/scanPipeline.mjs';
 import { loadPublishedSearchProfile, migrateSearchProfile } from '../ui/lib/searchProfile.mjs';
@@ -66,6 +66,31 @@ function scanMutationReceipt(root, artifacts) {
       run: artifacts.run,
     }),
   });
+}
+
+function backupHookOutcome(status) {
+  if (status === undefined) return Object.freeze({ status: 'complete' });
+  if (status?.state === 'needs-attention') {
+    return Object.freeze({ status: 'partial', reason: 'backup-needs-attention' });
+  }
+  if (status?.state === 'offline' || status?.state === 'pending' || status?.pending === true) {
+    return Object.freeze({ status: 'pending', reason: 'backup-offline' });
+  }
+  if (['synced', 'disabled'].includes(status?.state) && status?.pending !== true) {
+    return Object.freeze({ status: 'complete' });
+  }
+  return Object.freeze({ status: 'partial', reason: 'backup-status-unknown' });
+}
+
+function queuedScanOutcome(durable) {
+  if (durable?.outcome !== 'complete') return null;
+  if (durable.failures?.some((failure) => failure.code === 'backup-partial')) {
+    return 'succeeded-partial';
+  }
+  if (durable.failures?.some((failure) => failure.code === 'backup-pending')) {
+    return 'succeeded-pending';
+  }
+  return 'succeeded';
 }
 
 function sourceConfigFingerprint(config) {
@@ -616,8 +641,8 @@ export async function runScanWith(root, provider, mode, {
             logicalWindowId: execution.logicalWindowId,
             queueWorkspaceSyncFn,
           });
-          return queued.durable?.outcome === 'complete' ? 'succeeded'
-            : queued.status === 'skipped' ? 'skipped' : 'failed';
+          return queuedScanOutcome(queued.durable)
+            || (queued.status === 'skipped' ? 'skipped' : 'failed');
         },
       },
       async recordFailure({ error, lease }) {
@@ -649,9 +674,11 @@ export async function runScanWith(root, provider, mode, {
         return result;
       },
       async postTerminalSuccess({ lease }) {
-        assertCurrentFence(lease, synchronousFenceCallback(() => true));
-        await queueWorkspaceSyncFn(root, `complete ${mode} scan`);
-        assertCurrentFence(lease, synchronousFenceCallback(() => true));
+        const assertFence = () => assertCurrentFence(lease, synchronousFenceCallback(() => true));
+        assertFence();
+        const status = await queueWorkspaceSyncFn(root, `complete ${mode} scan`, { assertFence });
+        assertFence();
+        return backupHookOutcome(status);
       },
       async finalize({ lease, stageOutputs }) {
         collected = stageOutputs.collect;
@@ -718,7 +745,7 @@ export async function runScanWith(root, provider, mode, {
           const bundleFile = path.join(bundleDir, `${startedAt.replace(/[:.]/g, '-')}-${provider}-${mode}.json`);
           assertCurrentFence(lease, synchronousFenceCallback(() => {
             fs.mkdirSync(bundleDir, { recursive: true });
-            fs.writeFileSync(bundleFile, `${JSON.stringify({
+            fs.writeFileSync(bundleFile, `${JSON.stringify(durableScanProjection({
               generatedAt: collected.generatedAt,
               queries: collected.queries,
               sources: Object.fromEntries(Object.entries(collected.sources).map(([name, value]) => [name, { ...value, jobs: undefined }])),
@@ -728,7 +755,7 @@ export async function runScanWith(root, provider, mode, {
               hardExcluded: hardExcluded.map((item) => ({ vacancyId: item.vacancyId, code: item.code })),
               closedAdverts: closedAdverts.map((item) => ({ url: item.url, reason: item.liveness?.reason })),
               candidates,
-            }, null, 2)}\n`, 'utf8');
+            }), null, 2)}\n`, 'utf8');
           }));
           let assessmentResult = null;
           let usage = {};

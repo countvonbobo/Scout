@@ -657,6 +657,106 @@ test('runtime backup failure leaves the receipted scan successful with pending b
   }
 });
 
+test('runtime offline backup status leaves the successful scan explicitly pending', async () => {
+  const root = scanRoot();
+  try {
+    const result = await runScanWith(root, 'codex', 'primary', {
+      providerStatusFn: authenticated,
+      collectSourcesFn: async () => ({
+        generatedAt: '2026-07-28T09:00:00.000Z',
+        queries: [],
+        sources: { hiring_cafe: { configured: true, status: 'healthy', count: 0, jobs: [] } },
+      }),
+      queueWorkspaceSyncFn: async () => ({
+        state: 'offline',
+        enabled: true,
+        pending: true,
+        error: 'PRIVATE_OFFLINE_DETAIL',
+      }),
+    });
+
+    assert.equal(result.ok, true);
+    assert.equal(result.durable.outcome, 'complete');
+    assert.deepEqual(result.durable.failures, [{
+      code: 'backup-pending',
+      stage: 'post-success',
+      reason: 'backup-offline',
+    }]);
+    assert.doesNotMatch(JSON.stringify(result), /PRIVATE_OFFLINE_DETAIL/);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('runtime needs-attention backup status leaves the successful scan explicitly partial', async () => {
+  const root = scanRoot();
+  try {
+    const result = await runScanWith(root, 'codex', 'primary', {
+      providerStatusFn: authenticated,
+      collectSourcesFn: async () => ({
+        generatedAt: '2026-07-28T09:00:00.000Z',
+        queries: [],
+        sources: { hiring_cafe: { configured: true, status: 'healthy', count: 0, jobs: [] } },
+      }),
+      queueWorkspaceSyncFn: async () => ({
+        state: 'needs-attention',
+        enabled: true,
+        pending: true,
+        error: 'PRIVATE_RECONCILIATION_DETAIL',
+      }),
+    });
+
+    assert.equal(result.ok, true);
+    assert.equal(result.durable.outcome, 'complete');
+    assert.deepEqual(result.durable.failures, [{
+      code: 'backup-partial',
+      stage: 'post-success',
+      reason: 'backup-needs-attention',
+    }]);
+    assert.doesNotMatch(JSON.stringify(result), /PRIVATE_RECONCILIATION_DETAIL/);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('a queued backup-pending success remains visibly pending in durable queue state', async () => {
+  const root = scanRoot();
+  let collectionCalls = 0;
+  let overlap;
+  const options = {
+    providerStatusFn: authenticated,
+    collectSourcesFn: async () => {
+      collectionCalls += 1;
+      if (collectionCalls === 1) overlap = await runScanWith(root, 'codex', 'primary', options);
+      return {
+        generatedAt: '2026-07-28T09:00:00.000Z',
+        queries: [],
+        sources: { hiring_cafe: { configured: true, status: 'healthy', count: 0, jobs: [] } },
+      };
+    },
+    queueWorkspaceSyncFn: async () => ({
+      state: 'offline',
+      enabled: true,
+      pending: true,
+      error: 'PRIVATE_QUEUE_OFFLINE_DETAIL',
+    }),
+  };
+  try {
+    const primary = await runScanWith(root, 'codex', 'primary', options);
+
+    assert.equal(primary.ok, true);
+    assert.equal(overlap.status, 'queued');
+    assert.equal(collectionCalls, 2);
+    assert.equal(projectScanQueue(root).requests[0].status, 'succeeded-pending');
+    assert.doesNotMatch(
+      fs.readFileSync(path.join(root, '.scout', 'scan-queue.jsonl'), 'utf8'),
+      /PRIVATE_QUEUE_OFFLINE_DETAIL/,
+    );
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test('each terminally successful manual overlap run receives its own fenced backup', async () => {
   const root = scanRoot();
   let collectionCalls = 0;
@@ -920,6 +1020,75 @@ test('a queued keeper run completes against its claim-time tracker input instead
     assert.doesNotMatch(
       scanInput,
       /PRIVATE_USER|PRIVATE_PASSWORD|PRIVATE_SESSION|PRIVATE_FRAGMENT|nested-user|nested-pass|[?#]session=/,
+    );
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('fresh liveness keeps a transient query URL while every persisted scan projection is canonical', async () => {
+  const root = scanRoot();
+  enableRankedDiscovery(root);
+  const sourceUrl = 'https://example.test/jobs/query-only'
+    + '?posting=stable-query-id&session=PRIVATE_TRANSIENT_SESSION#PRIVATE_TRANSIENT_FRAGMENT';
+  let checkedUrl = null;
+  try {
+    const result = await runScanWith(root, 'codex', 'primary', {
+      providerStatusFn: authenticated,
+      collectSourcesFn: async () => ({
+        generatedAt: '2026-07-28T09:00:00.000Z',
+        queries: [],
+        sources: {
+          hiring_cafe: {
+            configured: true,
+            status: 'healthy',
+            count: 1,
+            jobs: [{
+              company: 'Query Identity Co',
+              title: 'Ideal Role',
+              url: sourceUrl,
+            }],
+          },
+        },
+      }),
+      runStructuredTurnFn: async ({ prompt, validate }) => {
+        const context = JSON.parse(prompt.split('\n\n').at(-1));
+        const value = assessmentFor(context.candidates);
+        validate(value);
+        return { value, usage: {} };
+      },
+      checkLivenessFn: async (candidates) => {
+        checkedUrl = candidates[0]?.url;
+        return {
+          live: candidates,
+          removed: [],
+          summary: { checked: candidates.length, gone: 0, unverified: 0 },
+        };
+      },
+      queueWorkspaceSyncFn: async () => ({ state: 'disabled', enabled: false }),
+    });
+
+    assert.equal(result.ok, true);
+    assert.equal(checkedUrl, sourceUrl.replace(/#.*$/, ''));
+    const persisted = [
+      ...fs.readdirSync(path.join(root, '.scout', 'runs'), { withFileTypes: true })
+        .filter((entry) => entry.isDirectory())
+        .flatMap((entry) => fs.readdirSync(path.join(root, '.scout', 'runs', entry.name, 'artifacts'))
+          .map((name) => fs.readFileSync(
+            path.join(root, '.scout', 'runs', entry.name, 'artifacts', name),
+            'utf8',
+          ))),
+      ...fs.readdirSync(path.join(root, '.scout', 'scan-input'))
+        .map((name) => fs.readFileSync(path.join(root, '.scout', 'scan-input', name), 'utf8')),
+      fs.readFileSync(path.join(root, 'data', 'scan-runs.jsonl'), 'utf8'),
+      fs.readFileSync(path.join(root, 'data', 'opportunities.json'), 'utf8'),
+      ...fs.readdirSync(path.join(root, 'reports'))
+        .map((name) => fs.readFileSync(path.join(root, 'reports', name), 'utf8')),
+    ].join('\n');
+    assert.match(persisted, /https:\/\/example\.test\/jobs\/query-only/);
+    assert.doesNotMatch(
+      persisted,
+      /stable-query-id|PRIVATE_TRANSIENT_SESSION|PRIVATE_TRANSIENT_FRAGMENT|[?#]posting=/,
     );
   } finally {
     fs.rmSync(root, { recursive: true, force: true });

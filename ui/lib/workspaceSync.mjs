@@ -1,7 +1,7 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { atomicWriteFile } from './atomicWrite.mjs';
 import {
   initializeRecoveryBackup, loadRecoveryHeader, RECOVERY_DIR, restoreRecoveryBackup, restoreRecoveryBackupWithKey,
@@ -11,6 +11,11 @@ import {
 const SETTINGS = '.scout/sync.json';
 const STATUS = new Map();
 const GITHUB_ED25519_HOST = 'github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl';
+const DEFAULT_COMMAND_TIMEOUT_MS = 30_000;
+const COMMAND_OUTPUT_LIMIT = 64 * 1024;
+const RUNTIME_FENCE_FAILURE = Symbol('runtime-fence-failure');
+
+class RuntimeCommandTimeoutError extends Error {}
 
 function runGit(cwd, args, options = {}) {
   const result = (options.spawn || spawnSync)('git', args, {
@@ -23,6 +28,86 @@ function runGit(cwd, args, options = {}) {
     stdout: String(result.stdout || '').trim(),
     stderr: String(result.stderr || '').trim(),
     error: String(result.stderr || result.stdout || `git ${args[0]} failed`).trim(),
+  };
+}
+
+function boundedOutput(value) {
+  return String(value || '').slice(-COMMAND_OUTPUT_LIMIT);
+}
+
+function defaultSpawnAsync(command, args, spawnOptions, timeoutMs) {
+  return new Promise((resolve) => {
+    const child = spawn(command, args, {
+      ...spawnOptions,
+      encoding: undefined,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    let stdout = '';
+    let stderr = '';
+    let settled = false;
+    const finish = (result) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve(result);
+    };
+    child.stdout?.on('data', (chunk) => { stdout = boundedOutput(stdout + chunk.toString('utf8')); });
+    child.stderr?.on('data', (chunk) => { stderr = boundedOutput(stderr + chunk.toString('utf8')); });
+    child.once('error', (error) => finish({
+      status: null,
+      stdout,
+      stderr: boundedOutput(error.message),
+    }));
+    child.once('close', (status) => finish({ status, stdout, stderr }));
+    const timer = setTimeout(() => {
+      child.kill();
+      finish({ status: null, stdout, stderr: 'command timed out', timedOut: true });
+    }, timeoutMs);
+    timer.unref?.();
+  });
+}
+
+async function runGitAsync(cwd, args, options = {}) {
+  const timeoutMs = options.commandTimeoutMs ?? DEFAULT_COMMAND_TIMEOUT_MS;
+  if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
+    throw new TypeError('workspace sync command timeout must be positive');
+  }
+  const spawnOptions = {
+    cwd,
+    windowsHide: true,
+    env: { ...process.env, ...(options.env || {}), GIT_TERMINAL_PROMPT: options.allowPrompt ? '1' : '0' },
+  };
+  let result;
+  if (options.spawnAsync || options.spawn) {
+    let timer;
+    const command = Promise.resolve().then(() => (
+      options.spawnAsync
+        ? options.spawnAsync('git', args, { ...spawnOptions, encoding: 'utf8' })
+        : options.spawn('git', args, { ...spawnOptions, encoding: 'utf8' })
+    ));
+    const timeout = new Promise((resolve) => {
+      timer = setTimeout(() => resolve({
+        status: null,
+        stdout: '',
+        stderr: 'command timed out',
+        timedOut: true,
+      }), timeoutMs);
+      timer.unref?.();
+    });
+    result = await Promise.race([command, timeout]);
+    clearTimeout(timer);
+  } else {
+    result = await defaultSpawnAsync('git', args, spawnOptions, timeoutMs);
+  }
+  const stdout = boundedOutput(result?.stdout).trim();
+  const stderr = boundedOutput(result?.stderr).trim();
+  return {
+    ok: result?.status === 0,
+    status: result?.status ?? null,
+    stdout,
+    stderr,
+    timedOut: result?.timedOut === true,
+    error: String(stderr || stdout || `git ${args[0]} failed`).trim(),
   };
 }
 
@@ -245,6 +330,139 @@ function commitAll(root, message, options = {}) {
   throw new Error(commit.error);
 }
 
+function assertRuntimeFence(options) {
+  if (typeof options.assertFence !== 'function') return;
+  try {
+    options.assertFence();
+  } catch (error) {
+    Object.defineProperty(error, RUNTIME_FENCE_FAILURE, { value: true });
+    throw error;
+  }
+}
+
+async function runtimeGit(root, args, options, { mutation = false } = {}) {
+  if (mutation) assertRuntimeFence(options);
+  const result = await runGitAsync(root, args, options);
+  if (mutation) assertRuntimeFence(options);
+  if (result.timedOut) throw new RuntimeCommandTimeoutError(`git ${args[0]} timed out`);
+  return result;
+}
+
+async function repoReadyAsync(root, options) {
+  const result = await runtimeGit(root, ['rev-parse', '--show-toplevel'], options);
+  if (!result.ok) return false;
+  const canonical = (value) => {
+    const resolved = path.resolve(value);
+    try { return fs.realpathSync.native(resolved); } catch { return resolved; }
+  };
+  const top = canonical(result.stdout);
+  const workspace = canonical(root);
+  return process.platform === 'win32'
+    ? top.toLowerCase() === workspace.toLowerCase()
+    : top === workspace;
+}
+
+async function ensureRepoAsync(root, options) {
+  if (!await repoReadyAsync(root, options)) {
+    const enclosing = await runtimeGit(root, ['rev-parse', '--show-toplevel'], options);
+    if (enclosing.ok) {
+      throw new Error('Private backup refuses a workspace nested inside another Git repository');
+    }
+    const init = await runtimeGit(root, ['init'], options, { mutation: true });
+    if (!init.ok) throw new Error(init.error);
+  }
+  const name = await runtimeGit(root, ['config', '--get', 'user.name'], options);
+  if (!name.ok) {
+    const configured = await runtimeGit(root, ['config', 'user.name', 'Scout'], options, { mutation: true });
+    if (!configured.ok) throw new Error(configured.error);
+  }
+  const email = await runtimeGit(root, ['config', '--get', 'user.email'], options);
+  if (!email.ok) {
+    const configured = await runtimeGit(root, ['config', 'user.email', 'scout@local'], options, { mutation: true });
+    if (!configured.ok) throw new Error(configured.error);
+  }
+}
+
+async function untrackLegacyChatsAsync(root, options) {
+  const tracked = await runtimeGit(root, ['ls-files', '-z', '--', 'data/chats'], options);
+  if (!tracked.ok) throw new Error(tracked.error);
+  if (!tracked.stdout.split('\0').filter(Boolean).length) return;
+  const removed = await runtimeGit(
+    root,
+    ['rm', '--cached', '-r', '--ignore-unmatch', '--', 'data/chats'],
+    options,
+    { mutation: true },
+  );
+  if (!removed.ok) throw new Error(`Private backup could not make chats device-local: ${removed.error}`);
+}
+
+async function untrackLegacyManagedInstructionsAsync(root, options) {
+  const tracked = await runtimeGit(root, ['ls-files', '-z', '--', 'AGENTS.md', 'CLAUDE.md'], options);
+  if (!tracked.ok) throw new Error(tracked.error);
+  if (!tracked.stdout.split('\0').filter(Boolean).length) return;
+  const removed = await runtimeGit(
+    root,
+    ['rm', '--cached', '--ignore-unmatch', '--', 'AGENTS.md', 'CLAUDE.md'],
+    options,
+    { mutation: true },
+  );
+  if (!removed.ok) throw new Error(`Private backup could not make managed instructions device-local: ${removed.error}`);
+}
+
+async function assertNoTrackedSecretsAsync(root, options) {
+  const tracked = await runtimeGit(root, ['ls-files', '-z'], options);
+  if (!tracked.ok) throw new Error(tracked.error);
+  const unsafe = tracked.stdout.split('\0').filter(sensitiveTrackedPath);
+  if (unsafe.length) {
+    throw new Error(
+      `Private backup cannot continue because sensitive ignored files are already tracked: ${unsafe.slice(0, 5).join(', ')}`,
+    );
+  }
+}
+
+async function commitAllAsync(root, message, options) {
+  await untrackLegacyChatsAsync(root, options);
+  await untrackLegacyManagedInstructionsAsync(root, options);
+  await assertNoTrackedSecretsAsync(root, options);
+  const update = await runtimeGit(root, ['add', '-u'], options, { mutation: true });
+  if (!update.ok) throw new Error(update.error);
+  const untracked = await runtimeGit(root, ['ls-files', '--others', '--exclude-standard', '-z'], options);
+  if (!untracked.ok) throw new Error(untracked.error);
+  const files = untracked.stdout.split('\0').filter(Boolean).filter((file) => !sensitiveTrackedPath(file));
+  for (let index = 0; index < files.length; index += 100) {
+    const add = await runtimeGit(
+      root,
+      ['add', '--', ...files.slice(index, index + 100)],
+      options,
+      { mutation: true },
+    );
+    if (!add.ok) throw new Error(add.error);
+  }
+  const commit = await runtimeGit(root, ['commit', '-m', message], options, { mutation: true });
+  if (commit.ok || /nothing to commit|nothing added|no changes added/i.test(commit.error)) return;
+  throw new Error(commit.error);
+}
+
+async function worktreeDirtyAsync(root, options) {
+  const status = await runtimeGit(root, ['status', '--porcelain', '--untracked-files=normal'], options);
+  if (!status.ok) throw new Error(status.error);
+  return Boolean(status.stdout);
+}
+
+async function checkpointLocallyAsync(root, settings, options, reason) {
+  if (settings.enabled) {
+    const key = Buffer.from(String(settings.dataKey || ''), 'base64url');
+    if (key.length !== 32) throw new Error('Recovery key cache is missing');
+    const header = loadRecoveryHeader(root);
+    assertRuntimeFence(options);
+    writeRecoveryBackup(root, key, header, {
+      devicePreferences: deviceBackupPreferences(options.deviceSettings),
+    });
+    assertRuntimeFence(options);
+  }
+  await commitAllAsync(root, `scout: ${reason}`, options);
+}
+
 function deviceBackupPreferences(settings) {
   if (settings === undefined) return undefined;
   return settings ? {
@@ -270,67 +488,165 @@ function checkpointLocally(root, settings, options, reason) {
 }
 
 export async function runWorkspaceSync(root, reason = 'workspace update', options = {}) {
-  const settings = loadSyncSettings(root);
-  if (!repoReady(root, options)) return setState(root, 'disabled', { enabled: false });
-  ensureRepo(root, options);
-  untrackLegacyChats(root, options);
-  untrackLegacyManagedInstructions(root, options);
-  assertNoTrackedSecrets(root, options);
-  if (!settings.enabled) {
-    commitAll(root, `scout: ${reason}`, options);
-    return setState(root, 'disabled', { enabled: false, committed: true });
-  }
-  const key = Buffer.from(String(settings.dataKey || ''), 'base64url');
-  if (key.length !== 32) return setState(root, 'needs-attention', { enabled: true, error: 'Recovery key cache is missing' });
+  try {
+    const settings = loadSyncSettings(root);
+    if (!await repoReadyAsync(root, options)) return setState(root, 'disabled', { enabled: false });
+    await ensureRepoAsync(root, options);
+    await untrackLegacyChatsAsync(root, options);
+    await untrackLegacyManagedInstructionsAsync(root, options);
+    await assertNoTrackedSecretsAsync(root, options);
+    if (!settings.enabled) {
+      await commitAllAsync(root, `scout: ${reason}`, options);
+      return setState(root, 'disabled', { enabled: false, committed: true });
+    }
+    const key = Buffer.from(String(settings.dataKey || ''), 'base64url');
+    if (key.length !== 32) {
+      return setState(root, 'needs-attention', {
+        enabled: true,
+        error: 'Recovery key cache is missing',
+      });
+    }
 
-  setState(root, 'syncing', { enabled: true });
-  const fetch = runGit(root, ['fetch', 'origin'], options);
-  if (!fetch.ok) {
-    checkpointLocally(root, settings, options, reason);
-    return setState(root, 'offline', { enabled: true, pending: true, error: fetch.error });
-  }
-  const branchResult = runGit(root, ['branch', '--show-current'], options);
-  const branch = branchResult.stdout || 'master';
-  const upstream = `refs/remotes/origin/${branch}`;
-  if (!runGit(root, ['show-ref', '--verify', '--quiet', upstream], options).ok) {
-    checkpointLocally(root, settings, options, reason);
-    const pushInitial = runGit(root, ['push', '-u', 'origin', 'HEAD'], { ...options, allowPrompt: true });
-    return pushInitial.ok
-      ? setState(root, 'synced', { enabled: true, pending: false })
-      : setState(root, 'offline', { enabled: true, pending: true, error: pushInitial.error });
-  }
-  const counts = runGit(root, ['rev-list', '--left-right', '--count', `HEAD...${upstream}`], options);
-  if (!counts.ok) return setState(root, 'needs-attention', { enabled: true, error: counts.error });
-  const [ahead, behind] = counts.stdout.split(/\s+/).map(Number);
-  if (ahead > 0 && behind > 0) {
-    checkpointLocally(root, settings, options, reason);
-    return setState(root, 'needs-attention', { enabled: true, pending: true, conflict: true, ahead, behind, error: 'This device and GitHub both contain new changes' });
-  }
-  if (behind > 0) {
-    if (worktreeDirty(root, options)) {
-      checkpointLocally(root, settings, options, reason);
-      return setState(root, 'needs-attention', { enabled: true, pending: true, conflict: true, ahead: Math.max(1, ahead), behind, error: 'This device has unsynced work and GitHub contains newer changes' });
+    setState(root, 'syncing', { enabled: true });
+    const fetch = await runtimeGit(root, ['fetch', 'origin'], options, { mutation: true });
+    if (!fetch.ok) {
+      await checkpointLocallyAsync(root, settings, options, reason);
+      return setState(root, 'offline', {
+        enabled: true,
+        pending: true,
+        error: fetch.error,
+      });
     }
-    const ff = runGit(root, ['merge', '--ff-only', upstream], options);
-    if (!ff.ok) return setState(root, 'needs-attention', { enabled: true, conflict: true, error: ff.error });
-    try {
-      restoreRecoveryBackupWithKey(root, root, key);
-    } catch (error) {
-      return setState(root, 'needs-attention', { enabled: true, error: `Remote recovery data could not be applied: ${error.message}` });
+    const branchResult = await runtimeGit(root, ['branch', '--show-current'], options);
+    const branch = branchResult.stdout || 'master';
+    const upstream = `refs/remotes/origin/${branch}`;
+    const upstreamExists = await runtimeGit(
+      root,
+      ['show-ref', '--verify', '--quiet', upstream],
+      options,
+    );
+    if (!upstreamExists.ok) {
+      await checkpointLocallyAsync(root, settings, options, reason);
+      const pushInitial = await runtimeGit(
+        root,
+        ['push', '-u', 'origin', 'HEAD'],
+        { ...options, allowPrompt: true },
+        { mutation: true },
+      );
+      if (pushInitial.ok) {
+        assertRuntimeFence(options);
+        const synced = setState(root, 'synced', { enabled: true, pending: false });
+        assertRuntimeFence(options);
+        return synced;
+      }
+      return setState(root, 'offline', {
+        enabled: true,
+        pending: true,
+        error: pushInitial.error,
+      });
     }
+    const counts = await runtimeGit(
+      root,
+      ['rev-list', '--left-right', '--count', `HEAD...${upstream}`],
+      options,
+    );
+    if (!counts.ok) {
+      return setState(root, 'needs-attention', { enabled: true, error: counts.error });
+    }
+    const [ahead, behind] = counts.stdout.split(/\s+/).map(Number);
+    if (ahead > 0 && behind > 0) {
+      await checkpointLocallyAsync(root, settings, options, reason);
+      return setState(root, 'needs-attention', {
+        enabled: true,
+        pending: true,
+        conflict: true,
+        ahead,
+        behind,
+        error: 'This device and GitHub both contain new changes',
+      });
+    }
+    if (behind > 0) {
+      if (await worktreeDirtyAsync(root, options)) {
+        await checkpointLocallyAsync(root, settings, options, reason);
+        return setState(root, 'needs-attention', {
+          enabled: true,
+          pending: true,
+          conflict: true,
+          ahead: Math.max(1, ahead),
+          behind,
+          error: 'This device has unsynced work and GitHub contains newer changes',
+        });
+      }
+      const ff = await runtimeGit(
+        root,
+        ['merge', '--ff-only', upstream],
+        options,
+        { mutation: true },
+      );
+      if (!ff.ok) {
+        return setState(root, 'needs-attention', {
+          enabled: true,
+          conflict: true,
+          error: ff.error,
+        });
+      }
+      try {
+        assertRuntimeFence(options);
+        restoreRecoveryBackupWithKey(root, root, key);
+        assertRuntimeFence(options);
+      } catch (error) {
+        if (error?.[RUNTIME_FENCE_FAILURE]) throw error;
+        return setState(root, 'needs-attention', {
+          enabled: true,
+          error: `Remote recovery data could not be applied: ${error.message}`,
+        });
+      }
+    }
+    await checkpointLocallyAsync(root, settings, options, reason);
+    const after = await runtimeGit(
+      root,
+      ['rev-list', '--left-right', '--count', `HEAD...${upstream}`],
+      options,
+    );
+    if (!after.ok) {
+      return setState(root, 'needs-attention', { enabled: true, error: after.error });
+    }
+    const [aheadAfter] = after.stdout.split(/\s+/).map(Number);
+    if (aheadAfter > 0) {
+      const push = await runtimeGit(
+        root,
+        ['push', 'origin', 'HEAD'],
+        { ...options, allowPrompt: true },
+        { mutation: true },
+      );
+      if (!push.ok) {
+        return setState(root, 'offline', {
+          enabled: true,
+          pending: true,
+          error: push.error,
+        });
+      }
+    }
+    assertRuntimeFence(options);
+    const synced = setState(root, 'synced', {
+      enabled: true,
+      pending: false,
+      pulled: behind > 0,
+      ...(behind > 0 ? { pulledAt: new Date().toISOString() } : {}),
+    });
+    assertRuntimeFence(options);
+    return synced;
+  } catch (error) {
+    if (error?.[RUNTIME_FENCE_FAILURE]) throw error;
+    if (error instanceof RuntimeCommandTimeoutError) {
+      return setState(root, 'needs-attention', {
+        enabled: loadSyncSettings(root).enabled,
+        pending: true,
+        error: 'Private backup command timed out',
+      });
+    }
+    throw error;
   }
-  checkpointLocally(root, settings, options, reason);
-  const after = runGit(root, ['rev-list', '--left-right', '--count', `HEAD...${upstream}`], options);
-  if (!after.ok) return setState(root, 'needs-attention', { enabled: true, error: after.error });
-  const [aheadAfter] = after.stdout.split(/\s+/).map(Number);
-  if (aheadAfter > 0) {
-    const push = runGit(root, ['push', 'origin', 'HEAD'], { ...options, allowPrompt: true });
-    if (!push.ok) return setState(root, 'offline', { enabled: true, pending: true, error: push.error });
-  }
-  return setState(root, 'synced', {
-    enabled: true, pending: false, pulled: behind > 0,
-    ...(behind > 0 ? { pulledAt: new Date().toISOString() } : {}),
-  });
 }
 
 const QUEUES = new Map();

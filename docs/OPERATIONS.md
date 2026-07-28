@@ -29,13 +29,24 @@ The maintained beta deployment uses one private, single-owner Ubuntu VPS:
   original run identity.
 - Only successfully terminalised mutations and scans queue encrypted
   private-repository backup checkpoints. The scan keeps its fenced lease and
-  heartbeat through the receipt-gated checkpoint; each successfully drained
+  heartbeat through the receipt-gated checkpoint. Runtime Git commands are
+  asynchronous, time-bounded, and fence-checked around every mutation so the
+  heartbeat remains live and a stale owner cannot start another mutation.
+  Offline backup is retained as `succeeded-pending`; reconciliation requiring
+  attention is retained as `succeeded-partial`. Both remain successful scan
+  outcomes for exact scheduled-window coverage. Each successfully drained
   queued run owns its own checkpoint. A queued contender, stale, lease-lost,
   receipted-backup-pending, or failed preflight scan has no unfenced backup
   authority.
 - A successful direct scheduled run durably covers only queued overlaps for
   the same schedule job, logical window, purpose, and execution fingerprint.
   Other windows and jobs remain queued.
+- Query-bearing source URLs may exist only in the live in-memory discovery
+  path used for liveness and deduplication. Stage artifacts, scan-input
+  bundles, scan history, tracker entries, and reports retain HTTP(S)
+  origin/path only. Semantic scan artifacts preserve bounded ordered clauses
+  and operators, redact credential-shaped values as a whole fact, and retain
+  a fact for every non-empty description clause.
 - Normal tracked career files remain readable only inside the private repository; ignored sensitive recovery state is encrypted under `.scout-backup/v1`.
 
 Do not assume a developer computer's local application checkout or workspace is live. Diagnose the VPS for production-like bugs unless the user explicitly reports a local-only installation.

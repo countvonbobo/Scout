@@ -37,6 +37,10 @@ const DURABLE_DISCOVERY_STAGES = Object.freeze([
 ]);
 const SAFE_ARTIFACT_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 const SHA256_DIGEST = /^[a-f0-9]{64}$/;
+const BOUNDED_REASON = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
+const SUCCESSFUL_QUEUE_OUTCOMES = new Set([
+  'succeeded', 'succeeded-pending', 'succeeded-partial',
+]);
 
 export class PipelineInterruptedError extends Error {
   constructor(message = 'scan pipeline was interrupted after a durable stage') {
@@ -64,6 +68,11 @@ function stageFunctions(stages) {
     execute,
     encode: execute?.artifactCodec?.encode ?? ((value) => encodePipelineStageValue(stageId, value)),
     decode: execute?.artifactCodec?.decode ?? decodeRankedStageValue,
+    transient: execute?.artifactCodec?.transient ?? ((executed) => (
+      stageId === 'collect'
+        ? encodePipelineStageValue(stageId, executed, null, { durableUrls: false })
+        : executed
+    )),
   }]));
   for (const stageId of DURABLE_DISCOVERY_STAGES) {
     if (typeof functions.get(stageId)?.execute !== 'function') {
@@ -152,21 +161,50 @@ function resultWithOutputs(result, outputs) {
 }
 
 function finalizationOutcome(value) {
-  const envelope = value?.schemaVersion === 1
+  const envelopeIntent = value?.schemaVersion === 1
+    && Object.getPrototypeOf(value) === Object.prototype
+    && Object.hasOwn(value, 'mutationReceipt');
+  const envelope = envelopeIntent
     && Object.getPrototypeOf(value) === Object.prototype
     && Object.keys(value).sort().join(',') === 'mutationReceipt,result,schemaVersion'
     ? value
     : null;
-  if (!envelope) return { result: value, mutationReceipt: null };
+  if (!envelope) {
+    return {
+      result: envelopeIntent && Object.hasOwn(value, 'result') ? value.result : value,
+      mutationReceipt: null,
+      receiptIssue: envelopeIntent ? 'mutation-receipt-invalid' : 'mutation-receipt-missing',
+    };
+  }
   const receipt = envelope.mutationReceipt;
   if (!receipt || Object.getPrototypeOf(receipt) !== Object.prototype
     || Object.keys(receipt).sort().join(',') !== 'digest,id,schemaVersion'
     || receipt.schemaVersion !== 1
     || !SAFE_ARTIFACT_ID.test(receipt.id || '')
     || !SHA256_DIGEST.test(receipt.digest || '')) {
-    throw new TypeError('scan finalizer mutation receipt is invalid');
+    return {
+      result: envelope.result,
+      mutationReceipt: null,
+      receiptIssue: 'mutation-receipt-invalid',
+    };
   }
-  return { result: envelope.result, mutationReceipt: Object.freeze({ ...receipt }) };
+  return {
+    result: envelope.result,
+    mutationReceipt: Object.freeze({ ...receipt }),
+    receiptIssue: null,
+  };
+}
+
+function postSuccessOutcome(value) {
+  if (value === undefined) return { status: 'complete' };
+  if (!value || Object.getPrototypeOf(value) !== Object.prototype) {
+    throw new TypeError('scan post-success result is invalid');
+  }
+  if (value.status === 'complete' && Object.keys(value).join(',') === 'status') return value;
+  if (['pending', 'partial'].includes(value.status)
+    && Object.keys(value).sort().join(',') === 'reason,status'
+    && BOUNDED_REASON.test(value.reason || '')) return value;
+  throw new TypeError('scan post-success result is invalid');
 }
 
 async function drainScanQueue(root, queue, compatibility, leaseOptions, initialLease = null) {
@@ -219,8 +257,8 @@ async function drainScanQueue(root, queue, compatibility, leaseOptions, initialL
       let queueFailure = null;
       try {
         const value = await queue.run(request, { runId: lease.runId, lease });
-        requestedOutcome = value === 'complete' || value === 'succeeded' ? 'succeeded'
-          : value === 'skipped' ? 'skipped' : 'failed';
+        requestedOutcome = value === 'complete' ? 'succeeded'
+          : SUCCESSFUL_QUEUE_OUTCOMES.has(value) || value === 'skipped' ? value : 'failed';
       } catch (error) {
         queueFailure = error;
         // A failed queued scan is a durable terminal result for that request;
@@ -231,8 +269,8 @@ async function drainScanQueue(root, queue, compatibility, leaseOptions, initialL
       const terminalCompatible = typeof queue.verify !== 'function'
         || await queue.verify(request, { lease, phase: 'terminal', manifest: terminalManifest });
       const outcome = !terminalCompatible ? 'stale'
-        : runOutcome === 'complete' && requestedOutcome === 'succeeded'
-        ? 'succeeded'
+        : runOutcome === 'complete' && SUCCESSFUL_QUEUE_OUTCOMES.has(requestedOutcome)
+        ? requestedOutcome
         : runOutcome === 'abandoned' && requestedOutcome === 'skipped'
           ? 'skipped'
           : 'failed';
@@ -450,6 +488,7 @@ export async function runScanPipeline({
   const failures = [];
   const outputs = new Map();
   let mutationReceipt = null;
+  let receiptIssue = 'mutation-receipt-missing';
   try {
     const mayRecoverClaimedRun = !ownsLease && openRunJournal(root, provisionalRunId).events.length > 0;
     const candidates = ownsLease || mayRecoverClaimedRun
@@ -492,14 +531,15 @@ export async function runScanPipeline({
       }
       const executed = plainStageData(await stage.execute({ run, lease, priorArtifact }), stageId);
       const persisted = plainStageData(stage.encode(executed), stageId);
-      const value = plainStageData(stage.decode(persisted), stageId);
+      const durableValue = plainStageData(stage.decode(persisted), stageId);
+      const value = plainStageData(stage.transient(executed, durableValue), stageId);
       const artifact = commitRunArtifact(run, {
         id: `${stageId}-g${lease.generation}`,
         schemaVersion: PIPELINE_STAGE_ARTIFACT_SCHEMA_VERSION,
       }, {
         schemaVersion: PIPELINE_STAGE_ARTIFACT_SCHEMA_VERSION,
         stageId,
-        stableIds: stableIdsFor(stageId, value),
+        stableIds: stableIdsFor(stageId, durableValue),
         data: persisted,
       }, lease);
       appendRunEvent(run, {
@@ -509,7 +549,7 @@ export async function runScanPipeline({
         payload: {
           schemaVersion: 1,
           reference: { kind: 'stage', id: stageId },
-          count: stableIdsFor(stageId, value).length,
+          count: stableIdsFor(stageId, durableValue).length,
           artifact,
         },
       }, lease);
@@ -527,6 +567,7 @@ export async function runScanPipeline({
       }));
       outputs.set('finalize', finalized.result);
       mutationReceipt = finalized.mutationReceipt;
+      receiptIssue = finalized.receiptIssue;
       if (mutationReceipt) {
         appendRunEvent(run, {
           type: 'mutation.receipted',
@@ -566,11 +607,20 @@ export async function runScanPipeline({
         failures.push(Object.freeze({
           code: 'backup-pending',
           stage: 'post-success',
-          reason: 'mutation-receipt-missing',
+          reason: receiptIssue,
         }));
       } else {
         try {
-          await postTerminalSuccess({ run, lease, manifest, mutationReceipt });
+          const postSuccess = postSuccessOutcome(
+            await postTerminalSuccess({ run, lease, manifest, mutationReceipt }),
+          );
+          if (postSuccess.status !== 'complete') {
+            failures.push(Object.freeze({
+              code: postSuccess.status === 'partial' ? 'backup-partial' : 'backup-pending',
+              stage: 'post-success',
+              reason: postSuccess.reason,
+            }));
+          }
         } catch {
           failures.push(Object.freeze({
             code: 'backup-pending',
@@ -905,7 +955,8 @@ function privacySafeStageUrl(value) {
 function encodeRankedStageValue(value) {
   if (Array.isArray(value)) return value.map(encodeRankedStageValue);
   if (!value || typeof value !== 'object') {
-    return typeof value === 'string' ? value.slice(0, 4_096) : value;
+    if (typeof value !== 'string') return value;
+    return privacySafeStageUrl(value) ?? value.slice(0, 4_096);
   }
   const encoded = {};
   for (const [key, item] of Object.entries(value)) {
@@ -919,6 +970,10 @@ function encodeRankedStageValue(value) {
   return encoded;
 }
 
+export function durableScanProjection(value) {
+  return encodeRankedStageValue(value);
+}
+
 function semanticText(value) {
   return String(value || '').normalize('NFKD').replace(/[\u0300-\u036f]/g, '')
     .toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
@@ -926,14 +981,26 @@ function semanticText(value) {
 
 const SEMANTIC_FACT_STOPWORDS = new Set([
   'a', 'an', 'and', 'are', 'be', 'for', 'from', 'in', 'is', 'must', 'mandatory',
-  'non', 'negotiable', 'of', 'on', 'or', 'required', 'requirement', 'requirements',
+  'negotiable', 'of', 'on', 'or', 'required', 'requirement', 'requirements',
   'role', 'the', 'this', 'to', 'with', 'you', 'your',
   'advert', 'authorization', 'bearer', 'credential', 'credentials', 'jwt', 'key',
   'legacy', 'password', 'private', 'secret', 'session', 'signature', 'token',
 ]);
-const RESPONSIBILITY_LANGUAGE = /\b(?:analyse|analyze|build|coordinate|create|deliver|design|develop|implement|improve|lead|maintain|manage|operate|own|support|work)\b/i;
+const CREDENTIAL_ASSIGNMENT = /\b(?:api[-_]?key|api[-_]?token|authorization|cookie|credential|jwt|password|secret|session|token)\b\s*[:=]\s*\S+/i;
+const AUTHORIZATION_VALUE = /\b(?:authorization\s*:?\s*)?(?:basic|bearer)\s+[a-z0-9._~+/=-]+/i;
+const JWT_VALUE = /\beyj[a-z0-9_-]*\.[a-z0-9_-]+\.[a-z0-9_-]+\b/i;
+const URL_USERINFO_VALUE = /https?:\/\/[^/\s:@]+:[^/\s@]+@/i;
+
+function credentialShapedSemanticText(value) {
+  const text = String(value || '');
+  return CREDENTIAL_ASSIGNMENT.test(text)
+    || AUTHORIZATION_VALUE.test(text)
+    || JWT_VALUE.test(text)
+    || URL_USERINFO_VALUE.test(text);
+}
 
 function semanticFact(value) {
+  if (credentialShapedSemanticText(value)) return 'sensitive requirement redacted';
   const tokens = semanticText(value).split(' ')
     .filter((token) => token && !SEMANTIC_FACT_STOPWORDS.has(token))
     .slice(0, 16);
@@ -943,7 +1010,7 @@ function semanticFact(value) {
 function responsibilityFacts(description) {
   return [...new Set(String(description || '').split(/(?:\r?\n|[.;]\s+)/)
     .map((sentence) => sentence.trim())
-    .filter((sentence) => sentence && RESPONSIBILITY_LANGUAGE.test(sentence))
+    .filter(Boolean)
     .map(semanticFact)
     .filter(Boolean))].slice(0, 6);
 }
@@ -962,7 +1029,7 @@ function digestText(value) {
   return createHash('sha256').update(String(value || '')).digest('hex');
 }
 
-function semanticObservation(job, sourceName, source, profile) {
+function semanticObservation(job, sourceName, source, profile, { durableUrls = true } = {}) {
   const observation = normaliseObservation(job, {
     sourceName: job?.source || sourceName,
     fetchedAt: source?.fetchedAt || source?.generatedAt || null,
@@ -994,8 +1061,8 @@ function semanticObservation(job, sourceName, source, profile) {
   void omittedDescription;
   return {
     ...safeObservation,
-    sourceUrl: privacySafeStageUrl(sourceUrl),
-    canonicalUrl: privacySafeStageUrl(canonicalUrl),
+    sourceUrl: durableUrls ? privacySafeStageUrl(sourceUrl) : sourceUrl,
+    canonicalUrl: durableUrls ? privacySafeStageUrl(canonicalUrl) : canonicalUrl,
     jobIdentity: {
       company: identity.company,
       title: identity.title,
@@ -1014,9 +1081,11 @@ function semanticObservation(job, sourceName, source, profile) {
   };
 }
 
-function semanticCollectedSource(source, sourceName, profile) {
+function semanticCollectedSource(source, sourceName, profile, options = {}) {
   const jobs = Array.isArray(source?.jobs) ? source.jobs : [];
-  const observations = jobs.map((job) => semanticObservation(job, sourceName, source, profile)).filter(Boolean);
+  const observations = jobs
+    .map((job) => semanticObservation(job, sourceName, source, profile, options))
+    .filter(Boolean);
   const status = ['healthy', 'degraded', 'unavailable'].includes(source?.status) ? source.status : 'unavailable';
   return {
     configured: Boolean(source?.configured),
@@ -1028,7 +1097,7 @@ function semanticCollectedSource(source, sourceName, profile) {
   };
 }
 
-function legacySemanticJob(job, sourceName) {
+function legacySemanticJob(job, sourceName, { durableUrls = true } = {}) {
   const candidate = normaliseJob(job);
   if (!candidate) return null;
   const description = String(job?.description || '');
@@ -1036,7 +1105,7 @@ function legacySemanticJob(job, sourceName) {
   return {
     company: candidate.company,
     title: candidate.role,
-    url: privacySafeStageUrl(candidate.url),
+    url: durableUrls ? privacySafeStageUrl(candidate.url) : candidate.url,
     location: candidate.location,
     salary: candidate.salary,
     workingType: candidate.workingType,
@@ -1045,7 +1114,7 @@ function legacySemanticJob(job, sourceName) {
     providerId: candidate.providerId,
     sourceReferences: candidate.sourceReferences.map((reference) => ({
       ...reference,
-      url: privacySafeStageUrl(reference.url),
+      url: durableUrls ? privacySafeStageUrl(reference.url) : reference.url,
     })),
     semanticEvidence: {
       descriptionPresent: Boolean(description.trim()),
@@ -1064,9 +1133,9 @@ function legacySemanticJob(job, sourceName) {
   };
 }
 
-function legacySemanticCollectedSource(source, sourceName) {
+function legacySemanticCollectedSource(source, sourceName, options = {}) {
   const jobs = Array.isArray(source?.jobs) ? source.jobs : [];
-  const semanticJobs = jobs.map((job) => legacySemanticJob(job, sourceName)).filter(Boolean);
+  const semanticJobs = jobs.map((job) => legacySemanticJob(job, sourceName, options)).filter(Boolean);
   return {
     configured: Boolean(source?.configured),
     status: ['healthy', 'degraded', 'unavailable'].includes(source?.status) ? source.status : 'unavailable',
@@ -1077,7 +1146,7 @@ function legacySemanticCollectedSource(source, sourceName) {
   };
 }
 
-function encodePipelineStageValue(stageId, value, profile = null) {
+function encodePipelineStageValue(stageId, value, profile = null, { durableUrls = true } = {}) {
   if (stageId !== 'collect') return encodeRankedStageValue(value);
   return {
     generatedAt: String(value?.generatedAt || '').slice(0, 80) || null,
@@ -1088,7 +1157,9 @@ function encodePipelineStageValue(stageId, value, profile = null) {
       .slice(0, 128)
       .map(([source, result]) => [
         String(source).slice(0, 80),
-        profile ? semanticCollectedSource(result, source, profile) : legacySemanticCollectedSource(result, source),
+        profile
+          ? semanticCollectedSource(result, source, profile, { durableUrls })
+          : legacySemanticCollectedSource(result, source, { durableUrls }),
       ])),
   };
 }
@@ -1122,6 +1193,11 @@ function withRankedArtifactCodec(stageId, execute, profile = null) {
         return encodePipelineStageValue(stageId, value, profile);
       },
       decode: decodeRankedStageValue,
+      transient(value) {
+        return stageId === 'collect'
+          ? encodePipelineStageValue(stageId, value, profile, { durableUrls: false })
+          : value;
+      },
     }),
   });
   return execute;
@@ -1579,7 +1655,9 @@ export function writeScanArtifacts(root, {
     ...exclusions.map((item) => boundedExplanation(item, { assessmentStatus: 'not-selected', deterministicExclusion: item.code || item.exclusionCode })),
   ].slice(0, 180);
   const selection_summary = reconciledFunnel ? { selected: Number(reconciledFunnel.selected || 0), assessed: Number(reconciledFunnel.assessed || 0), assessmentFailed: Number(reconciledFunnel.assessmentFailed || 0) } : null;
-  const run = {
+  const durableTracker = durableScanProjection(merged.tracker);
+  const durableReviewed = durableScanProjection(merged.reviewed);
+  const run = durableScanProjection({
     schemaVersion: 4, timestamp, started_at: startedAt, agent: provider, mode, degraded, skipped,
     sources_checked: Object.entries(health).filter(([, item]) => item.configured !== false).map(([name]) => name),
     queries_checked: [...queries], candidates_found: candidates.length, keepers_added: merged.keepersAdded,
@@ -1604,7 +1682,7 @@ export function writeScanArtifacts(root, {
     ...(selection.length ? { selection } : {}),
     ...(explanations.length ? { explanations } : {}),
     reviewed: merged.reviewed, errors, source_health: health,
-  };
+  });
   const earlierRuns = fs.existsSync(paths.scanRuns)
     ? fs.readFileSync(paths.scanRuns, 'utf8').split(/\r?\n/).filter(Boolean).map((line) => {
       try { return JSON.parse(line); } catch { return null; }
@@ -1616,9 +1694,9 @@ export function writeScanArtifacts(root, {
     date,
     degraded: dayRuns.some((item) => item.degraded),
     source_health: health,
-    kept: merged.tracker.opportunities,
+    kept: durableTracker.opportunities,
     discarded: merged.discarded,
-    reviewed: merged.reviewed,
+    reviewed: durableReviewed,
     errors: dayErrors,
   });
   const runLines = dayRuns.map((item) => {
@@ -1626,10 +1704,10 @@ export function writeScanArtifacts(root, {
     return `- **${item.agent} ${item.mode}** at ${String(item.timestamp || '').slice(11, 16) || 'unknown time'} UTC - ${item.skipped ? 'skipped because another scan was running' : item.degraded ? 'degraded' : 'healthy'}; ${item.candidates_found || 0} candidate(s), ${item.keepers_added || 0} added, ${item.keepers_updated || 0} updated; ${sourcesSummary}.`;
   }).join('\n');
   const report = baseReport.replace('## Action today', `## Scan runs\n\n${runLines}\n\n## Action today`);
-  if (!error) atomicWrite(paths.tracker, serializeTracker(merged.tracker));
+  if (!error) atomicWrite(paths.tracker, serializeTracker(durableTracker));
   atomicWrite(path.join(paths.reports, `${date}.md`), report);
   fs.mkdirSync(path.dirname(paths.scanRuns), { recursive: true });
   fs.appendFileSync(paths.scanRuns, `${JSON.stringify(run)}\n`, 'utf8');
   validateWrittenScanArtifacts(root, run);
-  return { run, tracker: merged.tracker, report: path.join(paths.reports, `${date}.md`) };
+  return { run, tracker: durableTracker, report: path.join(paths.reports, `${date}.md`) };
 }
