@@ -10,12 +10,15 @@ import {
 } from './scanLease.mjs';
 
 export const RUN_ARTIFACT_SCHEMA_VERSION = 1;
+export const PIPELINE_STAGE_ARTIFACT_SCHEMA_VERSION = 2;
 export const RUN_MANIFEST_SCHEMA_VERSION = 3;
 
-const MAX_ARTIFACT_BYTES = 16 * 1024;
+const MAX_LEGACY_ARTIFACT_BYTES = 16 * 1024;
+const MAX_PIPELINE_ARTIFACT_BYTES = 16 * 1024 * 1024;
 const MAX_STABLE_IDS = 128;
 const SAFE_TOKEN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 const SHA256 = /^[a-f0-9]{64}$/;
+const PRIVATE_PIPELINE_KEYS = /^(?:access[-_]?token|advert[-_]?body|api[-_]?(?:key|token)|auth(?:orization)?|body|cookies?|credentials?|cv|description|headers?|html|master[-_]?cv|password|payload|profile[-_]?evidence|prompt|raw[-_]?(?:html|response)|requirements?|response|secret(?:[-_]?(?:key|token))?|token|transcript)$/i;
 
 export class ArtifactIntegrityError extends Error {
   constructor(message) {
@@ -58,19 +61,62 @@ function requireRunDirectory(value, ErrorType = TypeError) {
   return path.resolve(value);
 }
 
+function validatePipelineData(value, ErrorType, seen = new Set()) {
+  if (value === null || typeof value === 'boolean' || typeof value === 'string') return;
+  if (typeof value === 'number') {
+    if (!Number.isFinite(value)) throw new ErrorType('pipeline artifact values must be finite JSON values');
+    return;
+  }
+  if (!value || typeof value !== 'object' || seen.has(value)) {
+    throw new ErrorType('pipeline artifact data must be acyclic JSON');
+  }
+  seen.add(value);
+  if (Array.isArray(value)) {
+    for (const item of value) validatePipelineData(item, ErrorType, seen);
+  } else {
+    if (Object.getPrototypeOf(value) !== Object.prototype) {
+      throw new ErrorType('pipeline artifact data must use plain JSON objects');
+    }
+    for (const [key, item] of Object.entries(value)) {
+      if (PRIVATE_PIPELINE_KEYS.test(key)) {
+        throw new ErrorType(`private pipeline artifact property is not allowed: ${key}`);
+      }
+      validatePipelineData(item, ErrorType, seen);
+    }
+  }
+  seen.delete(value);
+}
+
 function validateArtifactValue(descriptor, value, ErrorType = TypeError) {
-  if (descriptor.schemaVersion !== RUN_ARTIFACT_SCHEMA_VERSION) throw new ErrorType(`unsupported artifact schema version: ${descriptor.schemaVersion}`);
   if (!value || typeof value !== 'object' || Array.isArray(value) || Object.getPrototypeOf(value) !== Object.prototype) {
     throw new ErrorType('artifact value must be an object');
   }
   const keys = Object.keys(value).sort();
-  if (keys.join(',') !== 'schemaVersion,stableIds' || value.schemaVersion !== RUN_ARTIFACT_SCHEMA_VERSION
-    || !Array.isArray(value.stableIds) || value.stableIds.length > MAX_STABLE_IDS) {
-    throw new ErrorType('artifact value is not supported by schema version 1');
+  if (descriptor.schemaVersion === RUN_ARTIFACT_SCHEMA_VERSION) {
+    if (keys.join(',') !== 'schemaVersion,stableIds' || value.schemaVersion !== RUN_ARTIFACT_SCHEMA_VERSION) {
+      throw new ErrorType('artifact value is not supported by schema version 1');
+    }
+  } else if (descriptor.schemaVersion === PIPELINE_STAGE_ARTIFACT_SCHEMA_VERSION) {
+    if (keys.join(',') !== 'data,schemaVersion,stableIds,stageId'
+      || value.schemaVersion !== PIPELINE_STAGE_ARTIFACT_SCHEMA_VERSION) {
+      throw new ErrorType('artifact value is not supported by schema version 2');
+    }
+    requireSafeToken(value.stageId, 'artifact stage ID', ErrorType);
+    validatePipelineData(value.data, ErrorType);
+  } else {
+    throw new ErrorType(`unsupported artifact schema version: ${descriptor.schemaVersion}`);
+  }
+  if (!Array.isArray(value.stableIds) || value.stableIds.length > MAX_STABLE_IDS) {
+    throw new ErrorType(`artifact value is not supported by schema version ${descriptor.schemaVersion}`);
   }
   for (const id of value.stableIds) requireSafeToken(id, 'artifact stable ID', ErrorType);
   const encoded = stableJson(value);
-  if (Buffer.byteLength(encoded, 'utf8') > MAX_ARTIFACT_BYTES) throw new ErrorType('artifact exceeds the 16 KiB limit');
+  const maximum = descriptor.schemaVersion === RUN_ARTIFACT_SCHEMA_VERSION
+    ? MAX_LEGACY_ARTIFACT_BYTES
+    : MAX_PIPELINE_ARTIFACT_BYTES;
+  if (Buffer.byteLength(encoded, 'utf8') > maximum) {
+    throw new ErrorType(`artifact exceeds the ${maximum === MAX_LEGACY_ARTIFACT_BYTES ? '16 KiB' : '16 MiB'} limit`);
+  }
   return encoded;
 }
 
@@ -117,7 +163,9 @@ function validateReference(ref, ErrorType = ArtifactIntegrityError) {
   if (!ref || typeof ref !== 'object' || Array.isArray(ref)) throw new ErrorType('artifact reference is invalid');
   const descriptor = validateDescriptor({ id: ref.id, schemaVersion: ref.schemaVersion }, ErrorType);
   if (typeof ref.digest !== 'string' || !SHA256.test(ref.digest)) throw new ErrorType('artifact reference digest is invalid');
-  if (descriptor.schemaVersion !== RUN_ARTIFACT_SCHEMA_VERSION) throw new ErrorType(`unsupported artifact schema version: ${descriptor.schemaVersion}`);
+  if (![RUN_ARTIFACT_SCHEMA_VERSION, PIPELINE_STAGE_ARTIFACT_SCHEMA_VERSION].includes(descriptor.schemaVersion)) {
+    throw new ErrorType(`unsupported artifact schema version: ${descriptor.schemaVersion}`);
+  }
   return descriptor;
 }
 

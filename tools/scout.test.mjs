@@ -8,6 +8,8 @@ import {
 } from './scout.mjs';
 import { DEFAULT_WORKSPACE_CONFIG, writeWorkspaceConfig } from '../ui/lib/workspace.mjs';
 import { publishSearchProfile } from '../ui/lib/searchProfile.mjs';
+import { replayRunJournal } from '../ui/lib/runJournal.mjs';
+import { projectScanQueue } from '../ui/lib/scanQueue.mjs';
 
 function scanRoot() {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'scout-runtime-scan-'));
@@ -244,7 +246,7 @@ test('runtime scan filters from the published profile before provider assessment
     runStructuredTurnFn: async () => { providerCalls += 1; throw new Error('excluded vacancy must not be assessed'); },
     acquireLockFn: () => ({ ok: true, lock: { token: 'filter-test' } }), releaseLockFn: () => ({ ok: true }),
   });
-  assert.equal(result.ok, true);
+  assert.equal(result.ok, true, result.error);
   assert.equal(result.scan.candidates_found, 0);
   assert.equal(result.scan.discarded.hard_exclusion, 1);
   assert.equal(providerCalls, 0);
@@ -288,7 +290,7 @@ test('runtime ranks every unique job but does not pad assessment with zero-score
     ...scanHarness({ ats: { configured: true, status: 'healthy', count: jobs.length, jobs } }, () => candidates),
     checkLivenessFn: async (items) => { candidates = items; return { live: items, removed: [], summary: { checked: items.length, gone: 0, unverified: 0 } }; },
   });
-  assert.equal(result.ok, true);
+  assert.equal(result.ok, true, result.error);
   assert.equal(result.scan.funnel.uniqueVacancies, 2500);
   assert.equal(result.scan.funnel.ranked, result.scan.funnel.eligible);
   assert.equal(result.scan.funnel.selected, 1);
@@ -469,7 +471,115 @@ test('runtime scan records provider failure truthfully and always releases its l
   assert.equal(result.scan.degraded, true);
   assert.deepEqual(result.scan.errors, ['bounded provider failed']);
   assert.equal(released, true);
+  const events = replayRunJournal(path.join(root, '.scout', 'runs', result.runId, 'journal.jsonl'));
+  assert.equal(events.at(-1).type, 'run.completed');
+  assert.equal(events.at(-1).payload.outcome, 'failed');
+  assert.equal(fs.existsSync(path.join(root, '.scout', 'scan-lease.json')), false);
   assert.match(fs.readFileSync(path.join(root, 'data', 'scan-runs.jsonl'), 'utf8'), /bounded provider failed/);
+});
+
+test('runtime records a canonical failure when collection fails before finalization', async () => {
+  const root = scanRoot();
+  try {
+    const result = await runScanWith(root, 'codex', 'primary', {
+      providerStatusFn: authenticated,
+      collectSourcesFn: async () => {
+        throw new Error('synthetic collection failure');
+      },
+    });
+
+    assert.equal(result.ok, false);
+    assert.equal(result.status, 'failed');
+    assert.equal(result.scan.errors[0], 'synthetic collection failure');
+    const events = replayRunJournal(path.join(root, '.scout', 'runs', result.runId, 'journal.jsonl'));
+    assert.equal(events.at(-1).type, 'run.completed');
+    assert.equal(events.at(-1).payload.outcome, 'failed');
+    assert.equal(fs.existsSync(path.join(root, '.scout', 'scan-lease.json')), false);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('runtime allocates and journals a genuine durable run before source collection', async () => {
+  const root = scanRoot();
+  let observedRunId = null;
+  const result = await runScanWith(root, 'codex', 'primary', {
+    providerStatusFn: authenticated,
+    collectSourcesFn: async () => {
+      const lease = JSON.parse(fs.readFileSync(path.join(root, '.scout', 'scan-lease.json'), 'utf8'));
+      observedRunId = lease.runId;
+      const journal = path.join(root, '.scout', 'runs', observedRunId, 'journal.jsonl');
+      assert.equal(replayRunJournal(journal).at(-1).type, 'run.started');
+      return {
+        generatedAt: '2026-07-27T10:00:00.000Z',
+        queries: ['synthetic engineer'],
+        sources: { hiring_cafe: { configured: true, status: 'healthy', count: 0, jobs: [] } },
+      };
+    },
+  });
+
+  assert.equal(result.ok, true);
+  assert.equal(result.runId, observedRunId);
+  assert.equal(result.durable.outcome, 'complete');
+  assert.deepEqual(
+    result.durable.manifest.completedWork.map((work) => work.stageId),
+    ['collect', 'normalise', 'deduplicate', 'filter', 'rank', 'select'],
+  );
+  assert.equal(fs.existsSync(path.join(root, '.scout', 'scan-lease.json')), false);
+});
+
+test('a real scheduled overlap keeps scheduled queue semantics and executes after terminal release', async () => {
+  const root = scanRoot();
+  let collectionCalls = 0;
+  let overlap;
+  const options = {
+    requester: 'scheduled',
+    windowAt: new Date(Date.now() + 10 * 60 * 60 * 1000).toISOString(),
+    providerStatusFn: authenticated,
+    collectSourcesFn: async () => {
+      collectionCalls += 1;
+      if (collectionCalls === 1) {
+        overlap = await runScanWith(root, 'codex', 'primary', options);
+      }
+      return {
+        generatedAt: '2026-07-28T09:00:00.000Z',
+        queries: [],
+        sources: { hiring_cafe: { configured: true, status: 'healthy', count: 0, jobs: [] } },
+      };
+    },
+    runStructuredTurnFn: async () => {
+      throw new Error('empty queued scans must not call the provider');
+    },
+    checkLivenessFn: async (candidates) => ({
+      live: candidates,
+      removed: [],
+      summary: { checked: candidates.length, gone: 0, unverified: 0 },
+    }),
+  };
+
+  try {
+    const primary = await runScanWith(root, 'codex', 'primary', options);
+
+    assert.equal(overlap.status, 'queued');
+    assert.equal(primary.ok, true);
+    assert.equal(collectionCalls, 2);
+    const queued = projectScanQueue(root).requests[0];
+    assert.equal(queued.status, 'succeeded');
+    assert.equal(queued.requester, 'scheduled');
+    assert.equal(
+      Date.parse(queued.expiresAt),
+      Math.min(Date.parse(queued.requestedAt) + 12 * 60 * 60 * 1000, Date.parse(queued.windowAt)),
+    );
+    const runs = fs.readdirSync(path.join(root, '.scout', 'runs'));
+    assert.equal(runs.length, 2);
+    for (const runId of runs) {
+      const events = replayRunJournal(path.join(root, '.scout', 'runs', runId, 'journal.jsonl'));
+      assert.equal(events[0].type, 'run.started');
+      assert.equal(events.at(-1).type, 'run.completed');
+    }
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test('runtime scan preserves an evidence-rich profile larger than the former per-file limit', async () => {

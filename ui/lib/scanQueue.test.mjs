@@ -3,10 +3,12 @@ import { createHash } from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { spawn } from 'node:child_process';
 import { test } from 'node:test';
-import { acquireScanLease, currentLeaseOwner, releaseScanLease } from './scanLease.mjs';
+import { acquireScanLease, currentLeaseOwner, readScanLease, releaseScanLease } from './scanLease.mjs';
 import {
-  claimNextScanRequest, completeScanRequest, enqueueScanRequest, projectScanQueue, recoverOrphanedScanRequest,
+  claimNextScanRequest, completeScanRequest, enqueueOverlappingScanRequest, enqueueScanRequest,
+  projectScanQueue, recoverOrphanedScanRequest,
 } from './scanQueue.mjs';
 
 function workspace() {
@@ -43,6 +45,103 @@ function stableJson(value) {
 }
 
 function digest(value) { return createHash('sha256').update(stableJson(value)).digest('hex'); }
+
+test('an overlap enqueue requires the same still-active observed scan and is idempotent after a lost response', () => {
+  const root = workspace();
+  const activeLease = lease(root, 'active-overlap');
+  const { lease: ignored, ...overlap } = request({ id: 'overlap-request', lease: activeLease });
+  let observed;
+  void ignored;
+  try {
+    const current = readScanLease(root);
+    observed = {
+      leaseId: current.leaseId,
+      generation: current.generation,
+      runId: current.runId,
+      operation: current.operation,
+    };
+    assert.equal(enqueueOverlappingScanRequest(root, { ...overlap, observedLease: observed }).status, 'enqueued');
+    assert.equal(enqueueOverlappingScanRequest(root, { ...overlap, observedLease: observed }).status, 'existing');
+    assert.deepEqual(projectScanQueue(root).requests.map((item) => [item.id, item.status]), [
+      ['overlap-request', 'queued'],
+    ]);
+  } finally {
+    releaseScanLease(activeLease);
+  }
+
+  assert.equal(enqueueOverlappingScanRequest(root, {
+    ...overlap,
+    id: 'too-late',
+    key: 'too-late',
+    observedLease: {
+      leaseId: activeLease.leaseId,
+      generation: activeLease.generation,
+      runId: activeLease.runId,
+      operation: observed.operation,
+    },
+  }).status, 'not-active');
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+test('competing processes serialize overlap enqueues through the workspace guard', async () => {
+  const root = workspace();
+  const activeLease = lease(root, 'active-process-overlap');
+  const current = readScanLease(root);
+  const observedLease = {
+    leaseId: current.leaseId,
+    generation: current.generation,
+    runId: current.runId,
+    operation: current.operation,
+  };
+  const moduleUrl = new URL('./scanQueue.mjs', import.meta.url).href;
+  const contender = `
+    import { enqueueOverlappingScanRequest } from ${JSON.stringify(moduleUrl)};
+    const result = enqueueOverlappingScanRequest(
+      process.env.SCOUT_QUEUE_ROOT,
+      JSON.parse(process.env.SCOUT_QUEUE_REQUEST)
+    );
+    process.stdout.write(result.status);
+  `;
+  try {
+    const statuses = await Promise.all(Array.from({ length: 4 }, (_, index) => new Promise((resolve, reject) => {
+      const { lease: ignored, ...base } = request({
+        id: `process-overlap-${index}`,
+        key: `process-overlap-${index}`,
+        lease: activeLease,
+      });
+      void ignored;
+      const child = spawn(process.execPath, ['--input-type=module', '--eval', contender], {
+        env: {
+          ...process.env,
+          SCOUT_QUEUE_ROOT: root,
+          SCOUT_QUEUE_REQUEST: JSON.stringify({ ...base, observedLease }),
+        },
+        stdio: ['ignore', 'pipe', 'pipe'],
+        windowsHide: true,
+      });
+      let stdout = '';
+      let stderr = '';
+      child.stdout.setEncoding('utf8');
+      child.stderr.setEncoding('utf8');
+      child.stdout.on('data', (chunk) => { stdout += chunk; });
+      child.stderr.on('data', (chunk) => { stderr += chunk; });
+      child.once('error', reject);
+      child.once('close', (code) => {
+        if (code === 0) resolve(stdout);
+        else reject(new Error(`overlap contender failed (${code}): ${stderr}`));
+      });
+    })));
+
+    assert.deepEqual(statuses, ['enqueued', 'enqueued', 'enqueued', 'enqueued']);
+    assert.deepEqual(
+      projectScanQueue(root).requests.map((item) => item.id).sort(),
+      ['process-overlap-0', 'process-overlap-1', 'process-overlap-2', 'process-overlap-3'],
+    );
+  } finally {
+    releaseScanLease(activeLease);
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
 
 test('manual requests retain FIFO order and expire exactly 24 hours after request time', () => {
   const root = workspace();
@@ -338,6 +437,34 @@ test('replays a version-one journal and preserves queued work when version-two e
     assert.deepEqual(projectScanQueue(root).ready.map((item) => item.id), ['legacy-queued']);
     enqueueScanRequest(root, request({ id: 'version-two-queued', key: 'next-key', lease: activeLease }));
     assert.deepEqual(projectScanQueue(root).ready.map((item) => item.id), ['legacy-queued', 'version-two-queued']);
+  } finally {
+    releaseScanLease(activeLease);
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('version-one replay rejects schema-three execution metadata', () => {
+  const root = workspace();
+  const activeLease = lease(root, 'v1-execution-rejection');
+  try {
+    const { lease: ignored, ...legacyRequest } = request({ id: 'v1-hostile-execution', lease: activeLease });
+    void ignored;
+    legacyRequest.execution = {
+      schemaVersion: 1,
+      provider: 'codex',
+      mode: 'primary',
+      model: null,
+    };
+    const file = path.join(root, '.scout', 'scan-queue.jsonl');
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, `${JSON.stringify({
+      schemaVersion: 1,
+      eventId: '11111111-1111-4111-8111-111111111111',
+      type: 'enqueue',
+      at: '2026-07-27T08:00:00.000Z',
+      request: legacyRequest,
+    })}\n`, 'utf8');
+    assert.throws(() => projectScanQueue(root), /legacy.*execution|unsupported execution/i);
   } finally {
     releaseScanLease(activeLease);
     fs.rmSync(root, { recursive: true, force: true });

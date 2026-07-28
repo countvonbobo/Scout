@@ -59,11 +59,72 @@ test('commits a bounded versioned artifact and reads it only when its digest mat
   assert.throws(() => readRunArtifact({ ...run, ...ref, digest: '0'.repeat(64) }), ArtifactIntegrityError);
 });
 
+test('commits a bounded stage-data artifact without accepting provider or credential transcripts', () => {
+  const run = openRunJournal(temp(), 'run-1');
+  const value = {
+    schemaVersion: 2,
+    stageId: 'select',
+    stableIds: ['vacancy-1'],
+    data: { selected: [{ vacancyId: 'vacancy-1', title: 'Synthetic role' }] },
+  };
+  const ref = commitRunArtifact(run, { id: 'select-v1', schemaVersion: 2 }, value, lease);
+
+  assert.deepEqual(readRunArtifact(ref), value);
+  for (const privateData of [
+    { prompt: 'private provider request' },
+    { rawResponse: 'private provider response' },
+    { credentials: { token: 'private credential' } },
+    { profileEvidence: 'private CV evidence' },
+    { advertBody: 'full private advert content' },
+    { accessToken: 'private provider token' },
+    { authorization: 'private provider authorization' },
+    { masterCv: 'private CV content' },
+    { description: 'full private advert content' },
+    { requirements: 'full private requirements content' },
+    { rawHtml: '<html>private advert</html>' },
+    { body: 'private response body' },
+    { cookies: ['private session'] },
+    { headers: { value: 'private request headers' } },
+    { payload: 'private provider payload' },
+    { response: 'private provider response' },
+  ]) {
+    assert.throws(
+      () => commitRunArtifact(run, { id: `select-private-${Object.keys(privateData)[0]}`, schemaVersion: 2 }, {
+        schemaVersion: 2, stageId: 'select', stableIds: [], data: privateData,
+      }, lease),
+      /private pipeline artifact property/i,
+    );
+  }
+});
+
+test('the larger pipeline bound does not loosen the legacy artifact schema', () => {
+  const run = openRunJournal(temp(), 'run-1');
+  const legacyIds = Array.from({ length: 128 }, (_, index) => (
+    `vacancy-${String(index).padStart(3, '0')}-${'x'.repeat(116)}`
+  ));
+
+  assert.throws(
+    () => commitRunArtifact(run, { id: 'legacy-oversized', schemaVersion: 1 }, {
+      schemaVersion: 1,
+      stableIds: legacyIds,
+    }, lease),
+    /16 KiB limit/i,
+  );
+  const pipelineValue = {
+    schemaVersion: 2,
+    stageId: 'collect',
+    stableIds: ['vacancy-1'],
+    data: { boundedData: 'x'.repeat(20 * 1024) },
+  };
+  const ref = commitRunArtifact(run, { id: 'pipeline-larger', schemaVersion: 2 }, pipelineValue, lease);
+  assert.deepEqual(readRunArtifact(ref), pipelineValue);
+});
+
 test('rejects artifacts whose schema is not supported before writing them', () => {
   const run = openRunJournal(temp(), 'run-1');
 
   assert.throws(
-    () => commitRunArtifact(run, { id: 'collect-v1', schemaVersion: 2 }, { schemaVersion: 2, stableIds: [] }, lease),
+    () => commitRunArtifact(run, { id: 'collect-v1', schemaVersion: 3 }, { schemaVersion: 3, stableIds: [] }, lease),
     /unsupported artifact schema/i,
   );
   assert.equal(fs.existsSync(path.join(run.directory, 'artifacts')), false);

@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { atomicWriteFile } from './atomicWrite.mjs';
@@ -13,10 +14,484 @@ import { filterVacancies } from './vacancyFilter.mjs';
 import { normaliseObservation } from './vacancyObservation.mjs';
 import { rankVacancies } from './vacancyRank.mjs';
 import { selectVacancies } from './vacancySelect.mjs';
+import {
+  PIPELINE_STAGE_ARTIFACT_SCHEMA_VERSION, commitRunArtifact, projectRunManifest,
+  readRunArtifact, validateManifestAgreement,
+} from './runArtifacts.mjs';
+import { appendRunEvent, openRunJournal } from './runJournal.mjs';
+import { recoverRun, selectRecoverableRun } from './runRecovery.mjs';
+import {
+  LeaseLostError, acquireScanLease, assertScanLeaseScope, currentLeaseOwner, isScanLease,
+  readScanLease, releaseScanLease, startLeaseHeartbeat,
+} from './scanLease.mjs';
+import {
+  claimNextScanRequest, completeOrphanedScanRequest, completeScanRequest,
+  enqueueOverlappingScanRequest, projectScanQueue, recoverOrphanedScanRequest,
+} from './scanQueue.mjs';
 export { filterVacancies } from './vacancyFilter.mjs';
 
 const EMPTY_DISCARDED = Object.freeze({ hard_exclusion: 0, mandatory_unmet: 0, below_threshold: 0, provider_discarded: 0 });
 const REVIEW_REASON_LIMIT = 3;
+const DURABLE_DISCOVERY_STAGES = Object.freeze([
+  'collect', 'normalise', 'deduplicate', 'filter', 'rank', 'select',
+]);
+const SAFE_ARTIFACT_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
+
+export class PipelineInterruptedError extends Error {
+  constructor(message = 'scan pipeline was interrupted after a durable stage') {
+    super(message);
+    this.name = 'PipelineInterruptedError';
+  }
+}
+
+function pipelineOperation(runId, compatibility, phase) {
+  return {
+    kind: 'scan',
+    runId,
+    provider: compatibility.provider,
+    model: compatibility.model,
+    mode: compatibility.mode,
+    phase,
+  };
+}
+
+function stageFunctions(stages) {
+  const entries = Array.isArray(stages)
+    ? stages.map((stage) => [stage?.id, stage?.execute ?? stage?.run])
+    : Object.entries(stages || {});
+  const functions = new Map(entries.map(([stageId, execute]) => [stageId, {
+    execute,
+    encode: execute?.artifactCodec?.encode ?? ((value) => encodePipelineStageValue(stageId, value)),
+    decode: execute?.artifactCodec?.decode ?? decodeRankedStageValue,
+  }]));
+  for (const stageId of DURABLE_DISCOVERY_STAGES) {
+    if (typeof functions.get(stageId)?.execute !== 'function') {
+      throw new TypeError(`scan pipeline stage is required: ${stageId}`);
+    }
+  }
+  if (functions.size !== DURABLE_DISCOVERY_STAGES.length
+    || [...functions.keys()].some((stageId) => !DURABLE_DISCOVERY_STAGES.includes(stageId))) {
+    throw new TypeError('scan pipeline stages have an unsupported schema');
+  }
+  return functions;
+}
+
+function pipelineRunCandidates(root, requestedRunId) {
+  const directory = workspacePaths(root).runs;
+  if (!fs.existsSync(directory)) return [];
+  const names = requestedRunId ? [requestedRunId] : fs.readdirSync(directory);
+  const candidates = [];
+  for (const runId of names) {
+    try {
+      const stat = fs.statSync(path.join(directory, runId));
+      if (!stat.isDirectory()) continue;
+      const run = openRunJournal(root, runId);
+      if (!run.events.length) continue;
+      const manifest = projectRunManifest(run.events);
+      candidates.push({
+        runId,
+        updatedAt: run.events.at(-1).recordedAt,
+        outcome: manifest.outcome,
+        compatibility: manifest.compatibility,
+        completedWork: manifest.completedWork,
+      });
+    } catch {
+      // Recovery selection records supported-but-incompatible candidates. A
+      // journal that cannot even be validated is handled by the dedicated
+      // recovery diagnostics rather than guessed at here.
+    }
+  }
+  return candidates;
+}
+
+function plainStageData(value, stageId) {
+  if (value === undefined) throw new TypeError(`scan pipeline stage returned no artifact: ${stageId}`);
+  let encoded;
+  try {
+    encoded = JSON.stringify(value);
+  } catch (error) {
+    throw new TypeError(`scan pipeline stage artifact is not JSON: ${stageId}`, { cause: error });
+  }
+  if (encoded === undefined) throw new TypeError(`scan pipeline stage artifact is not JSON: ${stageId}`);
+  return JSON.parse(encoded);
+}
+
+function stableIdsFor(stageId, value) {
+  const supplied = Array.isArray(value?.stableIds) ? value.stableIds : [];
+  const ids = [...new Set(supplied.map(String).filter((id) => SAFE_ARTIFACT_ID.test(id)))].slice(0, 128);
+  return ids.length ? ids : [`${stageId}-output`];
+}
+
+function recoveredStageData(stage, codec) {
+  const value = readRunArtifact(stage.artifact);
+  if (value.schemaVersion !== PIPELINE_STAGE_ARTIFACT_SCHEMA_VERSION || value.stageId !== stage.stageId) {
+    throw new Error(`recovered pipeline artifact does not match stage: ${stage.stageId}`);
+  }
+  return plainStageData(codec.decode(value.data), stage.stageId);
+}
+
+function resultWithOutputs(result, outputs) {
+  Object.defineProperty(result, 'stageOutputs', {
+    value: Object.freeze(Object.fromEntries(outputs)),
+    enumerable: false,
+  });
+  return Object.freeze(result);
+}
+
+async function drainScanQueue(root, queue, compatibility, leaseOptions) {
+  if (!queue) return [];
+  if (typeof queue.run !== 'function') throw new TypeError('scan queue drain callback is required');
+  const drained = [];
+  for (let index = 0; index < 128; index += 1) {
+    const runId = randomUUID();
+    const lease = acquireScanLease(
+      root,
+      currentLeaseOwner(),
+      pipelineOperation(runId, compatibility, 'queue-drain'),
+      leaseOptions,
+    );
+    if (!lease) break;
+    let safeToRelease = false;
+    try {
+      reconcileOrphanedQueueClaim(root, lease);
+      const queueCompatibility = typeof queue.compatibility === 'function'
+        ? await queue.compatibility()
+        : queue.compatibility;
+      const currentCompatibility = {
+        ...queueCompatibility,
+        purpose: compatibility.purpose,
+      };
+      const request = claimNextScanRequest(root, currentCompatibility, lease, queue.now ?? new Date());
+      if (!request) {
+        safeToRelease = true;
+        break;
+      }
+      let requestedOutcome = 'failed';
+      try {
+        const value = await queue.run(request, { runId, lease });
+        requestedOutcome = value === 'complete' || value === 'succeeded' ? 'succeeded'
+          : value === 'skipped' ? 'skipped' : 'failed';
+      } catch {
+        // A failed queued scan is a durable terminal result for that request;
+        // it must not prevent the next compatible request from draining.
+      }
+      const runOutcome = ensureQueuedRunTerminal(root, lease, compatibility, request);
+      const outcome = runOutcome === 'complete' && requestedOutcome === 'succeeded'
+        ? 'succeeded'
+        : runOutcome === 'abandoned' && requestedOutcome === 'skipped'
+          ? 'skipped'
+          : 'failed';
+      completeScanRequest(root, request.id, outcome, lease, request.claim);
+      safeToRelease = true;
+      drained.push(Object.freeze({ requestId: request.id, outcome }));
+    } finally {
+      if (safeToRelease) {
+        try { releaseScanLease(lease); } catch { /* a successor fence owns cleanup */ }
+      }
+    }
+  }
+  return drained;
+}
+
+function terminalRunOutcome(root, runId) {
+  const run = openRunJournal(root, runId);
+  if (!run.events.length) return null;
+  const manifest = projectRunManifest(run.events);
+  return manifest.outcome === 'in-progress' ? null : manifest.outcome;
+}
+
+function reconcileOrphanedQueueClaim(root, lease) {
+  const orphan = projectScanQueue(root).requests.find((request) => request.status === 'claimed');
+  if (!orphan) return null;
+  let outcome = null;
+  try {
+    outcome = terminalRunOutcome(root, orphan.claim.runId);
+  } catch {
+    // A damaged/incomplete run cannot authorize queue completion. Requeue the
+    // request under the successor fence so a new journalled attempt can run.
+  }
+  if (outcome) {
+    const queueOutcome = outcome === 'complete' ? 'succeeded'
+      : outcome === 'abandoned' ? 'skipped' : 'failed';
+    return completeOrphanedScanRequest(root, orphan.id, queueOutcome, orphan.claim, lease);
+  }
+  return recoverOrphanedScanRequest(root, orphan.id, orphan.claim, lease);
+}
+
+function ensureQueuedRunTerminal(root, lease, compatibility, request) {
+  const existingOutcome = terminalRunOutcome(root, lease.runId);
+  if (existingOutcome) return existingOutcome;
+  const run = openRunJournal(root, lease.runId);
+  if (!run.events.length) {
+    const execution = request.execution || null;
+    appendRunEvent(run, {
+      type: 'run.started',
+      stageId: 'initialise',
+      idempotencyKey: 'queued-run-started-v1',
+      payload: {
+        schemaVersion: 1,
+        compatibility: {
+          ...compatibility,
+          provider: execution?.provider || compatibility.provider,
+          model: execution ? (execution.model || 'provider-default') : compatibility.model,
+          mode: execution?.mode || compatibility.mode,
+        },
+      },
+    }, lease);
+  }
+  appendRunEvent(run, {
+    type: 'run.completed',
+    stageId: 'finalise',
+    idempotencyKey: `queued-run-failed-g${lease.generation}`,
+    payload: { schemaVersion: 1, outcome: 'failed' },
+  }, lease);
+  return validateManifestAgreement(run, lease).manifest.outcome;
+}
+
+/**
+ * Execute the deterministic discovery boundary under a durable fenced run.
+ *
+ * Stage callbacks receive the current journal handle, genuine lease and the
+ * preceding stage's recovered-or-new artifact data. The enumerable result is
+ * deliberately limited to the public run contract; `stageOutputs` is a
+ * non-enumerable local execution aid for the legacy scan adapter.
+ */
+export async function runScanPipeline({
+  root,
+  compatibility,
+  stages,
+  runId: requestedRunId = null,
+  leaseOptions = {},
+  heartbeatOptions = {},
+  onStageCommitted = () => {},
+  finalize = null,
+  recordFailure = null,
+  queue = null,
+  claimedLease = null,
+} = {}) {
+  if (!root) throw new TypeError('scan pipeline workspace root is required');
+  if (recordFailure !== null && typeof recordFailure !== 'function') {
+    throw new TypeError('scan pipeline failure recorder must be a function');
+  }
+  const functions = stageFunctions(stages);
+  const ownsLease = claimedLease === null;
+  const provisionalRunId = claimedLease?.runId || requestedRunId || randomUUID();
+  if (claimedLease !== null) {
+    if (!isScanLease(claimedLease)) throw new TypeError('claimed queue lease must be a genuine scan lease');
+    assertScanLeaseScope(claimedLease, root, provisionalRunId);
+  }
+  let lease = claimedLease || acquireScanLease(
+      root,
+      currentLeaseOwner(),
+      pipelineOperation(provisionalRunId, compatibility, 'recovery-selection'),
+      leaseOptions,
+    );
+  let durableQueueSubmission = false;
+  for (let attempt = 0; !lease && queue?.request && attempt < 8; attempt += 1) {
+    const observed = readScanLease(root);
+    if (observed) {
+      const queued = enqueueOverlappingScanRequest(root, {
+        ...queue.request,
+        observedLease: {
+          leaseId: observed.leaseId,
+          generation: observed.generation,
+          runId: observed.runId,
+          operation: observed.operation,
+        },
+      }, leaseOptions);
+      if (queued.status !== 'not-active') {
+        durableQueueSubmission = true;
+        break;
+      }
+    }
+    lease = acquireScanLease(
+      root,
+      currentLeaseOwner(),
+      pipelineOperation(provisionalRunId, compatibility, 'recovery-selection'),
+      leaseOptions,
+    );
+  }
+  if (!lease) {
+    return resultWithOutputs({
+      runId: provisionalRunId,
+      outcome: durableQueueSubmission ? 'queued' : 'failed',
+      manifest: null,
+      failures: Object.freeze([{
+        code: durableQueueSubmission ? 'lease-busy' : 'queue-submit-raced',
+        stage: 'initialise',
+      }]),
+    }, new Map());
+  }
+
+  let run;
+  let recovery = null;
+  let manifest = null;
+  let terminal = false;
+  let released = false;
+  let retainInterruptedLease = false;
+  let heartbeat = null;
+  const failures = [];
+  const outputs = new Map();
+  try {
+    const candidates = ownsLease ? pipelineRunCandidates(root, requestedRunId) : [];
+    const selection = ownsLease
+      ? selectRecoverableRun(candidates, compatibility, { root, lease })
+      : { candidate: null };
+    if (ownsLease && selection.candidate) {
+      releaseScanLease(lease);
+      released = true;
+      lease = acquireScanLease(
+        root,
+        currentLeaseOwner(),
+        pipelineOperation(selection.candidate.runId, compatibility, 'recover'),
+        leaseOptions,
+      );
+      released = false;
+      if (!lease) {
+        return resultWithOutputs({
+          runId: selection.candidate.runId,
+          outcome: 'queued',
+          manifest: null,
+          failures: Object.freeze([{ code: 'lease-busy', stage: 'recover' }]),
+        }, outputs);
+      }
+      recovery = recoverRun(root, selection.candidate.runId, lease, selection.decision);
+      run = openRunJournal(root, recovery.runId);
+      manifest = recovery.manifest;
+    } else {
+      run = openRunJournal(root, provisionalRunId);
+      appendRunEvent(run, {
+        type: 'run.started',
+        stageId: 'initialise',
+        idempotencyKey: 'run-started-v1',
+        payload: { schemaVersion: 1, compatibility },
+      }, lease);
+      manifest = validateManifestAgreement(run, lease).manifest;
+    }
+    heartbeat = startLeaseHeartbeat(lease, heartbeatOptions);
+
+    const reusable = new Map((recovery?.reusableStages || []).map((stage) => [stage.stageId, stage]));
+    let priorArtifact = null;
+    for (const stageId of DURABLE_DISCOVERY_STAGES) {
+      const stage = functions.get(stageId);
+      if (reusable.has(stageId)) {
+        priorArtifact = recoveredStageData(reusable.get(stageId), stage);
+        outputs.set(stageId, priorArtifact);
+        continue;
+      }
+      const executed = plainStageData(await stage.execute({ run, lease, priorArtifact }), stageId);
+      const persisted = plainStageData(stage.encode(executed), stageId);
+      const value = plainStageData(stage.decode(persisted), stageId);
+      const artifact = commitRunArtifact(run, {
+        id: `${stageId}-g${lease.generation}`,
+        schemaVersion: PIPELINE_STAGE_ARTIFACT_SCHEMA_VERSION,
+      }, {
+        schemaVersion: PIPELINE_STAGE_ARTIFACT_SCHEMA_VERSION,
+        stageId,
+        stableIds: stableIdsFor(stageId, value),
+        data: persisted,
+      }, lease);
+      appendRunEvent(run, {
+        type: 'stage.completed',
+        stageId,
+        idempotencyKey: `${stageId}-completed-g${lease.generation}`,
+        payload: {
+          schemaVersion: 1,
+          reference: { kind: 'stage', id: stageId },
+          count: stableIdsFor(stageId, value).length,
+          artifact,
+        },
+      }, lease);
+      manifest = validateManifestAgreement(run, lease).manifest;
+      priorArtifact = value;
+      outputs.set(stageId, value);
+      await onStageCommitted({ stageId, run, lease, artifact, manifest });
+    }
+    if (finalize !== null) {
+      if (typeof finalize !== 'function') throw new TypeError('scan pipeline finalizer must be a function');
+      outputs.set('finalize', await finalize({
+        run,
+        lease,
+        stageOutputs: Object.freeze(Object.fromEntries(outputs)),
+      }));
+    }
+
+    appendRunEvent(run, {
+      type: 'run.completed',
+      stageId: 'finalise',
+      idempotencyKey: `run-completed-g${lease.generation}`,
+      payload: { schemaVersion: 1, outcome: 'complete' },
+    }, lease);
+    manifest = validateManifestAgreement(run, lease).manifest;
+    terminal = true;
+  } catch (error) {
+    if (error instanceof PipelineInterruptedError) {
+      retainInterruptedLease = true;
+      throw error;
+    }
+    if (error instanceof LeaseLostError) {
+      failures.push(Object.freeze({ code: 'lease-lost', stage: outputs.size ? DURABLE_DISCOVERY_STAGES[outputs.size] ?? 'finalise' : 'initialise' }));
+      manifest = run ? projectRunManifest(run.events) : null;
+      return resultWithOutputs({
+        runId: run?.runId ?? provisionalRunId,
+        outcome: 'lease-lost',
+        manifest,
+        failures: Object.freeze(failures),
+      }, outputs);
+    }
+    const failedStage = DURABLE_DISCOVERY_STAGES[outputs.size] ?? 'finalise';
+    failures.push(Object.freeze({
+      code: 'stage-failed',
+      stage: failedStage,
+      message: boundedText(error?.message, 220),
+    }));
+    if (run) {
+      try {
+        if (recordFailure !== null) {
+          try {
+            await recordFailure({
+              error,
+              failedStage,
+              run,
+              lease,
+              stageOutputs: Object.freeze(Object.fromEntries(outputs)),
+            });
+          } catch (recordError) {
+            if (recordError instanceof LeaseLostError) throw recordError;
+            failures.push(Object.freeze({
+              code: 'failure-record-failed',
+              stage: failedStage,
+              message: boundedText(recordError?.message, 220),
+            }));
+          }
+        }
+        appendRunEvent(run, {
+          type: 'run.completed',
+          stageId: 'finalise',
+          idempotencyKey: `run-failed-g${lease.generation}`,
+          payload: { schemaVersion: 1, outcome: 'failed' },
+        }, lease);
+        manifest = validateManifestAgreement(run, lease).manifest;
+        terminal = true;
+      } catch (commitError) {
+        if (!(commitError instanceof LeaseLostError)) throw commitError;
+      }
+    }
+  } finally {
+    heartbeat?.stop();
+    if (ownsLease && !released && !retainInterruptedLease) {
+      try { releaseScanLease(lease); released = true; } catch { /* lease loss is already reflected above */ }
+    }
+  }
+
+  if (terminal && ownsLease) await drainScanQueue(root, queue, compatibility, leaseOptions);
+  return resultWithOutputs({
+    runId: run?.runId ?? provisionalRunId,
+    outcome: manifest?.outcome ?? 'failed',
+    manifest,
+    failures: Object.freeze(failures),
+  }, outputs);
+}
 
 function boundedText(value, maximum = 220) {
   return String(value || '').replace(/[\r\n\t]+/g, ' ').replace(/\s{2,}/g, ' ').trim().slice(0, maximum);
@@ -217,6 +692,233 @@ export function prepareRankedDiscovery({
     selection,
     funnel,
     candidates: assessmentCandidatesForSelection(selection.selected),
+  };
+}
+
+const RANKED_STAGE_ARTIFACT_FIELDS = Object.freeze({
+  collect: Object.freeze(['generatedAt', 'queries', 'sources']),
+  normalise: Object.freeze(['generatedAt', 'initialFunnel', 'observations', 'queries']),
+  deduplicate: Object.freeze(['duplicateObservations', 'initialFunnel', 'normalisedCount', 'vacancies']),
+  filter: Object.freeze(['duplicateObservations', 'eligible', 'exclusions', 'initialFunnel', 'normalisedCount', 'uniqueVacancies']),
+  rank: Object.freeze(['duplicateObservations', 'exclusions', 'initialFunnel', 'normalisedCount', 'ranked', 'uniqueVacancies']),
+  select: Object.freeze(['candidates', 'exclusions', 'funnel', 'ranked', 'selection']),
+});
+const OMIT_PRIVATE_STAGE_KEY = /^(?:access[-_]?token|advert[-_]?body|api[-_]?(?:key|token)|auth(?:orization)?|body|cookies?|credentials?|cv|headers?|html|master[-_]?cv|password|payload|profile[-_]?evidence|prompt|raw[-_]?(?:html|response)|response|secret(?:[-_]?(?:key|token))?|token|transcript)$/i;
+const URL_STAGE_KEY = /(?:^url$|url$)/i;
+const PRIVATE_QUERY_PARAMETER = /^(?:utm_.+|gclid|fbclid|mc_.+|access[-_]?token|api[-_]?key|auth(?:orization)?|signature|token)$/i;
+
+function privacySafeStageUrl(value) {
+  try {
+    const parsed = new URL(String(value || ''));
+    if (!['http:', 'https:'].includes(parsed.protocol)) return null;
+    for (const key of [...parsed.searchParams.keys()]) {
+      if (PRIVATE_QUERY_PARAMETER.test(key)) parsed.searchParams.delete(key);
+    }
+    parsed.hash = '';
+    parsed.searchParams.sort();
+    return parsed.toString().replace(/\/$/, '').slice(0, 2_048);
+  } catch {
+    return null;
+  }
+}
+
+function encodeRankedStageValue(value) {
+  if (Array.isArray(value)) return value.map(encodeRankedStageValue);
+  if (!value || typeof value !== 'object') {
+    return typeof value === 'string' ? value.slice(0, 4_096) : value;
+  }
+  const encoded = {};
+  for (const [key, item] of Object.entries(value)) {
+    if (OMIT_PRIVATE_STAGE_KEY.test(key)) continue;
+    if (key === 'description') {
+      encoded.advertExcerpt = String(item || '').slice(0, 1_200);
+      continue;
+    }
+    if (key === 'requirements') {
+      encoded.requirementExcerpt = String(item || '').slice(0, 600);
+      continue;
+    }
+    if (URL_STAGE_KEY.test(key) && typeof item === 'string') {
+      encoded[key] = privacySafeStageUrl(item);
+      continue;
+    }
+    encoded[key] = encodeRankedStageValue(item);
+  }
+  return encoded;
+}
+
+const COLLECTED_JOB_FIELDS = Object.freeze([
+  'company', 'compensationRateType', 'description', 'employer', 'employmentType',
+  'laneId', 'location', 'portal', 'postedAt', 'postedDate', 'providerId', 'rateType',
+  'requirements', 'salary', 'salaryCurrency', 'salaryMax', 'salaryMin',
+  'salaryPeriod', 'salaryRateType', 'seniority', 'source', 'sourceRecordId',
+  'sourceUrl', 'tags', 'title', 'url', 'workingPattern', 'workingType',
+]);
+const COLLECTED_SOURCE_FIELDS = Object.freeze([
+  'available', 'configured', 'count', 'errors', 'failedRecords', 'fetchedAt',
+  'generatedAt', 'jobs', 'laneId', 'note', 'portalsChecked', 'reason', 'status',
+]);
+
+function encodeCollectedJob(job) {
+  const selected = {};
+  for (const key of COLLECTED_JOB_FIELDS) {
+    if (!Object.hasOwn(job || {}, key)) continue;
+    if (key === 'portal') {
+      selected.portal = {
+        name: String(job.portal?.name || '').slice(0, 200),
+        ats: String(job.portal?.ats || '').slice(0, 80),
+      };
+    } else {
+      selected[key] = job[key];
+    }
+  }
+  return encodeRankedStageValue(selected);
+}
+
+function encodeCollectedSource(source) {
+  const selected = {};
+  for (const key of COLLECTED_SOURCE_FIELDS) {
+    if (!Object.hasOwn(source || {}, key)) continue;
+    selected[key] = key === 'jobs'
+      ? (Array.isArray(source.jobs) ? source.jobs.map(encodeCollectedJob) : [])
+      : encodeRankedStageValue(source[key]);
+  }
+  return selected;
+}
+
+function encodePipelineStageValue(stageId, value) {
+  if (stageId !== 'collect') return encodeRankedStageValue(value);
+  return {
+    generatedAt: String(value?.generatedAt || '').slice(0, 80) || null,
+    queries: (Array.isArray(value?.queries) ? value.queries : [])
+      .slice(0, 128)
+      .map((query) => String(query || '').slice(0, 300)),
+    sources: Object.fromEntries(Object.entries(value?.sources || {})
+      .sort(([left], [right]) => compareText(left, right))
+      .slice(0, 128)
+      .map(([source, result]) => [String(source).slice(0, 80), encodeCollectedSource(result)])),
+  };
+}
+
+function decodeRankedStageValue(value) {
+  if (Array.isArray(value)) return value.map(decodeRankedStageValue);
+  if (!value || typeof value !== 'object') return value;
+  const decoded = {};
+  for (const [key, item] of Object.entries(value)) {
+    if (key === 'advertExcerpt') {
+      decoded.description = String(item || '');
+    } else if (key === 'requirementExcerpt') {
+      decoded.requirements = String(item || '');
+    } else {
+      decoded[key] = decodeRankedStageValue(item);
+    }
+  }
+  return decoded;
+}
+
+function withRankedArtifactCodec(stageId, execute) {
+  const fields = RANKED_STAGE_ARTIFACT_FIELDS[stageId];
+  Object.defineProperty(execute, 'artifactCodec', {
+    enumerable: false,
+    value: Object.freeze({
+      encode(value) {
+        const actual = Object.keys(value || {}).sort();
+        if (actual.join(',') !== fields.join(',')) {
+          throw new TypeError(`ranked ${stageId} stage returned an unsupported artifact schema`);
+        }
+        return encodePipelineStageValue(stageId, value);
+      },
+      decode: decodeRankedStageValue,
+    }),
+  });
+  return execute;
+}
+
+export function createRankedDiscoveryStages({
+  collect,
+  profile,
+  tracker = { opportunities: [] },
+  limit = DEFAULT_CANDIDATE_LIMIT,
+  relevanceThreshold,
+} = {}) {
+  if (typeof collect !== 'function') throw new TypeError('ranked discovery collection stage is required');
+  if (!profile || profile.status !== 'published') throw new Error('ranked discovery requires a published search profile');
+  return {
+    collect: withRankedArtifactCodec('collect', collect),
+    normalise: withRankedArtifactCodec('normalise', function normaliseStage({ priorArtifact }) {
+      const input = observationInputs(priorArtifact?.sources);
+      return {
+        generatedAt: priorArtifact?.generatedAt || null,
+        queries: priorArtifact?.queries || [],
+        observations: input.observations,
+        initialFunnel: createDiscoveryFunnel(input.funnelSources),
+      };
+    }),
+    deduplicate: withRankedArtifactCodec('deduplicate', function deduplicateStage({ priorArtifact }) {
+      const canonical = canonicaliseObservations(priorArtifact.observations);
+      return {
+        initialFunnel: priorArtifact.initialFunnel,
+        normalisedCount: priorArtifact.observations.length,
+        vacancies: canonical.vacancies.map(assessmentVacancy),
+        duplicateObservations: canonical.duplicateObservations,
+      };
+    }),
+    filter: withRankedArtifactCodec('filter', function filterStage({ priorArtifact }) {
+      const filtered = filterVacancies(priorArtifact.vacancies, profile);
+      const vacancyById = new Map(priorArtifact.vacancies.map((vacancy) => [
+        String(vacancy.vacancyId || vacancy.canonicalUrl),
+        vacancy,
+      ]));
+      return {
+        initialFunnel: priorArtifact.initialFunnel,
+        normalisedCount: priorArtifact.normalisedCount,
+        duplicateObservations: priorArtifact.duplicateObservations,
+        uniqueVacancies: priorArtifact.vacancies.length,
+        eligible: filtered.eligible,
+        exclusions: filtered.excluded.map((item) => {
+          const vacancy = vacancyById.get(String(item.vacancyId));
+          return { ...item, source: vacancy?.source || '', url: vacancy?.url || vacancy?.canonicalUrl || '' };
+        }),
+      };
+    }),
+    rank: withRankedArtifactCodec('rank', function rankStage({ priorArtifact }) {
+      return {
+        initialFunnel: priorArtifact.initialFunnel,
+        normalisedCount: priorArtifact.normalisedCount,
+        duplicateObservations: priorArtifact.duplicateObservations,
+        uniqueVacancies: priorArtifact.uniqueVacancies,
+        exclusions: priorArtifact.exclusions,
+        ranked: rankVacancies(priorArtifact.eligible, profile, tracker?.opportunities || []),
+      };
+    }),
+    select: withRankedArtifactCodec('select', function selectStage({ run, priorArtifact }) {
+      const configuredThreshold = Number(relevanceThreshold ?? profile?.selection?.relevanceThreshold ?? 1);
+      const threshold = Number.isFinite(configuredThreshold) ? Math.max(Number.EPSILON, configuredThreshold) : 1;
+      const selection = selectVacancies(priorArtifact.ranked, {
+        limit,
+        threshold,
+        exploration: Number(profile?.selection?.exploration || 0),
+        seed: run.runId,
+      });
+      const funnel = assertDiscoveryFunnel(advanceDiscoveryFunnel(priorArtifact.initialFunnel, 'selection', {
+        parsed: priorArtifact.initialFunnel.sourceRecords,
+        normalised: priorArtifact.normalisedCount,
+        duplicateObservations: priorArtifact.duplicateObservations,
+        uniqueVacancies: priorArtifact.uniqueVacancies,
+        deterministicallyExcluded: new Set(priorArtifact.exclusions.map((item) => String(item.vacancyId))).size,
+        eligible: priorArtifact.ranked.length,
+        ranked: priorArtifact.ranked.length,
+        aboveThreshold: priorArtifact.ranked.length - selection.belowCutoff.length,
+        selected: selection.selected.length,
+      }));
+      return {
+        exclusions: priorArtifact.exclusions,
+        ranked: priorArtifact.ranked,
+        selection,
+        funnel,
+        candidates: assessmentCandidatesForSelection(selection.selected),
+      };
+    }),
   };
 }
 

@@ -1186,6 +1186,57 @@ export function assertCurrentFence(lease, commit) {
   }
 }
 
+/**
+ * Serialize a request-submission append through the lease workspace guard
+ * without granting the contender ownership of the active scan fence.
+ *
+ * This deliberately exposes only a synchronous callback after the exact lease
+ * and operation observed by the contender have been revalidated. It is for
+ * durable overlap submission only; run, claim, completion and mutation writes
+ * must continue to use assertCurrentFence().
+ */
+export function withObservedActiveScanLease(root, observed, commit, inputOptions = {}) {
+  if (!observed || typeof observed !== 'object' || Array.isArray(observed)
+    || Object.keys(observed).sort().join(',') !== 'generation,leaseId,operation,runId'
+    || !Number.isSafeInteger(observed.generation) || observed.generation < 1
+    || typeof observed.leaseId !== 'string' || !SAFE_TOKEN.test(observed.leaseId)
+    || typeof observed.runId !== 'string' || !SAFE_RUN_ID.test(observed.runId)) {
+    throw new TypeError('observed active scan lease is invalid');
+  }
+  const operation = checkedOperation(observed.operation);
+  if (operation.runId !== observed.runId) throw new TypeError('observed scan operation does not match its run');
+  if (typeof commit !== 'function' || !synchronousFenceCallbacks.has(commit)) {
+    throw new TypeError('overlap append callback must be explicitly synchronous');
+  }
+  const options = timingOptions(inputOptions);
+  const expectedOperation = JSON.stringify(operation);
+  try {
+    return withGuard(root, currentLeaseOwner(), options, () => {
+      const current = readScanLease(root);
+      const activeUntil = current
+        ? Date.parse(current.expiresAt) + current.takeoverMarginMs
+        : Number.NEGATIVE_INFINITY;
+      const sameObservedLease = current?.leaseId === observed.leaseId
+        && current?.generation === observed.generation
+        && current?.runId === observed.runId
+        && JSON.stringify(current.operation) === expectedOperation;
+      if (!sameObservedLease || wallMilliseconds(options) >= activeUntil) {
+        return Object.freeze({ active: false, value: null });
+      }
+      const value = commit(Object.freeze(structuredClone(current)));
+      if (value && typeof value.then === 'function') {
+        throw new TypeError('overlap append must complete synchronously');
+      }
+      return Object.freeze({ active: true, value });
+    });
+  } catch (error) {
+    if (error instanceof GuardBusyError) {
+      throw new LeaseLostError('scan lease guard remained busy during overlap enqueue');
+    }
+    throw error;
+  }
+}
+
 export function renewScanLease(lease) {
   const settings = runtimeFor(lease);
   if (!currentProcessOwns(lease) || locallyExpired(settings)) throw new LeaseLostError();

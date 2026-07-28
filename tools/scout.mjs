@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { createHash, randomUUID } from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -13,25 +14,119 @@ import { assertSafeModel, providerStatus } from '../ui/lib/providers.mjs';
 import { setupReadiness } from '../ui/lib/setupReadiness.mjs';
 import { runStructuredTurn } from '../ui/lib/structuredTurn.mjs';
 import {
-  assessmentCandidatesForSelection, compactCandidates, DEFAULT_CANDIDATE_LIMIT, inboxRecheckCandidates, prepareRankedDiscovery, promptCandidate,
-  SCAN_ASSESSMENT_SCHEMA, validateAssessments, verificationCandidates, writeScanArtifacts,
+  assessmentCandidatesForSelection, compactCandidates, createRankedDiscoveryStages, DEFAULT_CANDIDATE_LIMIT,
+  inboxRecheckCandidates, promptCandidate, runScanPipeline, SCAN_ASSESSMENT_SCHEMA, validateAssessments,
+  verificationCandidates, writeScanArtifacts,
 } from '../ui/lib/scanPipeline.mjs';
 import { loadPublishedSearchProfile, migrateSearchProfile } from '../ui/lib/searchProfile.mjs';
 import { partitionLiveCandidates } from '../ui/lib/advertLiveness.mjs';
 import { isMainModule } from '../ui/lib/mainModule.mjs';
 import { runCvQuality } from '../ui/lib/cvQuality.mjs';
 import { queueWorkspaceSync } from '../ui/lib/workspaceSync.mjs';
-import { normaliseScheduleDays, registerDailySchedule, registerUnixSchedule, removeLegacySchedule, removeSchedule, runScheduledNow, scheduleStatus, schedulerRegistrationScript } from '../ui/lib/scheduler.mjs';
+import {
+  nextScheduledRun, normaliseScheduleDays, registerDailySchedule, registerUnixSchedule,
+  removeLegacySchedule, removeSchedule, runScheduledNow, scheduledRequestExpiry,
+  scheduleStatus, schedulerRegistrationScript,
+} from '../ui/lib/scheduler.mjs';
 import {
   loadWorkspaceConfig, resolveWorkspaceRoot, seedWorkspace as seedWorkspaceFiles,
   syncManagedInstructions, workspacePaths, writeWorkspaceConfig,
 } from '../ui/lib/workspace.mjs';
 import { acquireScanLock, readScanLock, releaseScanLock } from './scan-lock.mjs';
 import { runRemoteHostingPreflight } from './remote-hosting-preflight.mjs';
+import { assertCurrentFence, synchronousFenceCallback } from '../ui/lib/scanLease.mjs';
 
 const APP_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const MAX_SCAN_FILE_CHARS = 100_000;
 const MAX_SCAN_CONTEXT_CHARS = 280_000;
+
+function stableJson(value) {
+  if (Array.isArray(value)) return `[${value.map(stableJson).join(',')}]`;
+  if (value && typeof value === 'object') {
+    return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${stableJson(value[key])}`).join(',')}}`;
+  }
+  return JSON.stringify(value);
+}
+
+function scanDigest(value) {
+  return createHash('sha256').update(stableJson(value)).digest('hex');
+}
+
+function scanCompatibility({ config, mode, model, profile, provider, tracker }) {
+  return {
+    schemaVersion: 1,
+    mode,
+    purpose: 'manual-discovery',
+    profileVersion: profile?.id || 'legacy-profile',
+    sourceConfigFingerprint: scanDigest({
+      locale: config.locale,
+      currency: config.currency,
+      search: config.search,
+      sources: config.sources,
+    }),
+    journalSchemaVersion: 1,
+    artifactSchemaVersion: 1,
+    pipelineVersion: 'scan-pipeline-v2-private-stage-artifacts',
+    rankingVersion: `ranked-discovery-v1-${scanDigest(tracker).slice(0, 32)}`,
+    promptVersion: 'assessment-prompt-v1',
+    assessmentSchemaVersion: 1,
+    provider,
+    model: model || 'provider-default',
+    mutationSchemaVersion: 1,
+    targetRevision: `tracker-${scanDigest(tracker).slice(0, 32)}`,
+  };
+}
+
+function scanQueueCompatibility(compatibility, profile) {
+  return Object.freeze({
+    profileFingerprint: scanDigest(profile || { id: compatibility.profileVersion }),
+    configFingerprint: compatibility.sourceConfigFingerprint,
+    schemaVersion: 1,
+  });
+}
+
+function currentScanQueueCompatibility(root) {
+  const config = loadWorkspaceConfig(root);
+  const profile = loadPublishedSearchProfile(root);
+  return Object.freeze({
+    profileFingerprint: scanDigest(profile || { id: profile?.id || 'legacy-profile' }),
+    configFingerprint: scanDigest({
+      locale: config.locale,
+      currency: config.currency,
+      search: config.search,
+      sources: config.sources,
+    }),
+    schemaVersion: 1,
+  });
+}
+
+function scanQueueRequest(compatibility, profile, {
+  mode, model, provider, requestedAt, requester = 'manual', windowAt = null,
+}) {
+  if (!['manual', 'scheduled'].includes(requester)) throw new TypeError('scan requester is invalid');
+  if (requester === 'scheduled' && !windowAt) throw new TypeError('scheduled scan requires its next window');
+  return Object.freeze({
+    id: randomUUID(),
+    key: `scan-${scanDigest({
+      mode, model: model || 'provider-default', profile: compatibility.profileVersion, provider,
+      sourceConfigFingerprint: compatibility.sourceConfigFingerprint,
+    }).slice(0, 40)}`,
+    requester,
+    purpose: compatibility.purpose,
+    compatibility: scanQueueCompatibility(compatibility, profile),
+    execution: Object.freeze({
+      schemaVersion: 1,
+      provider,
+      mode,
+      model: model || null,
+    }),
+    requestedAt,
+    expiresAt: requester === 'scheduled'
+      ? scheduledRequestExpiry(requestedAt, windowAt)
+      : new Date(Date.parse(requestedAt) + 24 * 60 * 60 * 1000).toISOString(),
+    windowAt,
+  });
+}
 
 function argValue(name, argv = process.argv.slice(2)) {
   const i = argv.indexOf(name);
@@ -175,10 +270,13 @@ export function assertScanReady(root, provider, { providerStatusFn = providerSta
 
 export async function runScan(root, provider, mode, {
   onProgress = () => {}, model, autoBroaden = false, estimate = null,
+  requester = 'manual', windowAt = null,
 } = {}) {
   onProgress({ phase: 'Validating approved evidence', current: 1, total: 5 });
   assertScanReady(root, provider);
-  const initial = await runScanWith(root, provider, mode, { onProgress, model });
+  const initial = await runScanWith(root, provider, mode, {
+    onProgress, model, requester, windowAt,
+  });
   let result = initial;
   if (shouldAutoBroaden(initial, mode, autoBroaden)) {
     const broadenedEstimate = estimate ? {
@@ -320,6 +418,9 @@ export async function runScanWith(root, provider, mode, {
   runStructuredTurnFn = runStructuredTurn, acquireLockFn = acquireScanLock, releaseLockFn = releaseScanLock,
   checkLivenessFn = partitionLiveCandidates,
   onProgress = () => {}, model,
+  claimedLease = null,
+  requester = 'manual',
+  windowAt = null,
 } = {}) {
   if (!['codex', 'claude'].includes(provider)) throw new Error('provider must be codex or claude');
   if (!['primary', 'second-pass', 'broadened'].includes(mode)) throw new Error('mode must be primary, broadened or second-pass');
@@ -331,8 +432,10 @@ export async function runScanWith(root, provider, mode, {
     ? (config.ai?.provider === provider ? assertSafeModel(config.ai?.model) : null)
     : assertSafeModel(model);
   const startedAt = new Date().toISOString();
-  const lock = acquireLockFn(root, { agent: provider, mode });
-  if (!lock.ok) {
+  const injectedLegacyLock = claimedLease === null
+    && (acquireLockFn !== acquireScanLock || releaseLockFn !== releaseScanLock);
+  const lock = injectedLegacyLock ? acquireLockFn(root, { agent: provider, mode }) : null;
+  if (lock && !lock.ok) {
     const artifacts = writeScanArtifacts(root, {
       provider, mode, sources: {}, candidates: [], assessmentResult: null, policy: config.triage,
       startedAt, error: 'another scan is already running', skipped: true,
@@ -354,128 +457,256 @@ export async function runScanWith(root, provider, mode, {
   let funnel = null;
   let selection = [];
   let discoveryEngine = 'legacy-discovery';
-  try {
+  let durable = null;
+  const publishedAtStart = loadPublishedSearchProfile(root);
+  const trackerAtStart = JSON.parse(fs.readFileSync(workspacePaths(root).tracker, 'utf8'));
+  const compatibility = scanCompatibility({
+    config, mode, model, profile: publishedAtStart, provider, tracker: trackerAtStart,
+  });
+  const request = claimedLease === null
+    ? scanQueueRequest(compatibility, publishedAtStart, {
+      mode, model, provider, requestedAt: startedAt, requester, windowAt,
+    })
+    : null;
+  const collect = async () => {
     onProgress({ phase: 'Collecting current opportunities', current: 2, total: 5 });
-    collected = await collectSourcesFn(root, config, { broadened: mode === 'broadened' });
-    publishedProfile = loadPublishedSearchProfile(root);
-    const tracker = JSON.parse(fs.readFileSync(workspacePaths(root).tracker, 'utf8'));
-    if (publishedProfile) {
-      discovery = prepareRankedDiscovery({
-        sources: collected.sources, profile: publishedProfile, tracker, runId: `${startedAt}-${provider}-${mode}`,
-        limit: DEFAULT_CANDIDATE_LIMIT,
-        relevanceThreshold: config.search?.relevanceThreshold ?? config.triage?.checkScore,
-      });
-      hardExcluded = discovery.exclusions;
-      discoveryEngine = 'ranked-discovery';
-      const provisional = assessmentCandidatesForSelection(discovery.selection.selected);
-      const inboxRecheck = inboxRecheckCandidates(tracker, provisional);
-      inboxRechecked = inboxRecheck.checkable.length + inboxRecheck.missingSource.length;
-      onProgress({ phase: `Checking ${provisional.length + inboxRecheck.checkable.length} adverts are still open`, current: 2, total: 5 });
-      const liveness = await selectLiveRankedVacancies(discovery, inboxRecheck, checkLivenessFn);
-      closedAdverts = liveness.closed;
-      staleInboxEntries = liveness.staleInboxEntries;
-      livenessSummary = liveness.summary;
-      let selectedVacancies = liveness.selected;
-      if (mode === 'second-pass') {
-        const verification = verificationCandidates(
-          assessmentCandidatesForSelection(selectedVacancies), tracker, new Date().toISOString().slice(0, 10), config.triage,
-        );
-        const selectedIds = new Set(verification.candidates.map((candidate) => candidate.vacancyId));
-        selectedVacancies = selectedVacancies.filter((vacancy) => selectedIds.has(vacancy.vacancyId));
-        verificationScoped = verification.verified;
-      }
-      candidates = assessmentCandidatesForSelection(selectedVacancies);
-      selection = candidates.map((candidate) => ({ url: candidate.url, vacancyId: candidate.vacancyId, preRankScore: candidate.preRankScore, reason: discovery.selection.reasons.find((item) => item.vacancyId === candidate.vacancyId)?.reason || 'deterministic-rank' }));
-      funnel = { ...discovery.funnel, selected: candidates.length };
-    } else {
-      // beta.22 compatibility for migrated and grandfathered workspaces. A
-      // workspace without a published profile never enters ranked discovery.
-      const compacted = compactCandidates(collected.sources, DEFAULT_CANDIDATE_LIMIT);
-      dropped = compacted.dropped;
-      const inboxRecheck = inboxRecheckCandidates(tracker, compacted.candidates);
-      inboxRechecked = inboxRecheck.checkable.length + inboxRecheck.missingSource.length;
-      onProgress({ phase: `Checking ${compacted.candidates.length + inboxRecheck.checkable.length} adverts are still open`, current: 2, total: 5 });
-      const liveness = await checkLivenessFn([...compacted.candidates, ...inboxRecheck.checkable]);
-      closedAdverts = liveness.removed.filter((candidate) => !candidate._inboxRecheck);
-      staleInboxEntries = [
-        ...inboxRecheck.missingSource,
-        ...liveness.removed.filter((candidate) => candidate._inboxRecheck),
-      ];
-      livenessSummary = liveness.summary;
-      candidates = liveness.live.filter((candidate) => !candidate._inboxRecheck).map((candidate, index) => ({
-        ...candidate,
-        candidateId: `candidate-${String(index + 1).padStart(3, '0')}`,
-      }));
-      if (mode === 'second-pass') {
-        const verification = verificationCandidates(candidates, tracker, new Date().toISOString().slice(0, 10), config.triage);
-        candidates = verification.candidates.map((candidate, index) => ({
-          ...candidate,
-          candidateId: `candidate-${String(index + 1).padStart(3, '0')}`,
-        }));
-        verificationScoped = verification.verified;
-      }
-    }
+    return collectSourcesFn(root, config, { broadened: mode === 'broadened' });
+  };
+  const stages = publishedAtStart
+    ? createRankedDiscoveryStages({
+      collect,
+      profile: publishedAtStart,
+      tracker: trackerAtStart,
+      limit: DEFAULT_CANDIDATE_LIMIT,
+      relevanceThreshold: config.search?.relevanceThreshold ?? config.triage?.checkScore,
+    })
+    : {
+      collect,
+      normalise({ priorArtifact }) {
+        const compacted = compactCandidates(priorArtifact.sources, DEFAULT_CANDIDATE_LIMIT);
+        return { candidates: compacted.candidates, dropped: compacted.dropped };
+      },
+      deduplicate: ({ priorArtifact }) => priorArtifact,
+      filter: ({ priorArtifact }) => priorArtifact,
+      rank: ({ priorArtifact }) => priorArtifact,
+      select: ({ priorArtifact }) => priorArtifact,
+    };
+  try {
+    durable = await runScanPipeline({
+      root,
+      compatibility,
+      stages,
+      claimedLease,
+      queue: {
+        compatibility: () => currentScanQueueCompatibility(root),
+        ...(claimedLease === null ? { request } : {}),
+        async run(queuedRequest, context) {
+          const execution = queuedRequest.execution;
+          if (!execution) throw new Error('queued scan lacks a durable execution contract');
+          const queued = await runScanWith(root, execution.provider, execution.mode, {
+            providerStatusFn,
+            collectSourcesFn,
+            runStructuredTurnFn,
+            acquireLockFn,
+            releaseLockFn,
+            checkLivenessFn,
+            onProgress,
+            model: execution.model,
+            claimedLease: context.lease,
+            requester: queuedRequest.requester,
+            windowAt: queuedRequest.windowAt,
+          });
+          return queued.durable?.outcome === 'complete' ? 'succeeded'
+            : queued.status === 'skipped' ? 'skipped' : 'failed';
+        },
+      },
+      async recordFailure({ error, lease }) {
+        if (result) return result;
+        const artifacts = assertCurrentFence(lease, synchronousFenceCallback(() => writeScanArtifacts(root, {
+          provider,
+          mode,
+          sources: collected?.sources || {},
+          queries: collected?.queries || [],
+          candidates,
+          assessmentResult: null,
+          policy: config.triage,
+          startedAt,
+          error: error.message,
+          dropped,
+          hardExcluded,
+          closedAdverts,
+          livenessSummary,
+          verificationScoped,
+          funnel,
+          selection,
+          discoveryEngine,
+          exclusions: discovery?.exclusions || [],
+          profileId: publishedProfile?.id || publishedAtStart?.id || null,
+          staleInboxEntries,
+          inboxRechecked,
+        })));
+        result = { ok: false, status: 'failed', error: error.message, scan: artifacts.run };
+        return result;
+      },
+      async finalize({ lease, stageOutputs }) {
+        collected = stageOutputs.collect;
+        publishedProfile = publishedAtStart;
+        const tracker = JSON.parse(fs.readFileSync(workspacePaths(root).tracker, 'utf8'));
+        try {
+          if (publishedProfile) {
+            discovery = stageOutputs.select;
+            hardExcluded = discovery.exclusions;
+            discoveryEngine = 'ranked-discovery';
+            const provisional = assessmentCandidatesForSelection(discovery.selection.selected);
+            const inboxRecheck = inboxRecheckCandidates(tracker, provisional);
+            inboxRechecked = inboxRecheck.checkable.length + inboxRecheck.missingSource.length;
+            onProgress({ phase: `Checking ${provisional.length + inboxRecheck.checkable.length} adverts are still open`, current: 2, total: 5 });
+            const liveness = await selectLiveRankedVacancies(discovery, inboxRecheck, checkLivenessFn);
+            closedAdverts = liveness.closed;
+            staleInboxEntries = liveness.staleInboxEntries;
+            livenessSummary = liveness.summary;
+            let selectedVacancies = liveness.selected;
+            if (mode === 'second-pass') {
+              const verification = verificationCandidates(
+                assessmentCandidatesForSelection(selectedVacancies), tracker, new Date().toISOString().slice(0, 10), config.triage,
+              );
+              const selectedIds = new Set(verification.candidates.map((candidate) => candidate.vacancyId));
+              selectedVacancies = selectedVacancies.filter((vacancy) => selectedIds.has(vacancy.vacancyId));
+              verificationScoped = verification.verified;
+            }
+            candidates = assessmentCandidatesForSelection(selectedVacancies);
+            selection = candidates.map((candidate) => ({
+              url: candidate.url,
+              vacancyId: candidate.vacancyId,
+              preRankScore: candidate.preRankScore,
+              reason: discovery.selection.reasons.find((item) => item.vacancyId === candidate.vacancyId)?.reason || 'deterministic-rank',
+            }));
+            funnel = { ...discovery.funnel, selected: candidates.length };
+          } else {
+            dropped = stageOutputs.select.dropped;
+            const compactedCandidates = stageOutputs.select.candidates;
+            const inboxRecheck = inboxRecheckCandidates(tracker, compactedCandidates);
+            inboxRechecked = inboxRecheck.checkable.length + inboxRecheck.missingSource.length;
+            onProgress({ phase: `Checking ${compactedCandidates.length + inboxRecheck.checkable.length} adverts are still open`, current: 2, total: 5 });
+            const liveness = await checkLivenessFn([...compactedCandidates, ...inboxRecheck.checkable]);
+            closedAdverts = liveness.removed.filter((candidate) => !candidate._inboxRecheck);
+            staleInboxEntries = [
+              ...inboxRecheck.missingSource,
+              ...liveness.removed.filter((candidate) => candidate._inboxRecheck),
+            ];
+            livenessSummary = liveness.summary;
+            candidates = liveness.live.filter((candidate) => !candidate._inboxRecheck).map((candidate, index) => ({
+              ...candidate,
+              candidateId: `candidate-${String(index + 1).padStart(3, '0')}`,
+            }));
+            if (mode === 'second-pass') {
+              const verification = verificationCandidates(candidates, tracker, new Date().toISOString().slice(0, 10), config.triage);
+              candidates = verification.candidates.map((candidate, index) => ({
+                ...candidate,
+                candidateId: `candidate-${String(index + 1).padStart(3, '0')}`,
+              }));
+              verificationScoped = verification.verified;
+            }
+          }
 
-    const bundleDir = path.join(root, '.scout', 'scan-input');
-    fs.mkdirSync(bundleDir, { recursive: true });
-    const bundleFile = path.join(bundleDir, `${startedAt.replace(/[:.]/g, '-')}-${provider}-${mode}.json`);
-    fs.writeFileSync(bundleFile, `${JSON.stringify({ generatedAt: collected.generatedAt, queries: collected.queries, sources: Object.fromEntries(Object.entries(collected.sources).map(([name, value]) => [name, { ...value, jobs: undefined }])), discoveryEngine, dropped, livenessSummary, hardExcluded: hardExcluded.map((item) => ({ vacancyId: item.vacancyId, code: item.code })), closedAdverts: closedAdverts.map((item) => ({ url: item.url, reason: item.liveness?.reason })), candidates }, null, 2)}\n`, 'utf8');
-    let assessmentResult = null;
-    let usage = {};
-    if (candidates.length) {
-      onProgress({ phase: `Scoring ${candidates.length} candidates`, current: 3, total: 5 });
-      const paths = workspacePaths(root);
-      const context = buildScanContext(paths, config, candidates.map(promptCandidate));
-      const prompt = [
-        'Assess only the supplied Scout candidates. Return one assessment per candidate and only the required JSON schema.',
-        'Use a 100-point evidence-led breakdown. Treat every supplied normalized requirement signal, plus advert words such as required, essential, must and non-negotiable, as mandatory requirements.',
-        'Cover every supplied mandatorySignals item and copy its id into advertEvidenceId. For an additional mandatory requirement you identify, use a concise provider-<slug> advertEvidenceId.',
-        'Every met mandatory requirement needs explicit profile evidence. Use unknown when evidence is absent or ambiguous.',
-        'Apply hard exclusions before scoring. Never access files, run commands, browse, write artifacts, apply, or send outreach.',
-        JSON.stringify(context),
-      ].join('\n\n');
-      const turn = await runStructuredTurnFn({
-        provider, status, schema: SCAN_ASSESSMENT_SCHEMA, prompt,
-        model,
-        validate: (value) => validateAssessments(value, candidates), timeoutMs: 20 * 60 * 1000, maxInputTokens: 75_000,
-      });
-      assessmentResult = turn.value;
-      usage = turn.usage;
-    }
-    if (funnel) {
-      funnel = {
-        ...funnel,
-        selected: candidates.length,
-        assessed: assessmentResult?.assessments?.length || 0,
-        assessmentFailed: Math.max(0, candidates.length - (assessmentResult?.assessments?.length || 0)),
-        closed: closedAdverts.length,
+          const bundleDir = path.join(root, '.scout', 'scan-input');
+          const bundleFile = path.join(bundleDir, `${startedAt.replace(/[:.]/g, '-')}-${provider}-${mode}.json`);
+          assertCurrentFence(lease, synchronousFenceCallback(() => {
+            fs.mkdirSync(bundleDir, { recursive: true });
+            fs.writeFileSync(bundleFile, `${JSON.stringify({
+              generatedAt: collected.generatedAt,
+              queries: collected.queries,
+              sources: Object.fromEntries(Object.entries(collected.sources).map(([name, value]) => [name, { ...value, jobs: undefined }])),
+              discoveryEngine,
+              dropped,
+              livenessSummary,
+              hardExcluded: hardExcluded.map((item) => ({ vacancyId: item.vacancyId, code: item.code })),
+              closedAdverts: closedAdverts.map((item) => ({ url: item.url, reason: item.liveness?.reason })),
+              candidates,
+            }, null, 2)}\n`, 'utf8');
+          }));
+          let assessmentResult = null;
+          let usage = {};
+          if (candidates.length) {
+            onProgress({ phase: `Scoring ${candidates.length} candidates`, current: 3, total: 5 });
+            const paths = workspacePaths(root);
+            const context = buildScanContext(paths, config, candidates.map(promptCandidate));
+            const prompt = [
+              'Assess only the supplied Scout candidates. Return one assessment per candidate and only the required JSON schema.',
+              'Use a 100-point evidence-led breakdown. Treat every supplied normalized requirement signal, plus advert words such as required, essential, must and non-negotiable, as mandatory requirements.',
+              'Cover every supplied mandatorySignals item and copy its id into advertEvidenceId. For an additional mandatory requirement you identify, use a concise provider-<slug> advertEvidenceId.',
+              'Every met mandatory requirement needs explicit profile evidence. Use unknown when evidence is absent or ambiguous.',
+              'Apply hard exclusions before scoring. Never access files, run commands, browse, write artifacts, apply, or send outreach.',
+              JSON.stringify(context),
+            ].join('\n\n');
+            const turn = await runStructuredTurnFn({
+              provider, status, schema: SCAN_ASSESSMENT_SCHEMA, prompt,
+              model,
+              validate: (value) => validateAssessments(value, candidates), timeoutMs: 20 * 60 * 1000, maxInputTokens: 75_000,
+            });
+            assessmentResult = turn.value;
+            usage = turn.usage;
+          }
+          if (funnel) {
+            funnel = {
+              ...funnel,
+              selected: candidates.length,
+              assessed: assessmentResult?.assessments?.length || 0,
+              assessmentFailed: Math.max(0, candidates.length - (assessmentResult?.assessments?.length || 0)),
+              closed: closedAdverts.length,
+            };
+          }
+          onProgress({ phase: 'Writing tracker and report', current: 4, total: 5 });
+          const artifacts = assertCurrentFence(lease, synchronousFenceCallback(() => writeScanArtifacts(root, {
+            provider, mode, sources: collected.sources, queries: collected.queries, candidates, assessmentResult,
+            policy: config.triage, startedAt,
+            dropped, hardExcluded, closedAdverts, exclusions: discovery?.exclusions || [], livenessSummary, verificationScoped, funnel, selection, discoveryEngine, profileId: publishedProfile?.id || null,
+            staleInboxEntries, inboxRechecked,
+          })));
+          result = { ok: true, status: artifacts.run.degraded ? 'degraded' : candidates.length ? 'completed' : 'healthy-empty', scan: artifacts.run, usage };
+          return result;
+        } catch (error) {
+          try {
+            const artifacts = assertCurrentFence(lease, synchronousFenceCallback(() => writeScanArtifacts(root, {
+              provider, mode, sources: collected?.sources || {}, queries: collected?.queries || [], candidates,
+              assessmentResult: null, policy: config.triage, startedAt, error: error.message,
+              dropped, hardExcluded, closedAdverts, livenessSummary, verificationScoped, funnel, selection, discoveryEngine,
+              exclusions: discovery?.exclusions || [], profileId: publishedProfile?.id || null,
+              staleInboxEntries, inboxRechecked,
+            })));
+            result = { ok: false, status: 'failed', error: error.message, scan: artifacts.run };
+          } catch {
+            result = { ok: false, status: 'failed', error: error.message };
+          }
+          throw error;
+        }
+      },
+    });
+    if (!result) {
+      const failure = durable.failures[0];
+      result = {
+        ok: false,
+        status: durable.outcome === 'queued' ? 'queued' : 'failed',
+        error: failure?.message || (failure?.code === 'lease-busy' ? 'another scan is already running' : 'durable scan pipeline failed'),
       };
     }
-    onProgress({ phase: 'Writing tracker and report', current: 4, total: 5 });
-    const artifacts = writeScanArtifacts(root, {
-      provider, mode, sources: collected.sources, queries: collected.queries, candidates, assessmentResult,
-      policy: config.triage, startedAt,
-      dropped, hardExcluded, closedAdverts, exclusions: discovery?.exclusions || [], livenessSummary, verificationScoped, funnel, selection, discoveryEngine, profileId: publishedProfile?.id || null,
-      staleInboxEntries, inboxRechecked,
-    });
-    result = { ok: true, status: artifacts.run.degraded ? 'degraded' : candidates.length ? 'completed' : 'healthy-empty', scan: artifacts.run, usage };
-    onProgress({ phase: 'Scan completed', current: 5, total: 5 });
+    result = {
+      ...result,
+      runId: durable.runId,
+      durable: {
+        outcome: durable.outcome,
+        manifest: durable.manifest,
+        failures: durable.failures,
+      },
+    };
+    if (result.ok) onProgress({ phase: 'Scan completed', current: 5, total: 5 });
   } catch (error) {
-    try {
-      const artifacts = writeScanArtifacts(root, {
-        provider, mode, sources: collected?.sources || {}, queries: collected?.queries || [], candidates,
-        assessmentResult: null, policy: config.triage, startedAt, error: error.message,
-        dropped, hardExcluded, closedAdverts, livenessSummary, verificationScoped, funnel, selection, discoveryEngine,
-        exclusions: discovery?.exclusions || [], profileId: publishedProfile?.id || null,
-        staleInboxEntries, inboxRechecked,
-      });
-      result = { ok: false, status: 'failed', error: error.message, scan: artifacts.run };
-    } catch {
-      result = { ok: false, status: 'failed', error: error.message };
-    }
+    result = { ok: false, status: 'failed', error: error.message };
   } finally {
-    const released = releaseLockFn(root, lock.lock.token);
-    if (!released.ok) result = { ...(result || {}), ok: false, status: 'failed', error: 'scan lock could not be released safely' };
+    if (lock?.ok) {
+      const released = releaseLockFn(root, lock.lock.token);
+      if (!released.ok) result = { ...(result || {}), ok: false, status: 'failed', error: 'scan lock could not be released safely' };
+    }
   }
   const logs = workspacePaths(root).logs;
   fs.mkdirSync(logs, { recursive: true });
@@ -492,7 +723,10 @@ export function installSchedule(root, time, provider, { id = `${provider}-primar
   removeLegacySchedule();
   const cli = fileURLToPath(import.meta.url);
   if (process.platform !== 'win32') {
-    const args = [cli, 'scan', '--workspace', root, '--provider', provider, '--mode', mode];
+    const args = [
+      cli, 'scan', '--workspace', root, '--provider', provider, '--mode', mode,
+      '--scheduled', '--schedule-id', id,
+    ];
     if (model) args.push('--model', model);
     const result = registerUnixSchedule({ id, platform: process.platform, command: process.execPath, args, workingDirectory: APP_ROOT, time, timezone: config.timezone, days: selectedDays });
     if (result.ok) {
@@ -504,7 +738,7 @@ export function installSchedule(root, time, provider, { id = `${provider}-primar
   const scriptFile = path.join(os.tmpdir(), `scout-task-${process.pid}.ps1`);
   fs.writeFileSync(scriptFile, schedulerRegistrationScript(), 'utf8');
   try {
-    const argumentsText = `"${cli}" scan --workspace "${root}" --provider ${provider} --mode ${mode}${model ? ` --model ${model}` : ''}`;
+    const argumentsText = `"${cli}" scan --workspace "${root}" --provider ${provider} --mode ${mode} --scheduled --schedule-id ${id}${model ? ` --model ${model}` : ''}`;
     const result = registerDailySchedule({ id, scriptFile, command: process.execPath, argumentsText, workingDirectory: APP_ROOT, time, days: selectedDays });
     if (result.ok) {
       config.schedule.jobs = [...config.schedule.jobs.filter((job) => job.id !== id), { id, enabled: true, time, days: selectedDays, provider, mode, model: model || null }];
@@ -546,8 +780,22 @@ async function main() {
   if (command === 'scan') {
     const config = loadWorkspaceConfig(root);
     const provider = argValue('--provider', argv) || config.ai?.provider;
-    const result = await runScan(root, provider, argValue('--mode', argv) || 'primary', {
+    const mode = argValue('--mode', argv) || 'primary';
+    const scheduled = argv.includes('--scheduled');
+    let windowAt = null;
+    if (scheduled) {
+      const scheduleId = argValue('--schedule-id', argv);
+      const job = config.schedule?.jobs?.find((candidate) => candidate.id === scheduleId);
+      if (!job || job.provider !== provider || job.mode !== mode) {
+        throw new Error('scheduled scan does not match a configured schedule job');
+      }
+      windowAt = nextScheduledRun(job.time, new Date(), config.timezone, job.days);
+      if (!windowAt) throw new Error('scheduled scan has no next configured window');
+    }
+    const result = await runScan(root, provider, mode, {
       model: argv.includes('--model') ? argValue('--model', argv) : undefined,
+      requester: scheduled ? 'scheduled' : 'manual',
+      windowAt,
     });
     print(result);
     if (!result.ok) process.exitCode = 1;

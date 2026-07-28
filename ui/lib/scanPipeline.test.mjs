@@ -4,9 +4,13 @@ import os from 'node:os';
 import path from 'node:path';
 import { test } from 'node:test';
 import {
-  compactCandidates, DEFAULT_CANDIDATE_LIMIT, gateAssessment, inboxRecheckCandidates, prepareRankedDiscovery, promptCandidate,
-  filterVacancies, validateAssessments, validateWrittenScanArtifacts, verificationCandidates, writeScanArtifacts,
+  compactCandidates, createRankedDiscoveryStages, DEFAULT_CANDIDATE_LIMIT, gateAssessment, inboxRecheckCandidates, prepareRankedDiscovery, promptCandidate,
+  filterVacancies, PipelineInterruptedError, runScanPipeline, validateAssessments, validateWrittenScanArtifacts,
+  verificationCandidates, writeScanArtifacts,
 } from './scanPipeline.mjs';
+import { claimNextScanRequest, enqueueScanRequest, projectScanQueue } from './scanQueue.mjs';
+import { acquireScanLease, currentLeaseOwner, readScanLease, releaseScanLease } from './scanLease.mjs';
+import { appendRunEvent, openRunJournal, replayRunJournal } from './runJournal.mjs';
 
 const dimensions = [{ name: 'Fit', score: 90, maximum: 100, evidence: 'Advert and profile' }];
 const assessment = (status = 'met') => ({
@@ -38,6 +42,47 @@ test('ranked discovery is independent of source and portal order', () => {
   }, ...options });
   assert.deepEqual(forward.selection.selected.map((item) => item.url), reverse.selection.selected.map((item) => item.url));
   assert.deepEqual(forward.candidates.map((item) => item.candidateId), ['candidate-001', 'candidate-002']);
+});
+
+test('durable ranked stages preserve the established ranked discovery result', async () => {
+  const profile = {
+    version: 1, status: 'published', id: 'profile-durable',
+    target: { primaryTitles: [{ value: 'Ideal Role', strength: 'strong-preference', provenance: 'explicit' }] },
+    negative: {}, compensation: { currency: null, period: 'year', minimum: null, minimumStrength: 'neutral', unknownPolicy: 'include' },
+  };
+  const sources = {
+    ats: {
+      count: 2,
+      jobs: [
+        { company: 'Able', title: 'Ideal Role', url: 'https://example.test/able', providerId: 'able' },
+        { company: 'Baker', title: 'Other Role', url: 'https://example.test/baker', providerId: 'baker' },
+      ],
+    },
+  };
+  const options = { profile, tracker: { opportunities: [] }, runId: 'durable-run', limit: 60 };
+  const expected = prepareRankedDiscovery({ sources, ...options });
+  const stages = createRankedDiscoveryStages({
+    collect: async () => ({ generatedAt: '2026-07-27T10:00:00.000Z', queries: ['ideal'], sources }),
+    profile,
+    tracker: options.tracker,
+    limit: options.limit,
+  });
+  let priorArtifact = null;
+  for (const stageId of DURABLE_STAGES) {
+    priorArtifact = await stages[stageId]({
+      run: { runId: options.runId },
+      lease: { runId: options.runId },
+      priorArtifact,
+    });
+  }
+
+  assert.deepEqual(priorArtifact, {
+    exclusions: expected.exclusions,
+    ranked: expected.ranked,
+    selection: expected.selection,
+    funnel: expected.funnel,
+    candidates: expected.candidates,
+  });
 });
 
 test('ranked discovery excludes zero-score unrelated vacancies below the configured relevance threshold', () => {
@@ -515,4 +560,385 @@ test('scan artifacts archive only stale untriaged jobs', () => {
   assert.equal(artifacts.tracker.opportunities.find((item) => item.id === 'chosen').status, 'shortlist');
   assert.equal(artifacts.run.inbox_rechecked, 1);
   assert.equal(artifacts.run.inbox_archived, 1);
+});
+
+const DURABLE_STAGES = ['collect', 'normalise', 'deduplicate', 'filter', 'rank', 'select'];
+const RECOVERY_COMPATIBILITY = Object.freeze({
+  schemaVersion: 1,
+  mode: 'primary',
+  purpose: 'manual-discovery',
+  profileVersion: 'profile-v1',
+  sourceConfigFingerprint: 'a'.repeat(64),
+  journalSchemaVersion: 1,
+  artifactSchemaVersion: 1,
+  pipelineVersion: 'pipeline-v1',
+  rankingVersion: 'ranking-v1',
+  promptVersion: 'prompt-v1',
+  assessmentSchemaVersion: 1,
+  provider: 'codex',
+  model: 'provider-default',
+  mutationSchemaVersion: 1,
+  targetRevision: 'tracker-v1',
+});
+
+function durableStageHarness(calls) {
+  return Object.fromEntries(DURABLE_STAGES.map((stageId) => [stageId, async ({
+    run, lease, priorArtifact,
+  }) => {
+    assert.equal(run.runId, lease.runId);
+    calls.set(stageId, (calls.get(stageId) || 0) + 1);
+    return {
+      stageId,
+      stableIds: [...(priorArtifact?.stableIds || []), `${stageId}-1`],
+    };
+  }]));
+}
+
+for (const interruptedAfter of DURABLE_STAGES) {
+  test(`recovery reuses every committed artifact after interruption following ${interruptedAfter}`, async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'scout-durable-pipeline-'));
+    const calls = new Map();
+    let interruptedRunId;
+    let now = Date.parse('2026-07-27T10:00:00.000Z');
+    const leaseOptions = {
+      wallNow: () => now,
+      monotonicNow: () => now,
+      leaseDurationMs: 1_000,
+      takeoverMarginMs: 0,
+    };
+    try {
+      await assert.rejects(
+        runScanPipeline({
+          root,
+          compatibility: RECOVERY_COMPATIBILITY,
+          stages: durableStageHarness(calls),
+          leaseOptions,
+          onStageCommitted({ stageId, run }) {
+            if (stageId === interruptedAfter) {
+              interruptedRunId = run.runId;
+              now += 1_001;
+              throw new PipelineInterruptedError(`stopped after ${stageId}`);
+            }
+          },
+        }),
+        PipelineInterruptedError,
+      );
+      assert.equal(readScanLease(root)?.runId, interruptedRunId);
+
+      const beforeRecovery = Object.fromEntries(calls);
+      const recovered = await runScanPipeline({
+        root,
+        compatibility: RECOVERY_COMPATIBILITY,
+        stages: durableStageHarness(calls),
+        leaseOptions,
+      });
+
+      assert.equal(recovered.runId, interruptedRunId);
+      assert.equal(recovered.outcome, 'complete');
+      assert.deepEqual(Object.keys(recovered).sort(), ['failures', 'manifest', 'outcome', 'runId']);
+      const stopIndex = DURABLE_STAGES.indexOf(interruptedAfter);
+      for (const stageId of DURABLE_STAGES.slice(0, stopIndex + 1)) {
+        assert.equal(calls.get(stageId), beforeRecovery[stageId], `${stageId} must be reused`);
+      }
+      for (const stageId of DURABLE_STAGES.slice(stopIndex + 1)) {
+        assert.equal(calls.get(stageId), 1, `${stageId} must execute once after recovery`);
+      }
+      assert.deepEqual(recovered.manifest.completedWork.map((work) => work.stageId), DURABLE_STAGES);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+}
+
+test('a stale pipeline worker cannot commit another artifact or terminal event after takeover', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'scout-stale-pipeline-'));
+  let now = Date.parse('2026-07-27T10:00:00.000Z');
+  let takeover;
+  const leaseOptions = {
+    wallNow: () => now,
+    monotonicNow: () => now,
+    leaseDurationMs: 10_000,
+    takeoverMarginMs: 0,
+  };
+  try {
+    const result = await runScanPipeline({
+      root,
+      compatibility: RECOVERY_COMPATIBILITY,
+      leaseOptions,
+      stages: durableStageHarness(new Map()),
+      onStageCommitted({ stageId }) {
+        if (stageId !== 'collect') return;
+        now += 10_001;
+        takeover = acquireScanLease(
+          root,
+          currentLeaseOwner(),
+          { kind: 'scan', runId: 'successor-run', provider: 'codex', model: 'provider-default', mode: 'primary', phase: 'collect' },
+          leaseOptions,
+        );
+        assert.ok(takeover);
+      },
+    });
+
+    assert.equal(result.outcome, 'lease-lost');
+    assert.equal(result.failures.length, 1);
+    const events = replayRunJournal(path.join(root, '.scout', 'runs', result.runId, 'journal.jsonl'));
+    assert.deepEqual(events.map((event) => event.type), ['run.started', 'stage.completed']);
+    assert.equal(events.at(-1).stageId, 'collect');
+  } finally {
+    if (takeover) releaseScanLease(takeover);
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('terminal release drains the next queued request under a newer genuine fence', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'scout-pipeline-queue-'));
+  const queueCompatibility = {
+    profileFingerprint: 'b'.repeat(64),
+    configFingerprint: 'c'.repeat(64),
+    schemaVersion: 1,
+  };
+  let activeGeneration;
+  let primaryRunId;
+  const drained = [];
+  try {
+    const result = await runScanPipeline({
+      root,
+      compatibility: RECOVERY_COMPATIBILITY,
+      stages: {
+        ...durableStageHarness(new Map()),
+        collect: async ({ run, lease }) => {
+          primaryRunId = run.runId;
+          activeGeneration = lease.generation;
+          for (const request of [
+            {
+              id: 'manual-request-1', key: 'manual-key-1',
+              requestedAt: '2026-07-27T10:00:00.000Z', expiresAt: '2026-07-28T10:00:00.000Z',
+              requester: 'manual', windowAt: null,
+            },
+            {
+              id: 'manual-request-2', key: 'manual-key-2',
+              requestedAt: '2026-07-27T10:01:00.000Z', expiresAt: '2026-07-28T10:01:00.000Z',
+              requester: 'manual', windowAt: null,
+            },
+            {
+              id: 'scheduled-request-1', key: 'scheduled-key-1',
+              requestedAt: '2026-07-27T10:02:00.000Z', expiresAt: '2026-07-27T20:00:00.000Z',
+              requester: 'scheduled', windowAt: '2026-07-27T20:00:00.000Z',
+            },
+          ]) enqueueScanRequest(root, {
+            ...request,
+            purpose: 'manual-discovery',
+            compatibility: queueCompatibility,
+            lease,
+          });
+          return { stageId: 'collect', stableIds: ['collect-1'] };
+        },
+      },
+      queue: {
+        compatibility: queueCompatibility,
+        now: new Date('2026-07-27T10:05:00.000Z'),
+        async run(request, context) {
+          const events = replayRunJournal(path.join(root, '.scout', 'runs', primaryRunId, 'journal.jsonl'));
+          assert.equal(events.at(-1).type, 'run.completed');
+          assert.equal(readScanLease(root)?.leaseId, context.lease.leaseId);
+          drained.push({ id: request.id, generation: context.lease.generation });
+          if (request.id === 'manual-request-1') throw new Error('synthetic queued scan failure');
+          return (await runScanPipeline({
+            root,
+            compatibility: RECOVERY_COMPATIBILITY,
+            stages: durableStageHarness(new Map()),
+            claimedLease: context.lease,
+          })).outcome;
+        },
+      },
+    });
+
+    assert.equal(result.outcome, 'complete');
+    assert.deepEqual(drained.map((item) => item.id), [
+      'manual-request-1',
+      'manual-request-2',
+      'scheduled-request-1',
+    ]);
+    assert.ok(drained.every((item, index) => (
+      item.generation > activeGeneration
+      && (index === 0 || item.generation > drained[index - 1].generation)
+    )));
+    assert.equal(readScanLease(root), null);
+    for (const requestId of ['manual-request-1', 'manual-request-2', 'scheduled-request-1']) {
+      const requestRun = drained.find((item) => item.id === requestId);
+      const runDirectories = fs.readdirSync(path.join(root, '.scout', 'runs'));
+      const journal = runDirectories
+        .map((runId) => path.join(root, '.scout', 'runs', runId, 'journal.jsonl'))
+        .find((file) => replayRunJournal(file).some((event) => event.fencingGeneration === requestRun.generation));
+      assert.ok(journal, `${requestId} must execute a journalled scan`);
+      assert.equal(replayRunJournal(journal).at(-1).type, 'run.completed');
+    }
+    assert.deepEqual(
+      projectScanQueue(root).requests.map((request) => [request.id, request.status]),
+      [
+        ['manual-request-1', 'failed'],
+        ['manual-request-2', 'succeeded'],
+        ['scheduled-request-1', 'succeeded'],
+      ],
+    );
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('a terminal queued run is reconciled after its queue completion response is lost', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'scout-queue-terminal-reconcile-'));
+  const queueCompatibility = {
+    profileFingerprint: 'b'.repeat(64),
+    configFingerprint: 'c'.repeat(64),
+    schemaVersion: 1,
+  };
+  const oldLease = acquireScanLease(
+    root,
+    currentLeaseOwner(),
+    { kind: 'scan', runId: 'orphan-terminal-run', provider: 'codex', model: 'provider-default', mode: 'primary', phase: 'queue-drain' },
+  );
+  try {
+    enqueueScanRequest(root, {
+      id: 'lost-completion',
+      key: 'lost-completion',
+      requestedAt: '2026-07-27T10:00:00.000Z',
+      expiresAt: '2026-07-28T10:00:00.000Z',
+      requester: 'manual',
+      windowAt: null,
+      purpose: 'manual-discovery',
+      compatibility: queueCompatibility,
+      lease: oldLease,
+    });
+    claimNextScanRequest(
+      root,
+      { ...queueCompatibility, purpose: 'manual-discovery' },
+      oldLease,
+      new Date('2026-07-27T10:01:00.000Z'),
+    );
+    const orphanRun = openRunJournal(root, oldLease.runId);
+    appendRunEvent(orphanRun, {
+      type: 'run.started',
+      stageId: 'initialise',
+      idempotencyKey: 'orphan-started',
+      payload: { schemaVersion: 1, compatibility: RECOVERY_COMPATIBILITY },
+    }, oldLease);
+    appendRunEvent(orphanRun, {
+      type: 'run.completed',
+      stageId: 'finalise',
+      idempotencyKey: 'orphan-completed',
+      payload: { schemaVersion: 1, outcome: 'complete' },
+    }, oldLease);
+    releaseScanLease(oldLease);
+
+    let reruns = 0;
+    const primary = await runScanPipeline({
+      root,
+      compatibility: RECOVERY_COMPATIBILITY,
+      stages: durableStageHarness(new Map()),
+      queue: {
+        compatibility: queueCompatibility,
+        now: new Date('2026-07-27T10:02:00.000Z'),
+        async run() {
+          reruns += 1;
+          return 'succeeded';
+        },
+      },
+    });
+
+    assert.equal(primary.outcome, 'complete');
+    assert.equal(reruns, 0);
+    assert.equal(projectScanQueue(root).requests[0].status, 'succeeded');
+    assert.equal(readScanLease(root), null);
+  } finally {
+    try { releaseScanLease(oldLease); } catch {}
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('ranked stage artifacts contain bounded advert excerpts and no raw or tracking content', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'scout-private-ranked-artifacts-'));
+  const privateTail = `PRIVATE_TAIL_${'x'.repeat(4_000)}`;
+  const profile = {
+    version: 1, status: 'published', id: 'profile-private-artifacts',
+    target: { primaryTitles: [{ value: 'Platform Engineer', strength: 'strong-preference', provenance: 'explicit' }] },
+    negative: {},
+    compensation: { currency: null, period: 'year', minimum: null, minimumStrength: 'neutral', unknownPolicy: 'include' },
+  };
+  try {
+    const result = await runScanPipeline({
+      root,
+      compatibility: RECOVERY_COMPATIBILITY,
+      stages: createRankedDiscoveryStages({
+        collect: async () => ({
+          generatedAt: '2026-07-27T10:00:00.000Z',
+          queries: ['platform'],
+          sources: {
+            ats: {
+              configured: true,
+              status: 'healthy',
+              count: 1,
+              accessToken: 'PRIVATE_ACCESS_TOKEN',
+              response: { body: privateTail },
+              jobs: [{
+                company: 'Able',
+                title: 'Platform Engineer',
+                providerId: 'able-1',
+                url: 'https://example.test/jobs/able?utm_source=private&access_token=secret',
+                description: `Public bounded opening. ${privateTail}`,
+                requirements: `AWS required. ${privateTail}`,
+                rawHtml: `<html>${privateTail}</html>`,
+                payload: privateTail,
+                cookies: ['PRIVATE_COOKIE'],
+              }],
+            },
+          },
+        }),
+        profile,
+      }),
+    });
+
+    assert.equal(result.outcome, 'complete');
+    const artifactDirectory = path.join(root, '.scout', 'runs', result.runId, 'artifacts');
+    const persisted = fs.readdirSync(artifactDirectory)
+      .map((name) => fs.readFileSync(path.join(artifactDirectory, name), 'utf8'))
+      .join('\n');
+    assert.doesNotMatch(persisted, /PRIVATE_ACCESS_TOKEN|PRIVATE_COOKIE|rawHtml|accessToken|utm_source|access_token/);
+    assert.doesNotMatch(persisted, new RegExp(privateTail.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+    assert.doesNotMatch(persisted, /"description"|"requirements"/);
+    assert.match(persisted, /advertExcerpt/);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('a failed canonical failure recorder cannot prevent the terminal run event', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'scout-failure-recorder-'));
+  try {
+    const result = await runScanPipeline({
+      root,
+      compatibility: RECOVERY_COMPATIBILITY,
+      stages: {
+        ...durableStageHarness(new Map()),
+        collect: async () => {
+          throw new Error('collection failed');
+        },
+      },
+      recordFailure: async () => {
+        throw new Error('failure report unavailable');
+      },
+    });
+
+    assert.equal(result.outcome, 'failed');
+    assert.deepEqual(result.failures.map((failure) => failure.code), [
+      'stage-failed',
+      'failure-record-failed',
+    ]);
+    const events = replayRunJournal(path.join(root, '.scout', 'runs', result.runId, 'journal.jsonl'));
+    assert.equal(events.at(-1).type, 'run.completed');
+    assert.equal(events.at(-1).payload.outcome, 'failed');
+    assert.equal(readScanLease(root), null);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
 });
