@@ -650,6 +650,8 @@ test('the engine picker uses bounded injected catalogues and returns effective d
       return {
         codex: {
           state: 'refreshed',
+          reasonCode: '/Users/private person@example.test token=secret',
+          checkedAt: '/Users/private/.codex',
           models: [{ id: 'gpt-5.6-sol', isDefault: true }, { id: 'gpt-5.6-terra' }],
         },
         claude: { state: 'unsupported', models: [] },
@@ -700,4 +702,40 @@ test('a stale configured engine model is explained and cannot masquerade as the 
   assert.equal(codex.effectiveModel.id, 'gpt-old-stale');
   assert.equal(codex.effectiveModel.available, false);
   assert.equal(codex.models.find((model) => model.id === 'gpt-old-stale').available, false);
+});
+
+test('a provider-rejected model is marked unavailable on the next picker refresh', async () => {
+  const root = tmpRoot();
+  const routes = routeFixture(root, {
+    runTurnFn: () => ({
+      stop() {},
+      finished: Promise.resolve({
+        ok: false,
+        error: 'The provider reports: model gpt-former is not available for this account.',
+        filesTouched: [],
+      }),
+    }),
+    providerCataloguesFn: async () => ({
+      codex: {
+        state: 'refreshed',
+        models: [{ id: 'gpt-5.6-sol', isDefault: true }, { id: 'gpt-former' }],
+      },
+      claude: { state: 'unsupported', models: [] },
+    }),
+  });
+  await callRoute(
+    routes['POST /api/chat/send'],
+    JSON.stringify({ id: ID, engine: 'codex', model: 'gpt-former', text: 'Hello' }),
+  );
+
+  const response = new MockResponse();
+  await routes['GET /api/engines'](
+    new EventEmitter(), response, '', new URL('http://127.0.0.1/api/engines'),
+  );
+  await response.finished;
+  const rejected = JSON.parse(response.text()).engines.codex.models
+    .find((model) => model.id === 'gpt-former');
+  assert.equal(rejected.available, false);
+  assert.equal(rejected.selected, false);
+  assert.match(rejected.tradeoff, /provider rejected/i);
 });

@@ -236,6 +236,7 @@ test('Windows cmd shims use cmd.exe without enabling a Node shell', () => {
 test('model overrides reject shell metacharacters', () => {
   assert.equal(assertSafeModel('gpt-example-1'), 'gpt-example-1');
   assert.throws(() => assertSafeModel('model & calc'), /invalid model/);
+  assert.throws(() => assertSafeModel('x'.repeat(129)), /invalid model/);
 });
 
 test('Codex catalogue discovery uses fixed argv, shell false and bounded execution', async () => {
