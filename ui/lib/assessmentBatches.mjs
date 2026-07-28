@@ -6,7 +6,10 @@ import {
   validateManifestAgreement,
 } from './runArtifacts.mjs';
 import { appendRunEvent } from './runJournal.mjs';
-import { structuredTurnCancellationGraceMs } from './structuredTurn.mjs';
+import {
+  isCloseGatedProviderCall,
+  ProviderLifecycleUnclosedError,
+} from './structuredTurn.mjs';
 
 const MAX_BATCH_JOBS = 10;
 const DEFAULT_TIMEOUT_MS = 20 * 60 * 1000;
@@ -602,39 +605,83 @@ function commitFailure(batch, job, failure, context) {
 
 async function boundedProviderCall(batch, kind, subset, validationFailures, context) {
   const timeoutMs = batch.request.parameters.timeoutMs;
-  const cancellationGraceMs = structuredTurnCancellationGraceMs(timeoutMs);
   const heartbeatIntervalMs = Math.max(1, Number(context.heartbeatIntervalMs || 1_000));
   let timer;
-  let timeout;
+  let heartbeatTransferred = false;
   const heartbeat = typeof context.heartbeat === 'function'
     ? setInterval(() => {
       Promise.resolve(context.heartbeat()).catch(() => {});
     }, heartbeatIntervalMs)
     : null;
+  heartbeat?.unref?.();
   try {
-    const deadline = new Promise((resolve) => {
-      timer = setTimeout(() => resolve({
-        ok: false,
-        code: 'provider-timeout',
-      }), timeoutMs + cancellationGraceMs + 10);
-    });
-    const call = Promise.resolve().then(() => context.invokeProvider({
-      batchId: batch.id,
-      kind,
-      jobs: subset,
-      validationFailures,
-      timeoutMs,
-      maxInputTokens: batch.request.parameters.maxInputTokens,
-      provenance: batch.request.provenance,
-    })).then(
-      (value) => ({ ok: true, value }),
-      () => ({ ok: false, code: 'provider-call-failed' }),
+    let invocation;
+    try {
+      invocation = context.invokeProvider({
+        batchId: batch.id,
+        kind,
+        jobs: subset,
+        validationFailures,
+        timeoutMs,
+        maxInputTokens: batch.request.parameters.maxInputTokens,
+        provenance: batch.request.provenance,
+      });
+    } catch (error) {
+      if (error instanceof ProviderLifecycleUnclosedError) throw error;
+      return { ok: false, code: 'provider-call-failed' };
+    }
+    const lifecycleManaged = isCloseGatedProviderCall(invocation);
+    const call = Promise.resolve(invocation);
+    const closure = call.then(
+      () => undefined,
+      (error) => error instanceof ProviderLifecycleUnclosedError ? error.closure : undefined,
     );
-    timeout = await Promise.race([call, deadline]);
-    return timeout;
+    const settled = call.then(
+      (value) => ({ ok: true, value }),
+      (error) => ({ ok: false, error }),
+    );
+    let outcome;
+    if (lifecycleManaged) {
+      outcome = await settled;
+    } else {
+      const deadline = new Promise((resolve) => {
+        timer = setTimeout(() => resolve({ ok: false, watchdog: true }), timeoutMs);
+      });
+      outcome = await Promise.race([settled, deadline]);
+      if (outcome.watchdog) {
+        throw new ProviderLifecycleUnclosedError(
+          `assessment provider call did not settle within ${timeoutMs} ms`,
+          closure,
+        );
+      }
+    }
+    if (!outcome.ok) {
+      if (outcome.error instanceof ProviderLifecycleUnclosedError) throw outcome.error;
+      return { ok: false, code: 'provider-call-failed' };
+    }
+    return outcome;
+  } catch (error) {
+    if (!(error instanceof ProviderLifecycleUnclosedError)) throw error;
+    heartbeatTransferred = true;
+    error.closure.then(() => {
+      if (heartbeat) clearInterval(heartbeat);
+    });
+    const state = assessmentState(context.run, batch);
+    for (const job of subset) {
+      const id = jobId(job);
+      if (state.completed.has(id) || state.failed.has(id)) continue;
+      commitFailure(batch, job, {
+        code: 'assessment-provider-unclosed',
+        attempts: state.attempts.get(batch.id)
+          ? [...state.attempts.get(batch.id).values()].filter((ids) => ids.has(id)).length
+          : 0,
+        validationFailures: ['provider-lifecycle-unclosed'],
+      }, context);
+    }
+    throw error;
   } finally {
     clearTimeout(timer);
-    if (heartbeat) clearInterval(heartbeat);
+    if (heartbeat && !heartbeatTransferred) clearInterval(heartbeat);
   }
 }
 

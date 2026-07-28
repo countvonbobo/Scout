@@ -6,6 +6,20 @@ import { parseCodexLine } from './chatCodex.mjs';
 import { assertSafeModel } from './providers.mjs';
 import { runTurn } from './chatRun.mjs';
 
+const CLOSE_GATED_PROVIDER_CALL = Symbol('scout.close-gated-provider-call');
+
+export class ProviderLifecycleUnclosedError extends Error {
+  constructor(message, closure) {
+    super(message);
+    this.name = 'ProviderLifecycleUnclosedError';
+    this.closure = Promise.resolve(closure).then(() => undefined, () => undefined);
+  }
+}
+
+export function isCloseGatedProviderCall(value) {
+  return Boolean(value?.[CLOSE_GATED_PROVIDER_CALL]);
+}
+
 function parseJsonResult(text) {
   let value;
   try { value = JSON.parse(String(text || '').trim()); }
@@ -44,8 +58,9 @@ async function awaitBoundedTurn(turn, timeoutMs, provider) {
   const closed = await Promise.race([settled, closeDeadline.promise]);
   closeDeadline.cancel();
   if (closed.kind === 'close-timeout') {
-    throw new Error(
+    throw new ProviderLifecycleUnclosedError(
       `${provider} structured turn did not close within its ${cancellationGraceMs} ms cancellation grace`,
+      settled,
     );
   }
   const duration = timeoutMs % 60_000 === 0 ? `${timeoutMs / 60_000} minutes` : `${timeoutMs} ms`;
@@ -81,7 +96,7 @@ export function buildStructuredClaudeArgs(schema, options = {}) {
   return args;
 }
 
-export async function runStructuredTurn({
+async function runStructuredTurnOperation({
   provider, status, schema, prompt, model = null, timeoutMs = 10 * 60 * 1000,
   maxInputTokens = null, runTurnFn = runTurn, validate = (value) => value,
 } = {}) {
@@ -91,6 +106,8 @@ export async function runStructuredTurn({
   const taskDir = fs.mkdtempSync(path.join(os.tmpdir(), 'scout-structured-'));
   const schemaFile = path.join(taskDir, 'schema.json');
   fs.writeFileSync(schemaFile, `${JSON.stringify(schema, null, 2)}\n`, 'utf8');
+  let cleanupOnExit = true;
+  const cleanup = () => fs.rmSync(taskDir, { recursive: true, force: true });
   try {
     const args = provider === 'codex'
       ? buildStructuredCodexArgs(schemaFile, { model })
@@ -108,7 +125,19 @@ export async function runStructuredTurn({
     }
     const value = validate(parseJsonResult(result.text));
     return { ok: true, value, usage: result.usage || {}, provider };
+  } catch (error) {
+    if (error instanceof ProviderLifecycleUnclosedError) {
+      cleanupOnExit = false;
+      error.closure.then(cleanup);
+    }
+    throw error;
   } finally {
-    fs.rmSync(taskDir, { recursive: true, force: true });
+    if (cleanupOnExit) cleanup();
   }
+}
+
+export function runStructuredTurn(options = {}) {
+  const operation = runStructuredTurnOperation(options);
+  Object.defineProperty(operation, CLOSE_GATED_PROVIDER_CALL, { value: true });
+  return operation;
 }

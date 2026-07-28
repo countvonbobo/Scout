@@ -9,8 +9,13 @@ import {
   planAssessmentBatches,
   resumeAssessments,
 } from './assessmentBatches.mjs';
+import { readRunArtifact } from './runArtifacts.mjs';
 import { acquireScanLease, currentLeaseOwner, releaseScanLease } from './scanLease.mjs';
 import { appendRunEvent, openRunJournal, validateRunJournal } from './runJournal.mjs';
+import {
+  ProviderLifecycleUnclosedError,
+  runStructuredTurn,
+} from './structuredTurn.mjs';
 
 const provenance = Object.freeze({
   profileVersion: 'profile-v1',
@@ -577,7 +582,7 @@ test('resume never resubmits a committed sibling from an interrupted partial bat
   }
 });
 
-test('provider calls time out while an independent heartbeat keeps advancing', async () => {
+test('settled provider failures remain bounded while an independent heartbeat keeps advancing', async () => {
   const fixture = runFixture();
   try {
     const [batch] = planAssessmentBatches({
@@ -592,13 +597,74 @@ test('provider calls time out while an independent heartbeat keeps advancing', a
       lease: fixture.lease,
       heartbeatIntervalMs: 5,
       heartbeat: () => { heartbeats += 1; },
-      invokeProvider: () => new Promise(() => {}),
+      invokeProvider: () => new Promise((_, reject) => {
+        setTimeout(() => reject(new Error('synthetic settled provider failure')), 20);
+      }),
     });
     assert.ok(Date.now() - started < 500, 'provider timeout must remain bounded');
     assert.ok(heartbeats >= 2, `expected independent heartbeats, received ${heartbeats}`);
     assert.equal(result.assessments.length, 0);
     assert.equal(result.failures[0].code, 'assessment-provider-exhausted');
   } finally {
+    fixture.cleanup();
+  }
+});
+
+test('an unclosed provider turn fails closed without repair and keeps heartbeat ownership', async () => {
+  const fixture = runFixture();
+  let finish;
+  try {
+    const [batch] = planAssessmentBatches({
+      runId: fixture.run.runId, jobs: jobs(1), provenance,
+      contextBudgetCharacters: 5_000, contextOverheadCharacters: 100,
+      timeoutMs: 10,
+    });
+    let calls = 0;
+    let heartbeats = 0;
+    const error = await executeAssessmentBatch(batch, {
+      run: fixture.run,
+      lease: fixture.lease,
+      heartbeatIntervalMs: 5,
+      heartbeat: () => { heartbeats += 1; },
+      invokeProvider: () => {
+        calls += 1;
+        return runStructuredTurn({
+          provider: 'codex',
+          status: {
+            installed: true,
+            authenticated: true,
+            executable: 'codex',
+            capabilities: { structuredOutput: true },
+          },
+          schema: { type: 'object', properties: {}, required: [] },
+          prompt: 'synthetic',
+          timeoutMs: 10,
+          runTurnFn: () => ({
+            finished: new Promise((resolve) => { finish = resolve; }),
+            stop() {},
+          }),
+        });
+      },
+    }).then(
+      () => null,
+      (caught) => caught,
+    );
+
+    assert.ok(error instanceof ProviderLifecycleUnclosedError);
+    assert.equal(calls, 1);
+    const before = heartbeats;
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.ok(heartbeats > before, 'heartbeat must remain live while provider closure is unresolved');
+
+    const failed = validateRunJournal(fixture.run.file).events
+      .find((event) => event.type === 'assessment.job-failed');
+    assert.ok(failed, 'fail-closed assessment state must be journalled');
+    const stored = readRunArtifact({ ...failed.payload.artifact, directory: fixture.run.directory });
+    assert.equal(stored.data.code, 'assessment-provider-unclosed');
+    assert.deepEqual(stored.data.validationFailures, ['provider-lifecycle-unclosed']);
+  } finally {
+    finish?.({ ok: false, error: 'closed after operator intervention' });
+    await new Promise((resolve) => setTimeout(resolve, 0));
     fixture.cleanup();
   }
 });

@@ -1,7 +1,12 @@
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import { test } from 'node:test';
-import { buildStructuredClaudeArgs, buildStructuredCodexArgs, runStructuredTurn } from './structuredTurn.mjs';
+import {
+  buildStructuredClaudeArgs,
+  buildStructuredCodexArgs,
+  ProviderLifecycleUnclosedError,
+  runStructuredTurn,
+} from './structuredTurn.mjs';
 
 const schema = { type: 'object', properties: { answer: { type: 'string' } }, required: ['answer'] };
 
@@ -82,4 +87,35 @@ test('structured turns wait for adapter closure after stopping a timed-out turn'
   }), /timed out after 25 ms/);
   lifecycle.push('rejected');
   assert.deepEqual(lifecycle, ['stop', 'closed', 'rejected']);
+});
+
+test('structured turns expose unresolved closure as a distinct fail-closed outcome', { timeout: 1_000 }, async () => {
+  let stopped = 0;
+  let taskDirectory;
+  const error = await runStructuredTurn({
+    provider: 'codex',
+    status: { installed: true, authenticated: true, executable: 'codex', capabilities: { structuredOutput: true } },
+    schema,
+    prompt: 'synthetic',
+    timeoutMs: 10,
+    runTurnFn: ({ cwd }) => {
+      taskDirectory = cwd;
+      return {
+        finished: new Promise(() => {}),
+        stop() { stopped += 1; },
+      };
+    },
+  }).then(
+    () => null,
+    (caught) => caught,
+  );
+
+  assert.ok(error instanceof ProviderLifecycleUnclosedError);
+  assert.equal(stopped, 1);
+  let closureObserved = false;
+  error.closure.then(() => { closureObserved = true; });
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.equal(closureObserved, false);
+  assert.equal(fs.existsSync(taskDirectory), true);
+  fs.rmSync(taskDirectory, { recursive: true, force: true });
 });

@@ -33,6 +33,7 @@ import {
   planAssessmentBatches,
   resumeAssessments,
 } from './assessmentBatches.mjs';
+import { ProviderLifecycleUnclosedError } from './structuredTurn.mjs';
 export { filterVacancies } from './vacancyFilter.mjs';
 
 const EMPTY_DISCARDED = Object.freeze({ hard_exclusion: 0, mandatory_unmet: 0, below_threshold: 0, provider_discarded: 0 });
@@ -516,6 +517,7 @@ export async function runScanPipeline({
   let terminal = false;
   let released = false;
   let retainInterruptedLease = false;
+  let retainUnclosedAuthority = false;
   let heartbeat = null;
   const failures = [];
   const outputs = new Map();
@@ -668,33 +670,20 @@ export async function runScanPipeline({
       }
     }
   } catch (error) {
-    if (error instanceof PipelineInterruptedError) {
-      retainInterruptedLease = true;
-      throw error;
-    }
-    if (error instanceof LeaseLostError) {
-      failures.push(Object.freeze({ code: 'lease-lost', stage: outputs.size ? DURABLE_DISCOVERY_STAGES[outputs.size] ?? 'finalise' : 'initialise' }));
-      manifest = run ? projectRunManifest(run.events) : null;
-      return resultWithOutputs({
-        runId: run?.runId ?? provisionalRunId,
-        outcome: 'lease-lost',
-        manifest,
-        failures: Object.freeze(failures),
-      }, outputs);
-    }
-    const failedStage = DURABLE_DISCOVERY_STAGES[outputs.size] ?? 'finalise';
-    failures.push(Object.freeze({
-      code: 'stage-failed',
-      stage: failedStage,
-      message: boundedText(error?.message, 220),
-    }));
-    if (run) {
-      try {
+    if (error instanceof ProviderLifecycleUnclosedError) {
+      retainUnclosedAuthority = true;
+      const failure = Object.freeze({
+        code: 'provider-lifecycle-unclosed',
+        stage: 'finalise',
+        reason: 'operator-intervention-required',
+      });
+      failures.push(failure);
+      if (run) {
         if (recordFailure !== null) {
           try {
             await recordFailure({
               error,
-              failedStage,
+              failedStage: 'finalise',
               run,
               lease,
               stageOutputs: Object.freeze(Object.fromEntries(outputs)),
@@ -703,25 +692,83 @@ export async function runScanPipeline({
             if (recordError instanceof LeaseLostError) throw recordError;
             failures.push(Object.freeze({
               code: 'failure-record-failed',
-              stage: failedStage,
+              stage: 'finalise',
               message: boundedText(recordError?.message, 220),
             }));
           }
         }
         appendRunEvent(run, {
-          type: 'run.completed',
+          type: 'run.failure-recorded',
           stageId: 'finalise',
-          idempotencyKey: `run-failed-g${lease.generation}`,
-          payload: { schemaVersion: 1, outcome: 'failed' },
+          idempotencyKey: `provider-lifecycle-unclosed-g${lease.generation}`,
+          payload: {
+            schemaVersion: 1,
+            code: failure.code,
+            reason: failure.reason,
+          },
         }, lease);
         manifest = validateManifestAgreement(run, lease).manifest;
-        terminal = true;
-      } catch (commitError) {
-        if (!(commitError instanceof LeaseLostError)) throw commitError;
+      }
+      error.closure.then(() => {
+        heartbeat?.stop();
+        if (ownsLease && !released) {
+          try { releaseScanLease(lease); released = true; } catch { /* recovery owns any successor fence */ }
+        }
+      });
+    } else if (error instanceof PipelineInterruptedError) {
+      retainInterruptedLease = true;
+      throw error;
+    } else if (error instanceof LeaseLostError) {
+      failures.push(Object.freeze({ code: 'lease-lost', stage: outputs.size ? DURABLE_DISCOVERY_STAGES[outputs.size] ?? 'finalise' : 'initialise' }));
+      manifest = run ? projectRunManifest(run.events) : null;
+      return resultWithOutputs({
+        runId: run?.runId ?? provisionalRunId,
+        outcome: 'lease-lost',
+        manifest,
+        failures: Object.freeze(failures),
+      }, outputs);
+    } else {
+      const failedStage = DURABLE_DISCOVERY_STAGES[outputs.size] ?? 'finalise';
+      failures.push(Object.freeze({
+        code: 'stage-failed',
+        stage: failedStage,
+        message: boundedText(error?.message, 220),
+      }));
+      if (run) {
+        try {
+          if (recordFailure !== null) {
+            try {
+              await recordFailure({
+                error,
+                failedStage,
+                run,
+                lease,
+                stageOutputs: Object.freeze(Object.fromEntries(outputs)),
+              });
+            } catch (recordError) {
+              if (recordError instanceof LeaseLostError) throw recordError;
+              failures.push(Object.freeze({
+                code: 'failure-record-failed',
+                stage: failedStage,
+                message: boundedText(recordError?.message, 220),
+              }));
+            }
+          }
+          appendRunEvent(run, {
+            type: 'run.completed',
+            stageId: 'finalise',
+            idempotencyKey: `run-failed-g${lease.generation}`,
+            payload: { schemaVersion: 1, outcome: 'failed' },
+          }, lease);
+          manifest = validateManifestAgreement(run, lease).manifest;
+          terminal = true;
+        } catch (commitError) {
+          if (!(commitError instanceof LeaseLostError)) throw commitError;
+        }
       }
     }
   } finally {
-    heartbeat?.stop();
+    if (!retainUnclosedAuthority) heartbeat?.stop();
     if (ownsLease && !released && !retainInterruptedLease && terminal) {
       try { releaseScanLease(lease); released = true; } catch { /* lease loss is already reflected above */ }
     }

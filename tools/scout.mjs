@@ -785,7 +785,7 @@ export async function runScanWith(root, provider, mode, {
               contextBudgetCharacters: MAX_SCAN_CONTEXT_CHARS,
               contextOverheadCharacters: JSON.stringify(emptyContext).length,
               contextDigests,
-              async invokeProvider({ kind, jobs, validationFailures, timeoutMs, maxInputTokens }) {
+              invokeProvider({ kind, jobs, validationFailures, timeoutMs, maxInputTokens }) {
                 const context = buildScanContext(paths, config, jobs.map(promptCandidate));
                 const repairInstruction = kind === 'repair'
                   ? `Repair only the supplied invalid jobs against these bounded validation codes: ${JSON.stringify(validationFailures)}`

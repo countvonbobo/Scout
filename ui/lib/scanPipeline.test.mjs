@@ -11,6 +11,7 @@ import {
 import { claimNextScanRequest, enqueueScanRequest, projectScanQueue } from './scanQueue.mjs';
 import { acquireScanLease, currentLeaseOwner, readScanLease, releaseScanLease } from './scanLease.mjs';
 import { appendRunEvent, openRunJournal, replayRunJournal } from './runJournal.mjs';
+import { ProviderLifecycleUnclosedError } from './structuredTurn.mjs';
 
 const dimensions = [{ name: 'Fit', score: 90, maximum: 100, evidence: 'Advert and profile' }];
 const assessment = (status = 'met') => ({
@@ -1697,6 +1698,50 @@ test('a failed canonical failure recorder cannot prevent the terminal run event'
     assert.equal(events.at(-1).type, 'run.completed');
     assert.equal(events.at(-1).payload.outcome, 'failed');
     assert.equal(readScanLease(root), null);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('an unclosed provider lifecycle remains auditable without stopping heartbeat or releasing its fence', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'scout-provider-unclosed-'));
+  let heartbeatStops = 0;
+  const closure = new Promise(() => {});
+  try {
+    const result = await runScanPipeline({
+      root,
+      compatibility: RECOVERY_COMPATIBILITY,
+      stages: durableStageHarness(new Map()),
+      heartbeatOptions: {
+        intervalMs: 100,
+        setTimeoutFn() { return { unref() {} }; },
+        clearTimeoutFn() { heartbeatStops += 1; },
+      },
+      finalize: async () => {
+        throw new ProviderLifecycleUnclosedError(
+          'provider process did not close',
+          closure,
+        );
+      },
+    });
+
+    assert.equal(result.outcome, 'in-progress');
+    assert.deepEqual(result.failures, [{
+      code: 'provider-lifecycle-unclosed',
+      stage: 'finalise',
+      reason: 'operator-intervention-required',
+    }]);
+    assert.equal(heartbeatStops, 0);
+    const lease = readScanLease(root);
+    assert.ok(lease, 'the unresolved external call must retain fenced authority');
+    assert.equal(lease.runId, result.runId);
+    const events = replayRunJournal(openRunJournal(root, result.runId).file);
+    assert.ok(events.some((event) => (
+      event.type === 'run.failure-recorded'
+      && event.payload.code === 'provider-lifecycle-unclosed'
+      && event.payload.reason === 'operator-intervention-required'
+    )));
+    assert.equal(events.some((event) => event.type === 'run.completed'), false);
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }
