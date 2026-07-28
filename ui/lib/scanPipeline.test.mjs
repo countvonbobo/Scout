@@ -12,6 +12,7 @@ import { claimNextScanRequest, enqueueScanRequest, projectScanQueue } from './sc
 import { acquireScanLease, currentLeaseOwner, readScanLease, releaseScanLease } from './scanLease.mjs';
 import { appendRunEvent, openRunJournal, replayRunJournal } from './runJournal.mjs';
 import { ProviderLifecycleUnclosedError } from './structuredTurn.mjs';
+import { applyPreparedMutation, prepareMutation } from './mutationCoordinator.mjs';
 
 const dimensions = [{ name: 'Fit', score: 90, maximum: 100, evidence: 'Advert and profile' }];
 const assessment = (status = 'met') => ({
@@ -1812,6 +1813,41 @@ test('post-success work requires a durable mutation receipt and remains under th
     assert.equal(hookCalls, 1);
     assert.deepEqual(result.failures, []);
     assert.equal(readScanLease(root), null);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('pipeline accepts a coordinator-journalled receipt without projecting a duplicate mutation', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'scout-coordinated-receipt-'));
+  fs.mkdirSync(path.join(root, 'reports'), { recursive: true });
+  fs.writeFileSync(path.join(root, 'reports', 'coordinated.md'), '# Report\n\n## Headline\n\nBefore.\n');
+  try {
+    const result = await runScanPipeline({
+      root,
+      compatibility: RECOVERY_COMPATIBILITY,
+      stages: durableStageHarness(new Map()),
+      finalize: async ({ run, lease }) => {
+        const plan = prepareMutation({ handle: run, lease }, {
+          id: 'coordinated-report',
+          schemaVersion: 1,
+          files: [{ kind: 'report', path: 'reports/coordinated.md' }],
+        }, {
+          'reports/coordinated.md': '# Report\n\n## Headline\n\nAfter.\n',
+        });
+        return {
+          schemaVersion: 1,
+          result: { ok: true },
+          mutationReceipt: applyPreparedMutation(plan, lease),
+        };
+      },
+    });
+
+    assert.equal(result.outcome, 'complete');
+    const receipts = replayRunJournal(openRunJournal(root, result.runId).file)
+      .filter((event) => event.type === 'mutation.receipted');
+    assert.equal(receipts.length, 1);
+    assert.equal(result.manifest.receipts.length, 1);
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }

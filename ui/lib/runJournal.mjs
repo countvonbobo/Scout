@@ -46,6 +46,12 @@ const EVENT_PAYLOAD_SCHEMAS = Object.freeze({
       required: Object.freeze(new Set(['schemaVersion', 'reference', 'digest'])),
     }),
   }),
+  'mutation.prepared': Object.freeze({
+    1: Object.freeze({
+      allowed: Object.freeze(new Set(['schemaVersion', 'reference', 'digest', 'targetRevision'])),
+      required: Object.freeze(new Set(['schemaVersion', 'reference', 'digest', 'targetRevision'])),
+    }),
+  }),
   'assessment.batch-attempted': Object.freeze({
     1: Object.freeze({
       allowed: Object.freeze(new Set(['schemaVersion', 'reference', 'count', 'attempt', 'artifact'])),
@@ -281,6 +287,9 @@ function validatePayload(type, payload, ErrorType = TypeError) {
   }
   if (value.outcome !== undefined && !RUN_OUTCOMES.has(value.outcome)) throw new ErrorType('journal payload outcome is invalid');
   if (value.digest !== undefined && (typeof value.digest !== 'string' || !SHA256.test(value.digest))) throw new ErrorType('journal payload digest is invalid');
+  if (value.targetRevision !== undefined && (typeof value.targetRevision !== 'string' || !SHA256.test(value.targetRevision))) {
+    throw new ErrorType('journal payload target revision is invalid');
+  }
   if (value.attempt !== undefined) requireSafeToken(value.attempt, 'assessment attempt', ErrorType);
   if (type === 'run.failure-recorded') {
     requireSafeToken(value.code, 'failure code', ErrorType);

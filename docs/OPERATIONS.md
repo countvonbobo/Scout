@@ -58,6 +58,14 @@ The maintained beta deployment uses one private, single-owner Ubuntu VPS:
   completed jobs or batches. Durable request records contain only stable job
   references, input digests, bounded parameters and versioned provenance, not
   CVs, adverts, prompts, transcripts or raw provider responses.
+- Tracker, daily-report and scan-run finalisation is one journal-authorised
+  mutation plan. Scout persists the bounded intended content and target
+  revisions before taking the shared workspace mutation coordinator, then
+  rechecks the scan fence and revisions, atomically replaces each file,
+  verifies embedded opaque identities and written digests, and journals one
+  receipt. Recovery accepts matching written identities without replay and
+  stops for review on conflicting or unverifiable state. Backup starts only
+  after that receipt; a backup failure does not erase the successful scan.
 - Normal tracked career files remain readable only inside the private repository; ignored sensitive recovery state is encrypted under `.scout-backup/v1`.
 
 Do not assume a developer computer's local application checkout or workspace is live. Diagnose the VPS for production-like bugs unless the user explicitly reports a local-only installation.

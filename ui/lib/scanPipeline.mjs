@@ -34,6 +34,9 @@ import {
   resumeAssessments,
 } from './assessmentBatches.mjs';
 import { ProviderLifecycleUnclosedError } from './structuredTurn.mjs';
+import {
+  applyPreparedMutation, loadPreparedMutation, prepareMutation,
+} from './mutationCoordinator.mjs';
 export { filterVacancies } from './vacancyFilter.mjs';
 
 const EMPTY_DISCARDED = Object.freeze({ hard_exclusion: 0, mandatory_unmet: 0, below_threshold: 0, provider_discarded: 0 });
@@ -647,16 +650,25 @@ export async function runScanPipeline({
       mutationReceipt = finalized.mutationReceipt;
       receiptIssue = finalized.receiptIssue;
       if (mutationReceipt) {
-        appendRunEvent(run, {
-          type: 'mutation.receipted',
-          stageId: 'finalise',
-          idempotencyKey: `scan-mutation-receipt-g${lease.generation}`,
-          payload: {
-            schemaVersion: 1,
-            reference: { kind: 'mutation', id: mutationReceipt.id },
-            digest: mutationReceipt.digest,
-          },
-        }, lease);
+        const existingReceipt = run.events.find((event) => (
+          event.type === 'mutation.receipted'
+          && event.payload?.reference?.id === mutationReceipt.id
+        ));
+        if (existingReceipt && existingReceipt.payload.digest !== mutationReceipt.digest) {
+          throw new Error('scan mutation receipt conflicts with durable journal evidence');
+        }
+        if (!existingReceipt) {
+          appendRunEvent(run, {
+            type: 'mutation.receipted',
+            stageId: 'finalise',
+            idempotencyKey: `scan-mutation-receipt-g${lease.generation}`,
+            payload: {
+              schemaVersion: 1,
+              reference: { kind: 'mutation', id: mutationReceipt.id },
+              digest: mutationReceipt.digest,
+            },
+          }, lease);
+        }
         manifest = validateManifestAgreement(run, lease).manifest;
       }
     }
@@ -1806,15 +1818,16 @@ export function validateWrittenScanArtifacts(root, expectedRun) {
   return { tracker, report, run };
 }
 
-export function writeScanArtifacts(root, {
+function buildScanArtifacts(root, {
   provider, mode, sources, queries = [], candidates, assessmentResult, policy, startedAt,
   error = null, skipped = false, dropped = { perSource: {}, total: 0 }, hardExcluded = [], closedAdverts = [], exclusions = [],
   assessmentFailures = [],
   livenessSummary = { checked: 0, gone: 0, unverified: 0 }, verificationScoped = false,
   staleInboxEntries = [], inboxRechecked = 0, funnel = null, selection = [], discoveryEngine = 'legacy-discovery', profileId = null,
+  timestamp: requestedTimestamp = null,
 }) {
   const paths = workspacePaths(root);
-  const timestamp = new Date().toISOString();
+  const timestamp = requestedTimestamp || new Date().toISOString();
   const date = timestamp.slice(0, 10);
   const health = sourceHealth(sources);
   const configuredSources = Object.values(health).filter((item) => item.configured !== false);
@@ -1894,10 +1907,89 @@ export function writeScanArtifacts(root, {
     return `- **${item.agent} ${item.mode}** at ${String(item.timestamp || '').slice(11, 16) || 'unknown time'} UTC - ${item.skipped ? 'skipped because another scan was running' : item.degraded ? 'degraded' : 'healthy'}; ${item.candidates_found || 0} candidate(s), ${item.keepers_added || 0} added, ${item.keepers_updated || 0} updated; ${sourcesSummary}.`;
   }).join('\n');
   const report = baseReport.replace('## Action today', `## Scan runs\n\n${runLines}\n\n## Action today`);
-  if (!error) atomicWrite(paths.tracker, serializeTracker(durableTracker));
-  atomicWrite(path.join(paths.reports, `${date}.md`), report);
-  fs.mkdirSync(path.dirname(paths.scanRuns), { recursive: true });
-  fs.appendFileSync(paths.scanRuns, `${JSON.stringify(run)}\n`, 'utf8');
-  validateWrittenScanArtifacts(root, run);
-  return { run, tracker: durableTracker, report: path.join(paths.reports, `${date}.md`) };
+  const reportPath = path.join(paths.reports, `${date}.md`);
+  const priorRuns = fs.existsSync(paths.scanRuns) ? fs.readFileSync(paths.scanRuns, 'utf8').trimEnd() : '';
+  const scanRuns = `${priorRuns ? `${priorRuns}\n` : ''}${JSON.stringify(run)}\n`;
+  return {
+    run,
+    tracker: durableTracker,
+    report: reportPath,
+    contents: {
+      ...(error ? {} : { tracker: serializeTracker(durableTracker) }),
+      report,
+      scanRuns,
+    },
+  };
+}
+
+export function writeScanArtifacts(root, input) {
+  const paths = workspacePaths(root);
+  const artifacts = buildScanArtifacts(root, input);
+  if (artifacts.contents.tracker !== undefined) atomicWrite(paths.tracker, artifacts.contents.tracker);
+  atomicWrite(artifacts.report, artifacts.contents.report);
+  atomicWrite(paths.scanRuns, artifacts.contents.scanRuns);
+  validateWrittenScanArtifacts(root, artifacts.run);
+  return { run: artifacts.run, tracker: artifacts.tracker, report: artifacts.report };
+}
+
+function coordinatedArtifactsFromPlan(root, plan) {
+  const paths = workspacePaths(root);
+  const trackerTarget = plan.files.find((target) => target.kind === 'tracker');
+  const reportTarget = plan.files.find((target) => target.kind === 'report');
+  const runTarget = plan.files.find((target) => target.kind === 'run-log');
+  if (!trackerTarget || !reportTarget || !runTarget) {
+    throw new Error('prepared scan mutation does not contain tracker, report and run-log targets');
+  }
+  const tracker = JSON.parse(trackerTarget.preparedContent);
+  delete tracker._scoutMutation;
+  const lines = runTarget.preparedContent.trim().split(/\r?\n/);
+  const scanRun = JSON.parse(lines.at(-1));
+  delete scanRun._scoutMutation;
+  return {
+    run: scanRun,
+    tracker,
+    report: path.join(root, ...reportTarget.path.split('/')),
+    paths,
+  };
+}
+
+export function coordinateScanArtifacts(root, input, { run, lease }) {
+  const existing = [...run.events].reverse().find((event) => (
+    event.type === 'mutation.prepared'
+    && event.stageId === 'finalise'
+    && event.payload?.reference?.kind === 'mutation'
+  ));
+  let plan;
+  if (existing) {
+    plan = loadPreparedMutation(run, existing.payload.reference.id);
+  } else {
+    const timestamp = run.events.find((event) => event.type === 'run.started')?.recordedAt
+      || input.startedAt;
+    const artifacts = buildScanArtifacts(root, { ...input, timestamp });
+    const paths = workspacePaths(root);
+    const relative = (file) => path.relative(root, file).split(path.sep).join('/');
+    const target = {
+      id: 'scan-tracker-report',
+      schemaVersion: 1,
+      files: [
+        { kind: 'tracker', path: relative(paths.tracker) },
+        { kind: 'report', path: relative(artifacts.report) },
+        { kind: 'run-log', path: relative(paths.scanRuns) },
+      ],
+    };
+    plan = prepareMutation({ handle: run, lease }, target, {
+      [relative(paths.tracker)]: artifacts.contents.tracker,
+      [relative(artifacts.report)]: artifacts.contents.report,
+      [relative(paths.scanRuns)]: artifacts.contents.scanRuns,
+    });
+  }
+  const mutationReceipt = applyPreparedMutation(plan, lease);
+  const artifacts = coordinatedArtifactsFromPlan(root, plan);
+  validateWrittenScanArtifacts(root, artifacts.run);
+  return {
+    run: artifacts.run,
+    tracker: artifacts.tracker,
+    report: artifacts.report,
+    mutationReceipt,
+  };
 }

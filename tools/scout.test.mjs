@@ -544,8 +544,10 @@ test('runtime scan model is independent from the job-work model', async () => {
     acquireLockFn: () => ({ ok: true, lock: { token: `lock-${seen.length}` } }),
     releaseLockFn: () => ({ ok: true }),
   });
-  assert.equal((await run(null)).ok, true);
-  assert.equal((await run('gpt-scan')).ok, true);
+  const defaultModel = await run(null);
+  assert.equal(defaultModel.ok, true, defaultModel.error);
+  const explicitModel = await run('gpt-scan');
+  assert.equal(explicitModel.ok, true, explicitModel.error);
   assert.deepEqual(seen, [null, 'gpt-scan']);
 });
 
@@ -720,6 +722,7 @@ test('runtime backup consumes a mutation receipt while the successful scan fence
         const lease = readScanLease(root);
         assert.ok(lease);
         const events = replayRunJournal(path.join(root, '.scout', 'runs', lease.runId, 'journal.jsonl'));
+        assert.equal(events.at(-3).type, 'mutation.prepared');
         assert.equal(events.at(-2).type, 'mutation.receipted');
         assert.equal(events.at(-1).type, 'run.completed');
         assert.equal(events.at(-1).payload.outcome, 'complete');
@@ -731,6 +734,9 @@ test('runtime backup consumes a mutation receipt while the successful scan fence
     assert.equal(result.durable.outcome, 'complete');
     assert.deepEqual(result.durable.failures, []);
     assert.equal(backupCalls, 1);
+    assert.ok(JSON.parse(fs.readFileSync(path.join(root, 'data', 'opportunities.json'), 'utf8'))._scoutMutation);
+    assert.match(fs.readFileSync(path.join(root, 'reports', `${result.scan.timestamp.slice(0, 10)}.md`), 'utf8'), /scout-mutation:/);
+    assert.ok(JSON.parse(fs.readFileSync(path.join(root, 'data', 'scan-runs.jsonl'), 'utf8').trim())._scoutMutation);
     assert.equal(readScanLease(root), null);
   } finally {
     fs.rmSync(root, { recursive: true, force: true });

@@ -6,7 +6,8 @@ import { afterEach, test } from 'node:test';
 import { serializeTracker } from './tracker.mjs';
 import {
   acquireTrackerMutationLock, atomicReplaceTracker, mutateTrackerSnapshot,
-  readTrackerSnapshot, releaseTrackerMutationLock, TrackerRevisionConflictError,
+  embedTrackerMutationMarker, readTrackerMutationMarker, readTrackerSnapshot,
+  releaseTrackerMutationLock, TrackerRevisionConflictError,
 } from './trackerPersistence.mjs';
 
 const temporaryDirectories = [];
@@ -86,4 +87,21 @@ test('end-to-end regression: mutating a tracker with missing updated field prese
   const finalState = readTrackerSnapshot(file);
   assert.equal(finalState.data.opportunities[0].status, 'ignore');
   assert.equal(finalState.data.opportunities[0].id, 'incident-test');
+});
+
+test('tracker mutation markers remain verifiable but are hidden from tracker consumers', () => {
+  const { file } = fixture();
+  const marker = {
+    schemaVersion: 1,
+    mutationId: 'mutation-123',
+    mutationKey: 'a'.repeat(64),
+    runKey: 'b'.repeat(64),
+    intendedDigest: 'c'.repeat(64),
+  };
+  const marked = embedTrackerMutationMarker(fs.readFileSync(file, 'utf8'), marker);
+  fs.writeFileSync(file, marked);
+
+  assert.deepEqual(readTrackerMutationMarker(marked), marker);
+  assert.equal(Object.hasOwn(readTrackerSnapshot(file).data, '_scoutMutation'), false);
+  assert.equal(readTrackerSnapshot(file).data.opportunities[0].id, 'example-role-2026-07');
 });

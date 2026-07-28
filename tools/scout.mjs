@@ -15,7 +15,7 @@ import { setupReadiness } from '../ui/lib/setupReadiness.mjs';
 import { runStructuredTurn } from '../ui/lib/structuredTurn.mjs';
 import {
   assessScanCandidates, assessmentCandidatesForSelection, compactCandidates, createRankedDiscoveryStages, DEFAULT_CANDIDATE_LIMIT,
-  durableScanProjection, inboxRecheckCandidates, promptCandidate, runScanPipeline, SCAN_ASSESSMENT_SCHEMA,
+  coordinateScanArtifacts, durableScanProjection, inboxRecheckCandidates, promptCandidate, runScanPipeline, SCAN_ASSESSMENT_SCHEMA,
   verificationCandidates, writeScanArtifacts,
 } from '../ui/lib/scanPipeline.mjs';
 import { loadPublishedSearchProfile, migrateSearchProfile } from '../ui/lib/searchProfile.mjs';
@@ -53,19 +53,6 @@ function stableJson(value) {
 
 function scanDigest(value) {
   return createHash('sha256').update(stableJson(value)).digest('hex');
-}
-
-function scanMutationReceipt(root, artifacts) {
-  const paths = workspacePaths(root);
-  return Object.freeze({
-    schemaVersion: 1,
-    id: 'scan-tracker-report',
-    digest: scanDigest({
-      tracker: fs.readFileSync(paths.tracker, 'utf8'),
-      report: fs.readFileSync(artifacts.report, 'utf8'),
-      run: artifacts.run,
-    }),
-  });
 }
 
 function backupHookOutcome(status) {
@@ -111,6 +98,12 @@ function queueConfigFingerprint(config, tracker) {
   });
 }
 
+function readScanTracker(root) {
+  const tracker = JSON.parse(fs.readFileSync(workspacePaths(root).tracker, 'utf8'));
+  delete tracker._scoutMutation;
+  return tracker;
+}
+
 function scanCompatibility({
   config, mode, model, profile, provider, root, tracker,
   requester = 'manual', scheduleId = null, logicalWindowId = null,
@@ -149,7 +142,7 @@ function scanQueueCompatibility(compatibility, profile, config, tracker) {
 function currentScanQueueCompatibility(root) {
   const config = loadWorkspaceConfig(root);
   const profile = loadPublishedSearchProfile(root);
-  const tracker = JSON.parse(fs.readFileSync(workspacePaths(root).tracker, 'utf8'));
+  const tracker = readScanTracker(root);
   return Object.freeze({
     profileFingerprint: scanDigest(profile || { id: profile?.id || 'legacy-profile' }),
     configFingerprint: queueConfigFingerprint(config, tracker),
@@ -165,7 +158,7 @@ function verifyQueuedScanCompatibility(root, request, manifest = null) {
   }
   const config = loadWorkspaceConfig(root);
   const profile = loadPublishedSearchProfile(root);
-  const tracker = JSON.parse(fs.readFileSync(workspacePaths(root).tracker, 'utf8'));
+  const tracker = readScanTracker(root);
   const currentQueue = {
     ...currentScanQueueCompatibility(root),
     purpose: request.purpose,
@@ -339,7 +332,7 @@ export function migrateLegacyWorkspace(sourceRoot, targetRoot) {
 
 export function assertScanReady(root, provider, { providerStatusFn = providerStatus } = {}) {
   const config = loadWorkspaceConfig(root);
-  const tracker = JSON.parse(fs.readFileSync(workspacePaths(root).tracker, 'utf8'));
+  const tracker = readScanTracker(root);
   const selected = config.ai?.provider;
   const providers = Object.fromEntries([...new Set([selected, provider].filter(Boolean))].map((name) => [name, providerStatusFn(name)]));
   const readiness = setupReadiness(root, config, providers, tracker);
@@ -572,7 +565,7 @@ export async function runScanWith(root, provider, mode, {
   let discoveryEngine = 'legacy-discovery';
   let durable = null;
   const publishedAtStart = loadPublishedSearchProfile(root);
-  const trackerAtStart = JSON.parse(fs.readFileSync(workspacePaths(root).tracker, 'utf8'));
+  const trackerAtStart = readScanTracker(root);
   const compatibility = scanCompatibility({
     config, mode, model, profile: publishedAtStart, provider, root, tracker: trackerAtStart,
     requester, scheduleId, logicalWindowId,
@@ -708,7 +701,7 @@ export async function runScanWith(root, provider, mode, {
       async finalize({ run, lease, stageOutputs }) {
         collected = stageOutputs.collect;
         publishedProfile = publishedAtStart;
-        const tracker = JSON.parse(fs.readFileSync(workspacePaths(root).tracker, 'utf8'));
+        const tracker = readScanTracker(root);
         try {
           if (publishedProfile) {
             discovery = stageOutputs.select;
@@ -836,18 +829,18 @@ export async function runScanWith(root, provider, mode, {
             };
           }
           onProgress({ phase: 'Writing tracker and report', current: 4, total: 5 });
-          const artifacts = assertCurrentFence(lease, synchronousFenceCallback(() => writeScanArtifacts(root, {
+          const artifacts = coordinateScanArtifacts(root, {
             provider, mode, sources: collected.sources, queries: collected.queries, candidates, assessmentResult,
             policy: config.triage, startedAt,
             assessmentFailures,
             dropped, hardExcluded, closedAdverts, exclusions: discovery?.exclusions || [], livenessSummary, verificationScoped, funnel, selection, discoveryEngine, profileId: publishedProfile?.id || null,
             staleInboxEntries, inboxRechecked,
-          })));
+          }, { run, lease });
           result = { ok: true, status: artifacts.run.degraded ? 'degraded' : candidates.length ? 'completed' : 'healthy-empty', scan: artifacts.run, usage };
           return {
             schemaVersion: 1,
             result,
-            mutationReceipt: scanMutationReceipt(root, artifacts),
+            mutationReceipt: artifacts.mutationReceipt,
           };
         } catch (error) {
           try {
