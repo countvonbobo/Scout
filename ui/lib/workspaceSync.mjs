@@ -449,7 +449,7 @@ function markerFilterTrackedPaths(root, options) {
 
 function ensureMarkerCleanFilter(root, options = {}) {
   markerFilterAttributes(root);
-  const command = `node "${MARKER_CLEANER}"`;
+  const command = `node "${MARKER_CLEANER}" %f`;
   for (const [key, value] of [
     [`filter.${MARKER_FILTER}.clean`, command],
     [`filter.${MARKER_FILTER}.required`, 'true'],
@@ -579,7 +579,7 @@ async function ensureMarkerCleanFilterAsync(root, options) {
   assertRuntimeFence(options);
   markerFilterAttributes(root);
   assertRuntimeFence(options);
-  const command = `node "${MARKER_CLEANER}"`;
+  const command = `node "${MARKER_CLEANER}" %f`;
   for (const [key, value] of [
     [`filter.${MARKER_FILTER}.clean`, command],
     [`filter.${MARKER_FILTER}.required`, 'true'],

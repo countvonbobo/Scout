@@ -107,7 +107,7 @@ test('local-only checkpoints never contact a Git remote', async () => {
   fs.rmSync(f.base, { recursive: true, force: true });
 });
 
-test('committed backup payload is marker-free while the live workspace retains recovery markers', async () => {
+test('multi-record scan-run backup and fresh clone are marker-free while live recovery state remains', async () => {
   const f = fixture();
   const marker = {
     schemaVersion: 1,
@@ -129,7 +129,8 @@ test('committed backup payload is marker-free while the live workspace retains r
   );
   fs.writeFileSync(
     path.join(f.root, 'data', 'scan-runs.jsonl'),
-    `${JSON.stringify({ schemaVersion: 4, timestamp: '2026-07-28T10:00:00.000Z', _scoutMutation: marker })}\n`,
+    `${JSON.stringify({ schemaVersion: 4, timestamp: '2026-07-28T09:00:00.000Z' })}\n`
+      + `${JSON.stringify({ schemaVersion: 4, timestamp: '2026-07-28T10:00:00.000Z', _scoutMutation: marker })}\n`,
   );
   git(f.root, 'init');
 
@@ -145,9 +146,24 @@ test('committed backup payload is marker-free while the live workspace retains r
     assert.match(fs.readFileSync(path.join(f.root, ...relative.split('/')), 'utf8'), /scout-mutation|_scoutMutation/);
   }
   const restoredTracker = JSON.parse(git(f.root, 'show', 'HEAD:data/opportunities.json'));
-  const restoredRun = JSON.parse(git(f.root, 'show', 'HEAD:data/scan-runs.jsonl'));
+  const committedRuns = git(f.root, 'show', 'HEAD:data/scan-runs.jsonl')
+    .split(/\r?\n/).filter(Boolean).map((line) => JSON.parse(line));
   assert.equal(restoredTracker.opportunities[0].id, 'kept');
-  assert.equal(restoredRun.timestamp, '2026-07-28T10:00:00.000Z');
+  assert.deepEqual(
+    committedRuns.map((record) => record.timestamp),
+    ['2026-07-28T09:00:00.000Z', '2026-07-28T10:00:00.000Z'],
+  );
+  assert.equal(committedRuns.some((record) => Object.hasOwn(record, '_scoutMutation')), false);
+  const restored = path.join(f.base, 'fresh-clone');
+  git(f.base, 'clone', f.root, restored);
+  const restoredRuns = fs.readFileSync(path.join(restored, 'data', 'scan-runs.jsonl'), 'utf8')
+    .trim().split(/\r?\n/).map((line) => JSON.parse(line));
+  assert.equal(restoredRuns.length, 2);
+  assert.equal(restoredRuns.some((record) => Object.hasOwn(record, '_scoutMutation')), false);
+  const liveRuns = fs.readFileSync(path.join(f.root, 'data', 'scan-runs.jsonl'), 'utf8')
+    .trim().split(/\r?\n/).map((line) => JSON.parse(line));
+  assert.equal(Object.hasOwn(liveRuns[0], '_scoutMutation'), false);
+  assert.deepEqual(liveRuns[1]._scoutMutation, marker);
   assert.equal(git(f.root, 'status', '--porcelain'), '');
 
   const liveTracker = JSON.parse(fs.readFileSync(path.join(f.root, 'data', 'opportunities.json'), 'utf8'));
