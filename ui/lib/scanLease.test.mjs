@@ -5,9 +5,10 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { afterEach, test } from 'node:test';
+import * as scanLeaseModule from './scanLease.mjs';
 import {
   LeaseLostError, acquireScanLease, assertCurrentFence, currentLeaseOwner, readScanLease,
-  releaseScanLease, releaseScanLeaseByToken, renewScanLease, startLeaseHeartbeat,
+  handoffScanLease, releaseScanLease, releaseScanLeaseByToken, renewScanLease, startLeaseHeartbeat,
   synchronousFenceCallback,
 } from './scanLease.mjs';
 import { appendRunEvent, openRunJournal } from './runJournal.mjs';
@@ -1306,4 +1307,25 @@ test('acquisition rejects an owner identity that does not belong to the calling 
     kind: 'scan', runId: 'run-forged', provider: 'codex', mode: 'primary',
   }), /calling process/i);
   assert.equal(fs.existsSync(path.join(root, '.scout', 'scan-lease.json')), false);
+});
+
+test('lease handoff atomically changes run scope and invalidates the provisional fence', () => {
+  const root = temp();
+  const provisional = acquireScanLease(root, currentLeaseOwner(), operation('provisional-run'));
+  const recovered = handoffScanLease(provisional, operation('recoverable-run'));
+
+  assert.equal(recovered.runId, 'recoverable-run');
+  assert.equal(recovered.generation, provisional.generation + 1);
+  assert.equal(readScanLease(root).runId, 'recoverable-run');
+  assert.throws(
+    () => assertCurrentFence(provisional, synchronousFenceCallback(() => true)),
+    LeaseLostError,
+  );
+  assert.doesNotThrow(() => assertCurrentFence(recovered, synchronousFenceCallback(() => true)));
+  releaseScanLease(recovered);
+});
+
+test('lease module exposes no generic observed-non-owner mutation callback', () => {
+  assert.equal(scanLeaseModule.withObservedActiveScanLease, undefined);
+  assert.equal(typeof scanLeaseModule.appendObservedScanQueueEvent, 'function');
 });

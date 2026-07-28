@@ -23,6 +23,7 @@ const LEGACY_STALE_AFTER_MS = 2 * 60 * 60 * 1000;
 const CLEANUP_RETRY_LIMIT = 4;
 const SAFE_TOKEN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 const SAFE_RUN_ID = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
+const SHA256 = /^[a-f0-9]{64}$/;
 const runtime = Symbol('scanLeaseRuntime');
 const synchronousFenceCallbacks = new WeakSet();
 const sleepArray = new Int32Array(new SharedArrayBuffer(4));
@@ -1160,6 +1161,50 @@ export function acquireScanLease(root, owner, operation, inputOptions = {}) {
   }
 }
 
+/**
+ * Atomically retarget an owned provisional lease to a selected recoverable run.
+ *
+ * The shared guard never exposes an idle workspace between identities. A new
+ * generation deliberately invalidates every callback holding the provisional
+ * fence before the recovered run can commit.
+ */
+export function handoffScanLease(lease, operation) {
+  const settings = runtimeFor(lease);
+  operation = checkedOperation(operation);
+  if (!currentProcessOwns(lease) || locallyExpired(settings)) throw new LeaseLostError();
+  try {
+    return withGuard(settings.root, lease.owner, settings, () => {
+      assertNoLegacyCoexistence(settings.root);
+      const current = readScanLease(settings.root);
+      if (!sameFence(current, lease) || locallyExpired(settings)) throw new LeaseLostError();
+      const generation = current.generation + 1;
+      writeJsonAtomic(generationFile(settings.root), {
+        schemaVersion: SCAN_LEASE_SCHEMA_VERSION,
+        generation,
+      });
+      const now = wallMilliseconds(settings);
+      const timestamp = new Date(now).toISOString();
+      const record = {
+        ...current,
+        leaseId: randomUUID(),
+        generation,
+        runId: operation.runId,
+        operation,
+        acquiredAt: timestamp,
+        heartbeatAt: timestamp,
+        expiresAt: new Date(now + settings.leaseDurationMs).toISOString(),
+        heartbeatSequence: 0,
+      };
+      writeJsonAtomic(leaseFile(settings.root), record);
+      assertNoLegacyCoexistence(settings.root);
+      return hydrateLease(settings.root, record, settings);
+    });
+  } catch (error) {
+    if (error instanceof GuardBusyError) throw new LeaseLostError();
+    throw error;
+  }
+}
+
 export function assertCurrentFence(lease, commit) {
   if (typeof commit !== 'function') throw new TypeError('fenced commit callback is required');
   if (!synchronousFenceCallbacks.has(commit)) {
@@ -1195,7 +1240,7 @@ export function assertCurrentFence(lease, commit) {
  * durable overlap submission only; run, claim, completion and mutation writes
  * must continue to use assertCurrentFence().
  */
-export function withObservedActiveScanLease(root, observed, commit, inputOptions = {}) {
+function checkedObservedActiveLease(observed) {
   if (!observed || typeof observed !== 'object' || Array.isArray(observed)
     || Object.keys(observed).sort().join(',') !== 'generation,leaseId,operation,runId'
     || !Number.isSafeInteger(observed.generation) || observed.generation < 1
@@ -1205,8 +1250,28 @@ export function withObservedActiveScanLease(root, observed, commit, inputOptions
   }
   const operation = checkedOperation(observed.operation);
   if (operation.runId !== observed.runId) throw new TypeError('observed scan operation does not match its run');
-  if (typeof commit !== 'function' || !synchronousFenceCallbacks.has(commit)) {
-    throw new TypeError('overlap append callback must be explicitly synchronous');
+  return operation;
+}
+
+/**
+ * Append one already-validated queue event while the exact observed scan is
+ * still active. The expected journal digest makes projection plus append an
+ * optimistic atomic transition without exposing a non-owner callback.
+ */
+export function appendObservedScanQueueEvent(root, observed, input, inputOptions = {}) {
+  const operation = checkedObservedActiveLease(observed);
+  if (!input || typeof input !== 'object' || Array.isArray(input)
+    || Object.keys(input).sort().join(',') !== 'expectedDigest,record'
+    || typeof input.expectedDigest !== 'string' || !SHA256.test(input.expectedDigest)
+    || !input.record || typeof input.record !== 'object' || Array.isArray(input.record)
+    || !Number.isSafeInteger(input.record.schemaVersion) || input.record.schemaVersion < 2
+    || !['enqueue', 'deduplicated', 'scheduled-replaced'].includes(input.record.type)
+    || typeof input.record.eventId !== 'string' || !SAFE_TOKEN.test(input.record.eventId)) {
+    throw new TypeError('observed scan queue append is invalid');
+  }
+  const line = `${JSON.stringify(input.record)}\n`;
+  if (Buffer.byteLength(line, 'utf8') > 1024 * 1024) {
+    throw new TypeError('observed scan queue event exceeds its bound');
   }
   const options = timingOptions(inputOptions);
   const expectedOperation = JSON.stringify(operation);
@@ -1221,13 +1286,23 @@ export function withObservedActiveScanLease(root, observed, commit, inputOptions
         && current?.runId === observed.runId
         && JSON.stringify(current.operation) === expectedOperation;
       if (!sameObservedLease || wallMilliseconds(options) >= activeUntil) {
-        return Object.freeze({ active: false, value: null });
+        return Object.freeze({ active: false, appended: false });
       }
-      const value = commit(Object.freeze(structuredClone(current)));
-      if (value && typeof value.then === 'function') {
-        throw new TypeError('overlap append must complete synchronously');
+      const file = path.join(path.resolve(root), '.scout', 'scan-queue.jsonl');
+      const contents = fs.existsSync(file) ? fs.readFileSync(file) : Buffer.alloc(0);
+      const digest = createHash('sha256').update(contents).digest('hex');
+      if (digest !== input.expectedDigest) {
+        return Object.freeze({ active: true, appended: false });
       }
-      return Object.freeze({ active: true, value });
+      fs.mkdirSync(path.dirname(file), { recursive: true });
+      const descriptor = fs.openSync(file, 'a');
+      try {
+        fs.writeSync(descriptor, line, undefined, 'utf8');
+        fs.fsyncSync(descriptor);
+      } finally {
+        fs.closeSync(descriptor);
+      }
+      return Object.freeze({ active: true, appended: true });
     });
   } catch (error) {
     if (error instanceof GuardBusyError) {

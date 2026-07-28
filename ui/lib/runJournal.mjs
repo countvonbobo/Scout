@@ -34,6 +34,12 @@ const EVENT_PAYLOAD_SCHEMAS = Object.freeze({
       required: Object.freeze(new Set(['schemaVersion', 'outcome'])),
     }),
   }),
+  'run.failure-recorded': Object.freeze({
+    1: Object.freeze({
+      allowed: Object.freeze(new Set(['schemaVersion', 'code', 'reason'])),
+      required: Object.freeze(new Set(['schemaVersion', 'code', 'reason'])),
+    }),
+  }),
   'mutation.receipted': Object.freeze({
     1: Object.freeze({
       allowed: Object.freeze(new Set(['schemaVersion', 'reference', 'digest'])),
@@ -91,6 +97,9 @@ const RECOVERY_REASONS = new Set([
   'upstream-stage-restarted',
   'mutation-schema-version-mismatch',
   'target-revision-mismatch',
+  'stage-artifact-schema-mismatch',
+  'schedule-job-mismatch',
+  'logical-window-mismatch',
 ]);
 const RECOVERY_COMPATIBILITY_FIELDS = Object.freeze([
   'artifactSchemaVersion',
@@ -108,6 +117,12 @@ const RECOVERY_COMPATIBILITY_FIELDS = Object.freeze([
   'schemaVersion',
   'sourceConfigFingerprint',
   'targetRevision',
+]);
+const RECOVERY_COMPATIBILITY_FIELDS_V2 = Object.freeze([
+  ...RECOVERY_COMPATIBILITY_FIELDS,
+  'logicalWindowId',
+  'scheduleJobId',
+  'stageArtifactSchemaVersion',
 ]);
 
 export class JournalCorruptionError extends Error {
@@ -193,10 +208,16 @@ function validateArtifactReference(value, ErrorType) {
 }
 
 function validateRecoveryCompatibility(value, ErrorType) {
-  const compatibility = requireExactKeys(value, RECOVERY_COMPATIBILITY_FIELDS, 'compatibility', ErrorType);
-  if (compatibility.schemaVersion !== 1) throw new ErrorType('unsupported journal recovery compatibility schema');
+  const compatibility = requireExactKeys(
+    value,
+    value?.schemaVersion === 2 ? RECOVERY_COMPATIBILITY_FIELDS_V2 : RECOVERY_COMPATIBILITY_FIELDS,
+    'compatibility',
+    ErrorType,
+  );
+  if (![1, 2].includes(compatibility.schemaVersion)) throw new ErrorType('unsupported journal recovery compatibility schema');
   for (const key of [
     'artifactSchemaVersion', 'assessmentSchemaVersion', 'journalSchemaVersion', 'mutationSchemaVersion',
+    ...(compatibility.schemaVersion === 2 ? ['stageArtifactSchemaVersion'] : []),
   ]) {
     if (!Number.isSafeInteger(compatibility[key]) || compatibility[key] < 1) {
       throw new ErrorType(`journal recovery compatibility ${key} is invalid`);
@@ -205,6 +226,7 @@ function validateRecoveryCompatibility(value, ErrorType) {
   for (const key of [
     'mode', 'model', 'pipelineVersion', 'profileVersion', 'promptVersion',
     'provider', 'purpose', 'rankingVersion', 'targetRevision',
+    ...(compatibility.schemaVersion === 2 ? ['scheduleJobId', 'logicalWindowId'] : []),
   ]) {
     requireSafeToken(compatibility[key], `recovery compatibility ${key}`, ErrorType);
   }
@@ -235,6 +257,10 @@ function validatePayload(type, payload, ErrorType = TypeError) {
   }
   if (value.outcome !== undefined && !RUN_OUTCOMES.has(value.outcome)) throw new ErrorType('journal payload outcome is invalid');
   if (value.digest !== undefined && (typeof value.digest !== 'string' || !SHA256.test(value.digest))) throw new ErrorType('journal payload digest is invalid');
+  if (type === 'run.failure-recorded') {
+    requireSafeToken(value.code, 'failure code', ErrorType);
+    requireSafeToken(value.reason, 'failure reason', ErrorType);
+  }
   if (type === 'recovery.stage-decided') {
     if (!RECOVERY_ACTIONS.has(value.action)) throw new ErrorType('journal recovery action is invalid');
     if (!RECOVERY_REASONS.has(value.reason)) throw new ErrorType('journal recovery reason is invalid');

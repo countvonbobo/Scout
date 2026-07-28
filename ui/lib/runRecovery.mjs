@@ -25,6 +25,7 @@ import {
 } from './scanLease.mjs';
 
 const COMPATIBILITY_SCHEMA_VERSION = 1;
+const COMPATIBILITY_SCHEMA_VERSIONS = new Set([1, 2]);
 const SAFE_TOKEN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 const SAFE_RUN_ID = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
 const SHA256 = /^[a-f0-9]{64}$/;
@@ -46,6 +47,12 @@ const COMPATIBILITY_FIELDS = Object.freeze([
   'sourceConfigFingerprint',
   'targetRevision',
 ]);
+const COMPATIBILITY_FIELDS_V2 = Object.freeze([
+  ...COMPATIBILITY_FIELDS,
+  'logicalWindowId',
+  'scheduleJobId',
+  'stageArtifactSchemaVersion',
+]);
 const HARD_REQUIREMENTS = Object.freeze([
   'mode',
   'purpose',
@@ -53,7 +60,10 @@ const HARD_REQUIREMENTS = Object.freeze([
   'sourceConfigFingerprint',
   'journalSchemaVersion',
   'artifactSchemaVersion',
+  'stageArtifactSchemaVersion',
   'pipelineVersion',
+  'scheduleJobId',
+  'logicalWindowId',
 ]);
 const REASON_FOR_FIELD = Object.freeze({
   mode: 'scan-mode-mismatch',
@@ -62,7 +72,10 @@ const REASON_FOR_FIELD = Object.freeze({
   sourceConfigFingerprint: 'source-config-mismatch',
   journalSchemaVersion: 'journal-schema-mismatch',
   artifactSchemaVersion: 'artifact-schema-mismatch',
+  stageArtifactSchemaVersion: 'stage-artifact-schema-mismatch',
   pipelineVersion: 'pipeline-version-mismatch',
+  scheduleJobId: 'schedule-job-mismatch',
+  logicalWindowId: 'logical-window-mismatch',
   rankingVersion: 'ranking-version-mismatch',
   promptVersion: 'prompt-version-mismatch',
   assessmentSchemaVersion: 'assessment-schema-version-mismatch',
@@ -132,7 +145,11 @@ function runId(value) {
 
 function checkedCompatibility(input, { candidate = false } = {}) {
   try {
-    exactKeys(input, COMPATIBILITY_FIELDS, 'recovery compatibility schema');
+    exactKeys(
+      input,
+      input?.schemaVersion === 2 ? COMPATIBILITY_FIELDS_V2 : COMPATIBILITY_FIELDS,
+      'recovery compatibility schema',
+    );
   } catch (error) {
     if (candidate && (input === null || input === undefined)) {
       throw new CandidateSkipError('compatibility-missing', 'recovery compatibility is missing');
@@ -140,12 +157,13 @@ function checkedCompatibility(input, { candidate = false } = {}) {
     if (candidate) throw new CandidateSkipError('compatibility-missing', error.message);
     throw error;
   }
-  if (input.schemaVersion !== COMPATIBILITY_SCHEMA_VERSION) {
+  if (!COMPATIBILITY_SCHEMA_VERSIONS.has(input.schemaVersion)) {
     if (candidate) throw new CandidateSkipError('compatibility-schema-unsupported', 'unsupported recovery compatibility schema');
     throw new TypeError('unsupported recovery compatibility schema');
   }
   for (const field of [
     'artifactSchemaVersion', 'assessmentSchemaVersion', 'journalSchemaVersion', 'mutationSchemaVersion',
+    ...(input.schemaVersion === 2 ? ['stageArtifactSchemaVersion'] : []),
   ]) {
     if (!Number.isSafeInteger(input[field]) || input[field] < 1) {
       throw new TypeError(`recovery compatibility ${field} is invalid`);
@@ -154,6 +172,7 @@ function checkedCompatibility(input, { candidate = false } = {}) {
   for (const field of [
     'mode', 'model', 'pipelineVersion', 'profileVersion', 'promptVersion',
     'provider', 'purpose', 'rankingVersion', 'targetRevision',
+    ...(input.schemaVersion === 2 ? ['scheduleJobId', 'logicalWindowId'] : []),
   ]) token(input[field], `recovery compatibility ${field}`);
   if (typeof input.sourceConfigFingerprint !== 'string' || !SHA256.test(input.sourceConfigFingerprint)) {
     throw new TypeError('recovery compatibility source/config fingerprint is invalid');

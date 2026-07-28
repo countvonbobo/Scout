@@ -4,12 +4,13 @@ import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import {
-  assertScanReady, broadenSearchQueries, collectScanSources, migrateLegacyWorkspace, runScanWith, shouldAutoBroaden,
+  assertScanReady, broadenSearchQueries, collectScanSources, migrateLegacyWorkspace, runScan, runScanWith, shouldAutoBroaden,
 } from './scout.mjs';
-import { DEFAULT_WORKSPACE_CONFIG, writeWorkspaceConfig } from '../ui/lib/workspace.mjs';
+import { DEFAULT_WORKSPACE_CONFIG, loadWorkspaceConfig, writeWorkspaceConfig } from '../ui/lib/workspace.mjs';
 import { publishSearchProfile } from '../ui/lib/searchProfile.mjs';
 import { replayRunJournal } from '../ui/lib/runJournal.mjs';
 import { projectScanQueue } from '../ui/lib/scanQueue.mjs';
+import { acquireScanLease, currentLeaseOwner, releaseScanLease } from '../ui/lib/scanLease.mjs';
 
 function scanRoot() {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'scout-runtime-scan-'));
@@ -528,6 +529,69 @@ test('runtime allocates and journals a genuine durable run before source collect
   assert.equal(fs.existsSync(path.join(root, '.scout', 'scan-lease.json')), false);
 });
 
+test('an overlap loser only appends its queue request and performs no managed or log mutation', async () => {
+  const root = scanRoot();
+  const ignore = path.join(root, '.gitignore');
+  const agents = path.join(root, 'AGENTS.md');
+  fs.writeFileSync(ignore, 'synthetic-ignore\n', 'utf8');
+  fs.writeFileSync(agents, 'synthetic managed instructions sentinel\n', 'utf8');
+  const active = acquireScanLease(root, currentLeaseOwner(), {
+    kind: 'scan',
+    runId: 'active-overlap-owner',
+    provider: 'claude',
+    mode: 'primary',
+    phase: 'collect',
+  });
+  try {
+    const result = await runScanWith(root, 'codex', 'primary', {
+      providerStatusFn: authenticated,
+      collectSourcesFn: async () => {
+        throw new Error('overlap loser must not collect');
+      },
+    });
+
+    assert.equal(result.status, 'queued');
+    assert.equal(fs.readFileSync(ignore, 'utf8'), 'synthetic-ignore\n');
+    assert.equal(fs.readFileSync(agents, 'utf8'), 'synthetic managed instructions sentinel\n');
+    assert.equal(fs.existsSync(path.join(root, 'logs')), false);
+    assert.equal(projectScanQueue(root).ready.length, 1);
+  } finally {
+    releaseScanLease(active);
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('runScan queues workspace backup only after its own scan terminalises successfully', async () => {
+  const root = readyScanRoot();
+  enableRankedDiscovery(root);
+  const reasons = [];
+  const queued = await runScan(root, 'codex', 'primary', {
+    assertScanReadyFn: () => {},
+    runScanWithFn: async () => ({ ok: false, status: 'queued', durable: { outcome: 'queued' } }),
+    queueWorkspaceSyncFn: async (_root, reason) => {
+      reasons.push(reason);
+    },
+  });
+  assert.equal(queued.status, 'queued');
+  assert.deepEqual(reasons, []);
+
+  const complete = await runScan(root, 'codex', 'primary', {
+    assertScanReadyFn: () => {},
+    runScanWithFn: async () => ({
+      ok: true,
+      status: 'healthy-empty',
+      scan: { funnel: { selected: 0 }, degraded: false },
+      durable: { outcome: 'complete' },
+    }),
+    queueWorkspaceSyncFn: async (_root, reason) => {
+      reasons.push(reason);
+    },
+  });
+  assert.equal(complete.ok, true);
+  assert.deepEqual(reasons, ['complete primary scan']);
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
 test('a real scheduled overlap keeps scheduled queue semantics and executes after terminal release', async () => {
   const root = scanRoot();
   let collectionCalls = 0;
@@ -535,6 +599,8 @@ test('a real scheduled overlap keeps scheduled queue semantics and executes afte
   const options = {
     requester: 'scheduled',
     windowAt: new Date(Date.now() + 10 * 60 * 60 * 1000).toISOString(),
+    scheduleId: 'codex-primary',
+    logicalWindowId: new Date(Date.now() - 60 * 1000).toISOString(),
     providerStatusFn: authenticated,
     collectSourcesFn: async () => {
       collectionCalls += 1;
@@ -566,6 +632,8 @@ test('a real scheduled overlap keeps scheduled queue semantics and executes afte
     const queued = projectScanQueue(root).requests[0];
     assert.equal(queued.status, 'succeeded');
     assert.equal(queued.requester, 'scheduled');
+    assert.equal(queued.execution.scheduleId, 'codex-primary');
+    assert.equal(queued.execution.logicalWindowId, options.logicalWindowId);
     assert.equal(
       Date.parse(queued.expiresAt),
       Math.min(Date.parse(queued.requestedAt) + 12 * 60 * 60 * 1000, Date.parse(queued.windowAt)),
@@ -575,8 +643,59 @@ test('a real scheduled overlap keeps scheduled queue semantics and executes afte
     for (const runId of runs) {
       const events = replayRunJournal(path.join(root, '.scout', 'runs', runId, 'journal.jsonl'));
       assert.equal(events[0].type, 'run.started');
+      assert.equal(events[0].payload.compatibility.scheduleJobId, 'codex-primary');
+      assert.equal(events[0].payload.compatibility.logicalWindowId, options.logicalWindowId);
       assert.equal(events.at(-1).type, 'run.completed');
     }
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('a scheduled queued run becomes stale when complete live compatibility changes before terminal recheck', async () => {
+  const root = scanRoot();
+  let collectionCalls = 0;
+  let overlap;
+  const options = {
+    requester: 'scheduled',
+    windowAt: new Date(Date.now() + 10 * 60 * 60 * 1000).toISOString(),
+    scheduleId: 'codex-primary',
+    logicalWindowId: new Date(Date.now() - 60 * 1000).toISOString(),
+    providerStatusFn: authenticated,
+    collectSourcesFn: async () => {
+      collectionCalls += 1;
+      if (collectionCalls === 1) {
+        overlap = await runScanWith(root, 'codex', 'primary', options);
+      } else {
+        const config = loadWorkspaceConfig(root);
+        writeWorkspaceConfig(root, {
+          ...config,
+          triage: { ...config.triage, checkScore: Number(config.triage.checkScore) + 1 },
+        });
+      }
+      return {
+        generatedAt: '2026-07-28T09:00:00.000Z',
+        queries: [],
+        sources: { hiring_cafe: { configured: true, status: 'healthy', count: 0, jobs: [] } },
+      };
+    },
+    runStructuredTurnFn: async () => {
+      throw new Error('empty queued scans must not call the provider');
+    },
+    checkLivenessFn: async (candidates) => ({
+      live: candidates,
+      removed: [],
+      summary: { checked: candidates.length, gone: 0, unverified: 0 },
+    }),
+  };
+
+  try {
+    const primary = await runScanWith(root, 'codex', 'primary', options);
+
+    assert.equal(overlap.status, 'queued');
+    assert.equal(primary.ok, true);
+    assert.equal(collectionCalls, 2);
+    assert.equal(projectScanQueue(root).requests[0].status, 'stale');
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }

@@ -23,8 +23,13 @@ The maintained beta deployment uses one private, single-owner Ubuntu VPS:
 - Tailscale Serve provides the owner-only HTTPS route; Funnel and public ports are not used.
 - Codex and Claude authentication belongs to the dedicated unprivileged Scout account on the VPS.
 - Claude runs the 07:30 primary scan and Codex runs the 08:30 second pass in the workspace timezone.
-- The workspace lock prevents overlap and records a skipped conflicting run.
-- Completed mutations and scans queue encrypted private-repository backup checkpoints.
+- The fenced scan lease prevents overlap. A losing scan process may only append
+  a compatible durable queue request; idle startup drains older compatible work
+  before beginning new unqueued work, and interrupted claims resume under their
+  original run identity.
+- Only successfully terminalised mutations and scans queue encrypted
+  private-repository backup checkpoints. A queued, stale, lease-lost, or failed
+  preflight scan has no backup authority.
 - Normal tracked career files remain readable only inside the private repository; ignored sensitive recovery state is encrypted under `.scout-backup/v1`.
 
 Do not assume a developer computer's local application checkout or workspace is live. Diagnose the VPS for production-like bugs unless the user explicitly reports a local-only installation.

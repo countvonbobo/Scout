@@ -26,7 +26,7 @@ import { queueWorkspaceSync } from '../ui/lib/workspaceSync.mjs';
 import {
   nextScheduledRun, normaliseScheduleDays, registerDailySchedule, registerUnixSchedule,
   removeLegacySchedule, removeSchedule, runScheduledNow, scheduledRequestExpiry,
-  scheduleStatus, schedulerRegistrationScript,
+  scheduleStatus, scheduledLogicalWindow, schedulerRegistrationScript,
 } from '../ui/lib/scheduler.mjs';
 import {
   loadWorkspaceConfig, resolveWorkspaceRoot, seedWorkspace as seedWorkspaceFiles,
@@ -35,6 +35,8 @@ import {
 import { acquireScanLock, readScanLock, releaseScanLock } from './scan-lock.mjs';
 import { runRemoteHostingPreflight } from './remote-hosting-preflight.mjs';
 import { assertCurrentFence, synchronousFenceCallback } from '../ui/lib/scanLease.mjs';
+import { PIPELINE_STAGE_ARTIFACT_SCHEMA_VERSION, RUN_ARTIFACT_SCHEMA_VERSION } from '../ui/lib/runArtifacts.mjs';
+import { compatibilityFingerprint } from '../ui/lib/runRecovery.mjs';
 
 const APP_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const MAX_SCAN_FILE_CHARS = 100_000;
@@ -52,21 +54,38 @@ function scanDigest(value) {
   return createHash('sha256').update(stableJson(value)).digest('hex');
 }
 
-function scanCompatibility({ config, mode, model, profile, provider, tracker }) {
+function sourceConfigFingerprint(config) {
+  return scanDigest({
+    locale: config.locale,
+    currency: config.currency,
+    search: config.search,
+    sources: config.sources,
+    triage: config.triage,
+    commute: config.commute,
+  });
+}
+
+function queueConfigFingerprint(config, tracker) {
+  return scanDigest({
+    sourceConfigFingerprint: sourceConfigFingerprint(config),
+    tracker: scanDigest(tracker),
+  });
+}
+
+function scanCompatibility({
+  config, mode, model, profile, provider, tracker,
+  requester = 'manual', scheduleId = null, logicalWindowId = null,
+}) {
   return {
-    schemaVersion: 1,
+    schemaVersion: 2,
     mode,
     purpose: 'manual-discovery',
     profileVersion: profile?.id || 'legacy-profile',
-    sourceConfigFingerprint: scanDigest({
-      locale: config.locale,
-      currency: config.currency,
-      search: config.search,
-      sources: config.sources,
-    }),
+    sourceConfigFingerprint: sourceConfigFingerprint(config),
     journalSchemaVersion: 1,
-    artifactSchemaVersion: 1,
-    pipelineVersion: 'scan-pipeline-v2-private-stage-artifacts',
+    artifactSchemaVersion: RUN_ARTIFACT_SCHEMA_VERSION,
+    stageArtifactSchemaVersion: PIPELINE_STAGE_ARTIFACT_SCHEMA_VERSION,
+    pipelineVersion: 'scan-pipeline-v3-semantic-stage-artifacts',
     rankingVersion: `ranked-discovery-v1-${scanDigest(tracker).slice(0, 32)}`,
     promptVersion: 'assessment-prompt-v1',
     assessmentSchemaVersion: 1,
@@ -74,13 +93,15 @@ function scanCompatibility({ config, mode, model, profile, provider, tracker }) 
     model: model || 'provider-default',
     mutationSchemaVersion: 1,
     targetRevision: `tracker-${scanDigest(tracker).slice(0, 32)}`,
+    scheduleJobId: requester === 'scheduled' ? scheduleId : 'none',
+    logicalWindowId: requester === 'scheduled' ? logicalWindowId : 'none',
   };
 }
 
-function scanQueueCompatibility(compatibility, profile) {
+function scanQueueCompatibility(compatibility, profile, config, tracker) {
   return Object.freeze({
     profileFingerprint: scanDigest(profile || { id: compatibility.profileVersion }),
-    configFingerprint: compatibility.sourceConfigFingerprint,
+    configFingerprint: queueConfigFingerprint(config, tracker),
     schemaVersion: 1,
   });
 }
@@ -88,23 +109,52 @@ function scanQueueCompatibility(compatibility, profile) {
 function currentScanQueueCompatibility(root) {
   const config = loadWorkspaceConfig(root);
   const profile = loadPublishedSearchProfile(root);
+  const tracker = JSON.parse(fs.readFileSync(workspacePaths(root).tracker, 'utf8'));
   return Object.freeze({
     profileFingerprint: scanDigest(profile || { id: profile?.id || 'legacy-profile' }),
-    configFingerprint: scanDigest({
-      locale: config.locale,
-      currency: config.currency,
-      search: config.search,
-      sources: config.sources,
-    }),
+    configFingerprint: queueConfigFingerprint(config, tracker),
     schemaVersion: 1,
   });
 }
 
+function verifyQueuedScanCompatibility(root, request, manifest = null) {
+  const execution = request?.execution;
+  if (execution?.schemaVersion !== 2) return false;
+  const config = loadWorkspaceConfig(root);
+  const profile = loadPublishedSearchProfile(root);
+  const tracker = JSON.parse(fs.readFileSync(workspacePaths(root).tracker, 'utf8'));
+  const currentQueue = {
+    ...currentScanQueueCompatibility(root),
+    purpose: request.purpose,
+  };
+  if (stableJson(currentQueue) !== stableJson({ ...request.compatibility, purpose: request.purpose })) {
+    return false;
+  }
+  const currentRun = scanCompatibility({
+    config,
+    profile,
+    tracker,
+    provider: execution.provider,
+    mode: execution.mode,
+    model: execution.model,
+    requester: request.requester,
+    scheduleId: execution.scheduleId,
+    logicalWindowId: execution.logicalWindowId,
+  });
+  if (compatibilityFingerprint(currentRun) !== execution.compatibilityFingerprint) return false;
+  return manifest === null
+    || compatibilityFingerprint(manifest.compatibility) === execution.compatibilityFingerprint;
+}
+
 function scanQueueRequest(compatibility, profile, {
-  mode, model, provider, requestedAt, requester = 'manual', windowAt = null,
+  config, tracker, mode, model, provider, requestedAt, requester = 'manual',
+  windowAt = null, scheduleId = null, logicalWindowId = null,
 }) {
   if (!['manual', 'scheduled'].includes(requester)) throw new TypeError('scan requester is invalid');
   if (requester === 'scheduled' && !windowAt) throw new TypeError('scheduled scan requires its next window');
+  if (requester === 'scheduled' && (!scheduleId || !logicalWindowId)) {
+    throw new TypeError('scheduled scan requires its job and logical window identities');
+  }
   return Object.freeze({
     id: randomUUID(),
     key: `scan-${scanDigest({
@@ -113,12 +163,15 @@ function scanQueueRequest(compatibility, profile, {
     }).slice(0, 40)}`,
     requester,
     purpose: compatibility.purpose,
-    compatibility: scanQueueCompatibility(compatibility, profile),
+    compatibility: scanQueueCompatibility(compatibility, profile, config, tracker),
     execution: Object.freeze({
-      schemaVersion: 1,
+      schemaVersion: 2,
       provider,
       mode,
       model: model || null,
+      scheduleId: requester === 'scheduled' ? scheduleId : null,
+      logicalWindowId: requester === 'scheduled' ? logicalWindowId : null,
+      compatibilityFingerprint: compatibilityFingerprint(compatibility),
     }),
     requestedAt,
     expiresAt: requester === 'scheduled'
@@ -270,12 +323,15 @@ export function assertScanReady(root, provider, { providerStatusFn = providerSta
 
 export async function runScan(root, provider, mode, {
   onProgress = () => {}, model, autoBroaden = false, estimate = null,
-  requester = 'manual', windowAt = null,
+  requester = 'manual', windowAt = null, scheduleId = null, logicalWindowId = null,
+  assertScanReadyFn = assertScanReady,
+  runScanWithFn = runScanWith,
+  queueWorkspaceSyncFn = queueWorkspaceSync,
 } = {}) {
   onProgress({ phase: 'Validating approved evidence', current: 1, total: 5 });
-  assertScanReady(root, provider);
-  const initial = await runScanWith(root, provider, mode, {
-    onProgress, model, requester, windowAt,
+  assertScanReadyFn(root, provider);
+  const initial = await runScanWithFn(root, provider, mode, {
+    onProgress, model, requester, windowAt, scheduleId, logicalWindowId,
   });
   let result = initial;
   if (shouldAutoBroaden(initial, mode, autoBroaden)) {
@@ -292,10 +348,12 @@ export async function runScan(root, provider, mode, {
       ...progress, total: 10,
       current: Number.isFinite(progress.current) ? Math.min(10, 5 + progress.current) : 6,
     });
-    const broadened = await runScanWith(root, provider, 'broadened', { onProgress: retryProgress, model });
+    const broadened = await runScanWithFn(root, provider, 'broadened', { onProgress: retryProgress, model });
     result = { ...broadened, automaticBroadened: true, initialScan: initial.scan };
   }
-  await queueWorkspaceSync(root, `complete ${mode || 'primary'} scan`).catch(() => {});
+  if (result.ok && result.durable?.outcome === 'complete') {
+    await queueWorkspaceSyncFn(root, `complete ${mode || 'primary'} scan`).catch(() => {});
+  }
   return result;
 }
 
@@ -421,12 +479,13 @@ export async function runScanWith(root, provider, mode, {
   claimedLease = null,
   requester = 'manual',
   windowAt = null,
+  scheduleId = null,
+  logicalWindowId = null,
 } = {}) {
   if (!['codex', 'claude'].includes(provider)) throw new Error('provider must be codex or claude');
   if (!['primary', 'second-pass', 'broadened'].includes(mode)) throw new Error('mode must be primary, broadened or second-pass');
   const status = providerStatusFn(provider);
   if (!status.installed || !status.authenticated) throw new Error(`${provider} is not installed and authenticated; run scout doctor`);
-  syncManagedInstructions(APP_ROOT, root);
   const config = loadWorkspaceConfig(root);
   model = model === undefined
     ? (config.ai?.provider === provider ? assertSafeModel(config.ai?.model) : null)
@@ -462,10 +521,12 @@ export async function runScanWith(root, provider, mode, {
   const trackerAtStart = JSON.parse(fs.readFileSync(workspacePaths(root).tracker, 'utf8'));
   const compatibility = scanCompatibility({
     config, mode, model, profile: publishedAtStart, provider, tracker: trackerAtStart,
+    requester, scheduleId, logicalWindowId,
   });
   const request = claimedLease === null
     ? scanQueueRequest(compatibility, publishedAtStart, {
       mode, model, provider, requestedAt: startedAt, requester, windowAt,
+      scheduleId, logicalWindowId, config, tracker: trackerAtStart,
     })
     : null;
   const collect = async () => {
@@ -497,8 +558,18 @@ export async function runScanWith(root, provider, mode, {
       compatibility,
       stages,
       claimedLease,
+      prepare({ lease }) {
+        assertCurrentFence(lease, synchronousFenceCallback(() => {
+          syncManagedInstructions(APP_ROOT, root);
+        }));
+      },
       queue: {
         compatibility: () => currentScanQueueCompatibility(root),
+        verify: (queuedRequest, context) => verifyQueuedScanCompatibility(
+          root,
+          queuedRequest,
+          context.phase === 'terminal' ? context.manifest : null,
+        ),
         ...(claimedLease === null ? { request } : {}),
         async run(queuedRequest, context) {
           const execution = queuedRequest.execution;
@@ -515,6 +586,8 @@ export async function runScanWith(root, provider, mode, {
             claimedLease: context.lease,
             requester: queuedRequest.requester,
             windowAt: queuedRequest.windowAt,
+            scheduleId: execution.scheduleId,
+            logicalWindowId: execution.logicalWindowId,
           });
           return queued.durable?.outcome === 'complete' ? 'succeeded'
             : queued.status === 'skipped' ? 'skipped' : 'failed';
@@ -708,9 +781,6 @@ export async function runScanWith(root, provider, mode, {
       if (!released.ok) result = { ...(result || {}), ok: false, status: 'failed', error: 'scan lock could not be released safely' };
     }
   }
-  const logs = workspacePaths(root).logs;
-  fs.mkdirSync(logs, { recursive: true });
-  fs.writeFileSync(path.join(logs, `scan-${new Date().toISOString().replace(/[:.]/g, '-')}.json`), `${JSON.stringify({ provider, mode, ...result }, null, 2)}\n`);
   return result;
 }
 
@@ -783,19 +853,26 @@ async function main() {
     const mode = argValue('--mode', argv) || 'primary';
     const scheduled = argv.includes('--scheduled');
     let windowAt = null;
+    let scheduleId = null;
+    let logicalWindowId = null;
     if (scheduled) {
-      const scheduleId = argValue('--schedule-id', argv);
+      scheduleId = argValue('--schedule-id', argv);
       const job = config.schedule?.jobs?.find((candidate) => candidate.id === scheduleId);
       if (!job || job.provider !== provider || job.mode !== mode) {
         throw new Error('scheduled scan does not match a configured schedule job');
       }
-      windowAt = nextScheduledRun(job.time, new Date(), config.timezone, job.days);
+      const invokedAt = new Date();
+      logicalWindowId = scheduledLogicalWindow(job.time, invokedAt, config.timezone, job.days);
+      windowAt = nextScheduledRun(job.time, invokedAt, config.timezone, job.days);
+      if (!logicalWindowId) throw new Error('scheduled scan has no current configured logical window');
       if (!windowAt) throw new Error('scheduled scan has no next configured window');
     }
     const result = await runScan(root, provider, mode, {
       model: argv.includes('--model') ? argValue('--model', argv) : undefined,
       requester: scheduled ? 'scheduled' : 'manual',
       windowAt,
+      scheduleId,
+      logicalWindowId,
     });
     print(result);
     if (!result.ok) process.exitCode = 1;

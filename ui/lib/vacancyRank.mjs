@@ -73,11 +73,17 @@ function evidenceFor(source, rule, matched, unknown = false) {
 function scoreRules(vacancy, name, sourceName, mode, rules) {
   const source = sourceName === 'description' ? vacancy?.description : field(vacancy, sourceName);
   const actual = valueOf(source);
-  const unknown = actual === null || actual === undefined || actual === '';
+  const semanticEvidence = sourceName === 'description' ? vacancy?.semanticEvidence : null;
+  const semanticMatches = semanticEvidence
+    ? new Set(semanticEvidence.profileRuleMatches || [])
+    : null;
+  const unknown = semanticMatches ? false : actual === null || actual === undefined || actual === '';
   const positiveRules = rules.filter((rule) => (STRENGTH_WEIGHT[rule?.strength] || 0) > 0);
   const maximum = positiveRules.reduce((total, rule) => total + STRENGTH_WEIGHT[rule.strength], 0);
   const confidenceWeight = rules.reduce((total, rule) => total + Math.abs(STRENGTH_WEIGHT[rule?.strength] || 0), 0);
-  const matched = rules.filter((rule) => !unknown && match(actual, rule.value, mode));
+  const matched = rules.filter((rule) => (
+    semanticMatches ? semanticMatches.has(ruleId(rule)) : !unknown && match(actual, rule.value, mode)
+  ));
   const score = matched.reduce((total, rule) => total + STRENGTH_WEIGHT[rule.strength], 0);
   return {
     name,
@@ -85,11 +91,22 @@ function scoreRules(vacancy, name, sourceName, mode, rules) {
     maximum,
     confidence: confidenceWeight ? (unknown ? 0 : 1) : 1,
     confidenceWeight,
-    evidence: rules.map((rule) => evidenceFor(source, rule, matched.includes(rule), unknown)),
+    evidence: rules.map((rule) => semanticMatches
+      ? {
+        vacancy: {
+          digest: semanticEvidence.descriptionDigest,
+          matchedRule: matched.includes(rule) ? ruleId(rule) : null,
+        },
+        rule: rule.value,
+        matched: matched.includes(rule),
+      }
+      : evidenceFor(source, rule, matched.includes(rule), unknown)),
     profileRuleIds: rules.map(ruleId),
     contributions: matched.map((rule) => ({
       name, profileRuleId: ruleId(rule), score: STRENGTH_WEIGHT[rule.strength],
-      evidence: evidenceFor(source, rule, true),
+      evidence: semanticMatches
+        ? { vacancy: { digest: semanticEvidence.descriptionDigest, matchedRule: ruleId(rule) }, rule: rule.value, matched: true }
+        : evidenceFor(source, rule, true),
     })),
   };
 }

@@ -169,6 +169,33 @@ export function nextScheduledRun(time, now = new Date(), timezone = null, days =
   return null;
 }
 
+export function scheduledLogicalWindow(time, now = new Date(), timezone = null, days = null) {
+  validateTime(time);
+  const [hours, minutes] = time.split(':').map(Number);
+  const wanted = new Set(normaliseScheduleDays(days));
+  if (timezone) {
+    const zone = validateTimezone(timezone);
+    const today = zonedParts(now, zone);
+    for (let offset = 0; offset <= 7; offset += 1) {
+      const day = new Date(Date.UTC(today.year, today.month - 1, today.day - offset));
+      if (!wanted.has(day.getUTCDay())) continue;
+      const candidate = zonedInstant({
+        year: day.getUTCFullYear(), month: day.getUTCMonth() + 1, day: day.getUTCDate(),
+        hour: hours, minute: minutes,
+      }, zone);
+      if (candidate <= now) return candidate.toISOString();
+    }
+    return null;
+  }
+  for (let offset = 0; offset <= 7; offset += 1) {
+    const candidate = new Date(now);
+    candidate.setDate(candidate.getDate() - offset);
+    candidate.setHours(hours, minutes, 0, 0);
+    if (wanted.has(candidate.getDay()) && candidate <= now) return candidate.toISOString();
+  }
+  return null;
+}
+
 // A delayed native scheduler invocation must not revive a scheduled request
 // indefinitely: it is valid until its next configured window, capped at 12h.
 export function scheduledRequestExpiry(requestedAt, nextWindowAt) {

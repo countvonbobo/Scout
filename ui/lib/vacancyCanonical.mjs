@@ -49,7 +49,8 @@ function fingerprintShape(vacancy, { includeBoilerplate = false } = {}) {
     workingPattern: normaliseText(valueOf(vacancy?.workingPattern)),
     employmentType: normaliseText(valueOf(vacancy?.employmentType)),
     compensation: valueOf(vacancy?.compensation) || null,
-    description: includeBoilerplate ? normaliseText(vacancy?.description) : responsibilityDescription(vacancy),
+    description: vacancy?.semanticEvidence?.descriptionDigest
+      || (includeBoilerplate ? normaliseText(vacancy?.description) : responsibilityDescription(vacancy)),
   };
 }
 
@@ -73,13 +74,22 @@ function displayField(observations, name) {
 
 function canonicalVacancy(observations) {
   const orderedObservations = sortObservations(observations);
-  const description = orderedObservations.map((observation) => String(observation?.description || '').trim())
-    .sort((left, right) => right.length - left.length || compareStable(left, right))[0] || '';
+  const semanticObservation = [...orderedObservations]
+    .filter((observation) => observation?.semanticEvidence)
+    .sort((left, right) => (
+      Number(right.semanticEvidence.descriptionLength || 0) - Number(left.semanticEvidence.descriptionLength || 0)
+      || compareStable(left.semanticEvidence.descriptionDigest, right.semanticEvidence.descriptionDigest)
+    ))[0];
+  const description = semanticObservation
+    ? ''
+    : orderedObservations.map((observation) => String(observation?.description || '').trim())
+      .sort((left, right) => right.length - left.length || compareStable(left, right))[0] || '';
   return {
     observations: orderedObservations,
     canonicalUrl: orderedObservations.map((observation) => observation?.canonicalUrl).find(Boolean) || null,
     sourceReferences: mergeSourceReferences(...orderedObservations),
     description,
+    ...(semanticObservation ? { semanticEvidence: semanticObservation.semanticEvidence } : {}),
     ...Object.fromEntries(DISPLAY_FIELDS.map((name) => [name, displayField(orderedObservations, name)])),
   };
 }

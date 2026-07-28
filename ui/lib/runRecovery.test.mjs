@@ -290,6 +290,25 @@ test('compatibility fingerprints are canonical and reject unreviewed or raw fiel
   assert.throws(() => compatibilityFingerprint({ ...left, prompt: 'raw private prompt' }), /compatibility schema/i);
 });
 
+test('compatibility schema two negotiates storage envelope and stage data versions independently', () => {
+  const versioned = compatibility({
+    schemaVersion: 2,
+    stageArtifactSchemaVersion: 2,
+    scheduleJobId: 'none',
+    logicalWindowId: 'none',
+  });
+  assert.match(compatibilityFingerprint(versioned), /^[a-f0-9]{64}$/);
+
+  const stageChanged = new RecoveryCompatibilityDecision(
+    candidate('stage-schema-run', '2026-07-27T08:00:00.000Z', {
+      compatibility: versioned,
+    }),
+    { ...versioned, stageArtifactSchemaVersion: 3 },
+  );
+  assert.equal(stageChanged.recoverable, false);
+  assert.ok(stageChanged.reasons.includes('stage-artifact-schema-mismatch'));
+});
+
 test('selects the newest recoverable run and records why newer incomplete runs were skipped', () => {
   const candidates = [
     candidate('run-old', '2026-07-27T08:00:00.000Z'),

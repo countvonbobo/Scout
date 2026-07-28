@@ -2,13 +2,13 @@ import { createHash, randomUUID } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import {
-  assertCurrentFence, assertScanLeaseScope, synchronousFenceCallback, withObservedActiveScanLease,
+  appendObservedScanQueueEvent, assertCurrentFence, assertScanLeaseScope, synchronousFenceCallback,
 } from './scanLease.mjs';
 
-const QUEUE_SCHEMA_VERSION = 3;
-const REPLAYABLE_QUEUE_SCHEMA_VERSIONS = new Set([2, QUEUE_SCHEMA_VERSION]);
+const QUEUE_SCHEMA_VERSION = 4;
+const REPLAYABLE_QUEUE_SCHEMA_VERSIONS = new Set([2, 3, QUEUE_SCHEMA_VERSION]);
 const REQUESTERS = new Set(['manual', 'scheduled']);
-const OUTCOMES = new Set(['succeeded', 'failed', 'skipped']);
+const OUTCOMES = new Set(['succeeded', 'failed', 'skipped', 'stale']);
 const REQUEST_ID = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
 const REQUEST_KEY = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 const PURPOSE = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
@@ -54,14 +54,32 @@ function checkedRequest(input) {
   if (!FINGERPRINT.test(request.compatibility.profileFingerprint || '') || !FINGERPRINT.test(request.compatibility.configFingerprint || '')
     || !Number.isInteger(request.compatibility.schemaVersion) || request.compatibility.schemaVersion < 1) throw new TypeError('scan queue compatibility is invalid');
   if (withExecution) {
-    exactKeys(request.execution, ['mode', 'model', 'provider', 'schemaVersion'], 'scan queue execution');
-    if (request.execution.schemaVersion !== 1
+    const executionFields = request.execution?.schemaVersion === 2
+      ? ['compatibilityFingerprint', 'logicalWindowId', 'mode', 'model', 'provider', 'scheduleId', 'schemaVersion']
+      : ['mode', 'model', 'provider', 'schemaVersion'];
+    exactKeys(request.execution, executionFields, 'scan queue execution');
+    if (![1, 2].includes(request.execution.schemaVersion)
       || !['codex', 'claude'].includes(request.execution.provider)
       || !['primary', 'second-pass', 'broadened'].includes(request.execution.mode)
       || (request.execution.model !== null
         && (typeof request.execution.model !== 'string'
           || !/^[A-Za-z0-9._:-]{1,96}$/.test(request.execution.model)))) {
       throw new TypeError('scan queue execution is invalid');
+    }
+    if (request.execution.schemaVersion === 2) {
+      if (!FINGERPRINT.test(request.execution.compatibilityFingerprint || '')) {
+        throw new TypeError('scan queue execution compatibility is invalid');
+      }
+      if (request.requester === 'manual') {
+        if (request.execution.scheduleId !== null || request.execution.logicalWindowId !== null) {
+          throw new TypeError('manual scan execution cannot identify a schedule window');
+        }
+      } else {
+        if (!REQUEST_KEY.test(request.execution.scheduleId || '')) {
+          throw new TypeError('scheduled scan execution job is invalid');
+        }
+        timestamp(request.execution.logicalWindowId, 'scheduled scan logical window');
+      }
     }
   }
   const requestedAt = timestamp(request.requestedAt, 'scan queue requested time');
@@ -141,6 +159,9 @@ function checkedEvent(record) {
     if (record.schemaVersion === 2 && checked.execution !== undefined) {
       throw new Error('version-two scan queue request contains unsupported execution metadata');
     }
+    if (record.schemaVersion === 3 && checked.execution?.schemaVersion === 2) {
+      throw new Error('version-three scan queue request contains unsupported execution metadata');
+    }
     return { ...record, request: checked };
   }
   if (!REQUEST_ID.test(record.requestId || '')) throw new Error('scan queue journal event contains an invalid request ID');
@@ -180,10 +201,23 @@ function appendEvent(root, record) {
   try { fs.writeSync(descriptor, `${JSON.stringify(record)}\n`, undefined, 'utf8'); fs.fsyncSync(descriptor); } finally { fs.closeSync(descriptor); }
 }
 
-function readEvents(root) {
-  const file = queueFile(root); if (!fs.existsSync(file)) return [];
-  const contents = fs.readFileSync(file, 'utf8'); if (!contents || !contents.endsWith('\n')) throw new Error('scan queue journal is truncated');
+function eventsFromContents(contents) {
+  if (!contents) return [];
+  if (!contents.endsWith('\n')) throw new Error('scan queue journal is truncated');
   return contents.slice(0, -1).split('\n').map((line) => { try { return checkedEvent(JSON.parse(line)); } catch (error) { throw new Error(`scan queue journal is invalid: ${error.message}`); } });
+}
+
+function queueSnapshot(root) {
+  const file = queueFile(root);
+  const contents = fs.existsSync(file) ? fs.readFileSync(file, 'utf8') : '';
+  return {
+    digest: createHash('sha256').update(contents).digest('hex'),
+    events: eventsFromContents(contents),
+  };
+}
+
+function readEvents(root) {
+  return queueSnapshot(root).events;
 }
 
 function newerScheduled(incoming, previous) { return incoming.requestedAt > previous.requestedAt || (incoming.requestedAt === previous.requestedAt && incoming.id > previous.id); }
@@ -240,7 +274,16 @@ function stateFromEvents(events) {
   return { items: [...byId.values()], inputs, aliases };
 }
 
-function windowKey(item) { return item.windowAt && [item.windowAt, item.compatibility.profileFingerprint, item.compatibility.configFingerprint, item.purpose, item.compatibility.schemaVersion].join('|'); }
+function windowKey(item) {
+  return item.windowAt && [
+    item.execution?.scheduleId || '',
+    item.execution?.logicalWindowId || item.windowAt,
+    item.compatibility.profileFingerprint,
+    item.compatibility.configFingerprint,
+    item.purpose,
+    item.compatibility.schemaVersion,
+  ].join('|');
+}
 function pending(items, compatibility, now) {
   const terminal = []; const completedWindows = new Set(items.filter((item) => item.status === 'succeeded' && item.windowAt).map(windowKey));
   for (const item of items) {
@@ -272,19 +315,42 @@ export function enqueueScanRequest(root, input) {
 }
 
 function appendEnqueueTransition(root, request, digest = requestDigest(request)) {
-  const state = stateFromEvents(readEvents(root));
+  const transition = enqueueTransition(readEvents(root), request, digest);
+  if (transition.record) appendEvent(root, transition.record);
+  return transition.result;
+}
+
+function enqueueTransition(events, request, digest = requestDigest(request)) {
+  const state = stateFromEvents(events);
   if (state.inputs.has(request.id)) {
     if (!sameRequest(state.inputs.get(request.id), request)) throw new Error('scan queue request ID conflicts with its durable payload');
     const target = state.aliases.get(request.id) || request.id; const existing = state.items.find((item) => item.id === target);
-    if (!existing) throw new Error('scan queue request ID has no durable result'); return { status: state.aliases.has(request.id) ? 'deduplicated' : 'existing', request: publicItem(existing) };
+    if (!existing) throw new Error('scan queue request ID has no durable result');
+    return { record: null, result: { status: state.aliases.has(request.id) ? 'deduplicated' : 'existing', request: publicItem(existing) } };
   }
   const equivalent = state.items.find((item) => item.status === 'queued' && sameExecutionContract(item, request));
-  if (equivalent && request.requester === 'manual') { appendEvent(root, event('deduplicated', { request, requestDigest: digest, requestId: equivalent.id })); return { status: 'deduplicated', request: publicItem(equivalent) }; }
-  if (equivalent && request.requester === 'scheduled') {
-    if (!newerScheduled(request, equivalent)) { appendEvent(root, event('deduplicated', { request, requestDigest: digest, requestId: equivalent.id })); return { status: 'deduplicated', request: publicItem(equivalent) }; }
-    appendEvent(root, event('scheduled-replaced', { request, requestDigest: digest, supersededRequestId: equivalent.id })); return { status: 'enqueued', request: structuredClone(request), superseded: equivalent.id };
+  if (equivalent && request.requester === 'manual') {
+    return {
+      record: event('deduplicated', { request, requestDigest: digest, requestId: equivalent.id }),
+      result: { status: 'deduplicated', request: publicItem(equivalent) },
+    };
   }
-  appendEvent(root, event('enqueue', { request, requestDigest: digest })); return { status: 'enqueued', request: structuredClone(request) };
+  if (equivalent && request.requester === 'scheduled') {
+    if (!newerScheduled(request, equivalent)) {
+      return {
+        record: event('deduplicated', { request, requestDigest: digest, requestId: equivalent.id }),
+        result: { status: 'deduplicated', request: publicItem(equivalent) },
+      };
+    }
+    return {
+      record: event('scheduled-replaced', { request, requestDigest: digest, supersededRequestId: equivalent.id }),
+      result: { status: 'enqueued', request: structuredClone(request), superseded: equivalent.id },
+    };
+  }
+  return {
+    record: event('enqueue', { request, requestDigest: digest }),
+    result: { status: 'enqueued', request: structuredClone(request) },
+  };
 }
 
 export function enqueueOverlappingScanRequest(root, input, options = {}) {
@@ -296,15 +362,18 @@ export function enqueueOverlappingScanRequest(root, input, options = {}) {
   ], 'overlapping scan queue request');
   const { observedLease, ...payload } = input;
   const { request } = checkedRequest({ ...payload, lease: {} });
-  const committed = withObservedActiveScanLease(
-    root,
-    observedLease,
-    synchronousFenceCallback(() => appendEnqueueTransition(root, request)),
-    options,
-  );
-  return committed.active
-    ? committed.value
-    : Object.freeze({ status: 'not-active', request: null });
+  for (let attempt = 0; attempt < 16; attempt += 1) {
+    const snapshot = queueSnapshot(root);
+    const transition = enqueueTransition(snapshot.events, request);
+    if (!transition.record) return transition.result;
+    const committed = appendObservedScanQueueEvent(root, observedLease, {
+      expectedDigest: snapshot.digest,
+      record: transition.record,
+    }, options);
+    if (!committed.active) return Object.freeze({ status: 'not-active', request: null });
+    if (committed.appended) return transition.result;
+  }
+  throw new Error('scan queue changed repeatedly during overlap append');
 }
 
 export function claimNextScanRequest(root, inputCompatibility, lease, now = new Date()) {

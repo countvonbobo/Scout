@@ -100,10 +100,17 @@ function structuredExclusions(vacancy, profile) {
 
 function responsibilityExclusions(vacancy, profile) {
   const description = String(vacancy?.description || '');
+  const semanticMatches = new Set(vacancy?.semanticEvidence?.profileRuleMatches || []);
   return (profile?.negative?.excludedResponsibilities || []).flatMap((rule) => {
-    if (!hardRule(rule) || !phraseMatches(description, rule.value)) return [];
+    const matched = semanticMatches.has(ruleId(rule)) || phraseMatches(description, rule.value);
+    if (!hardRule(rule) || !matched) return [];
     return [exclusion(vacancy, profile, 'excluded-responsibility', rule,
-      { vacancy: description, rule: rule.value }, 'explicit-source', false)];
+      {
+        vacancy: vacancy?.semanticEvidence
+          ? { digest: vacancy.semanticEvidence.descriptionDigest, matchedRule: ruleId(rule) }
+          : description,
+        rule: rule.value,
+      }, 'explicit-source', false)];
   });
 }
 

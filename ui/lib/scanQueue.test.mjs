@@ -30,10 +30,12 @@ const compatibility = Object.freeze({
 function request({
   id, key = id, requester = 'manual', requestedAt = '2026-07-27T08:00:00.000Z',
   expiresAt = '2026-07-28T08:00:00.000Z', windowAt = null, purpose = 'daily-scan', requestCompatibility = null, lease: activeLease,
+  execution,
 } = {}) {
   return {
     id, key, requester, purpose,
     compatibility: requestCompatibility || { profileFingerprint: profile, configFingerprint: config, schemaVersion: 1 },
+    ...(execution ? { execution } : {}),
     requestedAt, expiresAt, windowAt, lease: activeLease,
   };
 }
@@ -203,6 +205,46 @@ test('newest equivalent scheduled request supersedes the older request and expir
       id: 'scheduled-too-late', requester: 'scheduled', windowAt: '2026-07-28T21:00:00.000Z',
       expiresAt: '2026-07-28T21:00:00.000Z', lease: activeLease,
     })), /12 hours/i);
+  } finally {
+    releaseScanLease(activeLease);
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('scheduled equivalence and window coverage require the same job and logical occurrence', () => {
+  const root = workspace();
+  const activeLease = lease(root, 'scheduled-identities');
+  const execution = (scheduleId, logicalWindowId) => ({
+    schemaVersion: 2,
+    provider: 'codex',
+    mode: 'primary',
+    model: null,
+    scheduleId,
+    logicalWindowId,
+    compatibilityFingerprint: 'd'.repeat(64),
+  });
+  try {
+    enqueueScanRequest(root, request({
+      id: 'morning-a',
+      key: 'same-settings',
+      requester: 'scheduled',
+      windowAt: '2026-07-27T20:00:00.000Z',
+      expiresAt: '2026-07-27T20:00:00.000Z',
+      execution: execution('morning-job', '2026-07-27T06:30:00.000Z'),
+      lease: activeLease,
+    }));
+    enqueueScanRequest(root, request({
+      id: 'morning-b',
+      key: 'same-settings',
+      requester: 'scheduled',
+      requestedAt: '2026-07-27T08:01:00.000Z',
+      windowAt: '2026-07-27T20:01:00.000Z',
+      expiresAt: '2026-07-27T20:01:00.000Z',
+      execution: execution('second-job', '2026-07-27T07:30:00.000Z'),
+      lease: activeLease,
+    }));
+
+    assert.deepEqual(projectScanQueue(root).ready.map((item) => item.id), ['morning-b', 'morning-a']);
   } finally {
     releaseScanLease(activeLease);
     fs.rmSync(root, { recursive: true, force: true });

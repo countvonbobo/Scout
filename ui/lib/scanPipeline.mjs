@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { atomicWriteFile } from './atomicWrite.mjs';
@@ -18,15 +18,15 @@ import {
   PIPELINE_STAGE_ARTIFACT_SCHEMA_VERSION, commitRunArtifact, projectRunManifest,
   readRunArtifact, validateManifestAgreement,
 } from './runArtifacts.mjs';
-import { appendRunEvent, openRunJournal } from './runJournal.mjs';
+import { appendRunEvent, openRunJournal, validateRunJournal } from './runJournal.mjs';
 import { recoverRun, selectRecoverableRun } from './runRecovery.mjs';
 import {
   LeaseLostError, acquireScanLease, assertScanLeaseScope, currentLeaseOwner, isScanLease,
-  readScanLease, releaseScanLease, startLeaseHeartbeat,
+  handoffScanLease, readScanLease, releaseScanLease, startLeaseHeartbeat,
 } from './scanLease.mjs';
 import {
   claimNextScanRequest, completeOrphanedScanRequest, completeScanRequest,
-  enqueueOverlappingScanRequest, projectScanQueue, recoverOrphanedScanRequest,
+  enqueueOverlappingScanRequest, projectScanQueue,
 } from './scanQueue.mjs';
 export { filterVacancies } from './vacancyFilter.mjs';
 
@@ -82,9 +82,12 @@ function pipelineRunCandidates(root, requestedRunId) {
   const names = requestedRunId ? [requestedRunId] : fs.readdirSync(directory);
   const candidates = [];
   for (const runId of names) {
+    let stat;
     try {
-      const stat = fs.statSync(path.join(directory, runId));
+      stat = fs.statSync(path.join(directory, runId));
       if (!stat.isDirectory()) continue;
+      const journalState = validateRunJournal(path.join(directory, runId, 'journal.jsonl'));
+      if (journalState.truncatedTail) throw new Error('recovery candidate has a truncated journal');
       const run = openRunJournal(root, runId);
       if (!run.events.length) continue;
       const manifest = projectRunManifest(run.events);
@@ -96,9 +99,18 @@ function pipelineRunCandidates(root, requestedRunId) {
         completedWork: manifest.completedWork,
       });
     } catch {
-      // Recovery selection records supported-but-incompatible candidates. A
-      // journal that cannot even be validated is handled by the dedicated
-      // recovery diagnostics rather than guessed at here.
+      if (stat?.isDirectory()) {
+        // Keep the damaged run itself immutable. Selection will classify this
+        // bounded placeholder and durably record the skip in the fenced
+        // workspace-level recovery diagnostic.
+        candidates.push({
+          runId,
+          updatedAt: stat.mtime.toISOString(),
+          outcome: 'in-progress',
+          compatibility: null,
+          completedWork: [],
+        });
+      }
     }
   }
   return candidates;
@@ -138,13 +150,13 @@ function resultWithOutputs(result, outputs) {
   return Object.freeze(result);
 }
 
-async function drainScanQueue(root, queue, compatibility, leaseOptions) {
+async function drainScanQueue(root, queue, compatibility, leaseOptions, initialLease = null) {
   if (!queue) return [];
   if (typeof queue.run !== 'function') throw new TypeError('scan queue drain callback is required');
   const drained = [];
   for (let index = 0; index < 128; index += 1) {
     const runId = randomUUID();
-    const lease = acquireScanLease(
+    const lease = index === 0 && initialLease ? initialLease : acquireScanLease(
       root,
       currentLeaseOwner(),
       pipelineOperation(runId, compatibility, 'queue-drain'),
@@ -153,7 +165,12 @@ async function drainScanQueue(root, queue, compatibility, leaseOptions) {
     if (!lease) break;
     let safeToRelease = false;
     try {
-      reconcileOrphanedQueueClaim(root, lease);
+      const orphan = reconcileOrphanedQueueClaim(root, lease);
+      if (orphan?.completed) {
+        safeToRelease = true;
+        drained.push(Object.freeze({ requestId: orphan.request.id, outcome: orphan.outcome }));
+        continue;
+      }
       const queueCompatibility = typeof queue.compatibility === 'function'
         ? await queue.compatibility()
         : queue.compatibility;
@@ -161,27 +178,50 @@ async function drainScanQueue(root, queue, compatibility, leaseOptions) {
         ...queueCompatibility,
         purpose: compatibility.purpose,
       };
-      const request = claimNextScanRequest(root, currentCompatibility, lease, queue.now ?? new Date());
+      const request = orphan?.resume
+        ? orphan.request
+        : claimNextScanRequest(root, currentCompatibility, lease, queue.now ?? new Date());
       if (!request) {
         safeToRelease = true;
         break;
       }
+      if (typeof queue.verify === 'function'
+        && !await queue.verify(request, { lease, phase: 'claim' })) {
+        if (orphan?.resume) {
+          completeOrphanedScanRequest(root, request.id, 'stale', request.claim, lease);
+        } else {
+          completeScanRequest(root, request.id, 'stale', lease, request.claim);
+        }
+        safeToRelease = true;
+        drained.push(Object.freeze({ requestId: request.id, outcome: 'stale' }));
+        continue;
+      }
       let requestedOutcome = 'failed';
+      let queueFailure = null;
       try {
-        const value = await queue.run(request, { runId, lease });
+        const value = await queue.run(request, { runId: lease.runId, lease });
         requestedOutcome = value === 'complete' || value === 'succeeded' ? 'succeeded'
           : value === 'skipped' ? 'skipped' : 'failed';
-      } catch {
+      } catch (error) {
+        queueFailure = error;
         // A failed queued scan is a durable terminal result for that request;
         // it must not prevent the next compatible request from draining.
       }
-      const runOutcome = ensureQueuedRunTerminal(root, lease, compatibility, request);
-      const outcome = runOutcome === 'complete' && requestedOutcome === 'succeeded'
+      const runOutcome = ensureQueuedRunTerminal(root, lease, compatibility, request, queueFailure);
+      const terminalManifest = projectRunManifest(openRunJournal(root, lease.runId).events);
+      const terminalCompatible = typeof queue.verify !== 'function'
+        || await queue.verify(request, { lease, phase: 'terminal', manifest: terminalManifest });
+      const outcome = !terminalCompatible ? 'stale'
+        : runOutcome === 'complete' && requestedOutcome === 'succeeded'
         ? 'succeeded'
         : runOutcome === 'abandoned' && requestedOutcome === 'skipped'
           ? 'skipped'
           : 'failed';
-      completeScanRequest(root, request.id, outcome, lease, request.claim);
+      if (orphan?.resume) {
+        completeOrphanedScanRequest(root, request.id, outcome, request.claim, lease);
+      } else {
+        completeScanRequest(root, request.id, outcome, lease, request.claim);
+      }
       safeToRelease = true;
       drained.push(Object.freeze({ requestId: request.id, outcome }));
     } finally {
@@ -213,12 +253,13 @@ function reconcileOrphanedQueueClaim(root, lease) {
   if (outcome) {
     const queueOutcome = outcome === 'complete' ? 'succeeded'
       : outcome === 'abandoned' ? 'skipped' : 'failed';
-    return completeOrphanedScanRequest(root, orphan.id, queueOutcome, orphan.claim, lease);
+    completeOrphanedScanRequest(root, orphan.id, queueOutcome, orphan.claim, lease);
+    return Object.freeze({ completed: true, request: orphan, outcome: queueOutcome });
   }
-  return recoverOrphanedScanRequest(root, orphan.id, orphan.claim, lease);
+  return Object.freeze({ resume: true, request: orphan });
 }
 
-function ensureQueuedRunTerminal(root, lease, compatibility, request) {
+function ensureQueuedRunTerminal(root, lease, compatibility, request, queueFailure = null) {
   const existingOutcome = terminalRunOutcome(root, lease.runId);
   if (existingOutcome) return existingOutcome;
   const run = openRunJournal(root, lease.runId);
@@ -236,6 +277,18 @@ function ensureQueuedRunTerminal(root, lease, compatibility, request) {
           model: execution ? (execution.model || 'provider-default') : compatibility.model,
           mode: execution?.mode || compatibility.mode,
         },
+      },
+    }, lease);
+  }
+  if (queueFailure) {
+    appendRunEvent(run, {
+      type: 'run.failure-recorded',
+      stageId: 'finalise',
+      idempotencyKey: `queued-run-failure-g${lease.generation}`,
+      payload: {
+        schemaVersion: 1,
+        code: 'queue-run-failed-before-pipeline',
+        reason: 'queued-scan-failed-before-durable-execution',
       },
     }, lease);
   }
@@ -264,6 +317,7 @@ export async function runScanPipeline({
   leaseOptions = {},
   heartbeatOptions = {},
   onStageCommitted = () => {},
+  prepare = null,
   finalize = null,
   recordFailure = null,
   queue = null,
@@ -272,6 +326,9 @@ export async function runScanPipeline({
   if (!root) throw new TypeError('scan pipeline workspace root is required');
   if (recordFailure !== null && typeof recordFailure !== 'function') {
     throw new TypeError('scan pipeline failure recorder must be a function');
+  }
+  if (prepare !== null && typeof prepare !== 'function') {
+    throw new TypeError('scan pipeline prepare callback must be a function');
   }
   const functions = stageFunctions(stages);
   const ownsLease = claimedLease === null;
@@ -323,6 +380,43 @@ export async function runScanPipeline({
     }, new Map());
   }
 
+  const startupQueueState = ownsLease && queue ? projectScanQueue(root).requests : [];
+  if (startupQueueState.some((request) => (
+    request.status === 'queued' || request.status === 'claimed'
+  ))) {
+    const startupQueueRunId = startupQueueState.find((request) => request.status === 'claimed')?.claim?.runId
+      || randomUUID();
+    let startupCompatibility = compatibility;
+    if (startupQueueRunId !== provisionalRunId) {
+      try {
+        const prior = openRunJournal(root, startupQueueRunId);
+        if (prior.events.length) startupCompatibility = projectRunManifest(prior.events).compatibility;
+      } catch {
+        // The resumed run will record bounded recovery evidence under this
+        // successor fence; do not trust damaged compatibility here.
+      }
+    }
+    lease = handoffScanLease(
+      lease,
+      pipelineOperation(startupQueueRunId, startupCompatibility, 'queue-drain'),
+    );
+    await drainScanQueue(root, queue, compatibility, leaseOptions, lease);
+    lease = acquireScanLease(
+      root,
+      currentLeaseOwner(),
+      pipelineOperation(provisionalRunId, compatibility, 'recovery-selection'),
+      leaseOptions,
+    );
+    if (!lease) {
+      return resultWithOutputs({
+        runId: provisionalRunId,
+        outcome: 'failed',
+        manifest: null,
+        failures: Object.freeze([{ code: 'startup-drain-raced', stage: 'initialise' }]),
+      }, new Map());
+    }
+  }
+
   let run;
   let recovery = null;
   let manifest = null;
@@ -333,27 +427,19 @@ export async function runScanPipeline({
   const failures = [];
   const outputs = new Map();
   try {
-    const candidates = ownsLease ? pipelineRunCandidates(root, requestedRunId) : [];
-    const selection = ownsLease
+    const mayRecoverClaimedRun = !ownsLease && openRunJournal(root, provisionalRunId).events.length > 0;
+    const candidates = ownsLease || mayRecoverClaimedRun
+      ? pipelineRunCandidates(root, mayRecoverClaimedRun ? provisionalRunId : requestedRunId)
+      : [];
+    const selection = ownsLease || mayRecoverClaimedRun
       ? selectRecoverableRun(candidates, compatibility, { root, lease })
       : { candidate: null };
-    if (ownsLease && selection.candidate) {
-      releaseScanLease(lease);
-      released = true;
-      lease = acquireScanLease(
-        root,
-        currentLeaseOwner(),
-        pipelineOperation(selection.candidate.runId, compatibility, 'recover'),
-        leaseOptions,
-      );
-      released = false;
-      if (!lease) {
-        return resultWithOutputs({
-          runId: selection.candidate.runId,
-          outcome: 'queued',
-          manifest: null,
-          failures: Object.freeze([{ code: 'lease-busy', stage: 'recover' }]),
-        }, outputs);
+    if (selection.candidate) {
+      if (ownsLease) {
+        lease = handoffScanLease(
+          lease,
+          pipelineOperation(selection.candidate.runId, compatibility, 'recover'),
+        );
       }
       recovery = recoverRun(root, selection.candidate.runId, lease, selection.decision);
       run = openRunJournal(root, recovery.runId);
@@ -369,6 +455,7 @@ export async function runScanPipeline({
       manifest = validateManifestAgreement(run, lease).manifest;
     }
     heartbeat = startLeaseHeartbeat(lease, heartbeatOptions);
+    if (prepare !== null) await prepare({ run, lease });
 
     const reusable = new Map((recovery?.reusableStages || []).map((stage) => [stage.stageId, stage]));
     let priorArtifact = null;
@@ -479,7 +566,7 @@ export async function runScanPipeline({
     }
   } finally {
     heartbeat?.stop();
-    if (ownsLease && !released && !retainInterruptedLease) {
+    if (ownsLease && !released && !retainInterruptedLease && terminal) {
       try { releaseScanLease(lease); released = true; } catch { /* lease loss is already reflected above */ }
     }
   }
@@ -612,11 +699,19 @@ function assessmentVacancy(vacancy) {
 
 function candidateFromSelected(vacancy, index) {
   const candidate = assessmentVacancy(vacancy);
+  const semantic = candidate.semanticEvidence || null;
+  const semanticSignals = (semantic?.mandatorySignals || []).map((signal) => ({
+    id: signal.id,
+    text: `Advert contains a ${signal.kind} requirement (${signal.digest.slice(0, 16)}).`,
+  }));
+  const semanticDescription = semantic
+    ? (semantic.profileRuleMatches || []).map((rule) => `Structured advert match: ${rule}.`).join(' ')
+    : null;
   return {
     ...candidate,
     candidateId: `candidate-${String(index + 1).padStart(3, '0')}`,
-    description: String(candidate.description || '').slice(0, 1200),
-    mandatorySignals: mandatorySignals(candidate.description, candidate.requirements),
+    description: semanticDescription ?? String(candidate.description || '').slice(0, 1200),
+    mandatorySignals: semantic ? semanticSignals : mandatorySignals(candidate.description, candidate.requirements),
   };
 }
 
@@ -627,7 +722,16 @@ export function assessmentCandidatesForSelection(selected) {
 function observationInputs(sources) {
   const observations = [];
   const funnelSources = {};
-  for (const [sourceName, source] of Object.entries(sources || {}).sort(([left], [right]) => compareText(left, right))) {
+  for (const [sourceName, source] of Object.entries(sources || {})) {
+    if (Array.isArray(source?.observations)) {
+      observations.push(...source.observations);
+      funnelSources[sourceName] = {
+        count: Number(source.count || source.observations.length),
+        failedRecords: Number(source.failedRecords || 0),
+        errors: Array.from({ length: Number(source.sourceErrorCount || 0) }, () => 'redacted'),
+      };
+      continue;
+    }
     const jobs = [...(source?.jobs || [])];
     const normalised = jobs.map((job) => normaliseObservation(job, {
       sourceName: job?.source || sourceName,
@@ -703,7 +807,7 @@ const RANKED_STAGE_ARTIFACT_FIELDS = Object.freeze({
   rank: Object.freeze(['duplicateObservations', 'exclusions', 'initialFunnel', 'normalisedCount', 'ranked', 'uniqueVacancies']),
   select: Object.freeze(['candidates', 'exclusions', 'funnel', 'ranked', 'selection']),
 });
-const OMIT_PRIVATE_STAGE_KEY = /^(?:access[-_]?token|advert[-_]?body|api[-_]?(?:key|token)|auth(?:orization)?|body|cookies?|credentials?|cv|headers?|html|master[-_]?cv|password|payload|profile[-_]?evidence|prompt|raw[-_]?(?:html|response)|response|secret(?:[-_]?(?:key|token))?|token|transcript)$/i;
+const OMIT_PRIVATE_STAGE_KEY = /^(?:access[-_]?token|advert[-_]?body|api[-_]?(?:key|token)|auth(?:orization)?|body|cookies?|credentials?|cv|description|headers?|html|master[-_]?cv|password|payload|profile[-_]?evidence|prompt|raw[-_]?(?:html|response)|requirements|response|secret(?:[-_]?(?:key|token))?|token|transcript)$/i;
 const URL_STAGE_KEY = /(?:^url$|url$)/i;
 const PRIVATE_QUERY_PARAMETER = /^(?:utm_.+|gclid|fbclid|mc_.+|access[-_]?token|api[-_]?key|auth(?:orization)?|signature|token)$/i;
 
@@ -730,14 +834,6 @@ function encodeRankedStageValue(value) {
   const encoded = {};
   for (const [key, item] of Object.entries(value)) {
     if (OMIT_PRIVATE_STAGE_KEY.test(key)) continue;
-    if (key === 'description') {
-      encoded.advertExcerpt = String(item || '').slice(0, 1_200);
-      continue;
-    }
-    if (key === 'requirements') {
-      encoded.requirementExcerpt = String(item || '').slice(0, 600);
-      continue;
-    }
     if (URL_STAGE_KEY.test(key) && typeof item === 'string') {
       encoded[key] = privacySafeStageUrl(item);
       continue;
@@ -747,46 +843,135 @@ function encodeRankedStageValue(value) {
   return encoded;
 }
 
-const COLLECTED_JOB_FIELDS = Object.freeze([
-  'company', 'compensationRateType', 'description', 'employer', 'employmentType',
-  'laneId', 'location', 'portal', 'postedAt', 'postedDate', 'providerId', 'rateType',
-  'requirements', 'salary', 'salaryCurrency', 'salaryMax', 'salaryMin',
-  'salaryPeriod', 'salaryRateType', 'seniority', 'source', 'sourceRecordId',
-  'sourceUrl', 'tags', 'title', 'url', 'workingPattern', 'workingType',
-]);
-const COLLECTED_SOURCE_FIELDS = Object.freeze([
-  'available', 'configured', 'count', 'errors', 'failedRecords', 'fetchedAt',
-  'generatedAt', 'jobs', 'laneId', 'note', 'portalsChecked', 'reason', 'status',
-]);
-
-function encodeCollectedJob(job) {
-  const selected = {};
-  for (const key of COLLECTED_JOB_FIELDS) {
-    if (!Object.hasOwn(job || {}, key)) continue;
-    if (key === 'portal') {
-      selected.portal = {
-        name: String(job.portal?.name || '').slice(0, 200),
-        ats: String(job.portal?.ats || '').slice(0, 80),
-      };
-    } else {
-      selected[key] = job[key];
-    }
-  }
-  return encodeRankedStageValue(selected);
+function semanticText(value) {
+  return String(value || '').normalize('NFKD').replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
 }
 
-function encodeCollectedSource(source) {
-  const selected = {};
-  for (const key of COLLECTED_SOURCE_FIELDS) {
-    if (!Object.hasOwn(source || {}, key)) continue;
-    selected[key] = key === 'jobs'
-      ? (Array.isArray(source.jobs) ? source.jobs.map(encodeCollectedJob) : [])
-      : encodeRankedStageValue(source[key]);
-  }
-  return selected;
+function semanticRuleId(rule) {
+  return `rule-${semanticText(rule?.value).replace(/\s+/g, '-')}`;
 }
 
-function encodePipelineStageValue(stageId, value) {
+function semanticPhraseMatches(value, phrase) {
+  const actual = new Set(semanticText(value).split(' ').filter(Boolean));
+  const expected = semanticText(phrase).split(' ').filter(Boolean);
+  return expected.length > 0 && expected.every((token) => actual.has(token));
+}
+
+function digestText(value) {
+  return createHash('sha256').update(String(value || '')).digest('hex');
+}
+
+function semanticObservation(job, sourceName, source, profile) {
+  const observation = normaliseObservation(job, {
+    sourceName: job?.source || sourceName,
+    fetchedAt: source?.fetchedAt || source?.generatedAt || null,
+    laneId: job?.laneId || job?.source || source?.laneId || sourceName,
+  });
+  if (!observation) return null;
+  const description = String(job?.description || '');
+  const requirements = String(job?.requirements || '');
+  const identity = jobIdentity(observation);
+  const descriptionRules = [
+    ...(profile?.target?.sectors || []),
+    ...(profile?.negative?.excludedResponsibilities || []),
+  ];
+  const profileRuleMatches = descriptionRules
+    .filter((rule) => semanticPhraseMatches(description, rule?.value))
+    .map(semanticRuleId);
+  const signals = mandatorySignals(description, requirements).map((signal) => ({
+    id: signal.id,
+    digest: digestText(signal.text),
+    kind: 'mandatory-language',
+  }));
+  const {
+    description: omittedDescription,
+    sourceUrl,
+    canonicalUrl,
+    ...safeObservation
+  } = observation;
+  void omittedDescription;
+  return {
+    ...safeObservation,
+    sourceUrl: privacySafeStageUrl(sourceUrl),
+    canonicalUrl: privacySafeStageUrl(canonicalUrl),
+    jobIdentity: {
+      company: identity.company,
+      title: identity.title,
+      location: identity.location,
+      seniority: identity.seniority,
+      evidenceTokenDigests: identity.evidenceTokens.map(digestText),
+    },
+    semanticEvidence: {
+      descriptionDigest: digestText(description),
+      descriptionLength: description.length,
+      profileRuleMatches,
+      mandatorySignals: signals,
+    },
+  };
+}
+
+function semanticCollectedSource(source, sourceName, profile) {
+  const jobs = Array.isArray(source?.jobs) ? source.jobs : [];
+  const observations = jobs.map((job) => semanticObservation(job, sourceName, source, profile)).filter(Boolean);
+  const status = ['healthy', 'degraded', 'unavailable'].includes(source?.status) ? source.status : 'unavailable';
+  return {
+    configured: Boolean(source?.configured),
+    status,
+    count: Number.isFinite(Number(source?.count)) ? Math.max(0, Number(source.count)) : jobs.length,
+    failedRecords: Math.max(0, Number(source?.failedRecords || 0) + jobs.length - observations.length),
+    sourceErrorCount: Array.isArray(source?.errors) ? source.errors.length : 0,
+    observations,
+  };
+}
+
+function legacySemanticJob(job, sourceName) {
+  const candidate = normaliseJob(job);
+  if (!candidate) return null;
+  const description = String(job?.description || '');
+  const requirements = String(job?.requirements || '');
+  return {
+    company: candidate.company,
+    title: candidate.role,
+    url: privacySafeStageUrl(candidate.url),
+    location: candidate.location,
+    salary: candidate.salary,
+    workingType: candidate.workingType,
+    postedDate: candidate.postedDate,
+    source: candidate.source || sourceName,
+    providerId: candidate.providerId,
+    sourceReferences: candidate.sourceReferences.map((reference) => ({
+      ...reference,
+      url: privacySafeStageUrl(reference.url),
+    })),
+    semanticEvidence: {
+      descriptionDigest: digestText(description),
+      descriptionLength: description.length,
+      requirementsDigest: digestText(requirements),
+      requirementsLength: requirements.length,
+      mandatorySignals: mandatorySignals(description, requirements).map((signal) => ({
+        id: signal.id,
+        digest: digestText(signal.text),
+        kind: 'mandatory-language',
+      })),
+    },
+  };
+}
+
+function legacySemanticCollectedSource(source, sourceName) {
+  const jobs = Array.isArray(source?.jobs) ? source.jobs : [];
+  const semanticJobs = jobs.map((job) => legacySemanticJob(job, sourceName)).filter(Boolean);
+  return {
+    configured: Boolean(source?.configured),
+    status: ['healthy', 'degraded', 'unavailable'].includes(source?.status) ? source.status : 'unavailable',
+    count: Number.isFinite(Number(source?.count)) ? Math.max(0, Number(source.count)) : jobs.length,
+    failedRecords: Math.max(0, Number(source?.failedRecords || 0) + jobs.length - semanticJobs.length),
+    sourceErrorCount: Array.isArray(source?.errors) ? source.errors.length : 0,
+    jobs: semanticJobs,
+  };
+}
+
+function encodePipelineStageValue(stageId, value, profile = null) {
   if (stageId !== 'collect') return encodeRankedStageValue(value);
   return {
     generatedAt: String(value?.generatedAt || '').slice(0, 80) || null,
@@ -794,9 +979,11 @@ function encodePipelineStageValue(stageId, value) {
       .slice(0, 128)
       .map((query) => String(query || '').slice(0, 300)),
     sources: Object.fromEntries(Object.entries(value?.sources || {})
-      .sort(([left], [right]) => compareText(left, right))
       .slice(0, 128)
-      .map(([source, result]) => [String(source).slice(0, 80), encodeCollectedSource(result)])),
+      .map(([source, result]) => [
+        String(source).slice(0, 80),
+        profile ? semanticCollectedSource(result, source, profile) : legacySemanticCollectedSource(result, source),
+      ])),
   };
 }
 
@@ -816,7 +1003,7 @@ function decodeRankedStageValue(value) {
   return decoded;
 }
 
-function withRankedArtifactCodec(stageId, execute) {
+function withRankedArtifactCodec(stageId, execute, profile = null) {
   const fields = RANKED_STAGE_ARTIFACT_FIELDS[stageId];
   Object.defineProperty(execute, 'artifactCodec', {
     enumerable: false,
@@ -826,7 +1013,7 @@ function withRankedArtifactCodec(stageId, execute) {
         if (actual.join(',') !== fields.join(',')) {
           throw new TypeError(`ranked ${stageId} stage returned an unsupported artifact schema`);
         }
-        return encodePipelineStageValue(stageId, value);
+        return encodePipelineStageValue(stageId, value, profile);
       },
       decode: decodeRankedStageValue,
     }),
@@ -844,7 +1031,7 @@ export function createRankedDiscoveryStages({
   if (typeof collect !== 'function') throw new TypeError('ranked discovery collection stage is required');
   if (!profile || profile.status !== 'published') throw new Error('ranked discovery requires a published search profile');
   return {
-    collect: withRankedArtifactCodec('collect', collect),
+    collect: withRankedArtifactCodec('collect', collect, profile),
     normalise: withRankedArtifactCodec('normalise', function normaliseStage({ priorArtifact }) {
       const input = observationInputs(priorArtifact?.sources);
       return {
@@ -1019,6 +1206,7 @@ function normaliseJob(job) {
     source: String(job?.source || ''), providerId: String(job?.providerId || ''),
     description: String(job?.description || ''), requirements: String(job?.requirements || ''),
     tags: Array.isArray(job?.tags) ? job.tags : [], sourceReferences: sourceReferencesOf(job), duplicateCount: 1,
+    semanticEvidence: job?.semanticEvidence || null,
   };
 }
 
@@ -1027,6 +1215,9 @@ function absorbDuplicate(existing, incoming) {
   existing.duplicateCount += 1;
   existing.tags = [...new Set([...existing.tags, ...incoming.tags])];
   if (incoming.description.length > existing.description.length) existing.description = incoming.description;
+  if (Number(incoming.semanticEvidence?.descriptionLength || 0) > Number(existing.semanticEvidence?.descriptionLength || 0)) {
+    existing.semanticEvidence = incoming.semanticEvidence;
+  }
   if (!existing.salary && incoming.salary) existing.salary = incoming.salary;
   invalidateJobIdentity(existing);
 }
@@ -1092,9 +1283,16 @@ export function compactCandidates(sources, maximum = DEFAULT_CANDIDATE_LIMIT) {
   const candidates = selected.map(({ job }, index) => ({
     ...job,
     candidateId: `candidate-${String(index + 1).padStart(3, '0')}`,
-    description: job.description.slice(0, 1200),
+    description: job.semanticEvidence
+      ? `advert-semantic:${job.semanticEvidence.descriptionDigest}`
+      : job.description.slice(0, 1200),
     sources: [...new Set(job.sourceReferences.map((reference) => reference.url).filter(Boolean))],
-    mandatorySignals: mandatorySignals(job.description, job.requirements),
+    mandatorySignals: job.semanticEvidence
+      ? (job.semanticEvidence.mandatorySignals || []).map((signal) => ({
+        id: signal.id,
+        text: `${signal.kind}:${signal.digest}`,
+      }))
+      : mandatorySignals(job.description, job.requirements),
   }));
   return {
     candidates,

@@ -10,7 +10,10 @@ const BASE_RECOVERY_REQUIREMENTS = Object.freeze([
   'sourceConfigFingerprint',
   'journalSchemaVersion',
   'artifactSchemaVersion',
+  'stageArtifactSchemaVersion',
   'pipelineVersion',
+  'scheduleJobId',
+  'logicalWindowId',
 ]);
 const RANKING_RECOVERY_REQUIREMENTS = Object.freeze([
   ...BASE_RECOVERY_REQUIREMENTS,

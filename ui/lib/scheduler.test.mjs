@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { describeScheduleDays, isEveryDay, linuxSystemdUnits, macLaunchAgent, nativeScheduleNames, nextScheduledRun, normaliseScheduleDays, registerDailySchedule, scheduleSummary, scheduledRequestExpiry, schedulerRegistrationScript, taskXml } from './scheduler.mjs';
+import { describeScheduleDays, isEveryDay, linuxSystemdUnits, macLaunchAgent, nativeScheduleNames, nextScheduledRun, normaliseScheduleDays, registerDailySchedule, scheduleSummary, scheduledLogicalWindow, scheduledRequestExpiry, schedulerRegistrationScript, taskXml } from './scheduler.mjs';
 
 test('scheduled task is catch-up enabled, non-overlapping and time limited', () => {
   const xml = taskXml({ command: 'node.exe', args: ['tools/scout.mjs', 'scan'], workingDirectory: 'C:\\Scout', time: '07:30', userId: 'user', now: new Date(2026, 6, 11, 8, 0) });
@@ -45,6 +45,17 @@ test('nextScheduledRun honours Europe/London across daylight saving time', () =>
   assert.equal(nextScheduledRun('07:30', new Date('2026-07-11T06:00:00.000Z'), 'Europe/London'), '2026-07-11T06:30:00.000Z');
   assert.equal(nextScheduledRun('07:30', new Date('2026-12-11T06:00:00.000Z'), 'Europe/London'), '2026-12-11T07:30:00.000Z');
   assert.throws(() => nextScheduledRun('07:30', new Date(), 'Europe/London; reboot'), /valid IANA timezone/);
+});
+
+test('scheduled logical window identifies the current configured occurrence separately from next expiry', () => {
+  assert.equal(
+    scheduledLogicalWindow('07:30', new Date('2026-07-27T08:05:00.000Z'), 'Europe/London', [1, 2, 3, 4, 5]),
+    '2026-07-27T06:30:00.000Z',
+  );
+  assert.equal(
+    nextScheduledRun('07:30', new Date('2026-07-27T08:05:00.000Z'), 'Europe/London', [1, 2, 3, 4, 5]),
+    '2026-07-28T06:30:00.000Z',
+  );
 });
 
 test('scheduled queue expiry is the earlier of the next window and 12 hours', () => {

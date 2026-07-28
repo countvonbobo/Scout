@@ -253,6 +253,9 @@ function addArtifact(artifacts, artifact) {
 }
 
 const RECOVERY_REASON_FOR_FIELD = Object.freeze({
+  stageArtifactSchemaVersion: 'stage-artifact-schema-mismatch',
+  scheduleJobId: 'schedule-job-mismatch',
+  logicalWindowId: 'logical-window-mismatch',
   rankingVersion: 'ranking-version-mismatch',
   promptVersion: 'prompt-version-mismatch',
   assessmentSchemaVersion: 'assessment-schema-version-mismatch',
@@ -266,7 +269,10 @@ const HARD_RECOVERY_REQUIREMENTS = Object.freeze([
   'sourceConfigFingerprint',
   'journalSchemaVersion',
   'artifactSchemaVersion',
+  'stageArtifactSchemaVersion',
   'pipelineVersion',
+  'scheduleJobId',
+  'logicalWindowId',
 ]);
 
 function expectedAtomicRecoveryPlan(completedByStage, prior, requested, substitution) {
