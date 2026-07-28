@@ -11,7 +11,10 @@ const previousDeviceSettings = process.env.SCOUT_DEVICE_SETTINGS;
 const testWorkspace = fs.mkdtempSync(path.join(os.tmpdir(), 'scout-server-test-'));
 process.env.SCOUT_WORKSPACE = testWorkspace;
 process.env.SCOUT_DEVICE_SETTINGS = path.join(testWorkspace, 'device-settings.json');
-const { APP_ROOT, APP_VERSION, UI_BUILD_ID, WORKSPACE_ROOT, createServer, operations, providerDetection, restartControl, shutdownControl } = await import('./server.mjs');
+const {
+  APP_ROOT, APP_VERSION, UI_BUILD_ID, WORKSPACE_ROOT, codexDeepLinkDetection,
+  createServer, inspectCodexDeepLinkHandler, operations, providerDetection, restartControl, shutdownControl,
+} = await import('./server.mjs');
 const { seedWorkspace, loadWorkspaceConfig, workspacePaths, writeWorkspaceConfig } = await import('./lib/workspace.mjs');
 const { profileFingerprint } = await import('./lib/searchProfile.mjs');
 const { acquireScanLock, releaseScanLock } = await import('../tools/scan-lock.mjs');
@@ -196,6 +199,69 @@ test('remote pages and APIs require the configured Tailscale owner', async () =>
   assert.equal(owner.headers['strict-transport-security'], 'max-age=31536000');
   const alteredOrigin = await request({ path: '/api/app-info', headers: { host: 'scout-host.example.ts.net', origin: 'https://other.example.ts.net', 'tailscale-user-login': 'owner@example.com' } });
   assert.equal(alteredOrigin.status, 403);
+});
+
+test('Codex deep-link capability is device-local, bounded and private', async () => {
+  let inspections = 0;
+  codexDeepLinkDetection.inspect = async () => {
+    inspections += 1;
+    return {
+      registered: false,
+      registryPath: 'HKCU\\Software\\Classes\\codex',
+      executable: 'C:\\Users\\private\\Codex.exe',
+      error: 'person@example.test token=secret',
+    };
+  };
+  const local = await request({ path: '/api/device/codex-deep-link' });
+  assert.equal(local.status, 200);
+  const localBody = JSON.parse(local.text);
+  assert.equal(localBody.state, 'unavailable');
+  assert.equal(localBody.canAttempt, false);
+  assert.doesNotMatch(local.text, /registry|Users|person@|token|executable|error/i);
+
+  const remote = await request({
+    path: '/api/device/codex-deep-link',
+    headers: { host: 'scout-host.example.ts.net', 'tailscale-user-login': 'owner@example.com' },
+  });
+  assert.equal(remote.status, 200);
+  assert.equal(JSON.parse(remote.text).state, 'remote');
+  assert.equal(inspections, 1);
+});
+
+test('Codex handler inspection uses only fixed read-only platform commands', async () => {
+  const macCalls = [];
+  const mac = await inspectCodexDeepLinkHandler({
+    platform: 'darwin',
+    run: async (command, args) => {
+      macCalls.push([command, args]);
+      return {
+        status: 0,
+        failed: false,
+        timedOut: false,
+        exceeded: false,
+        stdout: '({ LSHandlerRoleAll = "com.openai.codex"; LSHandlerURLScheme = codex; })',
+      };
+    },
+  });
+  assert.deepEqual(mac, { registered: true });
+  assert.deepEqual(macCalls, [[
+    '/usr/bin/defaults',
+    ['read', 'com.apple.LaunchServices/com.apple.launchservices.secure', 'LSHandlers'],
+  ]]);
+
+  const windowsCalls = [];
+  const windows = await inspectCodexDeepLinkHandler({
+    platform: 'win32',
+    run: async (command, args) => {
+      windowsCalls.push([command, args]);
+      return { status: windowsCalls.length === 2 ? 0 : 1, failed: false, timedOut: false, exceeded: false };
+    },
+  });
+  assert.deepEqual(windows, { registered: true });
+  assert.deepEqual(windowsCalls, [
+    ['reg.exe', ['query', 'HKCU\\Software\\Classes\\codex\\shell\\open\\command', '/ve']],
+    ['reg.exe', ['query', 'HKCR\\codex\\shell\\open\\command', '/ve']],
+  ]);
 });
 
 test('remote owner mutations require HTTPS Origin and administration remains local-only', async () => {

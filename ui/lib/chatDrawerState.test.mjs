@@ -115,3 +115,25 @@ test('a usage error preserves model choices', () => {
   assert.deepEqual(failed.engines, enginesReady.engines);
   assert.equal(failed.usage.status, 'error');
 });
+
+test('Codex link capability resolves independently without erasing models or usage', () => {
+  let state = requestBoth();
+  state = reduceChatDrawer(state, {
+    type: 'engines/resolved', chatId: 'chat-a', generation: 1, requestGeneration: 1,
+    value: { engines: { codex: { models: [{ id: 'safe-model' }] } } },
+  });
+  state = reduceChatDrawer(state, {
+    type: 'usage/resolved', chatId: 'chat-a', generation: 1, requestGeneration: 1,
+    value: { checkedAt: 'usage-ready' },
+  });
+  state = reduceChatDrawer(state, {
+    type: 'codexLink/requested', chatId: 'chat-a', generation: 1, requestGeneration: 1,
+  });
+  const complete = reduceChatDrawer(state, {
+    type: 'codexLink/resolved', chatId: 'chat-a', generation: 1, requestGeneration: 1,
+    value: { state: 'supported', canAttempt: true },
+  });
+  assert.deepEqual(complete.engines, state.engines);
+  assert.deepEqual(complete.usage, state.usage);
+  assert.equal(complete.codexLink.value.state, 'supported');
+});

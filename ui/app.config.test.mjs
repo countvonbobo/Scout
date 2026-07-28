@@ -4,6 +4,7 @@ import vm from 'node:vm';
 import { test } from 'node:test';
 import { CATEGORY_PALETTE } from './lib/categoryColor.mjs';
 import { createChatDrawerState, reduceChatDrawer } from './lib/chatDrawerState.mjs';
+import { codexDeepLinkCapability, openCodexTask } from './lib/codexDeepLink.mjs';
 
 function loadScout() {
   const context = {
@@ -14,6 +15,8 @@ function loadScout() {
     console,
     matchMedia: () => ({ matches: false }),
     createChatDrawerState,
+    codexDeepLinkCapability,
+    codexTaskLaunchView: openCodexTask,
     reduceChatDrawer,
   };
   context.activityState = () => 'thinking';
@@ -127,10 +130,23 @@ test('configured triage thresholds drive score presentation', () => {
   assert.equal(scout.fitClass(63), 'fit-weak');
 });
 
-test('Codex chats use the canonical desktop task deep link and raw tool commands stay hidden', () => {
-  const { context } = loadScout();
-  assert.equal(context.codexTaskUrl('019f1234-abcd-7890'), 'codex://threads/019f1234-abcd-7890');
-  assert.equal(context.codexTaskUrl('../unsafe'), null);
+test('Codex task controls escape fallback identity and never call a click success', () => {
+  const { scout } = loadScout();
+  scout.chat = {
+    id: 'chat-a',
+    engine: 'codex',
+    data: { cliSessionId: '<img src=x onerror=alert(1)>' },
+  };
+  scout.chatDrawerState = createChatDrawerState('chat-a', 1);
+  scout.chatDrawerState = reduceChatDrawer(scout.chatDrawerState, {
+    type: 'codexLink/resolved', chatId: 'chat-a', generation: 1, requestGeneration: 1,
+    value: { state: 'unavailable', canAttempt: false, reasonCode: 'handler-missing' },
+  });
+  const fallback = scout.codexTaskControlsHtml(scout.chat);
+  assert.match(fallback, /&lt;img src=x onerror=alert\(1\)&gt;/);
+  assert.doesNotMatch(fallback, /<img/);
+  assert.match(fallback, /copy task ID/i);
+  assert.doesNotMatch(fallback, /success/i);
   const source = fs.readFileSync(new URL('./app.js', import.meta.url), 'utf8');
   assert.doesNotMatch(source, /chat-msg tool/);
   assert.match(source, /Technical details/);
