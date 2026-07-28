@@ -816,19 +816,16 @@
     .scout-bubble::after { content:''; position:absolute; width:14px; height:14px; background:var(--panel); transform:rotate(45deg); }
     .scout-bubble.tail-left::after { left:-8px; top:38px; border-left:1px solid var(--line); border-bottom:1px solid var(--line); }
     .scout-bubble.tail-right::after { right:-8px; bottom:34px; border-right:1px solid var(--line); border-top:1px solid var(--line); }
-    .scout-sprite { position:absolute; inset:0; display:block; width:100%; height:100%; transform:translate(var(--scout-align-x,0),var(--scout-align-y,0)); transform-origin:center; background-image:var(--scout-src),var(--scout-fallback); background-repeat:no-repeat; background-size:calc(var(--scout-columns) * 100%) calc(var(--scout-rows) * 100%),contain; background-position:0 0,center; animation:scout-frames var(--scout-duration) step-end var(--scout-iterations); }
-    .scout-sprite.reduced-motion { animation:none; background-position:var(--scout-still-x) var(--scout-still-y), center; }
+    /* Two step animations walk the sheet: one sweeps a row's columns, one steps
+       down the rows. Both counts and both durations come from the per-state
+       custom properties published by ui/lib/scoutCharacter.mjs, so nothing here
+       assumes a frame count or a frame rate. jump-none keeps the first and last
+       cells inclusive, which is what makes each stop land on a whole cell. */
+    .scout-sprite { position:absolute; inset:0; display:block; width:100%; height:100%; transform:translate(var(--scout-align-x,0),var(--scout-align-y,0)); transform-origin:center; background-image:var(--scout-src),var(--scout-fallback); background-repeat:no-repeat; background-size:calc(var(--scout-columns) * 100%) calc(var(--scout-rows) * 100%),contain; background-position:var(--scout-still-x,0%) var(--scout-still-y,0%),center; animation:scout-frame-column var(--scout-row-duration) steps(var(--scout-columns), jump-none) var(--scout-column-iterations) both,scout-frame-row var(--scout-duration) steps(var(--scout-rows), jump-none) var(--scout-iterations) both; }
+    .scout-sprite.reduced-motion { animation:none; }
     .scout-offscreen .scout-sprite, .scout-page-hidden .scout-sprite { animation-play-state:paused; }
-    @keyframes scout-frames {
-      0% { background-position:0 0,center; } 6.25% { background-position:33.333% 0,center; }
-      12.5% { background-position:66.667% 0,center; } 18.75% { background-position:100% 0,center; }
-      25% { background-position:0 33.333%,center; } 31.25% { background-position:33.333% 33.333%,center; }
-      37.5% { background-position:66.667% 33.333%,center; } 43.75% { background-position:100% 33.333%,center; }
-      50% { background-position:0 66.667%,center; } 56.25% { background-position:33.333% 66.667%,center; }
-      62.5% { background-position:66.667% 66.667%,center; } 68.75% { background-position:100% 66.667%,center; }
-      75% { background-position:0 100%,center; } 81.25% { background-position:33.333% 100%,center; }
-      87.5% { background-position:66.667% 100%,center; } 93.75%,100% { background-position:100% 100%,center; }
-    }
+    @keyframes scout-frame-column { from { background-position-x:0%; } to { background-position-x:100%; } }
+    @keyframes scout-frame-row { from { background-position-y:0%; } to { background-position-y:100%; } }
     .chat-companion { display:flex; gap:12px; align-items:center; padding:10px 16px 4px; color:var(--muted); font-size:12px; }
     .chat-companion .scout-character { width:112px; height:112px; }
     .chat-companion .scout-bubble { padding:10px 14px; max-width:360px; }
@@ -849,7 +846,7 @@
     .source-unavailable { border-color:var(--danger); color:var(--danger); }
     @keyframes scout-arrive { from { opacity:0; transform:translateX(30px); } }
     @keyframes scout-arrive-mobile { from { opacity:0; } }
-    @media (prefers-reduced-motion:reduce) { .scout-sprite { animation:none; background-position:var(--scout-still-x) var(--scout-still-y), center; } .scout-arrival { animation:none; } }
+    @media (prefers-reduced-motion:reduce) { .scout-sprite { animation:none; } .scout-arrival { animation:none; } }
     @media (max-width:620px) { .scout-arrival { right:6px; } .scout-arrival-character { width:120px; height:120px; } .scout-arrival-copy { margin-bottom:48px; } }
     @media (max-width:700px) {
       body { overflow-x:hidden; }
@@ -983,6 +980,7 @@
   </div>
   <div id="scout-arrival" class="scout-arrival hidden"></div>
   <div id="undo-toast" class="hidden" role="status" aria-live="polite"></div>
+  <script type="module" src="/lib/scoutCharacter.mjs?v=__SCOUT_UI_BUILD__"></script>
   <script src="/reportView.js?v=__SCOUT_UI_BUILD__"></script>
   <script src="/app.js?v=__SCOUT_UI_BUILD__"></script>
   <script type="module" src="/setup.js?v=__SCOUT_UI_BUILD__"></script>

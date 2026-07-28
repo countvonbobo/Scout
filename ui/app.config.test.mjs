@@ -502,6 +502,41 @@ test('app.js inlined CATEGORY_PALETTE stays in sync with the canonical ui/lib/ca
   }
 });
 
+test('app.js keeps no Scout animation timing, geometry or alignment data of its own', () => {
+  const source = fs.readFileSync(new URL('./app.js', import.meta.url), 'utf8');
+  // Every duplicate below produced a different animation from the canonical
+  // ui/lib/scoutCharacter.mjs definition: one 2s/16-frame cycle for every state,
+  // an alignment table missing welcome/asking/sleeping, and a still frame pinned
+  // to frame zero regardless of the state's configured reducedMotionFrame.
+  assert.doesNotMatch(source, /SCOUT_RUNTIME_ALIGNMENT/);
+  assert.doesNotMatch(source, /SCOUT_RUNTIME_STATES/);
+  assert.doesNotMatch(source, /--scout-(?:duration|frames|columns|rows|iterations|align-[xy]|still-[xy]|src)/);
+  assert.doesNotMatch(source, /\/assets\/scout-\w+\.png/);
+  assert.match(source, /window\.ScoutCharacter/);
+});
+
+test('index.html loads the canonical character module and defines no fixed 16-frame animation', () => {
+  const html = fs.readFileSync(new URL('./index.html', import.meta.url), 'utf8');
+  assert.match(html, /<script type="module" src="\/lib\/scoutCharacter\.mjs\?v=__SCOUT_UI_BUILD__"><\/script>/);
+  // The old hand-written keyframe table hard-coded 16 cells and rounded thirds,
+  // so any state with a different grid or frame rate drifted off its cell.
+  assert.doesNotMatch(html, /@keyframes scout-frames/);
+  const sprite = html.match(/\.scout-sprite \{[^}]*\}/)?.[0] || '';
+  assert.ok(sprite, '.scout-sprite rule must exist');
+  assert.doesNotMatch(sprite, /\d+\.\d+%/);
+  assert.match(sprite, /steps\(var\(--scout-columns\), *jump-none\)/);
+  assert.match(sprite, /steps\(var\(--scout-rows\), *jump-none\)/);
+  assert.match(sprite, /var\(--scout-row-duration\)/);
+  // Offscreen and hidden-page pausing must survive the rewrite.
+  assert.match(html, /\.scout-offscreen \.scout-sprite, \.scout-page-hidden \.scout-sprite \{ animation-play-state:paused; \}/);
+});
+
+test('the character module is part of the cached offline shell', () => {
+  const worker = fs.readFileSync(new URL('./service-worker.js', import.meta.url), 'utf8');
+  assert.match(worker, /\/lib\/scoutCharacter\.mjs\?v=\$\{BUILD\}/);
+  assert.match(worker, /url\.pathname === '\/lib\/scoutCharacter\.mjs'/);
+});
+
 test('dynamic category lane machinery is gone', () => {
   const source = fs.readFileSync(new URL('./app.js', import.meta.url), 'utf8');
   assert.doesNotMatch(source, /renderCategory/);

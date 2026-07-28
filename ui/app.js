@@ -1,46 +1,22 @@
-// Kept self-contained so a browser connected to a pre-update Scout server can
-// still boot. The matching modules contain the unit-tested canonical helpers.
+// Kept dependency-free so a browser connected to a pre-update Scout server can
+// still boot. The matching modules contain the unit-tested canonical helpers,
+// and the Scout character is read from one of them rather than copied.
 const SCOUT_UI_BUILD = typeof document !== 'undefined'
   ? document.querySelector?.('meta[name="scout-ui-build"]')?.content || null
   : null;
-const uiAsset = (pathname) => SCOUT_UI_BUILD ? `${pathname}?v=${encodeURIComponent(SCOUT_UI_BUILD)}` : pathname;
-const SCOUT_RUNTIME_STATES = {
-  idle: [uiAsset('/assets/scout-idle.png'), 'Scout is ready'], listening: [uiAsset('/assets/scout-idle.png'), 'Scout is listening'],
-  thinking: [uiAsset('/assets/scout-thinking.png'), 'Scout is thinking'], searching: [uiAsset('/assets/scout-searching.png'), 'Scout is searching'],
-  writing: [uiAsset('/assets/scout-explaining.png'), 'Scout is updating your files'], explaining: [uiAsset('/assets/scout-explaining.png'), 'Scout is explaining'],
-  found: [uiAsset('/assets/scout-found.png'), 'Scout found a strong match'], success: [uiAsset('/assets/scout-found.png'), 'Scout finished successfully'],
-  warning: [uiAsset('/assets/scout-warning.png'), 'Scout needs your attention'],
-};
-const SCOUT_RUNTIME_ALIGNMENT = {
-  idle: [1.7, 4.8], listening: [1.7, 4.8], thinking: [2.8, 3.2], searching: [0.6, -1.4],
-  writing: [1.4, -1.8], explaining: [1.4, -1.8], found: [4.5, -1.6], success: [4.5, -1.6], warning: [0.7, -0.1],
-};
+// Character frame count, frame rate, looping, reduced-motion frame and anchor
+// belong to ui/lib/scoutCharacter.mjs alone. index.html loads that module and it
+// publishes window.ScoutCharacter; app.js only forwards to it, so there is no
+// second place a state's timing or alignment can disagree from.
+const scoutCharacter = () => (typeof window !== 'undefined' ? window.ScoutCharacter : null);
 function activityState(activity) {
-  const value = String(activity || '').toLowerCase();
-  if (/search|read|fetch|browse|source|advert/.test(value)) return 'searching';
-  if (/write|edit|patch|file|cv|resume/.test(value)) return 'writing';
-  if (/explain|answer|respond|delta/.test(value)) return 'explaining';
-  return 'thinking';
+  return scoutCharacter()?.activityState(activity) || 'thinking';
 }
 function scoutMarkup(state = 'idle', className = '') {
-  const def = SCOUT_RUNTIME_STATES[state] || SCOUT_RUNTIME_STATES.idle;
-  return `<span class="scout-character ${className}" data-scout-state="${state}" role="img" aria-label="${def[1]}"><span class="scout-sprite" aria-hidden="true"></span></span>`;
+  return scoutCharacter()?.scoutMarkup(state, className) || '';
 }
-function applyScoutState(element, state, { reducedMotion = false } = {}) {
-  if (!element) return;
-  const def = SCOUT_RUNTIME_STATES[state] || SCOUT_RUNTIME_STATES.idle;
-  const sprite = element.querySelector('.scout-sprite');
-  element.dataset.scoutState = state in SCOUT_RUNTIME_STATES ? state : 'idle';
-  element.setAttribute('aria-label', def[1]);
-  if (!sprite) return;
-  sprite.style.setProperty('--scout-src', `url("${def[0]}")`);
-  sprite.style.setProperty('--scout-columns', 4); sprite.style.setProperty('--scout-rows', 4);
-  sprite.style.setProperty('--scout-frames', 16); sprite.style.setProperty('--scout-duration', '2s');
-  sprite.style.setProperty('--scout-iterations', ['found','success','warning'].includes(state) ? '1' : 'infinite');
-  const align = SCOUT_RUNTIME_ALIGNMENT[state] || [0, 0];
-  sprite.style.setProperty('--scout-align-x', `${align[0]}%`); sprite.style.setProperty('--scout-align-y', `${align[1]}%`);
-  sprite.style.setProperty('--scout-still-x', '0%'); sprite.style.setProperty('--scout-still-y', '0%');
-  sprite.classList.toggle('reduced-motion', reducedMotion);
+function applyScoutState(element, state, options = {}) {
+  return scoutCharacter()?.applyScoutState(element, state, options) || null;
 }
 function strongUnseenMatches(entries, threshold, acknowledged = []) {
   const seen = new Set(acknowledged || []);
