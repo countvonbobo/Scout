@@ -186,6 +186,23 @@ test('rejects terminal and receipt events when projection-required fields are ab
   }, lease), /payload/i);
 });
 
+test('mutation receipts reject every non-mutation reference kind', () => {
+  const journal = openRunJournal(temp(), 'run-1');
+  for (const kind of ['source', 'vacancy', 'selection', 'stage', 'batch']) {
+    assert.throws(() => appendRunEvent(journal, {
+      type: 'mutation.receipted',
+      stageId: 'finalise',
+      idempotencyKey: `wrong-kind-${kind}`,
+      payload: {
+        schemaVersion: 1,
+        reference: { kind, id: 'mutation-one' },
+        digest: 'a'.repeat(64),
+      },
+    }, lease), /mutation reference kind/i);
+  }
+  assert.equal(fs.existsSync(journal.file), false);
+});
+
 test('rejects run IDs that are unsafe as Windows directory components', () => {
   for (const runId of ['run:one', 'run.', 'CON', 'lpt1']) {
     assert.throws(() => openRunJournal(temp(), runId), /run ID/i);

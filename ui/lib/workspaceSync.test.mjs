@@ -105,6 +105,60 @@ test('local-only checkpoints never contact a Git remote', async () => {
   fs.rmSync(f.base, { recursive: true, force: true });
 });
 
+test('committed backup payload is marker-free while the live workspace retains recovery markers', async () => {
+  const f = fixture();
+  const marker = {
+    schemaVersion: 1,
+    mutationId: 'mutation-backup-test',
+    mutationKey: 'a'.repeat(64),
+    runKey: 'b'.repeat(64),
+    intendedDigest: 'c'.repeat(64),
+    targetKey: 'd'.repeat(64),
+  };
+  fs.mkdirSync(path.join(f.root, 'reports'), { recursive: true });
+  fs.writeFileSync(path.join(f.root, 'data', 'opportunities.json'), `${JSON.stringify({
+    updated: '2026-07-28',
+    opportunities: [{ id: 'kept' }],
+    _scoutMutation: marker,
+  }, null, 2)}\n`);
+  fs.writeFileSync(
+    path.join(f.root, 'reports', '2026-07-28.md'),
+    `# Scout report\n\n## Headline\n\nSafe summary.\n\n<!-- scout-mutation:${encodeURIComponent(JSON.stringify(marker))} -->\n`,
+  );
+  fs.writeFileSync(
+    path.join(f.root, 'data', 'scan-runs.jsonl'),
+    `${JSON.stringify({ schemaVersion: 4, timestamp: '2026-07-28T10:00:00.000Z', _scoutMutation: marker })}\n`,
+  );
+  git(f.root, 'init');
+
+  const status = await runWorkspaceSync(f.root, 'marker-free recovery projection');
+
+  assert.equal(status.state, 'disabled');
+  for (const relative of [
+    'data/opportunities.json',
+    'data/scan-runs.jsonl',
+    'reports/2026-07-28.md',
+  ]) {
+    assert.doesNotMatch(git(f.root, 'show', `HEAD:${relative}`), /scout-mutation|_scoutMutation/);
+    assert.match(fs.readFileSync(path.join(f.root, ...relative.split('/')), 'utf8'), /scout-mutation|_scoutMutation/);
+  }
+  const restoredTracker = JSON.parse(git(f.root, 'show', 'HEAD:data/opportunities.json'));
+  const restoredRun = JSON.parse(git(f.root, 'show', 'HEAD:data/scan-runs.jsonl'));
+  assert.equal(restoredTracker.opportunities[0].id, 'kept');
+  assert.equal(restoredRun.timestamp, '2026-07-28T10:00:00.000Z');
+  assert.equal(git(f.root, 'status', '--porcelain'), '');
+
+  const liveTracker = JSON.parse(fs.readFileSync(path.join(f.root, 'data', 'opportunities.json'), 'utf8'));
+  liveTracker.opportunities.push({ id: 'later-semantic-change' });
+  fs.writeFileSync(path.join(f.root, 'data', 'opportunities.json'), `${JSON.stringify(liveTracker, null, 2)}\n`);
+  await runWorkspaceSync(f.root, 'later marker-bearing semantic change');
+  const laterBackup = JSON.parse(git(f.root, 'show', 'HEAD:data/opportunities.json'));
+  assert.deepEqual(laterBackup.opportunities.map((item) => item.id), ['kept', 'later-semantic-change']);
+  assert.equal(Object.hasOwn(laterBackup, '_scoutMutation'), false);
+  assert.equal(git(f.root, 'status', '--porcelain'), '');
+  fs.rmSync(f.base, { recursive: true, force: true });
+});
+
 test('runtime sync remains asynchronous while a Git mutation is pending', async () => {
   const f = fixture();
   git(f.root, 'init');

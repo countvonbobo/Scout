@@ -8,10 +8,11 @@ import {
 } from './scout.mjs';
 import { DEFAULT_WORKSPACE_CONFIG, loadWorkspaceConfig, writeWorkspaceConfig } from '../ui/lib/workspace.mjs';
 import { publishSearchProfile } from '../ui/lib/searchProfile.mjs';
-import { replayRunJournal } from '../ui/lib/runJournal.mjs';
+import { openRunJournal, replayRunJournal } from '../ui/lib/runJournal.mjs';
 import { projectScanQueue } from '../ui/lib/scanQueue.mjs';
 import { acquireScanLease, currentLeaseOwner, readScanLease, releaseScanLease } from '../ui/lib/scanLease.mjs';
 import { ProviderLifecycleUnclosedError } from '../ui/lib/structuredTurn.mjs';
+import { loadPreparedMutation, reconcileMutation } from '../ui/lib/mutationCoordinator.mjs';
 
 function scanRoot() {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'scout-runtime-scan-'));
@@ -183,6 +184,51 @@ test('runtime scan skips AI for a healthy empty source result and needs no Git r
   assert.equal(released, true);
   assert.equal(fs.existsSync(path.join(root, '.git')), false);
 });
+
+for (const failedTarget of [2, 3]) {
+  test(`runtime finalisation preserves the prepared plan when target ${failedTarget} replacement fails`, async () => {
+    const root = scanRoot();
+    let replacements = 0;
+    try {
+      const result = await runScanWith(root, 'codex', 'primary', {
+        providerStatusFn: authenticated,
+        collectSourcesFn: async () => ({
+          generatedAt: '2026-07-28T10:00:00Z',
+          queries: ['rare role'],
+          sources: { hiring_cafe: { configured: true, status: 'healthy', count: 0, jobs: [] } },
+        }),
+        runStructuredTurnFn: async () => { throw new Error('must not run'); },
+        acquireLockFn: () => ({ ok: true, lock: { token: `partial-${failedTarget}` } }),
+        releaseLockFn: () => ({ ok: true }),
+        mutationHooks: {
+          beforeReplacement() {
+            replacements += 1;
+            if (replacements === failedTarget) throw new Error(`synthetic target ${failedTarget} replacement failure`);
+          },
+        },
+      });
+
+      assert.equal(result.ok, false);
+      assert.match(result.error, new RegExp(`target ${failedTarget} replacement failure`));
+      const runId = fs.readdirSync(path.join(root, '.scout', 'runs'), { withFileTypes: true })
+        .find((entry) => entry.isDirectory()).name;
+      const run = openRunJournal(root, runId);
+      const prepared = run.events.find((event) => event.type === 'mutation.prepared');
+      assert.ok(prepared, 'real finalisation must durably prepare before replacing targets');
+      const plan = loadPreparedMutation(run, prepared.payload.reference.id);
+      const reconciled = reconcileMutation(plan);
+      assert.equal(reconciled.status, 'partially-applied');
+      assert.deepEqual(
+        reconciled.states,
+        failedTarget === 2 ? ['applied', 'pending', 'pending'] : ['applied', 'applied', 'pending'],
+      );
+      assert.equal(run.events.filter((event) => event.type === 'mutation.prepared').length, 1);
+      assert.equal(run.events.filter((event) => event.type === 'mutation.receipted').length, 0);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+}
 
 test('fresh scan readiness stages a reviewable search-profile draft and requires publication', () => {
   const root = readyScanRoot();

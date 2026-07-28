@@ -16,7 +16,7 @@ import { runStructuredTurn } from '../ui/lib/structuredTurn.mjs';
 import {
   assessScanCandidates, assessmentCandidatesForSelection, compactCandidates, createRankedDiscoveryStages, DEFAULT_CANDIDATE_LIMIT,
   coordinateScanArtifacts, durableScanProjection, inboxRecheckCandidates, promptCandidate, runScanPipeline, SCAN_ASSESSMENT_SCHEMA,
-  verificationCandidates, writeScanArtifacts,
+  verificationCandidates,
 } from '../ui/lib/scanPipeline.mjs';
 import { loadPublishedSearchProfile, migrateSearchProfile } from '../ui/lib/searchProfile.mjs';
 import { partitionLiveCandidates } from '../ui/lib/advertLiveness.mjs';
@@ -527,6 +527,7 @@ export async function runScanWith(root, provider, mode, {
   logicalWindowId = null,
   queueWorkspaceSyncFn = queueWorkspaceSync,
   heartbeatOptions = {},
+  mutationHooks = {},
 } = {}) {
   if (!['codex', 'claude'].includes(provider)) throw new Error('provider must be codex or claude');
   if (!['primary', 'second-pass', 'broadened'].includes(mode)) throw new Error('mode must be primary, broadened or second-pass');
@@ -541,11 +542,7 @@ export async function runScanWith(root, provider, mode, {
     && (acquireLockFn !== acquireScanLock || releaseLockFn !== releaseScanLock);
   const lock = injectedLegacyLock ? acquireLockFn(root, { agent: provider, mode }) : null;
   if (lock && !lock.ok) {
-    const artifacts = writeScanArtifacts(root, {
-      provider, mode, sources: {}, candidates: [], assessmentResult: null, policy: config.triage,
-      startedAt, error: 'another scan is already running', skipped: true,
-    });
-    return { ok: false, status: 'skipped', error: 'another scan is already running', lock: lock.lock, scan: artifacts.run };
+    return { ok: false, status: 'skipped', error: 'another scan is already running', lock: lock.lock };
   }
   let result;
   let collected = null;
@@ -648,6 +645,7 @@ export async function runScanWith(root, provider, mode, {
             logicalWindowId: execution.logicalWindowId,
             queueWorkspaceSyncFn,
             heartbeatOptions,
+            mutationHooks,
           });
           if (queued.status === 'in-progress'
             && queued.reason === 'operator-intervention-required'
@@ -662,9 +660,13 @@ export async function runScanWith(root, provider, mode, {
             || (queued.status === 'skipped' ? 'skipped' : 'failed');
         },
       },
-      async recordFailure({ error, lease }) {
+      async recordFailure({ error, lease, run }) {
         if (result) return result;
-        const artifacts = assertCurrentFence(lease, synchronousFenceCallback(() => writeScanArtifacts(root, {
+        if (run.events.some((event) => event.type === 'mutation.prepared')) {
+          result = { ok: false, status: 'failed', error: error.message };
+          return result;
+        }
+        const artifacts = coordinateScanArtifacts(root, {
           provider,
           mode,
           sources: collected?.sources || {},
@@ -687,7 +689,7 @@ export async function runScanWith(root, provider, mode, {
           profileId: publishedProfile?.id || publishedAtStart?.id || null,
           staleInboxEntries,
           inboxRechecked,
-        })));
+        }, { run, lease });
         result = { ok: false, status: 'failed', error: error.message, scan: artifacts.run };
         return result;
       },
@@ -835,7 +837,7 @@ export async function runScanWith(root, provider, mode, {
             assessmentFailures,
             dropped, hardExcluded, closedAdverts, exclusions: discovery?.exclusions || [], livenessSummary, verificationScoped, funnel, selection, discoveryEngine, profileId: publishedProfile?.id || null,
             staleInboxEntries, inboxRechecked,
-          }, { run, lease });
+          }, { run, lease, hooks: mutationHooks });
           result = { ok: true, status: artifacts.run.degraded ? 'degraded' : candidates.length ? 'completed' : 'healthy-empty', scan: artifacts.run, usage };
           return {
             schemaVersion: 1,
@@ -843,17 +845,7 @@ export async function runScanWith(root, provider, mode, {
             mutationReceipt: artifacts.mutationReceipt,
           };
         } catch (error) {
-          try {
-            const artifacts = assertCurrentFence(lease, synchronousFenceCallback(() => writeScanArtifacts(root, {
-              provider, mode, sources: collected?.sources || {}, queries: collected?.queries || [], candidates,
-              assessmentResult: null, policy: config.triage, startedAt, error: error.message,
-              assessmentFailures,
-              dropped, hardExcluded, closedAdverts, livenessSummary, verificationScoped, funnel, selection, discoveryEngine,
-              exclusions: discovery?.exclusions || [], profileId: publishedProfile?.id || null,
-              staleInboxEntries, inboxRechecked,
-            })));
-            result = { ok: false, status: 'failed', error: error.message, scan: artifacts.run };
-          } catch {
+          if (run.events.some((event) => event.type === 'mutation.prepared')) {
             result = { ok: false, status: 'failed', error: error.message };
           }
           throw error;

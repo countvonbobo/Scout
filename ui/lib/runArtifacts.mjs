@@ -417,6 +417,7 @@ export function projectRunManifest(events) {
   const compatibility = {};
   const completedByStage = new Map();
   const receipts = [];
+  const receiptIdentities = new Set();
   const recoveryDecisions = [];
   const providerSubstitutions = [];
   const recoveryAttempts = [];
@@ -452,6 +453,14 @@ export function projectRunManifest(events) {
       outcome = event.payload?.outcome;
       if (event.payload?.compatibility) compatibility[event.payload.compatibility.kind] = event.payload.compatibility.value;
     } else if (event.type === 'mutation.receipted') {
+      const identity = event.payload?.reference?.id;
+      if (event.payload?.reference?.kind !== 'mutation') {
+        throw new ManifestAgreementError('journal mutation receipt reference kind is invalid');
+      }
+      if (receiptIdentities.has(identity)) {
+        throw new ManifestAgreementError('journal contains a duplicate mutation receipt');
+      }
+      receiptIdentities.add(identity);
       receipts.push({ sequence: event.sequence, stageId: event.stageId, reference: event.payload?.reference, digest: event.payload?.digest });
     } else if (event.type.startsWith('assessment.')) {
       addArtifact(artifacts, event.payload?.artifact);

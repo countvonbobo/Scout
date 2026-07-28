@@ -276,6 +276,9 @@ function validatePayload(type, payload, ErrorType = TypeError) {
     if (value[key] === undefined) throw new ErrorType(`journal payload property is required: ${key}`);
   }
   if (value.reference !== undefined) validateReference(value.reference, ErrorType);
+  if (type.startsWith('mutation.') && value.reference?.kind !== 'mutation') {
+    throw new ErrorType('journal mutation reference kind must be mutation');
+  }
   if (value.count !== undefined && (!Number.isSafeInteger(value.count) || value.count < 0)) throw new ErrorType('journal payload count must be a non-negative whole number');
   if (value.version !== undefined) validateVersion(value.version, ErrorType);
   if (value.artifact !== undefined) validateArtifactReference(value.artifact, ErrorType);

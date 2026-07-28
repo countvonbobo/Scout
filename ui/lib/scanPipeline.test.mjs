@@ -301,6 +301,38 @@ test('runtime writes canonical scan records and preserves user tracker state', (
   assert.equal(validateWrittenScanArtifacts(root, artifacts.run).run.agent, 'codex');
 });
 
+test('scan artifact builder sanitises source reasons and failure text before persistence', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'scout-sanitised-scan-reasons-'));
+  fs.mkdirSync(path.join(root, 'data'), { recursive: true });
+  fs.writeFileSync(path.join(root, 'data', 'opportunities.json'), '{"updated":"2026-07-01","opportunities":[]}\n');
+  const artifacts = writeScanArtifacts(root, {
+    provider: 'codex',
+    mode: 'primary',
+    sources: {
+      ats: {
+        configured: true,
+        status: 'failed',
+        count: 0,
+        reason: 'raw provider response at C:\\Users\\private\\response.json https://user:pass@example.test/debug?utm_source=private#body',
+      },
+    },
+    candidates: [],
+    assessmentResult: null,
+    policy: {},
+    startedAt: '2026-07-14T10:00:00Z',
+    error: 'full private prompt saved at /home/private/prompt.txt',
+  });
+  const persisted = [
+    JSON.stringify(artifacts.run),
+    fs.readFileSync(artifacts.report, 'utf8'),
+    fs.readFileSync(path.join(root, 'data', 'scan-runs.jsonl'), 'utf8'),
+  ].join('\n');
+
+  assert.doesNotMatch(persisted, /raw provider response|full private prompt|C:\\Users|\/home\/private|user:pass|utm_source|#body/i);
+  assert.match(artifacts.run.source_health.ats.reason, /redacted/i);
+  assert.match(artifacts.run.errors[0], /redacted/i);
+});
+
 test('scan artifact exposes a reconciled funnel without claiming all jobs were assessed', () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'scout-ranked-scan-artifact-'));
   fs.mkdirSync(path.join(root, 'data'), { recursive: true });
@@ -1821,7 +1853,7 @@ test('post-success work requires a durable mutation receipt and remains under th
 test('pipeline accepts a coordinator-journalled receipt without projecting a duplicate mutation', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'scout-coordinated-receipt-'));
   fs.mkdirSync(path.join(root, 'reports'), { recursive: true });
-  fs.writeFileSync(path.join(root, 'reports', 'coordinated.md'), '# Report\n\n## Headline\n\nBefore.\n');
+  fs.writeFileSync(path.join(root, 'reports', '2026-07-28.md'), '# Report\n\n## Headline\n\nBefore.\n');
   try {
     const result = await runScanPipeline({
       root,
@@ -1831,9 +1863,9 @@ test('pipeline accepts a coordinator-journalled receipt without projecting a dup
         const plan = prepareMutation({ handle: run, lease }, {
           id: 'coordinated-report',
           schemaVersion: 1,
-          files: [{ kind: 'report', path: 'reports/coordinated.md' }],
+          files: [{ kind: 'report', key: 'report:2026-07-28' }],
         }, {
-          'reports/coordinated.md': '# Report\n\n## Headline\n\nAfter.\n',
+          'report:2026-07-28': '# Report\n\n## Headline\n\nAfter.\n',
         });
         return {
           schemaVersion: 1,

@@ -10,6 +10,7 @@ import {
   LeaseLostError, assertCurrentFence, assertScanLeaseScope, isScanLease,
   synchronousFenceCallback,
 } from './scanLease.mjs';
+import { workspacePaths } from './workspace.mjs';
 
 export const MUTATION_SCHEMA_VERSION = 1;
 const MUTATION_GUARD = 'mutation.guard';
@@ -20,6 +21,19 @@ const REPORT_MARKER = /\n?<!-- scout-mutation:([A-Za-z0-9%._~-]+) -->\s*$/;
 const PRIVATE_CONTENT_KEY = /^(?:access[-_]?token|advert[-_]?(?:body|description)|api[-_]?(?:key|token)|auth(?:orization)?|body|cookies?|credentials?|cv|description|headers?|html|master[-_]?cv|password|profile[-_]?evidence|prompt|raw[-_]?(?:html|output|provider(?:[-_]?response)?|response)|response|secret(?:[-_]?(?:key|token))?|token|transcript)$/i;
 const CREDENTIAL_VALUE = /(?:\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b)|(?:\b(?:api[-_ ]?key|authorization|password|secret|session[-_ ]?id|token)\s*[:=]\s*\S+)|(?:\bbearer\s+[A-Za-z0-9._~+/-]{8,})|(?:\bsk-[A-Za-z0-9_-]{16,})|(?:\bgh[pousr]_[A-Za-z0-9]{20,})|(?:\bxox[baprs]-[A-Za-z0-9-]{10,})|(?:\bAKIA[0-9A-Z]{16}\b)/i;
 const TRANSIENT_TRACKING_VALUE = /https?:\/\/[^\s"'<>]+[?&](?:fbclid|gclid|mc_[a-z]+|utm_[a-z]+)=/i;
+const ABSOLUTE_PATH_VALUE = /(?:\b[A-Za-z]:[\\/]|\\\\[^\\\s]+\\[^\\\s]+|(?:^|[\s"'(])(?:\/(?!\/)|\\(?!\\))\S+)/i;
+const PRIVATE_SOURCE_BODY_VALUE = /\b(?:(?:full|complete)\s+(?:private\s+)?(?:prompt|advert(?:isement)?(?:\s+text)?|cv)|curriculum vitae|master cv|raw provider (?:output|response))\b/i;
+const URL_VALUE = /https?:\/\/[^\s"'<>]+/gi;
+const TRACKER_TOP_LEVEL_KEYS = new Set(['opportunities', 'updated']);
+const RUN_LOG_TOP_LEVEL_KEYS = new Set([
+  '_scoutMutation', 'adverts_checked', 'adverts_closed', 'adverts_unverified',
+  'agent', 'assessment_failures', 'candidates_dropped', 'candidates_dropped_by_source',
+  'candidates_found', 'degraded', 'discarded', 'discovery_engine', 'duplicates_collapsed',
+  'errors', 'explanations', 'funnel', 'inbox_archived', 'inbox_rechecked',
+  'keepers_added', 'keepers_updated', 'mode', 'profile_id', 'queries_checked',
+  'reviewed', 'schemaVersion', 'selection', 'selection_summary', 'skipped',
+  'source_health', 'sources_checked', 'started_at', 'timestamp', 'verification_scoped',
+]);
 const MARKER_KEYS = [
   'intendedDigest', 'mutationId', 'mutationKey', 'runKey',
   'schemaVersion', 'targetKey',
@@ -76,18 +90,59 @@ function mutationContext(value) {
   return { handle, lease };
 }
 
-function relativeTargetPath(root, value) {
-  if (typeof value !== 'string' || !value || value.includes('\0')) throw new TypeError('mutation target path is invalid');
-  const file = path.resolve(root, value);
-  const relative = path.relative(path.resolve(root), file);
-  if (!relative || relative.startsWith('..') || path.isAbsolute(relative)) {
-    throw new TypeError('mutation target path must stay inside the workspace');
-  }
-  return relative.split(path.sep).join('/');
+function isInside(root, candidate) {
+  const relative = path.relative(root, candidate);
+  return relative === '' || (!relative.startsWith('..') && !path.isAbsolute(relative));
 }
 
-function fileContent(root, relative) {
-  const file = path.join(root, ...relative.split('/'));
+function validatePhysicalContainment(root, file) {
+  const canonicalRoot = fs.realpathSync.native(root);
+  const target = path.resolve(file);
+  if (!isInside(path.resolve(root), target)) throw new TypeError('mutation target escapes its workspace');
+  let cursor = target;
+  const pending = [];
+  while (!fs.existsSync(cursor)) {
+    pending.push(path.basename(cursor));
+    const parent = path.dirname(cursor);
+    if (parent === cursor) throw new TypeError('mutation target has no existing workspace parent');
+    cursor = parent;
+  }
+  let lexical = path.resolve(root);
+  const relativeExisting = path.relative(lexical, cursor);
+  for (const component of relativeExisting.split(path.sep).filter(Boolean)) {
+    lexical = path.join(lexical, component);
+    const stat = fs.lstatSync(lexical);
+    if (stat.isSymbolicLink()) throw new TypeError('mutation target traverses a symlink or junction');
+  }
+  const canonicalParent = fs.realpathSync.native(cursor);
+  if (!isInside(canonicalRoot, canonicalParent)) {
+    throw new TypeError('mutation target parent resolves outside its workspace');
+  }
+  if (!pending.length) {
+    const stat = fs.lstatSync(target);
+    if (stat.isSymbolicLink()) throw new TypeError('mutation target is a symlink or junction');
+    const canonicalTarget = fs.realpathSync.native(target);
+    if (!isInside(canonicalRoot, canonicalTarget)) {
+      throw new TypeError('mutation target resolves outside its workspace');
+    }
+  }
+  return target;
+}
+
+function resolveTarget(root, key, kind) {
+  const paths = workspacePaths(root);
+  let file;
+  if (key === 'tracker' && kind === 'tracker') file = paths.tracker;
+  else if (key === 'scan-log' && kind === 'run-log') file = paths.scanRuns;
+  else {
+    const report = typeof key === 'string' ? key.match(/^report:(\d{4}-\d{2}-\d{2})$/) : null;
+    if (!report || kind !== 'report') throw new TypeError('mutation target key is not supported');
+    file = path.join(paths.reports, `${report[1]}.md`);
+  }
+  return validatePhysicalContainment(root, file);
+}
+
+function fileContent(file) {
   try {
     return fs.readFileSync(file, 'utf8');
   } catch (error) {
@@ -118,6 +173,24 @@ function embedRunLogMarker(content, marker) {
   record._scoutMutation = marker;
   lines[lines.length - 1] = JSON.stringify(record);
   return `${lines.join('\n')}\n`;
+}
+
+export function markerFreeMutationContent(kind, content) {
+  if (kind === 'report') return `${String(content).replace(REPORT_MARKER, '').trimEnd()}\n`;
+  if (kind === 'run-log') {
+    const lines = String(content).split(/\r?\n/).filter(Boolean).map((line) => {
+      const record = JSON.parse(line);
+      delete record._scoutMutation;
+      return JSON.stringify(record);
+    });
+    return lines.length ? `${lines.join('\n')}\n` : '';
+  }
+  if (kind === 'tracker' || kind === 'json') {
+    const value = JSON.parse(content);
+    delete value._scoutMutation;
+    return `${JSON.stringify(value, null, 2)}\n`;
+  }
+  throw new TypeError(`unsupported mutation target kind: ${kind}`);
 }
 
 function runLogMarker(content) {
@@ -172,6 +245,20 @@ function validatePrivateValues(value, seen = new Set()) {
   if (typeof value === 'string') {
     if (CREDENTIAL_VALUE.test(value)) throw new TypeError('mutation content contains credential-shaped data');
     if (TRANSIENT_TRACKING_VALUE.test(value)) throw new TypeError('mutation content contains transient tracking data');
+    if (ABSOLUTE_PATH_VALUE.test(value)) throw new TypeError('mutation content contains an absolute path');
+    if (PRIVATE_SOURCE_BODY_VALUE.test(value)) throw new TypeError('private mutation content contains a source body');
+    for (const matched of value.matchAll(URL_VALUE)) {
+      const candidate = matched[0].replace(/[),.;]+$/, '');
+      try {
+        const parsed = new URL(candidate);
+        if (parsed.username || parsed.password || parsed.search || parsed.hash) {
+          throw new TypeError('mutation content contains a non-canonical URL');
+        }
+      } catch (error) {
+        if (error instanceof TypeError && error.message.includes('non-canonical')) throw error;
+        throw new TypeError('mutation content contains a non-canonical URL');
+      }
+    }
     return;
   }
   if (!value || typeof value !== 'object' || seen.has(value)) {
@@ -199,10 +286,23 @@ function validateMutationContent(kind, content) {
     return;
   }
   if (kind === 'run-log') {
-    for (const line of content.split(/\r?\n/).filter(Boolean)) validatePrivateValues(JSON.parse(line));
+    for (const line of content.split(/\r?\n/).filter(Boolean)) {
+      const value = JSON.parse(line);
+      for (const key of Object.keys(value)) {
+        if (!RUN_LOG_TOP_LEVEL_KEYS.has(key)) throw new TypeError(`private mutation content property is not allowlisted: ${key}`);
+      }
+      validatePrivateValues(value);
+    }
     return;
   }
-  validatePrivateValues(JSON.parse(content));
+  const value = JSON.parse(content);
+  if (kind === 'tracker') {
+    for (const key of Object.keys(value)) {
+      if (!TRACKER_TOP_LEVEL_KEYS.has(key)) throw new TypeError(`private mutation content property is not allowlisted: ${key}`);
+    }
+    if (!Array.isArray(value.opportunities)) throw new TypeError('tracker mutation must contain opportunities');
+  }
+  validatePrivateValues(value);
 }
 
 function exactMarker(value) {
@@ -226,6 +326,12 @@ function artifactFile(handle, mutationId) {
 }
 
 function attachRuntime(plan, handle) {
+  for (const target of plan.files || []) {
+    Object.defineProperty(target, 'file', {
+      value: resolveTarget(handle.root, target.key, target.kind),
+      enumerable: false,
+    });
+  }
   Object.defineProperties(plan, {
     root: { value: handle.root, enumerable: false },
     handle: { value: handle, enumerable: false },
@@ -293,33 +399,34 @@ export function prepareMutation(run, target, content) {
       || !['tracker', 'report', 'run-log', 'json'].includes(descriptor.kind)) {
       throw new TypeError('mutation target file is invalid');
     }
-    const relative = relativeTargetPath(handle.root, descriptor.path);
-    if (paths.has(relative)) throw new TypeError('mutation target path is duplicated');
-    paths.add(relative);
-    if (typeof content[relative] !== 'string') throw new TypeError(`mutation content is missing: ${relative}`);
-    validateMutationContent(descriptor.kind, content[relative]);
-    const current = fileContent(handle.root, relative);
-    validateCurrentMarker(descriptor.kind, current, relative);
+    const key = requireId(descriptor.key, 'mutation target key');
+    if (paths.has(key)) throw new TypeError('mutation target key is duplicated');
+    paths.add(key);
+    const file = resolveTarget(handle.root, key, descriptor.kind);
+    if (typeof content[key] !== 'string') throw new TypeError(`mutation content is missing: ${key}`);
+    validateMutationContent(descriptor.kind, content[key]);
+    const current = fileContent(file);
+    validateCurrentMarker(descriptor.kind, current, key);
     return {
       kind: descriptor.kind,
-      path: relative,
+      key,
       targetRevision: trackerRevision(current),
-      intendedContent: content[relative],
-      intendedDigest: sha256(content[relative]),
+      intendedDigest: sha256(content[key]),
+      intendedContent: content[key],
     };
   });
   if (Object.keys(content).sort().join(',') !== [...paths].sort().join(',')) {
     throw new TypeError('mutation content does not match its target files');
   }
-  const targetRevision = canonicalDigest(intended.map(({ path: file, targetRevision: revision }) => ({ path: file, revision })));
-  const intendedDigest = canonicalDigest(intended.map(({ path: file, intendedDigest: digest }) => ({ path: file, digest })));
+  const targetRevision = canonicalDigest(intended.map(({ key, targetRevision: revision }) => ({ key, revision })));
+  const intendedDigest = canonicalDigest(intended.map(({ key, intendedDigest: digest }) => ({ key, digest })));
   const key = canonicalDigest({
     schemaVersion: MUTATION_SCHEMA_VERSION,
     runId: handle.runId,
     target: {
       id: target.id,
       schemaVersion: target.schemaVersion,
-      files: intended.map(({ kind, path: file, targetRevision: revision }) => ({ kind, path: file, revision })),
+      files: intended.map(({ kind, key, targetRevision: revision }) => ({ kind, key, revision })),
     },
     targetRevision,
     intendedDigest,
@@ -333,13 +440,14 @@ export function prepareMutation(run, target, content) {
       mutationKey: key,
       runKey,
       intendedDigest: entry.intendedDigest,
-      targetKey: sha256(entry.path),
+      targetKey: sha256(entry.key),
     };
     const preparedContent = embedMarker(entry.kind, entry.intendedContent, marker);
+    const { intendedContent: _intendedContent, ...durable } = entry;
     return {
-      ...entry,
+      ...durable,
       marker,
-      preparedContent,
+      content: preparedContent,
       writtenDigest: sha256(preparedContent),
     };
   });
@@ -351,7 +459,7 @@ export function prepareMutation(run, target, content) {
     target: { id: target.id, schemaVersion: target.schemaVersion },
     targetRevision,
     intendedDigest,
-    receiptDigest: canonicalDigest(files.map(({ path: file, writtenDigest: digest }) => ({ path: file, digest }))),
+    receiptDigest: canonicalDigest(files.map(({ key, writtenDigest: digest }) => ({ key, digest }))),
     files,
   };
   const encoded = `${stableJson(planValue)}\n`;
@@ -385,29 +493,36 @@ export function prepareMutation(run, target, content) {
 }
 
 function targetState(plan, target) {
-  const current = fileContent(plan.root, target.path);
+  const file = resolveTarget(plan.root, target.key, target.kind);
+  const current = fileContent(file);
   let marker = null;
   try {
     marker = markerFor(target.kind, current);
   } catch (error) {
-    throw new MutationConflictError(`mutation target is unverifiable: ${target.path}: ${error.message}`);
+    throw new MutationConflictError(`mutation target is unverifiable: ${target.key}: ${error.message}`);
   }
   const hasMarker = marker !== null || markerSyntaxPresent(target.kind, current);
   if (hasMarker) {
     if (!sameMarker(marker, target.marker) || sha256(current) !== target.writtenDigest) {
       if (sha256(current) === target.targetRevision) return 'pending';
-      throw new MutationConflictError(`mutation target identity or digest conflicts: ${target.path}`);
+      throw new MutationConflictError(`mutation target identity or digest conflicts: ${target.key}`);
     }
     return 'applied';
   }
   if (sha256(current) === target.targetRevision) return 'pending';
-  throw new MutationConflictError(`mutation target revision conflicts: ${target.path}`);
+  throw new MutationConflictError(`mutation target revision conflicts: ${target.key}`);
 }
 
 function matchingReceipt(plan) {
   const events = replayRunJournal(plan.handle.file);
   const matches = events.filter((event) => event.type === 'mutation.receipted'
     && event.payload?.reference?.id === plan.mutationId);
+  if (matches.some((event) => event.payload?.reference?.kind !== 'mutation')) {
+    throw new MutationConflictError('mutation receipt reference kind conflicts with the prepared plan');
+  }
+  if (matches.length > 1) {
+    throw new MutationConflictError('journal contains a duplicate mutation receipt');
+  }
   if (matches.some((event) => event.payload.digest !== plan.receiptDigest)) {
     throw new MutationConflictError('mutation receipt conflicts with the prepared plan');
   }
@@ -525,11 +640,11 @@ export function applyPreparedMutation(plan, lease, hooks = {}) {
       assertCurrentFence(lease, synchronousFenceCallback(() => {
         if (targetState(plan, target) === 'applied') return;
         hooks.beforeReplacement?.(target);
-        const file = path.join(plan.root, ...target.path.split('/'));
-        atomicWriteFile(file, target.preparedContent);
+        const file = resolveTarget(plan.root, target.key, target.kind);
+        atomicWriteFile(file, target.content);
         hooks.afterReplacement?.(target);
         if (targetState(plan, target) !== 'applied') {
-          throw new MutationConflictError(`mutation target verification failed: ${target.path}`);
+          throw new MutationConflictError(`mutation target verification failed: ${target.key}`);
         }
       }));
     }

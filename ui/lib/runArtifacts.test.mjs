@@ -255,6 +255,23 @@ test('rebuilds a missing manifest entirely from journalled completion, compatibi
   assert.deepEqual(JSON.parse(fs.readFileSync(path.join(run.directory, 'manifest.json'), 'utf8')), expected);
 });
 
+test('manifest projection rejects duplicate receipts for one mutation identity', () => {
+  const run = openRunJournal(temp(), 'run-1');
+  for (const key of ['receipt-one', 'receipt-two']) {
+    appendRunEvent(run, {
+      type: 'mutation.receipted',
+      stageId: 'finalise',
+      idempotencyKey: key,
+      payload: {
+        schemaVersion: 1,
+        reference: { kind: 'mutation', id: 'mutation-one' },
+        digest: 'a'.repeat(64),
+      },
+    }, lease);
+  }
+  assert.throws(() => projectRunManifest(run.events), /duplicate mutation receipt/i);
+});
+
 test('rebuilds a contradictory manifest from the valid journal without trusting invented work', () => {
   const run = openRunJournal(temp(), 'run-1');
   const artifact = commitRunArtifact(run, { id: 'collect-v1', schemaVersion: 1 }, { schemaVersion: 1, stableIds: [] }, lease);

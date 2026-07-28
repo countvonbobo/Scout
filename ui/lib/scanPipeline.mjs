@@ -35,7 +35,7 @@ import {
 } from './assessmentBatches.mjs';
 import { ProviderLifecycleUnclosedError } from './structuredTurn.mjs';
 import {
-  applyPreparedMutation, loadPreparedMutation, prepareMutation,
+  applyPreparedMutation, loadPreparedMutation, markerFreeMutationContent, prepareMutation,
 } from './mutationCoordinator.mjs';
 export { filterVacancies } from './vacancyFilter.mjs';
 
@@ -650,10 +650,15 @@ export async function runScanPipeline({
       mutationReceipt = finalized.mutationReceipt;
       receiptIssue = finalized.receiptIssue;
       if (mutationReceipt) {
-        const existingReceipt = run.events.find((event) => (
+        const existingReceipts = run.events.filter((event) => (
           event.type === 'mutation.receipted'
           && event.payload?.reference?.id === mutationReceipt.id
         ));
+        if (existingReceipts.some((event) => event.payload?.reference?.kind !== 'mutation')
+          || existingReceipts.length > 1) {
+          throw new Error('scan mutation receipt authority is ambiguous');
+        }
+        const existingReceipt = existingReceipts[0];
         if (existingReceipt && existingReceipt.payload.digest !== mutationReceipt.digest) {
           throw new Error('scan mutation receipt conflicts with durable journal evidence');
         }
@@ -855,10 +860,27 @@ function boundedText(value, maximum = 220) {
   return String(value || '').replace(/[\r\n\t]+/g, ' ').replace(/\s{2,}/g, ' ').trim().slice(0, maximum);
 }
 
+const PRIVATE_DIAGNOSTIC_VALUE = /(?:\b[A-Za-z]:[\\/]|\\\\[^\\\s]+\\[^\\\s]+|(?:^|[\s"'(])(?:\/(?!\/)|\\(?!\\))\S+|\b(?:(?:full|complete)\s+(?:private\s+)?(?:prompt|advert(?:isement)?(?:\s+text)?|cv)|curriculum vitae|master cv|raw provider (?:output|response))\b|https?:\/\/[^/\s:@]+:[^/\s@]+@|https?:\/\/[^\s"'<>]+[?#])/i;
+
+function safeDiagnostic(value, maximum = 220) {
+  const text = boundedText(value?.message ?? value, maximum);
+  if (!text) return null;
+  if (PRIVATE_DIAGNOSTIC_VALUE.test(text) || credentialShapedSemanticText(text)) {
+    return '[redacted diagnostic]';
+  }
+  return text;
+}
+
 function safeSourceUrl(value) {
   try {
     const parsed = new URL(String(value || ''));
-    return ['http:', 'https:'].includes(parsed.protocol) && parsed.href.length <= 2048 ? parsed.href : null;
+    if (!['http:', 'https:'].includes(parsed.protocol)) return null;
+    parsed.username = '';
+    parsed.password = '';
+    parsed.search = '';
+    parsed.hash = '';
+    const canonical = parsed.toString().replace(/\/$/, '');
+    return canonical.length <= 2048 ? canonical : null;
   } catch { return null; }
 }
 
@@ -1723,7 +1745,7 @@ export function gateAssessment(assessment, policy) {
 function sourceHealth(sources) {
   return Object.fromEntries(Object.entries(sources || {}).map(([name, value]) => [name, {
     status: value.status || 'unavailable', count: Number.isFinite(Number(value.count)) ? Number(value.count) : null,
-    reason: value.reason || null, configured: value.configured !== false,
+    reason: safeDiagnostic(value.reason), configured: value.configured !== false,
   }]));
 }
 
@@ -1839,7 +1861,7 @@ function buildScanArtifacts(root, {
     validationFailures: (failure?.validationFailures || []).map((item) => boundedText(item, 100)).slice(0, 8),
   })).filter((failure) => failure.jobId && failure.code);
   const errors = [
-    ...(error ? [error] : []),
+    ...(error ? [safeDiagnostic(error)] : []),
     ...(!error && boundedAssessmentFailures.length ? [`${boundedAssessmentFailures.length} candidate assessment(s) exhausted bounded retries`] : []),
     ...(configuredSources.length ? [] : ['no job sources are configured']),
   ];
@@ -1892,7 +1914,7 @@ function buildScanArtifacts(root, {
     }).filter((item) => item?.timestamp?.startsWith(date))
     : [];
   const dayRuns = [...earlierRuns, run];
-  const dayErrors = [...new Set(dayRuns.flatMap((item) => item.errors || []))];
+  const dayErrors = [...new Set(dayRuns.flatMap((item) => item.errors || []).map((item) => safeDiagnostic(item)).filter(Boolean))];
   const baseReport = reportText({
     date,
     degraded: dayRuns.some((item) => item.degraded),
@@ -1908,7 +1930,9 @@ function buildScanArtifacts(root, {
   }).join('\n');
   const report = baseReport.replace('## Action today', `## Scan runs\n\n${runLines}\n\n## Action today`);
   const reportPath = path.join(paths.reports, `${date}.md`);
-  const priorRuns = fs.existsSync(paths.scanRuns) ? fs.readFileSync(paths.scanRuns, 'utf8').trimEnd() : '';
+  const priorRuns = fs.existsSync(paths.scanRuns)
+    ? markerFreeMutationContent('run-log', fs.readFileSync(paths.scanRuns, 'utf8')).trimEnd()
+    : '';
   const scanRuns = `${priorRuns ? `${priorRuns}\n` : ''}${JSON.stringify(run)}\n`;
   return {
     run,
@@ -1937,23 +1961,23 @@ function coordinatedArtifactsFromPlan(root, plan) {
   const trackerTarget = plan.files.find((target) => target.kind === 'tracker');
   const reportTarget = plan.files.find((target) => target.kind === 'report');
   const runTarget = plan.files.find((target) => target.kind === 'run-log');
-  if (!trackerTarget || !reportTarget || !runTarget) {
-    throw new Error('prepared scan mutation does not contain tracker, report and run-log targets');
+  if (!reportTarget || !runTarget) {
+    throw new Error('prepared scan mutation does not contain report and run-log targets');
   }
-  const tracker = JSON.parse(trackerTarget.preparedContent);
+  const tracker = JSON.parse(trackerTarget?.content ?? fs.readFileSync(paths.tracker, 'utf8'));
   delete tracker._scoutMutation;
-  const lines = runTarget.preparedContent.trim().split(/\r?\n/);
+  const lines = runTarget.content.trim().split(/\r?\n/);
   const scanRun = JSON.parse(lines.at(-1));
   delete scanRun._scoutMutation;
   return {
     run: scanRun,
     tracker,
-    report: path.join(root, ...reportTarget.path.split('/')),
+    report: reportTarget.file,
     paths,
   };
 }
 
-export function coordinateScanArtifacts(root, input, { run, lease }) {
+export function coordinateScanArtifacts(root, input, { run, lease, hooks = {} }) {
   const existing = [...run.events].reverse().find((event) => (
     event.type === 'mutation.prepared'
     && event.stageId === 'finalise'
@@ -1966,24 +1990,24 @@ export function coordinateScanArtifacts(root, input, { run, lease }) {
     const timestamp = run.events.find((event) => event.type === 'run.started')?.recordedAt
       || input.startedAt;
     const artifacts = buildScanArtifacts(root, { ...input, timestamp });
-    const paths = workspacePaths(root);
-    const relative = (file) => path.relative(root, file).split(path.sep).join('/');
+    const date = artifacts.run.timestamp.slice(0, 10);
+    const hasTracker = artifacts.contents.tracker !== undefined;
     const target = {
-      id: 'scan-tracker-report',
+      id: hasTracker ? 'scan-tracker-report' : 'scan-failure-report',
       schemaVersion: 1,
       files: [
-        { kind: 'tracker', path: relative(paths.tracker) },
-        { kind: 'report', path: relative(artifacts.report) },
-        { kind: 'run-log', path: relative(paths.scanRuns) },
+        ...(hasTracker ? [{ kind: 'tracker', key: 'tracker' }] : []),
+        { kind: 'report', key: `report:${date}` },
+        { kind: 'run-log', key: 'scan-log' },
       ],
     };
     plan = prepareMutation({ handle: run, lease }, target, {
-      [relative(paths.tracker)]: artifacts.contents.tracker,
-      [relative(artifacts.report)]: artifacts.contents.report,
-      [relative(paths.scanRuns)]: artifacts.contents.scanRuns,
+      ...(hasTracker ? { tracker: artifacts.contents.tracker } : {}),
+      [`report:${date}`]: artifacts.contents.report,
+      'scan-log': artifacts.contents.scanRuns,
     });
   }
-  const mutationReceipt = applyPreparedMutation(plan, lease);
+  const mutationReceipt = applyPreparedMutation(plan, lease, hooks);
   const artifacts = coordinatedArtifactsFromPlan(root, plan);
   validateWrittenScanArtifacts(root, artifacts.run);
   return {
