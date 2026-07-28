@@ -996,6 +996,140 @@ test('a real queued unclosed provider remains claimed with a live fence and cohe
   }
 });
 
+test('a post-terminal queue drain surfaces unresolved provider authority through the supervised scan result', async () => {
+  const root = readyScanRoot();
+  enableRankedDiscovery(root);
+  const emptySourceResult = {
+    generatedAt: '2026-07-28T09:00:00.000Z',
+    queries: [],
+    sources: {
+      hiring_cafe: {
+        configured: true,
+        status: 'healthy',
+        count: 0,
+        jobs: [],
+      },
+    },
+  };
+  const queuedSourceResult = {
+    generatedAt: '2026-07-28T09:01:00.000Z',
+    queries: [],
+    sources: {
+      hiring_cafe: {
+        configured: true,
+        status: 'healthy',
+        count: 1,
+        jobs: [{
+          company: 'Able',
+          title: 'Ideal Role',
+          providerId: 'post-terminal-unclosed-1',
+          url: 'https://example.test/jobs/post-terminal-unclosed',
+          description: 'Ideal role responsibility.',
+        }],
+      },
+    },
+  };
+  const activeHeartbeatTimers = new Set();
+  let nextHeartbeatTimer = 0;
+  let collectionCalls = 0;
+  let directRunId = null;
+  let overlap = null;
+  let successor = null;
+  const options = {
+    providerStatusFn: authenticated,
+    async collectSourcesFn() {
+      collectionCalls += 1;
+      if (collectionCalls === 1) {
+        directRunId = readScanLease(root)?.runId || null;
+        overlap = await runScanWith(root, 'codex', 'broadened', options);
+        successor = await runScanWith(root, 'codex', 'second-pass', options);
+        return emptySourceResult;
+      }
+      return queuedSourceResult;
+    },
+    runStructuredTurnFn: () => Promise.reject(new ProviderLifecycleUnclosedError(
+      'provider process did not close',
+      new Promise(() => {}),
+    )),
+    checkLivenessFn: async (candidates) => ({
+      live: candidates,
+      removed: [],
+      summary: { checked: candidates.length, gone: 0, unverified: 0 },
+    }),
+    queueWorkspaceSyncFn: async () => undefined,
+    heartbeatOptions: {
+      intervalMs: 100,
+      setTimeoutFn() {
+        const timer = { id: ++nextHeartbeatTimer, unref() {} };
+        activeHeartbeatTimers.add(timer.id);
+        return timer;
+      },
+      clearTimeoutFn(timer) {
+        activeHeartbeatTimers.delete(timer.id);
+      },
+    },
+  };
+
+  try {
+    const result = await runScan(root, 'codex', 'primary', {
+      assertScanReadyFn: () => ({ ready: true }),
+      runScanWithFn: (scanRoot, provider, mode, runtimeOptions) => runScanWith(
+        scanRoot,
+        provider,
+        mode,
+        { ...runtimeOptions, ...options },
+      ),
+    });
+
+    assert.equal(overlap.status, 'queued');
+    assert.equal(successor.status, 'queued');
+    assert.equal(collectionCalls, 2);
+    assert.ok(directRunId);
+    assert.equal(result.ok, false);
+    assert.equal(result.status, 'in-progress');
+    assert.equal(result.reason, 'operator-intervention-required');
+    assert.equal(result.durable.outcome, 'in-progress');
+    assert.deepEqual(result.durable.failures, [{
+      code: 'provider-lifecycle-unclosed',
+      stage: 'finalise',
+      reason: 'operator-intervention-required',
+    }]);
+    assert.equal(result.scan.candidates_found, 0);
+
+    const queue = projectScanQueue(root).requests;
+    assert.equal(queue.length, 2);
+    assert.equal(queue[0].status, 'claimed');
+    assert.equal(queue[1].status, 'queued');
+    assert.equal(queue[1].claim, null);
+    assert.equal(result.runId, queue[0].claim.runId);
+    assert.notEqual(result.runId, directRunId);
+    const lease = readScanLease(root);
+    assert.ok(lease);
+    assert.equal(lease.runId, queue[0].claim.runId);
+    assert.equal(activeHeartbeatTimers.size, 1);
+
+    const queuedEvents = replayRunJournal(path.join(
+      root, '.scout', 'runs', queue[0].claim.runId, 'journal.jsonl',
+    ));
+    assert.equal(queuedEvents.some((event) => event.type === 'run.completed'), false);
+    assert.ok(queuedEvents.some((event) => (
+      event.type === 'run.failure-recorded'
+      && event.payload.code === 'provider-lifecycle-unclosed'
+      && event.payload.reason === 'operator-intervention-required'
+    )));
+
+    const directEvents = replayRunJournal(path.join(
+      root, '.scout', 'runs', directRunId, 'journal.jsonl',
+    ));
+    assert.ok(directEvents.some((event) => (
+      event.type === 'run.completed'
+      && event.payload.outcome === 'complete'
+    )));
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test('each terminally successful manual overlap run receives its own fenced backup', async () => {
   const root = scanRoot();
   let collectionCalls = 0;

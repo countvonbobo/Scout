@@ -819,7 +819,18 @@ export async function runScanPipeline({
     }
   }
 
-  if (terminal && ownsLease) await drainScanQueue(root, queue, compatibility, leaseOptions);
+  if (terminal && ownsLease) {
+    const postTerminalDrain = await drainScanQueue(root, queue, compatibility, leaseOptions);
+    if (postTerminalDrain.paused) {
+      const pausedRun = openRunJournal(root, postTerminalDrain.paused.runId);
+      return resultWithOutputs({
+        runId: postTerminalDrain.paused.runId,
+        outcome: 'in-progress',
+        manifest: projectRunManifest(pausedRun.events),
+        failures: Object.freeze([...failures, postTerminalDrain.paused.failure]),
+      }, outputs, { providerClosure: postTerminalDrain.paused.closure });
+    }
+  }
   return resultWithOutputs({
     runId: run?.runId ?? provisionalRunId,
     outcome: manifest?.outcome ?? 'failed',
