@@ -249,6 +249,46 @@ test('assessment reuse recovery preserves valid earlier progress', () => {
   });
 });
 
+test('superseded repair attempts cannot control state after an upstream restart resumes collection', () => {
+  const fixture = runFixture({
+    completed: ['collect'],
+    tail: [
+      event(3, 'assessment.batch-attempted', 'assessment', {
+        reference: { id: 'old-batch' }, count: 1, attempt: 'repair',
+      }),
+      event(4, 'recovery.started', 'recover', {
+        schemaVersion: 2,
+        decisions: [{ stageId: 'collect', action: 'restart', reason: 'ranking-version-mismatch' }],
+      }, 2),
+      event(5, 'stage.completed', 'collect', {}, 2),
+    ],
+  });
+  assert.equal(publicRunSummary(fixture.manifest, { events: fixture.events }).state, 'normalising');
+  assert.equal(publicRunSummary(fixture.manifest, { events: fixture.events }).assessment, null);
+});
+
+test('assessment reuse keeps a valid repair attempt eligible for current state', () => {
+  const fixture = runFixture({
+    completed: ['collect', 'normalise', 'deduplicate', 'filter', 'rank', 'select'],
+    tail: [
+      event(8, 'assessment.batch-attempted', 'assessment', {
+        reference: { id: 'reused-batch' }, count: 1, attempt: 'repair',
+      }),
+      event(9, 'recovery.started', 'recover', {
+        schemaVersion: 2,
+        decisions: [{ stageId: 'assess', action: 'reuse', reason: 'compatible' }],
+      }, 2),
+      event(10, 'assessment.job-completed', 'assessment', {
+        reference: { id: 'reused-job' },
+      }, 2),
+    ],
+  });
+  const summary = publicRunSummary(fixture.manifest, { events: fixture.events });
+  assert.equal(summary.state, 'repairing');
+  assert.equal(summary.assessment.currentBatch, 1);
+  assert.equal(summary.assessment.completedJobs, 1);
+});
+
 test('active worker is shown only for a current nonterminal lease', () => {
   const now = new Date('2026-07-29T00:00:30.000Z');
   const fixture = runFixture();
