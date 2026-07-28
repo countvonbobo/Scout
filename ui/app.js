@@ -1870,7 +1870,7 @@ const Scout = {
       if (instr) prefill = prefill.replace('<your change>', instr);
     }
     document.getElementById('chat-input').value = prefill;
-    if (!c.engine) void this.loadEngineOptions(c);
+    void this.loadEngineOptions(c);
     void this.refreshUsage(c);
     void this.refreshCodexDeepLink(c);
     if (c.recovering) this.scheduleChatRecovery(c);
@@ -1936,6 +1936,7 @@ const Scout = {
         ? this.usageSummaryView(null)
         : { text: 'Checking AI usage…', title: 'Provider usage is loading' };
     const prep = c.purpose === 'interview-prep';
+    const chatModelStatus = this.chatModelStatusHtml(c);
     const codexTaskControls = this.codexTaskControlsHtml(c);
     const prepControls = prep ? `<div class="controls" style="padding:8px 12px;flex-wrap:wrap">
       <button class="act bridge" data-action="use-prep-prompt" data-prompt="interviewPrep">generate pack</button>
@@ -1948,6 +1949,7 @@ const Scout = {
         <b>${prep ? 'Interview prep - ' : ''}${this.esc(this.company(c.id))}</b>
         ${c.engine ? `<span class="chip" style="margin-left:0">${this.esc(c.engine)}</span>` : ''}
         ${c.engine ? `<span class="chip model-chip" title="Model used for this conversation">${this.esc(c.model || 'provider default')}</span>` : ''}
+        ${chatModelStatus}
         <span id="usage-meters" class="meta" role="status" aria-live="polite" title="${this.esc(usageView.title)}">${this.esc(usageView.text)}</span>
         ${c.engine && c.data.cliSessionId
           ? '<button class="act" data-action="handoff-chat">summarise &amp; switch</button>'
@@ -2174,6 +2176,21 @@ const Scout = {
     const value = card.querySelector('[data-engine-model]')?.value || '';
     if (value !== '__other__') return value || null;
     return card.querySelector('[data-engine-model-custom]')?.value.trim() || null;
+  },
+
+  chatModelStatusHtml(chat = this.chat) {
+    if (!chat?.engine) return '';
+    const info = this.chatDrawerState?.engines?.value?.engines?.[chat.engine];
+    if (!info) return '';
+    const record = chat.model
+      ? (info.models || []).find((model) => model.id === chat.model)
+      : info.effectiveModel;
+    if (record?.available !== false) return '';
+    const label = record.label || record.id || chat.model || 'saved provider default';
+    const subject = chat.model ? 'Conversation model' : 'Saved default';
+    return `<span class="chat-model-status meta" role="status" aria-live="polite">
+      ${this.esc(subject)} ${this.esc(label)} is unavailable. Choose a currently available model if a new turn fails.
+    </span>`;
   },
 
   codexTaskControlsHtml(chat = this.chat) {

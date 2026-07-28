@@ -532,3 +532,93 @@ test('a hostile Codex task identity is escaped, copyable and never launched', as
   await expect(page.locator('[data-action="open-codex-task"]')).toHaveCount(0);
   expect(await page.evaluate(() => window.__codexTarget)).toBeUndefined();
 });
+
+test('stale Codex model and unavailable task handler remain independently actionable', async ({ page }) => {
+  await page.unroute('**/api/chat?*');
+  await page.route('**/api/chat?*', (route) => route.fulfill({
+    contentType: 'application/json',
+    body: JSON.stringify({
+      chat: {
+        engine: 'codex',
+        model: null,
+        cliSessionId: 'task-stale-model',
+        messages: [],
+        filesTouched: [],
+      },
+      prefills: {},
+      purpose: 'job',
+      busy: false,
+    }),
+  }));
+  await page.unroute('**/api/engines');
+  await page.route('**/api/engines', (route) => route.fulfill({
+    contentType: 'application/json',
+    body: JSON.stringify({
+      engines: {
+        ...engines.engines,
+        codex: {
+          ...engines.engines.codex,
+          models: [{
+            id: 'gpt-old-stale',
+            label: 'gpt-old-stale',
+            tradeoff: 'Configured model is absent from the refreshed catalogue.',
+            source: 'configured',
+            available: false,
+            selected: false,
+          }],
+          defaultModel: null,
+          effectiveModel: {
+            id: 'gpt-old-stale',
+            label: 'gpt-old-stale',
+            source: 'configured',
+            available: false,
+            known: true,
+            state: 'stale',
+          },
+          catalogue: { state: 'refreshed', reasonCode: null, checkedAt: '2026-07-28T12:00:00.000Z' },
+        },
+      },
+    }),
+  }));
+  await page.unroute('**/api/device/codex-deep-link');
+  await page.route('**/api/device/codex-deep-link', (route) => route.fulfill({
+    contentType: 'application/json',
+    body: JSON.stringify({
+      state: 'unavailable',
+      canAttempt: false,
+      reasonCode: 'handler-missing',
+      checkedAt: '2026-07-28T12:00:00.000Z',
+      platform: 'darwin',
+    }),
+  }));
+
+  await page.evaluate((id) => window.Scout.openChat(id, 'ask'), opportunity.id);
+  await expect(page.locator('.chat-model-status')).toContainText(/saved default.*unavailable/i);
+  await expect(page.locator('.codex-link-status')).toContainText(/no supported Codex handler/i);
+  await expect(page.locator('#usage-meters')).toContainText('usage unavailable');
+  await expect(page.locator('.model-chip')).toHaveText('provider default');
+  await expect(page.locator('.codex-link-status')).toHaveAttribute('role', 'status');
+
+  const copy = page.locator('[data-action="copy-codex-task"]');
+  const close = page.locator('[data-action="close-chat"]');
+  await copy.focus();
+  await expect(copy).toBeFocused();
+  await close.focus();
+  await expect(close).toBeFocused();
+});
+
+test('model picker and custom model controls remain keyboard reachable', async ({ page }) => {
+  await page.evaluate((id) => window.Scout.openChat(id, 'ask'), opportunity.id);
+  const picker = page.locator('[data-engine-model="codex"]');
+  const custom = page.locator('[data-engine-model-custom="codex"]');
+  const close = page.locator('[data-action="close-chat"]');
+  await picker.focus();
+  await expect(picker).toBeFocused();
+  await page.selectOption('[data-engine-model="codex"]', '__other__');
+  await custom.focus();
+  await expect(custom).toBeFocused();
+  await close.focus();
+  await expect(close).toBeFocused();
+  await expect(page.locator('[data-engine-card="codex"] .engine-model-status'))
+    .toHaveAttribute('aria-live', 'polite');
+});
