@@ -1,6 +1,8 @@
-// Kept dependency-free so a browser connected to a pre-update Scout server can
-// still boot. The matching modules contain the unit-tested canonical helpers,
-// and the Scout character is read from one of them rather than copied.
+import { createChatDrawerState, reduceChatDrawer } from './lib/chatDrawerState.mjs';
+
+// Keep browser orchestration here while pure state machines live in /lib, where
+// deterministic unit tests exercise them without a DOM. Scout character data
+// is likewise read from its canonical module rather than copied here.
 const SCOUT_UI_BUILD = typeof document !== 'undefined'
   ? document.querySelector?.('meta[name="scout-ui-build"]')?.content || null
   : null;
@@ -219,6 +221,7 @@ const Scout = {
   cvPreviewZoom: 'page-width',
   cvRenderTimer: null,
   chat: null,
+  chatDrawerState: null,
   chatOpenSeq: 0,
   engineOptions: null,
   enginePicks: {},
@@ -1852,6 +1855,13 @@ const Scout = {
     }
     if (previous?.pollTimer) clearTimeout(previous.pollTimer);
     const openSeq = ++this.chatOpenSeq;
+    if (this.chatDrawerState && this.chatDrawerState.chatId !== null) {
+      this.chatDrawerState = reduceChatDrawer(this.chatDrawerState, {
+        type: 'chat/closed',
+        chatId: this.chatDrawerState.chatId,
+        generation: this.chatDrawerState.generation,
+      });
+    }
     let r;
     const optionQuery = cvOptions
       ? `&xyz=${cvOptions.xyz ? '1' : '0'}&humanize=${cvOptions.humanize ? '1' : '0'}`
@@ -1882,6 +1892,7 @@ const Scout = {
       mode: prefillKey === 'fit' ? 'fit-assessment' : null,
     };
     this.chat = c;
+    this.chatDrawerState = createChatDrawerState(id, openSeq);
     this.renderChatDrawer();
     let prefill = c.prefills[prefillKey] || '';
     if (prefillKey === 'tweak') {
@@ -1889,8 +1900,8 @@ const Scout = {
       if (instr) prefill = prefill.replace('<your change>', instr);
     }
     document.getElementById('chat-input').value = prefill;
-    if (!c.engine) void this.loadEngineOptions();
-    this.refreshUsage(c);
+    if (!c.engine) void this.loadEngineOptions(c);
+    void this.refreshUsage(c);
     if (c.recovering) this.scheduleChatRecovery(c);
   },
 
@@ -1946,6 +1957,12 @@ const Scout = {
     if (!c) return d.classList.add('hidden');
     d.classList.remove('hidden');
     const picker = this.chatPickerHtml();
+    const usageSlot = this.chatDrawerState?.usage;
+    const usageView = usageSlot?.status === 'ready'
+      ? this.usageSummaryView(usageSlot.value)
+      : usageSlot?.status === 'error'
+        ? this.usageSummaryView(null)
+        : { text: 'Checking AI usage…', title: 'Provider usage is loading' };
     const prep = c.purpose === 'interview-prep';
     const prepControls = prep ? `<div class="controls" style="padding:8px 12px;flex-wrap:wrap">
       <button class="act bridge" data-action="use-prep-prompt" data-prompt="interviewPrep">generate pack</button>
@@ -1958,7 +1975,7 @@ const Scout = {
         <b>${prep ? 'Interview prep - ' : ''}${this.esc(this.company(c.id))}</b>
         ${c.engine ? `<span class="chip" style="margin-left:0">${this.esc(c.engine)}</span>` : ''}
         ${c.engine ? `<span class="chip model-chip" title="Model used for this conversation">${this.esc(c.model || 'provider default')}</span>` : ''}
-        <span id="usage-meters" class="meta"></span>
+        <span id="usage-meters" class="meta" role="status" aria-live="polite" title="${this.esc(usageView.title)}">${this.esc(usageView.text)}</span>
         ${c.engine && c.data.cliSessionId
           ? '<button class="act" data-action="handoff-chat">summarise &amp; switch</button>'
           : ''}
@@ -2015,6 +2032,32 @@ const Scout = {
     return `<span class="engine-usage note">~${this.esc(thousands(entry.weekTokens))} tokens spent on this model this week</span>`;
   },
 
+  usageSummaryView(usage) {
+    const bits = [];
+    const titles = [];
+    if (usage?.claude && !usage.claude.unknown) {
+      bits.push(`claude estimated account usage ~${Math.round(Number(usage.claude.fiveHourTokens || 0) / 1000)}k/5h ~${Math.round(Number(usage.claude.weekTokens || 0) / 1000)}k/week`);
+    } else {
+      bits.push('claude usage unavailable');
+    }
+    const windows = usage?.codex?.windows?.length
+      ? usage.codex.windows
+      : [usage?.codex?.primary, usage?.codex?.secondary].filter(Boolean);
+    if (windows.length) {
+      bits.push(`codex ${windows.map((window) => `${Math.round(Number(window.usedPercent || 0))}% ${window.label} allowance used`).join(', ')}`);
+      for (const window of windows) {
+        if (window.resetsAt) titles.push(`codex ${window.label} resets ${new Date(window.resetsAt).toLocaleString()}`);
+      }
+    } else {
+      bits.push('codex usage unavailable');
+    }
+    if (usage?.checkedAt) titles.push(`checked ${new Date(usage.checkedAt).toLocaleTimeString()}`);
+    return {
+      text: bits.join(' · '),
+      title: ['Usage sources remain semantically distinct', ...titles].join(' · '),
+    };
+  },
+
   engineCardHtml(engine, info) {
     const name = engine[0].toUpperCase() + engine.slice(1);
     const models = info?.models || [];
@@ -2039,21 +2082,80 @@ const Scout = {
   chatPickerHtml() {
     const onboarding = this.chat?.id === 'setup-onboarding';
     const prep = this.chat?.purpose === 'interview-prep';
-    const engines = this.engineOptions?.engines;
+    const engineSlot = this.chatDrawerState?.engines;
+    const engines = engineSlot?.value?.engines;
     return `<div class="chat-picker">
       <div class="label">choose an engine and model for ${onboarding ? 'setup' : prep ? 'interview prep' : 'this job'}</div>
       <div class="engine-cards">
         ${['claude', 'codex'].map((engine) => this.engineCardHtml(engine, engines?.[engine])).join('')}
       </div>
-      ${engines ? '' : '<p class="meta">Checking how much of each provider allowance is left…</p>'}
+      ${engines ? '' : engineSlot?.status === 'error'
+        ? '<p class="meta" role="status">Model choices unavailable. Provider defaults and safe custom IDs remain available.</p>'
+        : '<p class="meta" role="status">Checking model choices…</p>'}
     </div>`;
   },
 
-  // Read once when the picker is shown; the drawer re-renders when it arrives.
-  async loadEngineOptions() {
-    try { this.engineOptions = await this.api('/api/engines'); }
-    catch { this.engineOptions = null; return; }
-    if (this.chat && !this.chat.engine) this.renderChatDrawer();
+  renderChatDrawerSnapshot() {
+    const draft = document.getElementById('chat-input')?.value;
+    const body = document.getElementById('chat-body');
+    const following = this.chatNearBottom(body);
+    const scrollTop = body?.scrollTop;
+    const customInputs = typeof document.querySelectorAll === 'function'
+      ? [...document.querySelectorAll('[data-engine-model-custom]')]
+      : [];
+    const customs = Object.fromEntries(customInputs
+      .map((input) => [input.dataset.engineModelCustom, input.value]));
+    this.renderChatDrawer();
+    const input = document.getElementById('chat-input');
+    if (input && draft !== undefined) input.value = draft;
+    for (const [engine, value] of Object.entries(customs)) {
+      const custom = document.querySelector(`[data-engine-model-custom="${engine}"]`);
+      if (custom) custom.value = value;
+    }
+    if (!following && scrollTop !== undefined) {
+      const nextBody = document.getElementById('chat-body');
+      if (nextBody) nextBody.scrollTop = scrollTop;
+    }
+  },
+
+  async loadEngineOptions(target = this.chat) {
+    const drawer = this.chatDrawerState;
+    if (!target || !drawer || drawer.chatId !== target.id) return;
+    const requestGeneration = drawer.engines.requestGeneration + 1;
+    this.chatDrawerState = reduceChatDrawer(drawer, {
+      type: 'engines/requested',
+      chatId: drawer.chatId,
+      generation: drawer.generation,
+      requestGeneration,
+    });
+    let value;
+    try {
+      value = await this.api('/api/engines');
+      if (!value?.engines) throw new Error('model choices unavailable');
+    } catch {
+      const before = this.chatDrawerState;
+      this.chatDrawerState = reduceChatDrawer(before, {
+        type: 'engines/rejected',
+        chatId: drawer.chatId,
+        generation: drawer.generation,
+        requestGeneration,
+        error: 'model choices unavailable',
+      });
+      if (this.chatDrawerState !== before) this.renderChatDrawerSnapshot();
+      return;
+    }
+    const before = this.chatDrawerState;
+    this.chatDrawerState = reduceChatDrawer(before, {
+      type: 'engines/resolved',
+      chatId: drawer.chatId,
+      generation: drawer.generation,
+      requestGeneration,
+      value,
+    });
+    if (this.chatDrawerState !== before) {
+      this.engineOptions = value;
+      this.renderChatDrawerSnapshot();
+    }
   },
 
   // Keep the remembered pick, the free-text field and the per-model spend line in
@@ -2346,33 +2448,52 @@ const Scout = {
     }
     if (this.chat?.pollTimer) clearTimeout(this.chat.pollTimer);
     this.chatOpenSeq += 1;
+    if (this.chatDrawerState && this.chatDrawerState.chatId !== null) {
+      this.chatDrawerState = reduceChatDrawer(this.chatDrawerState, {
+        type: 'chat/closed',
+        chatId: this.chatDrawerState.chatId,
+        generation: this.chatDrawerState.generation,
+      });
+    }
     this.chat = null;
     document.getElementById('chat-drawer').classList.add('hidden');
   },
 
   async refreshUsage(target = this.chat) {
-    if (!target) return;
+    const drawer = this.chatDrawerState;
+    if (!target || !drawer || drawer.chatId !== target.id) return;
+    const requestGeneration = drawer.usage.requestGeneration + 1;
+    this.chatDrawerState = reduceChatDrawer(drawer, {
+      type: 'usage/requested',
+      chatId: drawer.chatId,
+      generation: drawer.generation,
+      requestGeneration,
+    });
     let u;
-    try { u = await this.api('/api/usage'); } catch { return; }
-    if (this.chat !== target) return;
-    const el = document.getElementById('usage-meters');
-    if (!el) return;
-    const bits = [];
-    if (u.claude && !u.claude.unknown) {
-      bits.push(`claude ~${Math.round(u.claude.fiveHourTokens / 1000)}k/5h ~${Math.round(u.claude.weekTokens / 1000)}k/wk`);
-    } else bits.push('claude ?');
-    // Label each Codex window from its own length. Assuming the first window is
-    // the five-hour one reported a weekly allowance as "/5h".
-    const windows = u.codex?.windows?.length ? u.codex.windows : [u.codex?.primary, u.codex?.secondary].filter(Boolean);
-    if (windows.length) {
-      bits.push(`codex ${windows.map((window) => `${Math.round(window.usedPercent)}% ${window.label} used`).join(', ')}`);
-    } else bits.push('codex ?');
-    el.textContent = bits.join(' · ');
-    const resetBits = windows
-      .filter((window) => window.resetsAt)
-      .map((window) => `codex ${window.label} resets ${new Date(window.resetsAt).toLocaleString()}`);
-    const checked = u.checkedAt ? new Date(u.checkedAt).toLocaleTimeString() : 'unknown';
-    el.title = ['approximate', ...resetBits, `checked ${checked}`].join(' - ');
+    try {
+      u = await this.api('/api/usage');
+      if (!u || u.error) throw new Error('usage unavailable');
+    } catch {
+      const before = this.chatDrawerState;
+      this.chatDrawerState = reduceChatDrawer(before, {
+        type: 'usage/rejected',
+        chatId: drawer.chatId,
+        generation: drawer.generation,
+        requestGeneration,
+        error: 'usage unavailable',
+      });
+      if (this.chatDrawerState !== before) this.renderChatDrawerSnapshot();
+      return;
+    }
+    const before = this.chatDrawerState;
+    this.chatDrawerState = reduceChatDrawer(before, {
+      type: 'usage/resolved',
+      chatId: drawer.chatId,
+      generation: drawer.generation,
+      requestGeneration,
+      value: u,
+    });
+    if (this.chatDrawerState !== before) this.renderChatDrawerSnapshot();
   },
 
   openChatForCv() {

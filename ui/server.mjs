@@ -65,7 +65,7 @@ export const APP_VERSION = JSON.parse(fs.readFileSync(path.join(APP_ROOT, 'packa
 // clients keep the previous `scout-shell-<id>` cache and the previous ?v= URL.
 export const UI_BUILD_FILES = [
   'index.html', 'app.js', 'setup.js', 'reportView.js', 'service-worker.js', 'manifest.webmanifest',
-  'lib/scoutCharacter.mjs',
+  'lib/scoutCharacter.mjs', 'lib/chatDrawerState.mjs',
   'assets/scout-icon.ico', 'assets/scout-icon.png', 'assets/scout-idle.png',
   'assets/scout-thinking.png', 'assets/scout-searching.png', 'assets/scout-explaining.png',
   'assets/scout-found.png', 'assets/scout-warning.png',

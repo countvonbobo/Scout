@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import vm from 'node:vm';
 import { test } from 'node:test';
 import { CATEGORY_PALETTE } from './lib/categoryColor.mjs';
+import { createChatDrawerState, reduceChatDrawer } from './lib/chatDrawerState.mjs';
 
 function loadScout() {
   const context = {
@@ -12,6 +13,8 @@ function loadScout() {
     fetch: () => new Promise(() => {}),
     console,
     matchMedia: () => ({ matches: false }),
+    createChatDrawerState,
+    reduceChatDrawer,
   };
   context.activityState = () => 'thinking';
   context.applyScoutState = () => {};
@@ -131,6 +134,32 @@ test('Codex chats use the canonical desktop task deep link and raw tool commands
   const source = fs.readFileSync(new URL('./app.js', import.meta.url), 'utf8');
   assert.doesNotMatch(source, /chat-msg tool/);
   assert.match(source, /Technical details/);
+});
+
+test('chat usage copy keeps unavailable, account estimate, allowance window, model spend and reset timing distinct', () => {
+  const { scout } = loadScout();
+  const unavailable = scout.usageSummaryView({ claude: { unknown: true }, codex: { unknown: true } });
+  assert.match(unavailable.text, /claude usage unavailable/i);
+  assert.match(unavailable.text, /codex usage unavailable/i);
+
+  const estimated = scout.usageSummaryView({
+    checkedAt: '2026-07-28T10:00:00.000Z',
+    claude: { fiveHourTokens: 2_000, weekTokens: 5_000, approximate: true },
+    codex: {
+      windows: [{
+        usedPercent: 42, label: 'weekly', resetsAt: '2026-07-29T10:00:00.000Z',
+      }],
+    },
+  });
+  assert.match(estimated.text, /estimated account usage/i);
+  assert.match(estimated.text, /42% weekly allowance used/i);
+  assert.match(estimated.title, /weekly resets/i);
+
+  const spend = scout.modelSpendHtml('claude', {
+    byModel: [{ model: 'safe-model', weekTokens: 9_000 }],
+  }, 'safe-model');
+  assert.match(spend, /spent on this model/i);
+  assert.doesNotMatch(spend, /allowance remaining/i);
 });
 
 test('interview prep is a manual, separate conversation with escaped saved-pack content', () => {

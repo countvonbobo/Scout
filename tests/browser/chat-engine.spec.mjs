@@ -52,6 +52,12 @@ const opportunity = {
   score: 82, status: 'new', sources: ['https://example.test/job'], lastChecked: '2026-07-20',
 };
 
+function deferred() {
+  let resolve;
+  const promise = new Promise((done) => { resolve = done; });
+  return { promise, resolve };
+}
+
 test.beforeEach(async ({ page }) => {
   await page.route('**/api/setup/status', (route) => route.fulfill({ contentType: 'application/json', body: JSON.stringify(establishedStatus) }));
   await page.route('**/api/setup/proposal', (route) => route.fulfill({ contentType: 'application/json', body: JSON.stringify({ proposal: null }) }));
@@ -164,4 +170,140 @@ test('the picker still works when provider usage cannot be read', async ({ page 
   await expect(page.locator('.chat-picker')).toContainText('usage unavailable');
   await page.click('[data-engine-card="claude"] [data-action="pick-engine"]');
   await expect(page.locator('.chat-head .model-chip')).toHaveText('provider default');
+});
+
+test('usage resolving before engines remains visible after the picker renders', async ({ page }) => {
+  await page.unroute('**/api/usage');
+  await page.unroute('**/api/engines');
+  const usageGate = deferred();
+  const enginesGate = deferred();
+  await page.route('**/api/usage', async (route) => {
+    await usageGate.promise;
+    await route.fulfill({
+      contentType: 'application/json',
+      body: JSON.stringify({
+        claude: { fiveHourTokens: 2_000, weekTokens: 5_000, approximate: true },
+        codex: { windows: [{ usedPercent: 42, label: 'weekly' }] },
+      }),
+    });
+  });
+  await page.route('**/api/engines', async (route) => {
+    await enginesGate.promise;
+    await route.fulfill({ contentType: 'application/json', body: JSON.stringify(engines) });
+  });
+
+  await page.evaluate((id) => window.Scout.openChat(id, 'ask'), opportunity.id);
+  usageGate.resolve();
+  await expect(page.locator('#usage-meters')).toContainText('42% weekly allowance used');
+  enginesGate.resolve();
+  await expect(page.locator('[data-engine-model="claude"]')).toBeVisible();
+  await expect(page.locator('#usage-meters')).toContainText('42% weekly allowance used');
+});
+
+test('engines resolving before usage keeps model choices visible', async ({ page }) => {
+  await page.unroute('**/api/usage');
+  await page.unroute('**/api/engines');
+  const usageGate = deferred();
+  const enginesGate = deferred();
+  await page.route('**/api/usage', async (route) => {
+    await usageGate.promise;
+    await route.fulfill({
+      contentType: 'application/json',
+      body: JSON.stringify({ claude: { unknown: true }, codex: { unknown: true } }),
+    });
+  });
+  await page.route('**/api/engines', async (route) => {
+    await enginesGate.promise;
+    await route.fulfill({ contentType: 'application/json', body: JSON.stringify(engines) });
+  });
+
+  await page.evaluate((id) => window.Scout.openChat(id, 'ask'), opportunity.id);
+  enginesGate.resolve();
+  await expect(page.locator('[data-engine-model="claude"]')).toContainText('Opus 4.8');
+  usageGate.resolve();
+  await expect(page.locator('#usage-meters')).toContainText('usage unavailable');
+  await expect(page.locator('[data-engine-model="claude"]')).toContainText('Opus 4.8');
+});
+
+test('switching chats rejects late usage and engine results from the previous chat', async ({ page }) => {
+  await page.unroute('**/api/usage');
+  await page.unroute('**/api/engines');
+  const oldUsageGate = deferred();
+  const oldEnginesGate = deferred();
+  let usageCalls = 0;
+  let engineCalls = 0;
+  await page.route('**/api/usage', async (route) => {
+    usageCalls += 1;
+    if (usageCalls === 1) {
+      await oldUsageGate.promise;
+      await route.fulfill({
+        contentType: 'application/json',
+        body: JSON.stringify({
+          claude: { unknown: true },
+          codex: { windows: [{ usedPercent: 99, label: 'stale-window' }] },
+        }),
+      });
+      return;
+    }
+    await route.fulfill({
+      contentType: 'application/json',
+      body: JSON.stringify({
+        claude: { unknown: true },
+        codex: { windows: [{ usedPercent: 12, label: 'current-window' }] },
+      }),
+    });
+  });
+  await page.route('**/api/engines', async (route) => {
+    engineCalls += 1;
+    if (engineCalls === 1) {
+      await oldEnginesGate.promise;
+      await route.fulfill({
+        contentType: 'application/json',
+        body: JSON.stringify({
+          engines: {
+            claude: { usage: { unknown: true }, models: [{ id: 'stale-only', label: 'Stale only' }], defaultModel: null },
+            codex: { usage: { unknown: true }, models: [], defaultModel: null },
+          },
+        }),
+      });
+      return;
+    }
+    await route.fulfill({ contentType: 'application/json', body: JSON.stringify(engines) });
+  });
+
+  await page.evaluate((id) => window.Scout.openChat(id, 'ask'), opportunity.id);
+  await expect.poll(() => usageCalls).toBe(1);
+  await expect.poll(() => engineCalls).toBe(1);
+  await page.evaluate(() => window.Scout.openChat('second-synthetic-chat-2026-07', 'ask'));
+  await expect(page.locator('#usage-meters')).toContainText('12% current-window allowance used');
+  await expect(page.locator('[data-engine-model="claude"]')).toContainText('Opus 4.8');
+  oldUsageGate.resolve();
+  oldEnginesGate.resolve();
+  await expect(page.locator('#usage-meters')).not.toContainText('stale-window');
+  await expect(page.locator('[data-engine-model="claude"]')).not.toContainText('Stale only');
+});
+
+test('closing the drawer rejects late usage and engine results', async ({ page }) => {
+  await page.unroute('**/api/usage');
+  await page.unroute('**/api/engines');
+  const usageGate = deferred();
+  const enginesGate = deferred();
+  await page.route('**/api/usage', async (route) => {
+    await usageGate.promise;
+    await route.fulfill({
+      contentType: 'application/json',
+      body: JSON.stringify({ claude: { unknown: true }, codex: { unknown: true } }),
+    });
+  });
+  await page.route('**/api/engines', async (route) => {
+    await enginesGate.promise;
+    await route.fulfill({ contentType: 'application/json', body: JSON.stringify(engines) });
+  });
+
+  await page.evaluate((id) => window.Scout.openChat(id, 'ask'), opportunity.id);
+  await page.evaluate(() => window.Scout.closeChat());
+  usageGate.resolve();
+  enginesGate.resolve();
+  await expect(page.locator('#chat-drawer')).toBeHidden();
+  await expect.poll(() => page.evaluate(() => window.Scout.chat)).toBe(null);
 });
