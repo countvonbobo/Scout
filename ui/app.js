@@ -358,21 +358,34 @@ const Scout = {
   },
 
   async loadOpportunities() {
-    const [data, cvFiles, latest] = await Promise.all([
+    const [data, cvFiles, latest, durableRuns, durableQueue] = await Promise.all([
       this.api('/api/opportunities'),
       this.api('/api/cv'),
       this.api('/api/scans/latest').catch(() => ({ scan: null })),
+      this.api('/api/scan/runs').catch(() => ({ state: 'waiting', runs: [] })),
+      this.api('/api/scan/queue').catch(() => ({ state: 'waiting', requests: [] })),
     ]);
     this.state.data = data;
     this.state.cvFiles = cvFiles;
     this.latestScan = latest?.scan || null;
+    this.scanRuns = Array.isArray(durableRuns?.runs) ? durableRuns.runs : [];
+    this.scanRunState = durableRuns?.state || 'waiting';
+    this.scanQueue = durableQueue && Array.isArray(durableQueue.requests)
+      ? durableQueue
+      : { state: 'waiting', requests: [] };
     this.applyWorkspaceConfig(this.state.data.workspaceConfig, { render: false });
     const h = this.state.data.scanHealth;
+    const activeRun = this.scanRuns.find((run) => !['complete', 'partial', 'abandoned', 'failed'].includes(run.state));
+    const queuedCount = this.scanQueue.requests.filter((request) => request.status === 'queued').length;
     const status = document.getElementById('scan-status');
     if (status) {
-      status.textContent = h?.lastRunAt
+      status.textContent = activeRun
+        ? `${activeRun.label || 'Scan in progress'}${activeRun.assessment?.totalBatches ? ` · batch ${activeRun.assessment.currentBatch} of ${activeRun.assessment.totalBatchesExact ? '' : 'at least '}${activeRun.assessment.totalBatches}` : ''}`
+        : queuedCount
+        ? `${queuedCount} queued ${queuedCount === 1 ? 'request' : 'requests'}`
+        : h?.lastRunAt
         ? `Last scan: ${Number(h.funnel?.assessed ?? h.candidatesFound ?? 0)} assessed · ${Number(h.keepersAdded || 0)} kept`
-        : 'No scan completed yet';
+        : 'Waiting to scan';
       status.dataset.action = h?.lastRunAt ? 'open-scan-result' : '';
       status.tabIndex = h?.lastRunAt ? 0 : -1;
       status.setAttribute('role', h?.lastRunAt ? 'button' : 'status');
@@ -442,14 +455,40 @@ const Scout = {
   },
 
   latestScanCard() {
+    const audit = this.scanRunAuditCard();
     const scan = this.latestScan;
-    if (!scan?.runAt) return '';
+    if (!scan?.runAt) return audit;
     const broadened = scan.automaticBroadened ? ' after an automatic broader discovery pass' : '';
-    return `<div class="card scan-result-card">
+    return `${audit}<div class="card scan-result-card">
       <div class="top"><b>Latest scan result</b><span class="chip">${this.esc(scan.degraded ? 'degraded' : 'complete')}</span></div>
       <p><strong>${this.esc(scan.funnel?.assessed ?? scan.candidatesFound)} assessed, ${this.esc(scan.keepersAdded)} kept</strong>${this.discardBreakdown(scan) ? ` — ${this.esc(this.discardBreakdown(scan))}` : ''}${this.esc(broadened)}.</p>
       <p class="meta">Zero keepers can be a valid result: Scout keeps approved gates in force even when it broadens discovery.</p>
       <div class="controls"><button class="act" data-action="open-scan-result">Review this scan</button>${scan.reportDate ? `<button class="act" data-action="open-scan-report" data-date="${this.esc(scan.reportDate)}">Open dated report</button>` : ''}</div>
+    </div>`;
+  },
+
+  scanRunAuditCard() {
+    const run = Array.isArray(this.scanRuns) ? this.scanRuns[0] : null;
+    const queued = (this.scanQueue?.requests || []).filter((request) => request.status === 'queued');
+    if (!run && !queued.length) {
+      if (this.scanRunState !== 'waiting' && this.scanQueue?.state !== 'waiting') return '';
+      return `<div class="card scan-run-audit">
+        <div class="top"><b>Durable scan state</b><span class="chip">waiting</span></div>
+        <p><strong>Waiting to scan</strong></p>
+      </div>`;
+    }
+    const batch = run?.assessment?.totalBatches
+      ? ` · batch ${this.esc(run.assessment.currentBatch)} of ${run.assessment.totalBatchesExact ? '' : 'at least '}${this.esc(run.assessment.totalBatches)}`
+      : '';
+    const recoveries = Number(run?.recoveryCount || 0);
+    const recoveryText = `${recoveries} ${recoveries === 1 ? 'recovery' : 'recoveries'}`;
+    const queueText = `${queued.length} queued ${queued.length === 1 ? 'request' : 'requests'}`;
+    const terminal = run?.terminalReason ? ` · ${this.esc(run.terminalReason)}` : '';
+    return `<div class="card scan-run-audit">
+      <div class="top"><b>Durable scan state</b><span class="chip">${this.esc(run?.state || 'queued')}</span></div>
+      ${run ? `<p><strong>${this.esc(run.label || run.state)}</strong>${batch}${terminal}</p>
+        <div class="meta">run ${this.esc(run.id)} · ${this.esc(run.owner || 'inactive worker')} · ${this.esc(recoveryText)}</div>` : ''}
+      <div class="meta">${this.esc(queueText)}</div>
     </div>`;
   },
 
@@ -469,7 +508,7 @@ const Scout = {
       ['Excluded by confirmed rules', funnel.deterministicallyExcluded], ['Eligible and ranked', funnel.ranked],
       ['Selected for detailed assessment', funnel.selected], ['Successfully assessed', funnel.assessed], ['Assessment failed', funnel.assessmentFailed],
     ].filter(([, value]) => Number.isFinite(Number(value))).map(([label, value]) => `<li>${this.esc(label)}: <b>${this.esc(value)}</b></li>`).join('') : '';
-    return `<div class="card">
+    return `${this.scanRunAuditCard()}<div class="card">
       <div class="top"><b>Scan health</b><span class="chip">${this.esc(healthText)}</span></div>
       <p><strong>${this.esc(Number(health?.funnel?.assessed ?? health?.candidatesFound ?? 0))} assessed, ${this.esc(Number(health?.keepersAdded || 0))} kept</strong>${this.discardBreakdown(health) ? ` — ${this.esc(this.discardBreakdown(health))}` : ''}. Zero keepers can be a valid result when strict gates exclude every candidate.</p>
       <div class="meta">last run: ${this.esc(health?.lastRunAt || 'never')}</div>

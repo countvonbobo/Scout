@@ -15,6 +15,9 @@ const { APP_ROOT, APP_VERSION, UI_BUILD_ID, WORKSPACE_ROOT, createServer, operat
 const { seedWorkspace, loadWorkspaceConfig, workspacePaths, writeWorkspaceConfig } = await import('./lib/workspace.mjs');
 const { profileFingerprint } = await import('./lib/searchProfile.mjs');
 const { acquireScanLock, releaseScanLock } = await import('../tools/scan-lock.mjs');
+const { appendRunEvent, openRunJournal } = await import('./lib/runJournal.mjs');
+const { acquireScanLease, currentLeaseOwner, releaseScanLease } = await import('./lib/scanLease.mjs');
+const { enqueueScanRequest } = await import('./lib/scanQueue.mjs');
 
 let server;
 let port;
@@ -585,6 +588,65 @@ test('latest scan API bounds source URLs in persisted explanation records', asyn
   const response = await request({ path: '/api/scans/latest' });
   const { scan } = JSON.parse(response.text);
   assert.equal(scan.explanations[0].sourceUrl, null);
+});
+
+test('run and queue APIs expose journal-backed state through privacy-safe summaries', async () => {
+  const runId = 'run-1234567890-private';
+  const lease = acquireScanLease(testWorkspace, currentLeaseOwner(), { kind: 'scan', runId });
+  try {
+    const journal = openRunJournal(testWorkspace, runId);
+    appendRunEvent(journal, {
+      type: 'run.started', stageId: 'initialise', idempotencyKey: 'run-started',
+      payload: {
+        schemaVersion: 1,
+        compatibility: {
+          schemaVersion: 1, mode: 'primary', purpose: 'job-discovery',
+          profileVersion: 'profile-v3', sourceConfigFingerprint: 'a'.repeat(64),
+          journalSchemaVersion: 1, artifactSchemaVersion: 1,
+          pipelineVersion: 'pipeline-v9', rankingVersion: 'ranking-v1',
+          promptVersion: 'prompt-v1', assessmentSchemaVersion: 1,
+          provider: 'codex', model: 'gpt-5', mutationSchemaVersion: 1,
+          targetRevision: 'tracker-v1',
+        },
+      },
+    }, lease);
+    appendRunEvent(journal, {
+      type: 'stage.completed', stageId: 'collect', idempotencyKey: 'collect-completed',
+      payload: { schemaVersion: 1, reference: { kind: 'stage', id: 'collect' }, count: 12 },
+    }, lease);
+    enqueueScanRequest(testWorkspace, {
+      id: 'request-1234567890-private', key: 'manual-discovery',
+      requester: 'manual', purpose: 'job-discovery',
+      requestedAt: '2026-07-29T00:00:00.000Z', expiresAt: '2026-07-30T00:00:00.000Z',
+      windowAt: null,
+      compatibility: {
+        profileFingerprint: 'b'.repeat(64), configFingerprint: 'c'.repeat(64), schemaVersion: 1,
+      },
+      lease,
+    });
+
+    const runsResponse = await request({ path: '/api/scan/runs' });
+    const queueResponse = await request({ path: '/api/scan/queue' });
+    assert.equal(runsResponse.status, 200);
+    assert.equal(queueResponse.status, 200);
+    const runs = JSON.parse(runsResponse.text);
+    const queue = JSON.parse(queueResponse.text);
+    assert.equal(runs.runs[0].id, 'run-1234…');
+    assert.equal(runs.runs[0].state, 'normalising');
+    assert.equal(runs.runs[0].owner, 'active worker');
+    assert.equal(queue.requests[0].id, 'request-…');
+    assert.equal(queue.requests[0].status, 'queued');
+    for (const text of [runsResponse.text, queueResponse.text]) {
+      assert.doesNotMatch(text, /run-1234567890-private|request-1234567890-private/i);
+      assert.doesNotMatch(text, new RegExp(currentLeaseOwner().host.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i'));
+      assert.doesNotMatch(text, new RegExp(String(process.pid)));
+      assert.doesNotMatch(text, /profileFingerprint|configFingerprint|sourceConfigFingerprint|targetRevision/i);
+    }
+  } finally {
+    releaseScanLease(lease);
+    fs.rmSync(path.join(testWorkspace, '.scout', 'runs'), { recursive: true, force: true });
+    fs.rmSync(path.join(testWorkspace, '.scout', 'scan-queue.jsonl'), { force: true });
+  }
 });
 
 test('legacy CV downloads require a hash-bound explicit override', async () => {

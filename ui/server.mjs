@@ -10,7 +10,10 @@ import { triage } from './lib/derive.mjs';
 import { emptyTrackerView, pipeline } from './lib/pipeline.mjs';
 import { cvPdfPath, listCvFiles, renderCvTarget, safeCvPath } from './lib/cv.mjs';
 import { cvDownloadDecision, overrideCvQuality, readCvQuality, runCvQuality } from './lib/cvQuality.mjs';
-import { parseScanRuns, scanHealthFromText } from './lib/scanHealth.mjs';
+import {
+  parseScanRuns, readPublicRunSummaries, readPublicScanQueue, scanHealthFromText,
+} from './lib/scanHealth.mjs';
+import { readScanLease } from './lib/scanLease.mjs';
 import { scanEstimate } from './lib/scanEstimate.mjs';
 import { scheduleStatus, scheduleSummary } from './lib/scheduler.mjs';
 import { loadPortals, portalSummary } from './lib/ats.mjs';
@@ -537,6 +540,14 @@ async function handleRead(req, res, url) {
   }
   if (req.method === 'GET' && url.pathname === '/api/scan-health') {
     return sendJson(res, 200, readScanHealth());
+  }
+  if (req.method === 'GET' && url.pathname === '/api/scan/runs') {
+    try { return sendJson(res, 200, readPublicRunSummaries(WORKSPACE_ROOT, { lease: readScanLease(WORKSPACE_ROOT) })); }
+    catch { return sendJson(res, 503, { error: 'durable scan state needs attention' }); }
+  }
+  if (req.method === 'GET' && url.pathname === '/api/scan/queue') {
+    try { return sendJson(res, 200, readPublicScanQueue(WORKSPACE_ROOT)); }
+    catch { return sendJson(res, 503, { error: 'durable scan queue needs attention' }); }
   }
   if (req.method === 'GET' && url.pathname === '/api/scans/latest') {
     return sendJson(res, 200, { scan: publicLatestScan() });

@@ -30,12 +30,31 @@ test.beforeEach(async ({ page }) => {
     categories: [{ id: 'priority', label: 'Priority' }], workspaceConfig: { ai: { provider: 'codex' }, commute: {} }, trackerRevision: 'synthetic',
   }) }));
   await page.route('**/api/scans/latest', (route) => route.fulfill({ contentType: 'application/json', body: JSON.stringify({ scan }) }));
+  await page.route('**/api/scan/runs', (route) => route.fulfill({ contentType: 'application/json', body: JSON.stringify({
+    runs: [{
+      id: 'run-1234…', state: 'repairing', label: 'Repairing affected jobs',
+      owner: 'active worker', startedAt: '2026-07-22T09:53:00.000Z',
+      updatedAt: '2026-07-22T09:59:00.000Z', recoveryCount: 1,
+      completedStages: ['collect', 'normalise', 'deduplicate', 'filter', 'rank', 'select'],
+      assessment: {
+        currentBatch: 2, totalBatches: 4, totalBatchesExact: true,
+        completedBatches: 1, completedJobs: 10, failedJobs: 0,
+      },
+      terminalReason: null,
+    }],
+  }) }));
+  await page.route('**/api/scan/queue', (route) => route.fulfill({ contentType: 'application/json', body: JSON.stringify({
+    requests: [{
+      id: 'request-…', status: 'queued', requester: 'manual', purpose: 'job-discovery',
+      requestedAt: '2026-07-22T09:58:00.000Z', expiresAt: '2026-07-23T09:58:00.000Z',
+    }],
+  }) }));
   await page.route('**/api/cv', (route) => route.fulfill({ contentType: 'application/json', body: JSON.stringify({ master: 'cv/master-cv.md', masterRender: {}, applications: [], entries: [] }) }));
   await page.goto('/');
 });
 
 test('zero-keeper results remain visible and expose the complete sanitised audit', async ({ page }) => {
-  await expect(page.locator('#scan-status')).toHaveText(/40 assessed · 0 kept/);
+  await expect(page.locator('#scan-status')).toHaveText(/Repairing affected jobs/);
   await expect(page.getByText('40 assessed, 0 kept').first()).toBeVisible();
   await expect(page.getByText(/16 mandatory gates/).first()).toBeVisible();
   await expect(page.getByText(/automatic broader discovery pass/)).toBeVisible();
@@ -45,6 +64,42 @@ test('zero-keeper results remain visible and expose the complete sanitised audit
   await expect(dialog.getByText('Assessment discards (24)')).toBeVisible();
   await expect(dialog.locator('.scan-review-item')).toHaveCount(40);
   await expect(page.locator('.card[data-id]')).toHaveCount(0);
+});
+
+test('journal-backed recovery and queued overlap stay visible without diagnostic identity', async ({ page }) => {
+  await expect(page.locator('#scan-status')).toContainText(/Repairing affected jobs/i);
+  await expect(page.getByText(/batch 2 of 4/i).first()).toBeVisible();
+  await expect(page.getByText(/1 recovery/i).first()).toBeVisible();
+  await expect(page.getByText(/1 queued request/i).first()).toBeVisible();
+  await expect(page.getByText('run-1234…').first()).toBeVisible();
+  await expect(page.getByText(/PRIVATE-HOST|private-start|4242/)).toHaveCount(0);
+});
+
+test('first-run queue and waiting states come from durable summaries', async ({ page }) => {
+  await page.unroute('**/api/opportunities');
+  await page.route('**/api/opportunities', (route) => route.fulfill({ contentType: 'application/json', body: JSON.stringify({
+    updated: '2026-07-22', opportunities: [], triage: { action: [], unlock: [], followups: [], other: [] },
+    pipeline: { summary: {}, new: [], watch: [], active: [], recentlyClosed: [], flags: [] },
+    scanHealth: { healthy: false, lastRunAt: null }, categories: [],
+    workspaceConfig: { ai: { provider: 'codex' }, commute: {} }, trackerRevision: 'synthetic',
+  }) }));
+  await page.unroute('**/api/scans/latest');
+  await page.route('**/api/scans/latest', (route) => route.fulfill({ contentType: 'application/json', body: '{"scan":null}' }));
+  await page.unroute('**/api/scan/runs');
+  await page.route('**/api/scan/runs', (route) => route.fulfill({ contentType: 'application/json', body: '{"state":"waiting","runs":[]}' }));
+  await page.unroute('**/api/scan/queue');
+  await page.route('**/api/scan/queue', (route) => route.fulfill({ contentType: 'application/json', body: JSON.stringify({
+    state: 'queued', requests: [{ id: 'request-…', status: 'queued', requester: 'manual', purpose: 'job-discovery' }],
+  }) }));
+  await page.reload();
+  await expect(page.locator('#scan-status')).toHaveText(/1 queued request/i);
+  await expect(page.getByText(/1 queued request/i).first()).toBeVisible();
+
+  await page.unroute('**/api/scan/queue');
+  await page.route('**/api/scan/queue', (route) => route.fulfill({ contentType: 'application/json', body: '{"state":"waiting","requests":[]}' }));
+  await page.reload();
+  await expect(page.locator('#scan-status')).toHaveText(/Waiting to scan/i);
+  await expect(page.getByText(/Waiting to scan/i).first()).toBeVisible();
 });
 
 test('manual scan status and approximate remaining time stay visible on a narrow screen', async ({ page }) => {

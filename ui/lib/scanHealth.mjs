@@ -1,3 +1,10 @@
+import fs from 'node:fs';
+import path from 'node:path';
+import { projectRunManifest } from './runArtifacts.mjs';
+import { validateRunJournal } from './runJournal.mjs';
+import { projectScanQueue } from './scanQueue.mjs';
+import { workspacePaths } from './workspace.mjs';
+
 export function parseScanRuns(text) {
   const runs = [];
   const errors = [];
@@ -98,4 +105,166 @@ function publicFunnel(value) {
     'deterministicallyExcluded', 'eligible', 'ranked', 'selected', 'assessed', 'assessmentFailed',
   ];
   return Object.fromEntries(names.filter((name) => Number.isFinite(Number(value[name]))).map((name) => [name, Number(value[name])]));
+}
+
+const NEXT_RUN_STATE = Object.freeze({
+  collect: 'normalising',
+  normalise: 'deduplicating',
+  deduplicate: 'filtering',
+  filter: 'ranking',
+  rank: 'selecting',
+  select: 'assessing',
+  assess: 'updating-tracker',
+  tracker: 'writing-report',
+  report: 'finalising',
+});
+
+const RUN_LABELS = Object.freeze({
+  waiting: 'Waiting to scan',
+  collecting: 'Collecting vacancies',
+  normalising: 'Normalising vacancies',
+  deduplicating: 'Deduplicating vacancies',
+  filtering: 'Filtering confirmed exclusions',
+  ranking: 'Ranking eligible vacancies',
+  selecting: 'Selecting vacancies for assessment',
+  assessing: 'Assessing selected vacancies',
+  repairing: 'Repairing affected jobs',
+  recovering: 'Recovering interrupted scan',
+  'updating-tracker': 'Updating tracker',
+  'writing-report': 'Writing report',
+  finalising: 'Finalising scan',
+  partial: 'Scan partially completed',
+  abandoned: 'Scan abandoned',
+  failed: 'Scan failed',
+  complete: 'Scan complete',
+});
+
+function shortId(value) {
+  const id = String(value || '');
+  return id.length > 8 ? `${id.slice(0, 8)}…` : id;
+}
+
+function safeToken(value) {
+  const token = String(value || '');
+  return /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(token) ? token : null;
+}
+
+function eventSequence(event) {
+  return Number.isSafeInteger(event?.sequence) ? event.sequence : 0;
+}
+
+function assessmentProgress(manifest, events) {
+  const attempted = events.filter((event) => event.type === 'assessment.batch-attempted');
+  const completed = events.filter((event) => event.type === 'assessment.batch-completed');
+  const batchIds = new Set(attempted.map((event) => event.payload?.reference?.id).filter(Boolean));
+  const selectedCount = Number(manifest.completedWork?.find((work) => work.stageId === 'select')?.count || 0);
+  const totalBatches = Math.max(batchIds.size, completed.length, Math.ceil(selectedCount / 10));
+  if (!totalBatches && !attempted.length) return null;
+  const latestAttempt = attempted.at(-1);
+  const currentId = latestAttempt?.payload?.reference?.id;
+  const orderedIds = [...batchIds];
+  return {
+    currentBatch: currentId ? orderedIds.indexOf(currentId) + 1 : Math.min(completed.length + 1, totalBatches),
+    totalBatches,
+    totalBatchesExact: manifest.completedWork?.some((work) => work.stageId === 'assess') || false,
+    completedBatches: new Set(completed.map((event) => event.payload?.reference?.id).filter(Boolean)).size,
+    completedJobs: events.filter((event) => event.type === 'assessment.job-completed').length,
+    failedJobs: events.filter((event) => event.type === 'assessment.job-failed').length,
+  };
+}
+
+function durableRunState(manifest, events) {
+  if (['partial', 'abandoned', 'failed', 'complete'].includes(manifest?.outcome)) return manifest.outcome;
+  const latestRecovery = [...events].reverse().find((event) => event.type === 'recovery.started');
+  const latestStage = [...events].reverse().find((event) => event.type === 'stage.completed');
+  if (latestRecovery && eventSequence(latestRecovery) > eventSequence(latestStage)) return 'recovering';
+  const latestAttempt = [...events].reverse().find((event) => event.type === 'assessment.batch-attempted');
+  const assessCompleted = manifest?.completedWork?.some((work) => work.stageId === 'assess');
+  if (latestAttempt && !assessCompleted && /^(?:repair|retry-)/.test(String(latestAttempt.payload?.attempt || ''))) return 'repairing';
+  const completed = manifest?.completedWork || [];
+  if (!completed.length) return 'collecting';
+  return NEXT_RUN_STATE[completed.at(-1).stageId] || 'finalising';
+}
+
+export function publicRunSummary(manifest = {}, { events = [], lease = null } = {}) {
+  const state = durableRunState(manifest, events);
+  const failure = [...events].reverse().find((event) => event.type === 'run.failure-recorded');
+  const completedStages = (manifest.completedWork || []).map((work) => safeToken(work.stageId)).filter(Boolean);
+  const startedAt = events.find((event) => event.type === 'run.started')?.recordedAt || null;
+  const updatedAt = events.at(-1)?.recordedAt || startedAt;
+  const runId = String(manifest.runId || events[0]?.runId || '');
+  const result = {
+    id: shortId(runId),
+    state,
+    label: RUN_LABELS[state] || RUN_LABELS.waiting,
+    owner: lease?.runId === runId ? 'active worker' : null,
+    startedAt,
+    updatedAt,
+    profileVersion: safeToken(manifest.compatibility?.profileVersion),
+    pipelineVersion: safeToken(manifest.compatibility?.pipelineVersion),
+    completedStages,
+    assessment: assessmentProgress(manifest, events),
+    recoveryCount: Array.isArray(manifest.recoveryAttempts) ? manifest.recoveryAttempts.length : 0,
+    terminalReason: safeToken(failure?.payload?.reason)
+      || (['partial', 'abandoned', 'failed'].includes(state) ? 'reason-not-recorded' : null),
+  };
+  return Object.fromEntries(Object.entries(result).filter(([, value]) => value !== undefined));
+}
+
+export function publicQueueSummary(projection = {}) {
+  const requests = (Array.isArray(projection.requests) ? projection.requests : []).map((request) => {
+    const item = {
+      id: shortId(request.id),
+      status: safeToken(request.status) || 'queued',
+      requester: ['manual', 'scheduled'].includes(request.requester) ? request.requester : 'manual',
+      purpose: safeToken(request.purpose),
+      requestedAt: typeof request.requestedAt === 'string' ? request.requestedAt : null,
+      expiresAt: typeof request.expiresAt === 'string' ? request.expiresAt : null,
+    };
+    if (request.claim?.runId) item.runId = shortId(request.claim.runId);
+    if (request.claim?.owner) item.owner = 'active worker';
+    return item;
+  });
+  return {
+    state: requests.some((request) => request.status === 'queued') ? 'queued' : 'waiting',
+    generatedAt: typeof projection.generatedAt === 'string' ? projection.generatedAt : null,
+    requests,
+  };
+}
+
+export function readPublicRunSummaries(root, { lease = null } = {}) {
+  const directory = workspacePaths(root).runs;
+  if (!fs.existsSync(directory)) return { state: 'waiting', runs: [] };
+  const runs = [];
+  for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
+    if (!entry.isDirectory()) continue;
+    const journalFile = path.join(directory, entry.name, 'journal.jsonl');
+    if (!fs.existsSync(journalFile)) continue;
+    try {
+      const { events } = validateRunJournal(journalFile);
+      if (!events.length) continue;
+      runs.push(publicRunSummary(projectRunManifest(events), { events, lease }));
+    } catch {
+      runs.push({
+        id: 'invalid-run',
+        state: 'failed',
+        label: RUN_LABELS.failed,
+        owner: null,
+        startedAt: null,
+        updatedAt: null,
+        profileVersion: null,
+        pipelineVersion: null,
+        completedStages: [],
+        assessment: null,
+        recoveryCount: 0,
+        terminalReason: 'journal-validation-failed',
+      });
+    }
+  }
+  runs.sort((left, right) => String(right.updatedAt || '').localeCompare(String(left.updatedAt || '')));
+  return { state: runs[0]?.state || 'waiting', runs };
+}
+
+export function readPublicScanQueue(root, now = new Date()) {
+  return publicQueueSummary(projectScanQueue(root, now));
 }

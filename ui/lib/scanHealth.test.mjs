@@ -1,6 +1,12 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { normaliseSourceHealth, parseScanRuns, scanHealthFromText } from './scanHealth.mjs';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import {
+  normaliseSourceHealth, parseScanRuns, publicQueueSummary, publicRunSummary,
+  readPublicRunSummaries, scanHealthFromText,
+} from './scanHealth.mjs';
 
 test('parseScanRuns parses jsonl and reports bad lines', () => {
   const out = parseScanRuns('{"timestamp":"2026-07-08T07:30:00"}\nnope\n');
@@ -79,5 +85,171 @@ test('normaliseSourceHealth prefers explicit source records from new scans', () 
     { name: 'ats', status: 'degraded', count: 8, reason: 'one portal blocked' },
     { name: 'hiring_cafe', status: 'healthy', count: 0, reason: null },
   ]);
+});
+
+function event(sequence, type, stageId, payload = {}) {
+  return {
+    sequence, type, stageId, recordedAt: `2026-07-29T00:00:${String(sequence).padStart(2, '0')}.000Z`,
+    payload,
+  };
+}
+
+function runFixture({ outcome = 'in-progress', completed = [], tail = [], runId = 'run-1234567890-private' } = {}) {
+  const events = [
+    event(1, 'run.started', 'initialise', {
+      compatibility: { profileVersion: 'profile-v3', pipelineVersion: 'pipeline-v9' },
+    }),
+    ...completed.map((stageId, index) => event(index + 2, 'stage.completed', stageId, {})),
+    ...tail,
+  ];
+  return {
+    manifest: {
+      runId, outcome,
+      compatibility: { profileVersion: 'profile-v3', pipelineVersion: 'pipeline-v9' },
+      completedWork: completed.map((stageId, index) => ({ stageId, sequence: index + 2 })),
+      recoveryAttempts: tail.filter((item) => item.type === 'recovery.started'),
+    },
+    events,
+  };
+}
+
+test('public run summaries cover every durable pipeline and terminal state', () => {
+  const cases = [
+    ['collecting', []],
+    ['normalising', ['collect']],
+    ['deduplicating', ['collect', 'normalise']],
+    ['filtering', ['collect', 'normalise', 'deduplicate']],
+    ['ranking', ['collect', 'normalise', 'deduplicate', 'filter']],
+    ['selecting', ['collect', 'normalise', 'deduplicate', 'filter', 'rank']],
+    ['assessing', ['collect', 'normalise', 'deduplicate', 'filter', 'rank', 'select']],
+    ['updating-tracker', ['collect', 'normalise', 'deduplicate', 'filter', 'rank', 'select', 'assess']],
+    ['writing-report', ['collect', 'normalise', 'deduplicate', 'filter', 'rank', 'select', 'assess', 'tracker']],
+  ];
+  for (const [want, completed] of cases) {
+    const fixture = runFixture({ completed });
+    assert.equal(publicRunSummary(fixture.manifest, { events: fixture.events }).state, want);
+  }
+  for (const outcome of ['partial', 'abandoned', 'failed', 'complete']) {
+    const fixture = runFixture({ outcome });
+    assert.equal(publicRunSummary(fixture.manifest, { events: fixture.events }).state, outcome);
+  }
+});
+
+test('public run summaries show durable assessment repair, batch progress and recovery evidence', () => {
+  const selected = ['collect', 'normalise', 'deduplicate', 'filter', 'rank', 'select'];
+  const assessment = runFixture({
+    completed: selected,
+    tail: [
+      event(8, 'assessment.batch-attempted', 'assessment', {
+        reference: { id: 'batch-1' }, count: 10, attempt: 'batch',
+      }),
+      event(9, 'assessment.batch-completed', 'assessment', {
+        reference: { id: 'batch-1' }, count: 10,
+      }),
+      event(10, 'assessment.batch-attempted', 'assessment', {
+        reference: { id: 'batch-2' }, count: 3, attempt: 'repair',
+      }),
+      event(11, 'assessment.job-completed', 'assessment', { reference: { id: 'job-11' } }),
+      event(12, 'assessment.job-failed', 'assessment', { reference: { id: 'job-12' } }),
+    ],
+  });
+  assessment.manifest.completedWork.find((work) => work.stageId === 'select').count = 20;
+  const repairing = publicRunSummary(assessment.manifest, { events: assessment.events });
+  assert.equal(repairing.state, 'repairing');
+  assert.deepEqual(repairing.assessment, {
+    currentBatch: 2, totalBatches: 2, totalBatchesExact: false,
+    completedBatches: 1, completedJobs: 1, failedJobs: 1,
+  });
+
+  const recoveryEvent = event(8, 'recovery.started', 'recover', {});
+  const recovery = runFixture({ completed: ['collect'], tail: [recoveryEvent] });
+  recovery.manifest.recoveryAttempts = [{ sequence: 8 }];
+  const summary = publicRunSummary(recovery.manifest, { events: recovery.events });
+  assert.equal(summary.state, 'recovering');
+  assert.equal(summary.recoveryCount, 1);
+});
+
+test('active assessment totals are marked as lower bounds and missing failure reasons stay auditable', () => {
+  const active = runFixture({
+    completed: ['collect', 'normalise', 'deduplicate', 'filter', 'rank', 'select'],
+    tail: [event(8, 'assessment.batch-attempted', 'assessment', {
+      reference: { id: 'context-limited-batch-1' }, count: 2, attempt: 'batch',
+    })],
+  });
+  active.manifest.completedWork.find((work) => work.stageId === 'select').count = 20;
+  assert.deepEqual(publicRunSummary(active.manifest, { events: active.events }).assessment, {
+    currentBatch: 1, totalBatches: 2, totalBatchesExact: false,
+    completedBatches: 0, completedJobs: 0, failedJobs: 0,
+  });
+
+  const failed = runFixture({ outcome: 'failed' });
+  assert.equal(
+    publicRunSummary(failed.manifest, { events: failed.events }).terminalReason,
+    'reason-not-recorded',
+  );
+});
+
+test('public run and queue summaries use closed privacy-safe projections', () => {
+  const fullRunId = 'run-1234567890-private';
+  const fixture = runFixture({
+    runId: fullRunId,
+    outcome: 'failed',
+    tail: [event(2, 'run.failure-recorded', 'finalise', {
+      code: 'provider-timeout', reason: 'provider-timeout',
+      prompt: 'private prompt', advert: 'full advert body', providerOutput: 'raw output',
+    })],
+  });
+  fixture.manifest.host = 'PRIVATE-HOST';
+  fixture.manifest.pid = 4242;
+  fixture.manifest.path = 'C:\\private\\workspace';
+  fixture.manifest.cv = 'private CV body';
+  const run = publicRunSummary(fixture.manifest, {
+    events: fixture.events,
+    lease: {
+      runId: fullRunId, owner: { host: 'PRIVATE-HOST', pid: 4242, processStart: 'private-start' },
+    },
+  });
+  assert.equal(run.id, 'run-1234…');
+  assert.equal(run.owner, 'active worker');
+  assert.equal(run.terminalReason, 'provider-timeout');
+  const runText = JSON.stringify(run);
+  for (const secret of [fullRunId, 'PRIVATE-HOST', '4242', 'private-start', 'C:\\\\private', 'private prompt', 'full advert body', 'raw output', 'private CV body']) {
+    assert.doesNotMatch(runText, new RegExp(secret.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i'));
+  }
+
+  const queue = publicQueueSummary({
+    generatedAt: '2026-07-29T01:00:00.000Z',
+    requests: [{
+      id: 'request-1234567890-private', status: 'claimed', requester: 'manual',
+      purpose: 'job-discovery', requestedAt: '2026-07-29T00:00:00.000Z',
+      expiresAt: '2026-07-30T00:00:00.000Z',
+      compatibility: { profileFingerprint: 'a'.repeat(64), configFingerprint: 'b'.repeat(64) },
+      execution: { prompt: 'private prompt', token: 'secret-token' },
+      claim: {
+        runId: fullRunId, leaseId: 'private-lease', generation: 7,
+        owner: { host: 'PRIVATE-HOST', pid: 4242, processStart: 'private-start' },
+      },
+    }],
+  });
+  assert.deepEqual(queue.requests[0], {
+    id: 'request-…', status: 'claimed', requester: 'manual', purpose: 'job-discovery',
+    requestedAt: '2026-07-29T00:00:00.000Z', expiresAt: '2026-07-30T00:00:00.000Z',
+    runId: 'run-1234…', owner: 'active worker',
+  });
+  assert.doesNotMatch(JSON.stringify(queue), /PRIVATE-HOST|4242|private-start|private-lease|secret-token|private prompt|a{32}|b{32}/i);
+});
+
+test('a corrupt run directory never publishes its unvalidated name', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'scout-public-run-corrupt-'));
+  try {
+    const directory = path.join(root, '.scout', 'runs', 'private-looking-prefix-secret');
+    fs.mkdirSync(directory, { recursive: true });
+    fs.writeFileSync(path.join(directory, 'journal.jsonl'), '{"not":"a journal"}\n');
+    const result = readPublicRunSummaries(root);
+    assert.equal(result.runs[0].id, 'invalid-run');
+    assert.doesNotMatch(JSON.stringify(result), /private-looking-prefix-secret|private-looking/i);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
 });
 

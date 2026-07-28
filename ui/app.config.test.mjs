@@ -266,6 +266,50 @@ test('scan health labels distinguish selection from successful assessment', () =
   assert.doesNotMatch(html, /vacancies checked/i);
 });
 
+test('run audit renders persisted recovery and queue state without private diagnostic fields', () => {
+  const { scout } = loadScout();
+  scout.scanRuns = [{
+    id: 'run-1234…', state: 'repairing', label: 'Repairing affected jobs',
+    owner: 'active worker', startedAt: '2026-07-29T00:00:00.000Z',
+    updatedAt: '2026-07-29T00:05:00.000Z', profileVersion: 'profile-v3',
+    pipelineVersion: 'pipeline-v9', completedStages: ['collect', 'normalise', 'deduplicate', 'filter', 'rank', 'select'],
+    assessment: {
+      currentBatch: 2, totalBatches: 3, totalBatchesExact: false,
+      completedBatches: 1, completedJobs: 10, failedJobs: 1,
+    },
+    recoveryCount: 2, terminalReason: null,
+    host: 'PRIVATE-HOST', pid: 4242, prompt: 'private prompt', advert: 'full advert body',
+  }];
+  scout.scanQueue = {
+    requests: [{
+      id: 'request-…', status: 'queued', requester: 'manual', purpose: 'job-discovery',
+      requestedAt: '2026-07-29T00:04:00.000Z', expiresAt: '2026-07-30T00:04:00.000Z',
+      prompt: 'private queued prompt',
+    }],
+  };
+  const html = scout.scanRunAuditCard();
+  assert.match(html, /Repairing affected jobs/);
+  assert.match(html, /batch 2 of at least 3/i);
+  assert.match(html, /2 recoveries/i);
+  assert.match(html, /1 queued request/i);
+  assert.match(html, /run-1234…/);
+  assert.doesNotMatch(html, /PRIVATE-HOST|4242|private prompt|full advert body|private queued prompt/i);
+});
+
+test('the Jobs audit remains visible for queue-only and waiting workspaces', () => {
+  const { scout } = loadScout();
+  scout.latestScan = null;
+  scout.scanRuns = [];
+  scout.scanRunState = 'waiting';
+  scout.scanQueue = {
+    state: 'queued',
+    requests: [{ id: 'request-…', status: 'queued', requester: 'manual', purpose: 'job-discovery' }],
+  };
+  assert.match(scout.latestScanCard(), /1 queued request/i);
+  scout.scanQueue = { state: 'waiting', requests: [] };
+  assert.match(scout.latestScanCard(), /Waiting to scan/i);
+});
+
 test('renderJobs lists only new jobs, highest score first, with tags and actions', () => {
   const { scout, context } = loadScout();
   const { doc } = withJobsDom();
