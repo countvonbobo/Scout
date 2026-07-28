@@ -1,5 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
+import { assessmentRecoveryBoundary } from './assessmentBatches.mjs';
 import { projectRunManifest } from './runArtifacts.mjs';
 import { validateRunJournal } from './runJournal.mjs';
 import { projectScanQueue } from './scanQueue.mjs';
@@ -154,8 +155,14 @@ function eventSequence(event) {
 }
 
 function assessmentProgress(manifest, events) {
-  const attempted = events.filter((event) => event.type === 'assessment.batch-attempted');
-  const completed = events.filter((event) => event.type === 'assessment.batch-completed');
+  const boundary = assessmentRecoveryBoundary({ events });
+  const current = events.filter((event) => (
+    event.type.startsWith('assessment.')
+    && eventSequence(event) > boundary.sequence
+    && Number(event.fencingGeneration) >= boundary.fencingGeneration
+  ));
+  const attempted = current.filter((event) => event.type === 'assessment.batch-attempted');
+  const completed = current.filter((event) => event.type === 'assessment.batch-completed');
   const batchIds = new Set(attempted.map((event) => event.payload?.reference?.id).filter(Boolean));
   const selectedCount = Number(manifest.completedWork?.find((work) => work.stageId === 'select')?.count || 0);
   const totalBatches = Math.max(batchIds.size, completed.length, Math.ceil(selectedCount / 10));
@@ -168,16 +175,18 @@ function assessmentProgress(manifest, events) {
     totalBatches,
     totalBatchesExact: manifest.completedWork?.some((work) => work.stageId === 'assess') || false,
     completedBatches: new Set(completed.map((event) => event.payload?.reference?.id).filter(Boolean)).size,
-    completedJobs: events.filter((event) => event.type === 'assessment.job-completed').length,
-    failedJobs: events.filter((event) => event.type === 'assessment.job-failed').length,
+    completedJobs: current.filter((event) => event.type === 'assessment.job-completed').length,
+    failedJobs: current.filter((event) => event.type === 'assessment.job-failed').length,
   };
 }
 
 function durableRunState(manifest, events) {
   if (['partial', 'abandoned', 'failed', 'complete'].includes(manifest?.outcome)) return manifest.outcome;
   const latestRecovery = [...events].reverse().find((event) => event.type === 'recovery.started');
-  const latestStage = [...events].reverse().find((event) => event.type === 'stage.completed');
-  if (latestRecovery && eventSequence(latestRecovery) > eventSequence(latestStage)) return 'recovering';
+  const latestWork = [...events].reverse().find((event) => (
+    event.type === 'stage.completed' || event.type.startsWith('assessment.') || event.type.startsWith('mutation.')
+  ));
+  if (latestRecovery && eventSequence(latestRecovery) > eventSequence(latestWork)) return 'recovering';
   const latestAttempt = [...events].reverse().find((event) => event.type === 'assessment.batch-attempted');
   const assessCompleted = manifest?.completedWork?.some((work) => work.stageId === 'assess');
   if (latestAttempt && !assessCompleted && /^(?:repair|retry-)/.test(String(latestAttempt.payload?.attempt || ''))) return 'repairing';
@@ -186,7 +195,18 @@ function durableRunState(manifest, events) {
   return NEXT_RUN_STATE[completed.at(-1).stageId] || 'finalising';
 }
 
-export function publicRunSummary(manifest = {}, { events = [], lease = null } = {}) {
+function hasCurrentActiveLease(lease, runId, outcome, now) {
+  if (!lease || lease.runId !== runId || outcome !== 'in-progress' || lease.lastTerminalSequence !== null) return false;
+  if (!(now instanceof Date) || Number.isNaN(now.getTime())) throw new TypeError('run projection time must be a date');
+  const expiresAt = Date.parse(lease.expiresAt || '');
+  if (!Number.isFinite(expiresAt) || expiresAt <= now.getTime()) return false;
+  const owner = lease.owner;
+  return Boolean(owner && typeof owner.host === 'string' && owner.host
+    && Number.isSafeInteger(owner.pid) && owner.pid > 0
+    && typeof owner.processStart === 'string' && owner.processStart);
+}
+
+export function publicRunSummary(manifest = {}, { events = [], lease = null, now = new Date() } = {}) {
   const state = durableRunState(manifest, events);
   const failure = [...events].reverse().find((event) => event.type === 'run.failure-recorded');
   const completedStages = (manifest.completedWork || []).map((work) => safeToken(work.stageId)).filter(Boolean);
@@ -197,7 +217,7 @@ export function publicRunSummary(manifest = {}, { events = [], lease = null } = 
     id: shortId(runId),
     state,
     label: RUN_LABELS[state] || RUN_LABELS.waiting,
-    owner: lease?.runId === runId ? 'active worker' : null,
+    owner: hasCurrentActiveLease(lease, runId, manifest.outcome, now) ? 'active worker' : null,
     startedAt,
     updatedAt,
     profileVersion: safeToken(manifest.compatibility?.profileVersion),
@@ -232,7 +252,7 @@ export function publicQueueSummary(projection = {}) {
   };
 }
 
-export function readPublicRunSummaries(root, { lease = null } = {}) {
+export function readPublicRunSummaries(root, { lease = null, now = new Date() } = {}) {
   const directory = workspacePaths(root).runs;
   if (!fs.existsSync(directory)) return { state: 'waiting', runs: [] };
   const runs = [];
@@ -243,7 +263,7 @@ export function readPublicRunSummaries(root, { lease = null } = {}) {
     try {
       const { events } = validateRunJournal(journalFile);
       if (!events.length) continue;
-      runs.push(publicRunSummary(projectRunManifest(events), { events, lease }));
+      runs.push(publicRunSummary(projectRunManifest(events), { events, lease, now }));
     } catch {
       runs.push({
         id: 'invalid-run',

@@ -87,10 +87,10 @@ test('normaliseSourceHealth prefers explicit source records from new scans', () 
   ]);
 });
 
-function event(sequence, type, stageId, payload = {}) {
+function event(sequence, type, stageId, payload = {}, fencingGeneration = 1) {
   return {
     sequence, type, stageId, recordedAt: `2026-07-29T00:00:${String(sequence).padStart(2, '0')}.000Z`,
-    payload,
+    fencingGeneration, payload,
   };
 }
 
@@ -189,6 +189,88 @@ test('active assessment totals are marked as lower bounds and missing failure re
   );
 });
 
+test('assessment restart recovery ignores superseded batches and jobs for schema v1 and upstream schema v2', () => {
+  for (const recovery of [
+    event(12, 'recovery.started', 'recover', { schemaVersion: 1 }, 2),
+    event(12, 'recovery.started', 'recover', {
+      schemaVersion: 2,
+      decisions: [{ stageId: 'select', action: 'restart', reason: 'ranking-version-mismatch' }],
+    }, 2),
+  ]) {
+    const fixture = runFixture({
+      completed: ['collect', 'normalise', 'deduplicate', 'filter', 'rank', 'select'],
+      tail: [
+        event(8, 'assessment.batch-attempted', 'assessment', {
+          reference: { id: 'old-batch' }, count: 2, attempt: 'batch',
+        }),
+        event(9, 'assessment.job-completed', 'assessment', { reference: { id: 'old-complete' } }),
+        event(10, 'assessment.job-failed', 'assessment', { reference: { id: 'old-failed' } }),
+        event(11, 'assessment.batch-completed', 'assessment', {
+          reference: { id: 'old-batch' }, count: 2,
+        }),
+        recovery,
+        event(13, 'assessment.batch-attempted', 'assessment', {
+          reference: { id: 'new-batch' }, count: 1, attempt: 'batch',
+        }, 2),
+      ],
+    });
+    fixture.manifest.completedWork.find((work) => work.stageId === 'select').count = 20;
+    assert.deepEqual(publicRunSummary(fixture.manifest, { events: fixture.events }).assessment, {
+      currentBatch: 1, totalBatches: 2, totalBatchesExact: false,
+      completedBatches: 0, completedJobs: 0, failedJobs: 0,
+    });
+  }
+});
+
+test('assessment reuse recovery preserves valid earlier progress', () => {
+  const fixture = runFixture({
+    completed: ['collect', 'normalise', 'deduplicate', 'filter', 'rank', 'select'],
+    tail: [
+      event(8, 'assessment.batch-attempted', 'assessment', {
+        reference: { id: 'batch-1' }, count: 2, attempt: 'batch',
+      }),
+      event(9, 'assessment.job-completed', 'assessment', { reference: { id: 'job-complete' } }),
+      event(10, 'assessment.job-failed', 'assessment', { reference: { id: 'job-failed' } }),
+      event(11, 'assessment.batch-completed', 'assessment', {
+        reference: { id: 'batch-1' }, count: 2,
+      }),
+      event(12, 'recovery.started', 'recover', {
+        schemaVersion: 2,
+        decisions: [{ stageId: 'assess', action: 'reuse', reason: 'compatible' }],
+      }, 2),
+      event(13, 'assessment.batch-attempted', 'assessment', {
+        reference: { id: 'batch-2' }, count: 1, attempt: 'batch',
+      }, 2),
+    ],
+  });
+  assert.deepEqual(publicRunSummary(fixture.manifest, { events: fixture.events }).assessment, {
+    currentBatch: 2, totalBatches: 2, totalBatchesExact: false,
+    completedBatches: 1, completedJobs: 1, failedJobs: 1,
+  });
+});
+
+test('active worker is shown only for a current nonterminal lease', () => {
+  const now = new Date('2026-07-29T00:00:30.000Z');
+  const fixture = runFixture();
+  const lease = {
+    runId: fixture.manifest.runId,
+    expiresAt: '2026-07-29T00:01:00.000Z',
+    lastTerminalSequence: null,
+    owner: { host: 'PRIVATE-HOST', pid: 4242, processStart: 'private-start' },
+  };
+  assert.equal(publicRunSummary(fixture.manifest, { events: fixture.events, lease, now }).owner, 'active worker');
+  assert.equal(publicRunSummary(fixture.manifest, {
+    events: fixture.events,
+    lease: { ...lease, expiresAt: '2026-07-29T00:00:30.000Z' },
+    now,
+  }).owner, null);
+  assert.equal(publicRunSummary({ ...fixture.manifest, outcome: 'complete' }, {
+    events: fixture.events,
+    lease: { ...lease, lastTerminalSequence: 4 },
+    now,
+  }).owner, null);
+});
+
 test('public run and queue summaries use closed privacy-safe projections', () => {
   const fullRunId = 'run-1234567890-private';
   const fixture = runFixture({
@@ -206,11 +288,13 @@ test('public run and queue summaries use closed privacy-safe projections', () =>
   const run = publicRunSummary(fixture.manifest, {
     events: fixture.events,
     lease: {
-      runId: fullRunId, owner: { host: 'PRIVATE-HOST', pid: 4242, processStart: 'private-start' },
+      runId: fullRunId, expiresAt: '2026-07-29T01:00:00.000Z', lastTerminalSequence: null,
+      owner: { host: 'PRIVATE-HOST', pid: 4242, processStart: 'private-start' },
     },
+    now: new Date('2026-07-29T00:30:00.000Z'),
   });
   assert.equal(run.id, 'run-1234…');
-  assert.equal(run.owner, 'active worker');
+  assert.equal(run.owner, null);
   assert.equal(run.terminalReason, 'provider-timeout');
   const runText = JSON.stringify(run);
   for (const secret of [fullRunId, 'PRIVATE-HOST', '4242', 'private-start', 'C:\\\\private', 'private prompt', 'full advert body', 'raw output', 'private CV body']) {

@@ -386,17 +386,21 @@ export function validateAssessmentJob(value, job) {
   return Object.freeze([]);
 }
 
-function assessmentRecoveryBoundary(run) {
+const ASSESSMENT_INVALIDATING_STAGES = new Set([
+  'collect', 'normalise', 'deduplicate', 'filter', 'rank', 'select', 'assess', 'assessment',
+]);
+
+export function assessmentRecoveryBoundary(run) {
   let boundary = { sequence: 0, fencingGeneration: 1 };
   for (const event of run.events || []) {
     let restart = false;
     if (event.type === 'recovery.started') {
       restart = event.payload.schemaVersion === 1
         || event.payload.decisions?.some((decision) => (
-          ['assess', 'assessment'].includes(decision.stageId) && decision.action === 'restart'
+          ASSESSMENT_INVALIDATING_STAGES.has(decision.stageId) && decision.action === 'restart'
         ));
     } else if (event.type === 'recovery.stage-decided') {
-      restart = ['assess', 'assessment'].includes(event.stageId) && event.payload.action === 'restart';
+      restart = ASSESSMENT_INVALIDATING_STAGES.has(event.stageId) && event.payload.action === 'restart';
     }
     if (restart) {
       boundary = {
