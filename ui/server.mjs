@@ -1278,6 +1278,16 @@ routes['POST /api/scan'] = (req, res, body) => {
     const estimate = scanEstimate(readScanRecords(), provider, 'primary');
     const operation = operations.start('scan', async (update) => {
       const result = await runScan(WORKSPACE_ROOT, provider, 'primary', { onProgress: update, model, autoBroaden: true, estimate });
+      if (!result.ok && result.status === 'in-progress'
+        && result.reason === 'operator-intervention-required') {
+        update({ phase: 'Operator intervention required' });
+        return {
+          ok: false,
+          status: result.status,
+          reason: result.reason,
+          runId: result.runId || null,
+        };
+      }
       if (!result.ok) throw new Error(result.error || `scan ended with ${result.status}`);
       const scanHealth = readScanHealth();
       return {

@@ -533,6 +533,7 @@ export async function runScanWith(root, provider, mode, {
   scheduleId = null,
   logicalWindowId = null,
   queueWorkspaceSyncFn = queueWorkspaceSync,
+  heartbeatOptions = {},
 } = {}) {
   if (!['codex', 'claude'].includes(provider)) throw new Error('provider must be codex or claude');
   if (!['primary', 'second-pass', 'broadened'].includes(mode)) throw new Error('mode must be primary, broadened or second-pass');
@@ -611,6 +612,7 @@ export async function runScanWith(root, provider, mode, {
       compatibility,
       stages,
       claimedLease,
+      heartbeatOptions,
       prepare({ lease }) {
         assertCurrentFence(lease, synchronousFenceCallback(() => {
           syncManagedInstructions(APP_ROOT, root);
@@ -652,7 +654,17 @@ export async function runScanWith(root, provider, mode, {
             scheduleId: execution.scheduleId,
             logicalWindowId: execution.logicalWindowId,
             queueWorkspaceSyncFn,
+            heartbeatOptions,
           });
+          if (queued.status === 'in-progress'
+            && queued.reason === 'operator-intervention-required'
+            && typeof queued.providerClosure?.then === 'function') {
+            return {
+              outcome: 'in-progress',
+              reason: 'operator-intervention-required',
+              closure: queued.providerClosure,
+            };
+          }
           return queuedScanOutcome(queued.durable)
             || (queued.status === 'skipped' ? 'skipped' : 'failed');
         },
@@ -863,6 +875,20 @@ export async function runScanWith(root, provider, mode, {
         error: failure?.message || (failure?.code === 'lease-busy' ? 'another scan is already running' : 'durable scan pipeline failed'),
       };
     }
+    const intervention = durable.outcome === 'in-progress'
+      && durable.failures.find((failure) => (
+        failure.code === 'provider-lifecycle-unclosed'
+        && failure.reason === 'operator-intervention-required'
+      ));
+    if (intervention) {
+      result = {
+        ...(result || {}),
+        ok: false,
+        status: 'in-progress',
+        reason: intervention.reason,
+        error: 'provider lifecycle remains unresolved; operator intervention is required',
+      };
+    }
     result = {
       ...result,
       runId: durable.runId,
@@ -872,6 +898,12 @@ export async function runScanWith(root, provider, mode, {
         failures: durable.failures,
       },
     };
+    if (durable.providerClosure) {
+      Object.defineProperty(result, 'providerClosure', {
+        value: durable.providerClosure,
+        enumerable: false,
+      });
+    }
     if (result.ok) onProgress({ phase: 'Scan completed', current: 5, total: 5 });
   } catch (error) {
     result = { ok: false, status: 'failed', error: error.message };

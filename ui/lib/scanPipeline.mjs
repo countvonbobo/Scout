@@ -47,6 +47,7 @@ const BOUNDED_REASON = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
 const SUCCESSFUL_QUEUE_OUTCOMES = new Set([
   'succeeded', 'succeeded-pending', 'succeeded-partial',
 ]);
+const OPERATOR_INTERVENTION_REASON = 'operator-intervention-required';
 
 export class PipelineInterruptedError extends Error {
   constructor(message = 'scan pipeline was interrupted after a durable stage') {
@@ -158,11 +159,17 @@ function recoveredStageData(stage, codec) {
   return plainStageData(codec.decode(value.data), stage.stageId);
 }
 
-function resultWithOutputs(result, outputs) {
+function resultWithOutputs(result, outputs, { providerClosure = null } = {}) {
   Object.defineProperty(result, 'stageOutputs', {
     value: Object.freeze(Object.fromEntries(outputs)),
     enumerable: false,
   });
+  if (providerClosure) {
+    Object.defineProperty(result, 'providerClosure', {
+      value: providerClosure,
+      enumerable: false,
+    });
+  }
   return Object.freeze(result);
 }
 
@@ -277,6 +284,33 @@ async function drainScanQueue(root, queue, compatibility, leaseOptions, initialL
       let queueFailure = null;
       try {
         const value = await queue.run(request, { runId: lease.runId, lease });
+        if (value?.outcome === 'in-progress'
+          && value.reason === OPERATOR_INTERVENTION_REASON
+          && typeof value.closure?.then === 'function') {
+          const failure = Object.freeze({
+            code: 'provider-lifecycle-unclosed',
+            stage: 'finalise',
+            reason: OPERATOR_INTERVENTION_REASON,
+          });
+          drained.push(Object.freeze({
+            requestId: request.id,
+            outcome: 'in-progress',
+            reason: OPERATOR_INTERVENTION_REASON,
+          }));
+          Object.defineProperty(drained, 'paused', {
+            value: Object.freeze({
+              requestId: request.id,
+              runId: lease.runId,
+              closure: value.closure,
+              failure,
+            }),
+            enumerable: false,
+          });
+          value.closure.then(() => {
+            try { releaseScanLease(lease); } catch { /* recovery owns any successor fence */ }
+          });
+          return drained;
+        }
         requestedOutcome = value === 'complete' ? 'succeeded'
           : SUCCESSFUL_QUEUE_OUTCOMES.has(value) || value === 'skipped' ? value : 'failed';
       } catch (error) {
@@ -494,7 +528,16 @@ export async function runScanPipeline({
       lease,
       pipelineOperation(startupQueueRunId, startupCompatibility, 'queue-drain'),
     );
-    await drainScanQueue(root, queue, compatibility, leaseOptions, lease);
+    const startupDrain = await drainScanQueue(root, queue, compatibility, leaseOptions, lease);
+    if (startupDrain.paused) {
+      const pausedRun = openRunJournal(root, startupDrain.paused.runId);
+      return resultWithOutputs({
+        runId: startupDrain.paused.runId,
+        outcome: 'in-progress',
+        manifest: projectRunManifest(pausedRun.events),
+        failures: Object.freeze([startupDrain.paused.failure]),
+      }, new Map(), { providerClosure: startupDrain.paused.closure });
+    }
     lease = acquireScanLease(
       root,
       currentLeaseOwner(),
@@ -518,6 +561,7 @@ export async function runScanPipeline({
   let released = false;
   let retainInterruptedLease = false;
   let retainUnclosedAuthority = false;
+  let providerClosure = null;
   let heartbeat = null;
   const failures = [];
   const outputs = new Map();
@@ -672,6 +716,7 @@ export async function runScanPipeline({
   } catch (error) {
     if (error instanceof ProviderLifecycleUnclosedError) {
       retainUnclosedAuthority = true;
+      providerClosure = error.closure;
       const failure = Object.freeze({
         code: 'provider-lifecycle-unclosed',
         stage: 'finalise',
@@ -780,7 +825,7 @@ export async function runScanPipeline({
     outcome: manifest?.outcome ?? 'failed',
     manifest,
     failures: Object.freeze(failures),
-  }, outputs);
+  }, outputs, { providerClosure });
 }
 
 function boundedText(value, maximum = 220) {

@@ -11,6 +11,7 @@ import { publishSearchProfile } from '../ui/lib/searchProfile.mjs';
 import { replayRunJournal } from '../ui/lib/runJournal.mjs';
 import { projectScanQueue } from '../ui/lib/scanQueue.mjs';
 import { acquireScanLease, currentLeaseOwner, readScanLease, releaseScanLease } from '../ui/lib/scanLease.mjs';
+import { ProviderLifecycleUnclosedError } from '../ui/lib/structuredTurn.mjs';
 
 function scanRoot() {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'scout-runtime-scan-'));
@@ -890,6 +891,106 @@ test('a queued backup-pending success remains visibly pending in durable queue s
       fs.readFileSync(path.join(root, '.scout', 'scan-queue.jsonl'), 'utf8'),
       /PRIVATE_QUEUE_OFFLINE_DETAIL/,
     );
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('a real queued unclosed provider remains claimed with a live fence and coherent public status', async () => {
+  const root = readyScanRoot();
+  enableRankedDiscovery(root);
+  const active = acquireScanLease(root, currentLeaseOwner(), {
+    kind: 'scan',
+    runId: 'queue-unclosed-seed',
+    provider: 'claude',
+    model: 'provider-default',
+    mode: 'primary',
+    phase: 'collect',
+  });
+  const sourceResult = {
+    generatedAt: '2026-07-28T09:00:00.000Z',
+    queries: [],
+    sources: {
+      hiring_cafe: {
+        configured: true,
+        status: 'healthy',
+        count: 1,
+        jobs: [{
+          company: 'Able',
+          title: 'Ideal Role',
+          providerId: 'queue-unclosed-1',
+          url: 'https://example.test/jobs/queue-unclosed',
+          description: 'Ideal role responsibility.',
+        }],
+      },
+    },
+  };
+  const activeHeartbeatTimers = new Set();
+  let nextHeartbeatTimer = 0;
+  const options = {
+    providerStatusFn: authenticated,
+    collectSourcesFn: async () => sourceResult,
+    runStructuredTurnFn: () => Promise.reject(new ProviderLifecycleUnclosedError(
+      'provider process did not close',
+      new Promise(() => {}),
+    )),
+    checkLivenessFn: async (candidates) => ({
+      live: candidates,
+      removed: [],
+      summary: { checked: candidates.length, gone: 0, unverified: 0 },
+    }),
+    heartbeatOptions: {
+      intervalMs: 100,
+      setTimeoutFn() {
+        const timer = { id: ++nextHeartbeatTimer, unref() {} };
+        activeHeartbeatTimers.add(timer.id);
+        return timer;
+      },
+      clearTimeoutFn(timer) {
+        activeHeartbeatTimers.delete(timer.id);
+      },
+    },
+  };
+  try {
+    const first = await runScanWith(root, 'codex', 'primary', options);
+    const successor = await runScanWith(root, 'codex', 'broadened', options);
+    assert.equal(first.status, 'queued');
+    assert.equal(successor.status, 'queued');
+  } finally {
+    releaseScanLease(active);
+  }
+
+  try {
+    const result = await runScanWith(root, 'codex', 'second-pass', options);
+
+    assert.equal(result.ok, false);
+    assert.equal(result.status, 'in-progress');
+    assert.equal(result.reason, 'operator-intervention-required');
+    assert.equal(result.durable.outcome, 'in-progress');
+    assert.deepEqual(result.durable.failures, [{
+      code: 'provider-lifecycle-unclosed',
+      stage: 'finalise',
+      reason: 'operator-intervention-required',
+    }]);
+
+    const queue = projectScanQueue(root).requests;
+    assert.equal(queue.length, 2);
+    assert.equal(queue[0].status, 'claimed');
+    assert.equal(queue[1].status, 'queued');
+    assert.equal(queue[1].claim, null);
+    const lease = readScanLease(root);
+    assert.ok(lease);
+    assert.equal(lease.runId, queue[0].claim.runId);
+    assert.equal(activeHeartbeatTimers.size, 1);
+
+    const events = replayRunJournal(path.join(
+      root, '.scout', 'runs', queue[0].claim.runId, 'journal.jsonl',
+    ));
+    assert.equal(events.some((event) => event.type === 'run.completed'), false);
+    assert.ok(events.some((event) => (
+      event.type === 'run.failure-recorded'
+      && event.payload.reason === 'operator-intervention-required'
+    )));
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }
