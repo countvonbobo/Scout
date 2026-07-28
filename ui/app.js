@@ -2061,20 +2061,44 @@ const Scout = {
   engineCardHtml(engine, info) {
     const name = engine[0].toUpperCase() + engine.slice(1);
     const models = info?.models || [];
-    const selected = this.enginePicks?.[engine] ?? (info?.defaultModel || '');
-    const option = (value, label) => `<option value="${this.esc(value)}" ${String(selected) === String(value) ? 'selected' : ''}>${this.esc(label)}</option>`;
+    const selected = this.enginePicks?.[engine] ?? '';
+    const effective = info?.effectiveModel || {
+      id: info?.defaultModel || null,
+      label: info?.defaultModel || 'Provider default (model unknown)',
+      known: Boolean(info?.defaultModel),
+      available: 'unknown',
+    };
+    const defaultUnavailable = effective.available === false;
+    const defaultLabel = defaultUnavailable
+      ? `Provider default unavailable — ${effective.label}`
+      : effective.known ? `Provider default — ${effective.label}` : 'Provider default — model unknown';
+    const option = (value, label, { disabled = false } = {}) =>
+      `<option value="${this.esc(value)}" ${disabled ? 'disabled' : ''} ${String(selected) === String(value) ? 'selected' : ''}>${this.esc(label)}</option>`;
+    const catalogueLabel = info?.catalogue?.state === 'refreshed'
+      ? 'refreshed catalogue'
+      : 'bundled fallback · availability may be unknown';
+    const modelLabel = (model) => [
+      model.label,
+      model.tradeoff,
+      model.available === false ? 'unavailable' : model.available === 'unknown' ? 'availability unknown' : '',
+    ].filter(Boolean).join(' — ');
+    const unavailableExplanation = defaultUnavailable
+      ? `<div class="engine-model-warning" role="status">Saved default unavailable. Choose another model before starting this chat.</div>`
+      : '';
     return `<div class="engine-card" data-engine-card="${this.esc(engine)}">
-      <div class="engine-head"><b>${this.esc(name)}</b>${info?.defaultModel ? `<span class="chip">default ${this.esc(info.defaultModel)}</span>` : ''}</div>
+      <div class="engine-head"><b>${this.esc(name)}</b><span class="chip">${this.esc(catalogueLabel)}</span></div>
       <div class="engine-usage-block">${this.engineUsageHtml(engine, info?.usage)}</div>
       <label class="engine-model">Model
         <select data-engine-model="${this.esc(engine)}">
-          ${option('', 'Provider default')}
-          ${models.map((model) => option(model.id, model.label + (model.detected ? ' · used here' : ''))).join('')}
+          ${option('', defaultLabel, { disabled: defaultUnavailable })}
+          ${models.map((model) => option(model.id, modelLabel(model), { disabled: model.available === false })).join('')}
           ${option('__other__', 'Other…')}
         </select>
       </label>
       <input class="engine-model-custom ${selected === '__other__' ? '' : 'hidden'}" data-engine-model-custom="${this.esc(engine)}" type="text" placeholder="Exact model id" pattern="[A-Za-z0-9._:\-]+">
       <div class="engine-model-spend">${this.modelSpendHtml(engine, info?.usage, selected)}</div>
+      ${unavailableExplanation}
+      <div class="engine-model-status meta" role="status" aria-live="polite"></div>
       <button class="act primary" data-action="pick-engine" data-engine="${this.esc(engine)}">Use ${this.esc(name)}</button>
     </div>`;
   },
@@ -2166,8 +2190,11 @@ const Scout = {
     if (!card) return;
     this.enginePicks = { ...this.enginePicks, [engine]: select.value };
     card.querySelector('[data-engine-model-custom]')?.classList.toggle('hidden', select.value !== '__other__');
+    const status = card.querySelector('.engine-model-status');
+    if (status) status.textContent = '';
     const spend = card.querySelector('.engine-model-spend');
-    if (spend) spend.innerHTML = this.modelSpendHtml(engine, this.engineOptions?.engines?.[engine]?.usage, select.value);
+    const info = this.chatDrawerState?.engines?.value?.engines?.[engine];
+    if (spend) spend.innerHTML = this.modelSpendHtml(engine, info?.usage, select.value);
   },
 
   selectedEngineModel(engine) {
@@ -2275,8 +2302,21 @@ const Scout = {
 
   pickEngine(engine) {
     const val = document.getElementById('chat-input').value;
+    const card = document.querySelector(`[data-engine-card="${engine}"]`);
+    const selection = card?.querySelector('[data-engine-model]')?.value || '';
+    const info = this.chatDrawerState?.engines?.value?.engines?.[engine];
+    const status = card?.querySelector('.engine-model-status');
+    if (!selection && info?.effectiveModel?.available === false) {
+      if (status) status.textContent = 'Choose an available model before starting this chat.';
+      return;
+    }
+    const model = this.selectedEngineModel(engine);
+    if (selection === '__other__' && !/^[A-Za-z0-9._:-]+$/.test(String(model || ''))) {
+      if (status) status.textContent = 'Enter a safe exact model ID.';
+      return;
+    }
     this.chat.engine = engine;
-    this.chat.model = this.selectedEngineModel(engine);
+    this.chat.model = model;
     this.renderChatDrawer();
     document.getElementById('chat-input').value = val;
   },

@@ -3,7 +3,9 @@ import { test } from 'node:test';
 import {
   assertSafeModel,
   commandInvocation,
+  codexModelCatalogueStatus,
   createProviderDetector,
+  createProviderModelCatalogueDetector,
   providerEnvironment,
   providerCandidates,
   providerCommand,
@@ -234,4 +236,79 @@ test('Windows cmd shims use cmd.exe without enabling a Node shell', () => {
 test('model overrides reject shell metacharacters', () => {
   assert.equal(assertSafeModel('gpt-example-1'), 'gpt-example-1');
   assert.throws(() => assertSafeModel('model & calc'), /invalid model/);
+});
+
+test('Codex catalogue discovery uses fixed argv, shell false and bounded execution', async () => {
+  const calls = [];
+  const result = await codexModelCatalogueStatus({
+    installed: true,
+    authenticated: true,
+    executable: '/synthetic/codex',
+    env: { SYNTHETIC: '1' },
+  }, {
+    platform: 'linux',
+    run: async (command, args, options) => {
+      calls.push({ command, args, options });
+      return {
+        status: 0,
+        stdout: JSON.stringify({ models: [{ slug: 'gpt-5.6-sol', is_default: true }] }),
+        stderr: '',
+      };
+    },
+  });
+  assert.equal(result.state, 'refreshed');
+  assert.deepEqual(result.models, [{ id: 'gpt-5.6-sol', isDefault: true }]);
+  assert.deepEqual(calls[0].args, ['debug', 'models']);
+  assert.equal(calls[0].options.shell, false);
+  assert.ok(calls[0].options.timeoutMs <= 10_000);
+  assert.ok(calls[0].options.maxOutputBytes <= 524_288);
+});
+
+test('unsupported, malformed, oversized and timed-out catalogues fail closed without raw output', async () => {
+  const status = {
+    installed: true,
+    authenticated: true,
+    executable: '/Users/example/.local/bin/codex',
+    env: {},
+  };
+  const cases = [
+    { status: 2, stdout: '', stderr: 'unknown command person@example.test token=secret' },
+    { status: 0, stdout: '{', stderr: '/Users/example/.codex' },
+    { status: 0, stdout: 'x'.repeat(600_000), stderr: 'oversized secret' },
+    { status: null, stdout: '', stderr: 'timed out /Users/example', timedOut: true },
+  ];
+  for (const synthetic of cases) {
+    const result = await codexModelCatalogueStatus(status, { run: async () => synthetic });
+    assert.ok(['unsupported', 'failed'].includes(result.state));
+    assert.deepEqual(result.models, []);
+    assert.doesNotMatch(JSON.stringify(result), /person@|Users|token|secret|stderr|stdout/);
+  }
+});
+
+test('provider catalogue discovery caches a refresh and expires explicitly', async () => {
+  let clock = 1_000;
+  let detects = 0;
+  let catalogues = 0;
+  const discover = createProviderModelCatalogueDetector({
+    now: () => clock,
+    ttlMs: 500,
+    detect: async () => {
+      detects += 1;
+      return { codex: { installed: true, authenticated: true, executable: '/synthetic/codex' } };
+    },
+    catalogue: async () => {
+      catalogues += 1;
+      return { state: 'refreshed', reasonCode: null, models: [{ id: 'gpt-5.6-sol' }] };
+    },
+  });
+
+  const first = await discover();
+  assert.equal(await discover(), first);
+  assert.equal(detects, 1);
+  assert.equal(catalogues, 1);
+
+  clock = 1_501;
+  assert.notEqual(await discover(), first);
+  assert.equal(detects, 2);
+  assert.equal(catalogues, 2);
 });

@@ -2,6 +2,7 @@ import { spawn as spawnProcess, spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { parseCodexModelCatalogue } from './providerModels.mjs';
 
 export const PROVIDERS = Object.freeze(['codex', 'claude']);
 
@@ -104,24 +105,59 @@ export function providerStatus(provider, {
 
 function runProviderCommand(command, args, options = {}) {
   return new Promise((resolve) => {
+    const {
+      timeoutMs = 10_000,
+      maxOutputBytes: configuredMaxOutputBytes = 64 * 1024,
+      ...spawnOptions
+    } = options;
     let child;
     try {
       child = spawnProcess(command, args, {
-        ...options, stdio: ['ignore', 'pipe', 'pipe'], timeout: options.timeoutMs,
+        ...spawnOptions, stdio: ['ignore', 'pipe', 'pipe'],
       });
     } catch (error) {
       resolve({ status: null, stdout: '', stderr: '', error });
       return;
     }
+    const maxOutputBytes = Number(configuredMaxOutputBytes);
     const stdout = [];
     const stderr = [];
+    let stdoutBytes = 0;
+    let stderrBytes = 0;
+    let outputExceeded = false;
+    let timedOut = false;
     let error = null;
-    child.stdout?.on('data', (chunk) => stdout.push(chunk));
-    child.stderr?.on('data', (chunk) => stderr.push(chunk));
+    const timeout = setTimeout(() => {
+      timedOut = true;
+      child.kill();
+    }, timeoutMs);
+    timeout.unref?.();
+    const collect = (chunks, chunk, stream) => {
+      if (outputExceeded) return;
+      const nextBytes = stream === 'stdout' ? stdoutBytes + chunk.length : stderrBytes + chunk.length;
+      if (nextBytes > maxOutputBytes) {
+        outputExceeded = true;
+        child.kill();
+        return;
+      }
+      chunks.push(chunk);
+      if (stream === 'stdout') stdoutBytes = nextBytes;
+      else stderrBytes = nextBytes;
+    };
+    child.stdout?.on('data', (chunk) => collect(stdout, chunk, 'stdout'));
+    child.stderr?.on('data', (chunk) => collect(stderr, chunk, 'stderr'));
     child.on('error', (value) => { error = value; });
-    child.on('close', (status) => resolve({
-      status, stdout: Buffer.concat(stdout).toString('utf8'), stderr: Buffer.concat(stderr).toString('utf8'), error,
-    }));
+    child.on('close', (status) => {
+      clearTimeout(timeout);
+      resolve({
+        status,
+        stdout: Buffer.concat(stdout).toString('utf8'),
+        stderr: Buffer.concat(stderr).toString('utf8'),
+        error,
+        outputExceeded,
+        timedOut,
+      });
+    });
   });
 }
 
@@ -354,3 +390,91 @@ export function commandInvocation(command, args, {
     windowsVerbatimArguments: true,
   };
 }
+
+export async function codexModelCatalogueStatus(status, {
+  run = runProviderCommand,
+  platform = process.platform,
+  timeoutMs = 7_500,
+  maxOutputBytes = 512 * 1024,
+  now = () => new Date().toISOString(),
+} = {}) {
+  if (!status?.installed || !status?.authenticated || !status?.executable) {
+    return { state: 'unsupported', reasonCode: 'provider-unavailable', models: [], checkedAt: now() };
+  }
+  const invocation = commandInvocation(status.executable, ['debug', 'models'], {
+    platform,
+    env: status.env || process.env,
+    resolve: (value) => value,
+  });
+  let result;
+  try {
+    result = await run(invocation.command, invocation.args, {
+      shell: false,
+      windowsHide: true,
+      windowsVerbatimArguments: invocation.windowsVerbatimArguments,
+      env: status.env || process.env,
+      timeoutMs,
+      maxOutputBytes,
+    });
+  } catch {
+    return { state: 'failed', reasonCode: 'command-failed', models: [], checkedAt: now() };
+  }
+  if (result?.outputExceeded) {
+    return { state: 'failed', reasonCode: 'output-too-large', models: [], checkedAt: now() };
+  }
+  if (result?.status !== 0) {
+    const timedOut = result?.timedOut === true || result?.error?.code === 'ETIMEDOUT';
+    return {
+      state: timedOut ? 'failed' : 'unsupported',
+      reasonCode: timedOut ? 'timeout' : 'command-unsupported',
+      models: [],
+      checkedAt: now(),
+    };
+  }
+  try {
+    const parsed = parseCodexModelCatalogue(result.stdout, { maxBytes: maxOutputBytes });
+    return { state: 'refreshed', reasonCode: null, models: parsed.models, checkedAt: now() };
+  } catch (error) {
+    return {
+      state: 'failed',
+      reasonCode: /too large/i.test(error.message) ? 'output-too-large' : 'invalid-output',
+      models: [],
+      checkedAt: now(),
+    };
+  }
+}
+
+export function createProviderModelCatalogueDetector({
+  detect = detectProvidersAsync,
+  catalogue = codexModelCatalogueStatus,
+  ttlMs = 5 * 60 * 1000,
+  now = Date.now,
+} = {}) {
+  let cached = null;
+  let expiresAt = 0;
+  let inFlight = null;
+  return async function detectCatalogues() {
+    const current = now();
+    if (cached && current < expiresAt) return cached;
+    if (inFlight) return inFlight;
+    inFlight = Promise.resolve(detect())
+      .then(async (statuses) => ({
+        codex: await catalogue(statuses?.codex),
+        claude: {
+          state: 'unsupported',
+          reasonCode: 'enumeration-unsupported',
+          models: [],
+          checkedAt: new Date(now()).toISOString(),
+        },
+      }))
+      .then((value) => {
+        cached = value;
+        expiresAt = now() + ttlMs;
+        return value;
+      })
+      .finally(() => { inFlight = null; });
+    return inFlight;
+  };
+}
+
+export const detectProviderModelCataloguesAsync = createProviderModelCatalogueDetector();

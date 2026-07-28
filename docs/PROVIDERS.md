@@ -34,7 +34,11 @@ On Windows, Codex runs under its documented `unelevated` sandbox. Scout never us
 
 ## Configure
 
-Choose the primary provider in **Settings → AI providers**. The same screen accepts an optional model identifier for Codex and Claude independently. Those choices apply to individual job conversations, CV tailoring, fit assessment and interview preparation. Leave either field blank to use that provider's current default; provider defaults age better than hard-coded model names.
+Choose the primary provider in **Settings → AI providers**. The same screen accepts an optional model identifier for Codex and Claude independently. Those choices apply to individual job conversations, CV tailoring, fit assessment and interview preparation. Leave either field blank to use that provider's current default.
+
+When a new conversation starts, Scout shows a model picker. Codex models come from the installed CLI's bounded model catalogue when that capability is available; Scout labels this as a refreshed catalogue. If catalogue refresh is unavailable or fails, Scout clearly labels its short built-in list as fallback suggestions whose availability is unknown. Claude suggestions are also labelled as fallback because its CLI does not currently expose a model catalogue. A saved model missing from a refreshed catalogue, or one the provider has rejected, remains visible for diagnosis but cannot be selected again.
+
+**Other…** is the advanced escape hatch for an exact provider model ID. Scout checks its syntax locally, but the provider remains the authority on whether it is accepted. Raw provider catalogue output, executable paths, account details and diagnostics are never sent to the browser.
 
 Scan models are separate. Choose an optional model for each job under **Settings → Scans & schedule**. The supervised scan uses the model shown for the primary scan row, and an enabled daily job saves its own model. Leaving it blank uses the provider default rather than the job-conversation model.
 
@@ -56,7 +60,7 @@ For a one-off explicit override, add `--model MODEL`. Omit it to use the configu
 - **Installed but unauthenticated:** run the provider's status command, complete its official login, then retry.
 - **Signed in but update required:** update the official CLI, verify `--output-schema` (Codex) or `--json-schema` (Claude) support, and refresh Scout.
 - **Works in terminal, not Scout:** restart Scout/Windows after `PATH` changes and check whether the CLI is installed for a different Windows user.
-- **Model rejected:** clear the relevant model field in **Settings → AI providers** or **Settings → Scans & schedule** and use the provider default.
+- **Model rejected or saved default unavailable:** choose a model marked available in the conversation picker, or clear the relevant model field in **Settings → AI providers** or **Settings → Scans & schedule**. Do not assume a fallback suggestion is currently available; the provider validates it when the conversation starts.
 - **Corporate/network restriction:** test the provider directly and follow its proxy/firewall documentation; do not paste credentials into Scout logs or issues.
 
 Provider output may contain private prompt context. Keep workspace `logs/` private when requesting support.

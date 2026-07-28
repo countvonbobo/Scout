@@ -30,18 +30,26 @@ const engines = {
         approximate: true,
       },
       models: [
-        { id: 'claude-opus-4-8', label: 'Opus 4.8 — most capable', detected: true },
-        { id: 'claude-haiku-4-5', label: 'Haiku 4.5 — fastest', detected: false },
+        { id: 'claude-opus-4-8', label: 'Opus 4.8', tradeoff: 'Most capable bundled Claude suggestion.', source: 'bundled', available: 'unknown', selected: false },
+        { id: 'claude-haiku-4-5', label: 'Haiku 4.5', tradeoff: 'Fastest bundled Claude suggestion.', source: 'bundled', available: 'unknown', selected: false },
       ],
       defaultModel: null,
+      effectiveModel: { id: null, label: 'Provider default (model unknown)', source: null, available: 'unknown', known: false, state: 'unknown' },
+      catalogue: { state: 'fallback', reasonCode: 'enumeration-unsupported', checkedAt: '2026-07-22T12:00:00.000Z' },
     },
     codex: {
       usage: {
         windows: [{ usedPercent: 62, windowMinutes: 10080, label: 'weekly', resetsInSeconds: 3600, resetsAt: '2026-07-23T09:00:00.000Z' }],
         approximate: true,
       },
-      models: [],
+      models: [
+        { id: 'gpt-5.6-sol', label: 'GPT-5.6 Sol', tradeoff: 'Most capable for complex, open-ended work.', source: 'refreshed', available: true, selected: true },
+        { id: 'gpt-5.6-terra', label: 'GPT-5.6 Terra', tradeoff: 'Balanced everyday workhorse.', source: 'refreshed', available: true, selected: false },
+        { id: 'gpt-5.6-luna', label: 'GPT-5.6 Luna', tradeoff: 'Fast for clear, repeatable work.', source: 'refreshed', available: true, selected: false },
+      ],
       defaultModel: null,
+      effectiveModel: { id: 'gpt-5.6-sol', label: 'GPT-5.6 Sol', source: 'refreshed', available: true, known: true, state: 'provider-default' },
+      catalogue: { state: 'refreshed', reasonCode: null, checkedAt: '2026-07-22T12:00:00.000Z' },
     },
   },
   checkedAt: '2026-07-22T12:00:00.000Z',
@@ -108,10 +116,13 @@ test('the engine picker shows each provider allowance and offers models', async 
   await expect(picker).toContainText('account-wide; Claude does not publish a per-model limit');
 
   const claudeModels = picker.locator('[data-engine-model="claude"] option');
-  await expect(claudeModels).toContainText(['Provider default', 'Opus 4.8 — most capable · used here', 'Haiku 4.5 — fastest', 'Other…']);
-
-  // Codex offers no guessed identifiers — default plus free text only.
-  await expect(picker.locator('[data-engine-model="codex"] option')).toHaveCount(2);
+  await expect(claudeModels).toContainText(['Provider default', 'Opus 4.8', 'Haiku 4.5', 'Other…']);
+  await expect(picker.locator('[data-engine-card="codex"]')).toContainText('Provider default — GPT-5.6 Sol');
+  await expect(picker.locator('[data-engine-card="codex"]')).toContainText('refreshed catalogue');
+  await expect(picker.locator('[data-engine-model="codex"] option')).toHaveCount(5);
+  await expect(picker.locator('[data-engine-model="codex"]')).toContainText('Most capable for complex');
+  await expect(picker.locator('[data-engine-model="codex"]')).toContainText('Balanced everyday');
+  await expect(picker.locator('[data-engine-model="codex"]')).toContainText('Fast for clear');
 
   // Leave no modal open: the drawer makes the rest of the page inert, and a test
   // that ends mid-modal bleeds that state into whatever runs next.
@@ -157,12 +168,85 @@ test('a free-text model is accepted for a provider Scout cannot enumerate', asyn
   await expect(page.locator('.chat-head .model-chip')).toHaveText('gpt-5.6-sol');
 });
 
+test('fallback and stale catalogues are explicit and force a deliberate valid choice', async ({ page }) => {
+  await page.unroute('**/api/engines');
+  await page.route('**/api/engines', async (route) => {
+    await route.fulfill({
+      contentType: 'application/json',
+      body: JSON.stringify({
+        engines: {
+          claude: engines.engines.claude,
+          codex: {
+            usage: { unknown: true },
+            models: [
+              { id: 'gpt-5.6-sol', label: 'GPT-5.6 Sol', tradeoff: 'Most capable bundled choice.', source: 'bundled', available: 'unknown', selected: false },
+              { id: 'gpt-old-stale', label: 'gpt-old-stale', tradeoff: 'Configured model is absent from the refreshed catalogue.', source: 'configured', available: false, selected: false },
+            ],
+            defaultModel: null,
+            effectiveModel: { id: 'gpt-old-stale', label: 'gpt-old-stale', source: 'configured', available: false, known: true, state: 'stale' },
+            catalogue: { state: 'fallback', reasonCode: 'command-unsupported', checkedAt: null },
+            raw: '/Users/example person@example.test token=secret',
+          },
+        },
+      }),
+    });
+  });
+  await page.evaluate((id) => window.Scout.openChat(id, 'ask'), opportunity.id);
+  const codex = page.locator('[data-engine-card="codex"]');
+  await expect(codex).toContainText('bundled fallback');
+  await expect(codex).toContainText(/saved default unavailable/i);
+  await expect(codex.locator('option[value="gpt-old-stale"]')).toHaveAttribute('disabled', '');
+  await expect(codex).not.toContainText('/Users/example');
+  await expect(codex).not.toContainText('person@example.test');
+  await expect(codex).not.toContainText('token=secret');
+  await page.click('[data-engine-card="codex"] [data-action="pick-engine"]');
+  await expect(page.locator('#chat-drawer')).toContainText('Choose an available model');
+  await page.selectOption('[data-engine-model="codex"]', 'gpt-5.6-sol');
+  await page.click('[data-engine-card="codex"] [data-action="pick-engine"]');
+  await expect(page.locator('.chat-head .model-chip')).toHaveText('gpt-5.6-sol');
+});
+
+test('a provider-rejected choice is disabled and explained', async ({ page }) => {
+  await page.unroute('**/api/engines');
+  await page.route('**/api/engines', async (route) => {
+    await route.fulfill({
+      contentType: 'application/json',
+      body: JSON.stringify({
+        engines: {
+          claude: engines.engines.claude,
+          codex: {
+            usage: { unknown: true },
+            models: [{
+              id: 'gpt-former',
+              label: 'gpt-former',
+              tradeoff: 'Provider rejected this model; choose another model deliberately.',
+              source: 'configured',
+              available: false,
+              selected: false,
+            }],
+            defaultModel: null,
+            effectiveModel: { id: 'gpt-former', label: 'gpt-former', source: 'configured', available: false, known: true, state: 'stale' },
+            catalogue: { state: 'refreshed', reasonCode: null, checkedAt: null },
+          },
+        },
+      }),
+    });
+  });
+  await page.evaluate((id) => window.Scout.openChat(id, 'ask'), opportunity.id);
+  const codex = page.locator('[data-engine-card="codex"]');
+  await expect(codex).toContainText('Provider rejected this model');
+  await expect(codex.locator('option[value="gpt-former"]')).toHaveAttribute('disabled', '');
+});
+
 test('the picker still works when provider usage cannot be read', async ({ page }) => {
   await page.unroute('**/api/engines');
   await page.route('**/api/engines', async (route) => {
     await route.fulfill({
       contentType: 'application/json',
-      body: JSON.stringify({ engines: { claude: { usage: { unknown: true }, models: [], defaultModel: null }, codex: { usage: { unknown: true }, models: [], defaultModel: null } } }),
+      body: JSON.stringify({ engines: {
+        claude: { usage: { unknown: true }, models: [], defaultModel: null, effectiveModel: { id: null, label: 'Provider default (model unknown)', available: 'unknown', known: false }, catalogue: { state: 'fallback' } },
+        codex: { usage: { unknown: true }, models: [], defaultModel: null, effectiveModel: { id: null, label: 'Provider default (model unknown)', available: 'unknown', known: false }, catalogue: { state: 'fallback' } },
+      } }),
     });
   });
   await page.evaluate((id) => window.Scout.openChat(id, 'ask'), opportunity.id);

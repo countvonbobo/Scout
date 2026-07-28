@@ -59,6 +59,10 @@ function routeFixture(root, overrides = {}) {
     repoRoot: root,
     readTracker: () => ({ opportunities: [ENTRY] }),
     providerStatusFn: () => ({ installed: true, authenticated: true, executable: 'provider', env: process.env }),
+    providerCataloguesFn: async () => ({
+      claude: { state: 'unsupported', models: [] },
+      codex: { state: 'unsupported', models: [] },
+    }),
     ...overrides,
   });
   return routes;
@@ -632,14 +636,30 @@ test('an unsafe model identifier is rejected before any turn runs', async () => 
   assert.equal(ran, false);
 });
 
-test('the engine picker is answered without spawning a provider CLI', async () => {
+test('the engine picker uses bounded injected catalogues and returns effective defaults', async () => {
   const root = tmpRoot();
-  let providerChecks = 0;
+  const config = {
+    locale: 'en-GB', currency: 'GBP', timezone: 'Europe/London',
+    ai: { provider: 'codex', model: null, models: { codex: 'gpt-5.6-terra', claude: null } },
+  };
+  fs.writeFileSync(path.join(root, 'workspace.json'), `${JSON.stringify(config)}\n`);
+  let catalogueChecks = 0;
   const routes = routeFixture(root, {
-    providerStatusFn: (engine) => { providerChecks += 1; return { installed: true, authenticated: true, executable: engine, env: {} }; },
+    providerCataloguesFn: async () => {
+      catalogueChecks += 1;
+      return {
+        codex: {
+          state: 'refreshed',
+          models: [{ id: 'gpt-5.6-sol', isDefault: true }, { id: 'gpt-5.6-terra' }],
+        },
+        claude: { state: 'unsupported', models: [] },
+      };
+    },
   });
   const response = new MockResponse();
-  routes['GET /api/engines'](new EventEmitter(), response, '', new URL('http://127.0.0.1/api/engines'));
+  await routes['GET /api/engines'](
+    new EventEmitter(), response, '', new URL('http://127.0.0.1/api/engines'),
+  );
   await response.finished;
   const body = JSON.parse(response.text());
   assert.deepEqual(Object.keys(body.engines).sort(), ['claude', 'codex']);
@@ -647,6 +667,37 @@ test('the engine picker is answered without spawning a provider CLI', async () =
     assert.ok(Array.isArray(body.engines[engine].models));
     assert.ok('usage' in body.engines[engine]);
     assert.ok('defaultModel' in body.engines[engine]);
+    assert.ok('effectiveModel' in body.engines[engine]);
+    assert.ok('catalogue' in body.engines[engine]);
   }
-  assert.equal(providerChecks, 0, 'opening the picker must not probe provider CLIs');
+  assert.equal(body.engines.codex.defaultModel, 'gpt-5.6-terra');
+  assert.equal(body.engines.codex.effectiveModel.label, 'GPT-5.6 Terra');
+  assert.equal(body.engines.codex.catalogue.state, 'refreshed');
+  assert.equal(catalogueChecks, 1);
+  assert.doesNotMatch(response.text(), /executable|env|stdout|stderr|Users|person@|token/);
+});
+
+test('a stale configured engine model is explained and cannot masquerade as the default', async () => {
+  const root = tmpRoot();
+  const config = {
+    locale: 'en-GB', currency: 'GBP', timezone: 'Europe/London',
+    ai: { provider: 'codex', model: null, models: { codex: 'gpt-old-stale', claude: null } },
+  };
+  fs.writeFileSync(path.join(root, 'workspace.json'), `${JSON.stringify(config)}\n`);
+  const routes = routeFixture(root, {
+    providerCataloguesFn: async () => ({
+      codex: { state: 'refreshed', models: [{ id: 'gpt-5.6-sol', isDefault: true }] },
+      claude: { state: 'unsupported', models: [] },
+    }),
+  });
+  const response = new MockResponse();
+  await routes['GET /api/engines'](
+    new EventEmitter(), response, '', new URL('http://127.0.0.1/api/engines'),
+  );
+  await response.finished;
+  const codex = JSON.parse(response.text()).engines.codex;
+  assert.equal(codex.defaultModel, null);
+  assert.equal(codex.effectiveModel.id, 'gpt-old-stale');
+  assert.equal(codex.effectiveModel.available, false);
+  assert.equal(codex.models.find((model) => model.id === 'gpt-old-stale').available, false);
 });
