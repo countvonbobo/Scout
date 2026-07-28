@@ -97,6 +97,45 @@ test('commits a bounded stage-data artifact without accepting provider or creden
   }
 });
 
+test('assessment artifacts enforce their kind-specific privacy envelope', () => {
+  const run = openRunJournal(temp(), 'run-1');
+  const request = {
+    schemaVersion: 1,
+    batchId: 'batch-1',
+    runId: 'run-1',
+    jobReferences: [{ jobId: 'candidate-001', inputDigest: 'a'.repeat(64) }],
+    parameters: { maxJobs: 10, maxInputTokens: 75_000, timeoutMs: 60_000, contextBudgetCharacters: 280_000 },
+    provenance: {
+      profileVersion: 'profile-v1',
+      promptVersion: 'prompt-v1',
+      assessmentSchemaVersion: 1,
+      pipelineVersion: 'pipeline-v1',
+      provider: 'codex',
+      model: 'provider-default',
+    },
+  };
+  const value = {
+    schemaVersion: 3,
+    type: 'request',
+    stableIds: ['candidate-001'],
+    data: { request },
+  };
+  assert.doesNotThrow(() => commitRunArtifact(run, { id: 'assessment-request', schemaVersion: 3 }, value, lease));
+  assert.throws(
+    () => commitRunArtifact(run, { id: 'assessment-arbitrary', schemaVersion: 3 }, {
+      schemaVersion: 3, type: 'request', stableIds: [], data: { summary: 'unreviewed persisted content' },
+    }, lease),
+    /assessment request artifact shape/i,
+  );
+  assert.throws(
+    () => commitRunArtifact(run, { id: 'assessment-private', schemaVersion: 3 }, {
+      ...value,
+      data: { request: { ...request, prompt: 'full private prompt' } },
+    }, lease),
+    /private assessment artifact property/i,
+  );
+});
+
 test('the larger pipeline bound does not loosen the legacy artifact schema', () => {
   const run = openRunJournal(temp(), 'run-1');
   const legacyIds = Array.from({ length: 128 }, (_, index) => (
@@ -124,7 +163,7 @@ test('rejects artifacts whose schema is not supported before writing them', () =
   const run = openRunJournal(temp(), 'run-1');
 
   assert.throws(
-    () => commitRunArtifact(run, { id: 'collect-v1', schemaVersion: 3 }, { schemaVersion: 3, stableIds: [] }, lease),
+    () => commitRunArtifact(run, { id: 'collect-v1', schemaVersion: 4 }, { schemaVersion: 4, stableIds: [] }, lease),
     /unsupported artifact schema/i,
   );
   assert.equal(fs.existsSync(path.join(run.directory, 'artifacts')), false);

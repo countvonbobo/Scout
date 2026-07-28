@@ -11,14 +11,25 @@ import {
 
 export const RUN_ARTIFACT_SCHEMA_VERSION = 1;
 export const PIPELINE_STAGE_ARTIFACT_SCHEMA_VERSION = 2;
+export const ASSESSMENT_ARTIFACT_SCHEMA_VERSION = 3;
 export const RUN_MANIFEST_SCHEMA_VERSION = 3;
 
 const MAX_LEGACY_ARTIFACT_BYTES = 16 * 1024;
 const MAX_PIPELINE_ARTIFACT_BYTES = 16 * 1024 * 1024;
+const MAX_ASSESSMENT_ARTIFACT_BYTES = 256 * 1024;
 const MAX_STABLE_IDS = 128;
 const SAFE_TOKEN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 const SHA256 = /^[a-f0-9]{64}$/;
 const PRIVATE_PIPELINE_KEYS = /^(?:access[-_]?token|advert[-_]?body|api[-_]?(?:key|token)|auth(?:orization)?|body|cookies?|credentials?|cv|description|headers?|html|master[-_]?cv|password|payload|profile[-_]?evidence|prompt|raw[-_]?(?:html|response)|requirements?|response|secret(?:[-_]?(?:key|token))?|token|transcript)$/i;
+const PRIVATE_ASSESSMENT_KEYS = /^(?:access[-_]?token|advert[-_]?body|api[-_]?(?:key|token)|auth(?:orization)?|body|cookies?|credentials?|cv|headers?|html|master[-_]?cv|password|prompt|raw[-_]?(?:html|response)|response|secret(?:[-_]?(?:key|token))?|token|transcript)$/i;
+const CREDENTIAL_VALUE = /(?:https?:\/\/[^/\s:@]+:[^/\s@]+@)|(?:\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b)|(?:\b(?:api[-_ ]?key|authorization|password|secret|session[-_ ]?id|token)\s*[:=]\s*\S+)/i;
+const ASSESSMENT_ARTIFACT_TYPES = new Set(['request', 'result', 'failure', 'batch']);
+const ASSESSMENT_DATA_KEYS = Object.freeze({
+  request: Object.freeze(['request']),
+  result: Object.freeze(['assessment', 'batchId', 'jobId', 'provenance']),
+  failure: Object.freeze(['attempts', 'batchId', 'code', 'jobId', 'validationFailures']),
+  batch: Object.freeze(['batchId', 'completedJobIds', 'failedJobIds', 'provenance']),
+});
 
 export class ArtifactIntegrityError extends Error {
   constructor(message) {
@@ -87,6 +98,47 @@ function validatePipelineData(value, ErrorType, seen = new Set()) {
   seen.delete(value);
 }
 
+function validateAssessmentData(value, ErrorType, seen = new Set()) {
+  if (value === null || typeof value === 'boolean') return;
+  if (typeof value === 'number') {
+    if (!Number.isFinite(value)) throw new ErrorType('assessment artifact values must be finite JSON values');
+    return;
+  }
+  if (typeof value === 'string') {
+    if (value.length > 2_000) throw new ErrorType('assessment artifact strings must be bounded');
+    if (CREDENTIAL_VALUE.test(value)) throw new ErrorType('assessment artifact credentials are not allowed');
+    return;
+  }
+  if (!value || typeof value !== 'object' || seen.has(value)) {
+    throw new ErrorType('assessment artifact data must be acyclic JSON');
+  }
+  seen.add(value);
+  if (Array.isArray(value)) {
+    if (value.length > 128) throw new ErrorType('assessment artifact arrays must be bounded');
+    for (const item of value) validateAssessmentData(item, ErrorType, seen);
+  } else {
+    if (Object.getPrototypeOf(value) !== Object.prototype) {
+      throw new ErrorType('assessment artifact data must use plain JSON objects');
+    }
+    for (const [key, item] of Object.entries(value)) {
+      if (PRIVATE_ASSESSMENT_KEYS.test(key)) {
+        throw new ErrorType(`private assessment artifact property is not allowed: ${key}`);
+      }
+      validateAssessmentData(item, ErrorType, seen);
+    }
+  }
+  seen.delete(value);
+}
+
+function validateAssessmentArtifactData(type, value, ErrorType) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)
+    || Object.getPrototypeOf(value) !== Object.prototype
+    || Object.keys(value).sort().join(',') !== [...ASSESSMENT_DATA_KEYS[type]].sort().join(',')) {
+    throw new ErrorType(`assessment ${type} artifact shape is invalid`);
+  }
+  validateAssessmentData(value, ErrorType);
+}
+
 function validateArtifactValue(descriptor, value, ErrorType = TypeError) {
   if (!value || typeof value !== 'object' || Array.isArray(value) || Object.getPrototypeOf(value) !== Object.prototype) {
     throw new ErrorType('artifact value must be an object');
@@ -103,6 +155,13 @@ function validateArtifactValue(descriptor, value, ErrorType = TypeError) {
     }
     requireSafeToken(value.stageId, 'artifact stage ID', ErrorType);
     validatePipelineData(value.data, ErrorType);
+  } else if (descriptor.schemaVersion === ASSESSMENT_ARTIFACT_SCHEMA_VERSION) {
+    if (keys.join(',') !== 'data,schemaVersion,stableIds,type'
+      || value.schemaVersion !== ASSESSMENT_ARTIFACT_SCHEMA_VERSION
+      || !ASSESSMENT_ARTIFACT_TYPES.has(value.type)) {
+      throw new ErrorType('artifact value is not supported by schema version 3');
+    }
+    validateAssessmentArtifactData(value.type, value.data, ErrorType);
   } else {
     throw new ErrorType(`unsupported artifact schema version: ${descriptor.schemaVersion}`);
   }
@@ -113,9 +172,13 @@ function validateArtifactValue(descriptor, value, ErrorType = TypeError) {
   const encoded = stableJson(value);
   const maximum = descriptor.schemaVersion === RUN_ARTIFACT_SCHEMA_VERSION
     ? MAX_LEGACY_ARTIFACT_BYTES
-    : MAX_PIPELINE_ARTIFACT_BYTES;
+    : descriptor.schemaVersion === PIPELINE_STAGE_ARTIFACT_SCHEMA_VERSION
+      ? MAX_PIPELINE_ARTIFACT_BYTES
+      : MAX_ASSESSMENT_ARTIFACT_BYTES;
   if (Buffer.byteLength(encoded, 'utf8') > maximum) {
-    throw new ErrorType(`artifact exceeds the ${maximum === MAX_LEGACY_ARTIFACT_BYTES ? '16 KiB' : '16 MiB'} limit`);
+    const label = maximum === MAX_LEGACY_ARTIFACT_BYTES ? '16 KiB'
+      : maximum === MAX_PIPELINE_ARTIFACT_BYTES ? '16 MiB' : '256 KiB';
+    throw new ErrorType(`artifact exceeds the ${label} limit`);
   }
   return encoded;
 }
@@ -163,7 +226,7 @@ function validateReference(ref, ErrorType = ArtifactIntegrityError) {
   if (!ref || typeof ref !== 'object' || Array.isArray(ref)) throw new ErrorType('artifact reference is invalid');
   const descriptor = validateDescriptor({ id: ref.id, schemaVersion: ref.schemaVersion }, ErrorType);
   if (typeof ref.digest !== 'string' || !SHA256.test(ref.digest)) throw new ErrorType('artifact reference digest is invalid');
-  if (![RUN_ARTIFACT_SCHEMA_VERSION, PIPELINE_STAGE_ARTIFACT_SCHEMA_VERSION].includes(descriptor.schemaVersion)) {
+  if (![RUN_ARTIFACT_SCHEMA_VERSION, PIPELINE_STAGE_ARTIFACT_SCHEMA_VERSION, ASSESSMENT_ARTIFACT_SCHEMA_VERSION].includes(descriptor.schemaVersion)) {
     throw new ErrorType(`unsupported artifact schema version: ${descriptor.schemaVersion}`);
   }
   return descriptor;
@@ -337,6 +400,8 @@ export function projectRunManifest(events) {
   const recoveryDecisions = [];
   const providerSubstitutions = [];
   const recoveryAttempts = [];
+  const assessmentJobs = new Map();
+  const assessmentBatches = new Map();
   const stageIndexes = new Map(RECOVERABLE_PIPELINE_STAGES.map((stage, index) => [stage.id, index]));
   const invalidatedByGeneration = new Map();
   const plannedByGeneration = new Map();
@@ -368,6 +433,23 @@ export function projectRunManifest(events) {
       if (event.payload?.compatibility) compatibility[event.payload.compatibility.kind] = event.payload.compatibility.value;
     } else if (event.type === 'mutation.receipted') {
       receipts.push({ sequence: event.sequence, stageId: event.stageId, reference: event.payload?.reference, digest: event.payload?.digest });
+    } else if (event.type.startsWith('assessment.')) {
+      addArtifact(artifacts, event.payload?.artifact);
+      if (event.type === 'assessment.job-completed' || event.type === 'assessment.job-failed') {
+        assessmentJobs.set(event.payload.reference.id, {
+          sequence: event.sequence,
+          jobId: event.payload.reference.id,
+          status: event.type === 'assessment.job-completed' ? 'completed' : 'failed',
+          artifact: event.payload.artifact,
+        });
+      } else if (event.type === 'assessment.batch-completed') {
+        assessmentBatches.set(event.payload.reference.id, {
+          sequence: event.sequence,
+          batchId: event.payload.reference.id,
+          count: event.payload.count,
+          artifact: event.payload.artifact,
+        });
+      }
     } else if (event.type === 'recovery.started') {
       const priorCompatibility = structuredClone(compatibility);
       if (event.payload.schemaVersion === 2) {
@@ -529,6 +611,8 @@ export function projectRunManifest(events) {
     recoveryDecisions,
     providerSubstitutions,
     recoveryAttempts,
+    ...(assessmentJobs.size ? { assessmentJobs: [...assessmentJobs.values()] } : {}),
+    ...(assessmentBatches.size ? { assessmentBatches: [...assessmentBatches.values()] } : {}),
   };
 }
 

@@ -28,6 +28,11 @@ import {
   claimNextScanRequest, completeOrphanedScanRequest, completeScanRequest,
   enqueueOverlappingScanRequest, projectScanQueue,
 } from './scanQueue.mjs';
+import {
+  ASSESSMENT_RESPONSE_SCHEMA,
+  planAssessmentBatches,
+  resumeAssessments,
+} from './assessmentBatches.mjs';
 export { filterVacancies } from './vacancyFilter.mjs';
 
 const EMPTY_DISCARDED = Object.freeze({ hard_exclusion: 0, mandatory_unmet: 0, below_threshold: 0, provider_discarded: 0 });
@@ -742,38 +747,56 @@ function safeSourceUrl(value) {
   } catch { return null; }
 }
 
-export const SCAN_ASSESSMENT_SCHEMA = Object.freeze({
-  type: 'object', additionalProperties: false,
-  properties: {
-    assessments: {
-      type: 'array', items: {
-        type: 'object', additionalProperties: false,
-        properties: {
-          candidateId: { type: 'string' }, categoryId: { type: ['string', 'null'] }, summary: { type: 'string' },
-          hardExclusionMatches: { type: 'array', items: { type: 'string' } },
-          mandatoryRequirements: {
-            type: 'array', items: {
-              type: 'object', additionalProperties: false,
-              properties: {
-                requirement: { type: 'string' }, advertEvidence: { type: 'string' },
-                advertEvidenceId: { type: 'string' },
-                status: { type: 'string', enum: ['met', 'unmet', 'unknown'] }, profileEvidence: { type: ['string', 'null'] },
-              }, required: ['requirement', 'advertEvidence', 'advertEvidenceId', 'status', 'profileEvidence'],
-            },
-          },
-          dimensions: {
-            type: 'array', minItems: 1, items: {
-              type: 'object', additionalProperties: false,
-              properties: { name: { type: 'string' }, score: { type: 'number' }, maximum: { type: 'number' }, evidence: { type: 'string' } },
-              required: ['name', 'score', 'maximum', 'evidence'],
-            },
-          },
-          recommendation: { type: 'string', enum: ['keep', 'discard'] },
-        }, required: ['candidateId', 'categoryId', 'summary', 'hardExclusionMatches', 'mandatoryRequirements', 'dimensions', 'recommendation'],
-      },
-    },
-  }, required: ['assessments'],
-});
+export const SCAN_ASSESSMENT_SCHEMA = ASSESSMENT_RESPONSE_SCHEMA;
+
+export async function assessScanCandidates({
+  run,
+  lease,
+  candidates,
+  compatibility,
+  invokeProvider,
+  contextBudgetCharacters,
+  contextOverheadCharacters = 0,
+  timeoutMs = 20 * 60 * 1000,
+  maxInputTokens = 75_000,
+  providerSubstitution = null,
+  heartbeat = null,
+  heartbeatIntervalMs,
+} = {}) {
+  if (!run || !lease || !compatibility || !Array.isArray(candidates)) {
+    throw new TypeError('scan assessment requires a run, lease, compatibility and candidates');
+  }
+  const provenance = {
+    profileVersion: compatibility.profileVersion,
+    promptVersion: compatibility.promptVersion,
+    assessmentSchemaVersion: compatibility.assessmentSchemaVersion,
+    pipelineVersion: compatibility.pipelineVersion,
+    provider: compatibility.provider,
+    model: compatibility.model,
+  };
+  const batches = planAssessmentBatches({
+    runId: run.runId,
+    jobs: candidates.map((candidate) => ({
+      ...candidate,
+      // One extra character accounts for the comma between adjacent JSON
+      // array items, so planning never underestimates the assembled context.
+      contextCharacters: JSON.stringify(promptCandidate(candidate)).length + 1,
+    })),
+    provenance,
+    contextBudgetCharacters,
+    contextOverheadCharacters,
+    timeoutMs,
+    maxInputTokens,
+  });
+  return resumeAssessments(run, {
+    batches,
+    lease,
+    invokeProvider,
+    providerSubstitution,
+    heartbeat,
+    heartbeatIntervalMs,
+  });
+}
 
 function slug(value) {
   return String(value || '').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 48) || 'opportunity';
@@ -1663,6 +1686,7 @@ export function validateWrittenScanArtifacts(root, expectedRun) {
 export function writeScanArtifacts(root, {
   provider, mode, sources, queries = [], candidates, assessmentResult, policy, startedAt,
   error = null, skipped = false, dropped = { perSource: {}, total: 0 }, hardExcluded = [], closedAdverts = [], exclusions = [],
+  assessmentFailures = [],
   livenessSummary = { checked: 0, gone: 0, unverified: 0 }, verificationScoped = false,
   staleInboxEntries = [], inboxRechecked = 0, funnel = null, selection = [], discoveryEngine = 'legacy-discovery', profileId = null,
 }) {
@@ -1672,7 +1696,17 @@ export function writeScanArtifacts(root, {
   const health = sourceHealth(sources);
   const configuredSources = Object.values(health).filter((item) => item.configured !== false);
   const configuredFailures = Object.values(health).filter((item) => item.configured !== false && item.status !== 'healthy');
-  const errors = [...(error ? [error] : []), ...(configuredSources.length ? [] : ['no job sources are configured'])];
+  const boundedAssessmentFailures = (assessmentFailures || []).map((failure) => ({
+    jobId: boundedText(failure?.jobId, 128),
+    code: boundedText(failure?.code, 100),
+    attempts: Number.isSafeInteger(failure?.attempts) ? failure.attempts : 0,
+    validationFailures: (failure?.validationFailures || []).map((item) => boundedText(item, 100)).slice(0, 8),
+  })).filter((failure) => failure.jobId && failure.code);
+  const errors = [
+    ...(error ? [error] : []),
+    ...(!error && boundedAssessmentFailures.length ? [`${boundedAssessmentFailures.length} candidate assessment(s) exhausted bounded retries`] : []),
+    ...(configuredSources.length ? [] : ['no job sources are configured']),
+  ];
   const degraded = configuredFailures.length > 0 || errors.length > 0;
   const existing = JSON.parse(fs.readFileSync(paths.tracker, 'utf8'));
   const merged = assessmentResult
@@ -1711,6 +1745,7 @@ export function writeScanArtifacts(root, {
     profile_id: profileId, discovery_engine: discoveryEngine,
     ...(reconciledFunnel ? { funnel: reconciledFunnel } : {}),
     ...(selection_summary ? { selection_summary } : {}),
+    ...(boundedAssessmentFailures.length ? { assessment_failures: boundedAssessmentFailures } : {}),
     ...(selection.length ? { selection } : {}),
     ...(explanations.length ? { explanations } : {}),
     reviewed: merged.reviewed, errors, source_health: health,

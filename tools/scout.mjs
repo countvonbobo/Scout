@@ -14,8 +14,8 @@ import { assertSafeModel, providerStatus } from '../ui/lib/providers.mjs';
 import { setupReadiness } from '../ui/lib/setupReadiness.mjs';
 import { runStructuredTurn } from '../ui/lib/structuredTurn.mjs';
 import {
-  assessmentCandidatesForSelection, compactCandidates, createRankedDiscoveryStages, DEFAULT_CANDIDATE_LIMIT,
-  durableScanProjection, inboxRecheckCandidates, promptCandidate, runScanPipeline, SCAN_ASSESSMENT_SCHEMA, validateAssessments,
+  assessScanCandidates, assessmentCandidatesForSelection, compactCandidates, createRankedDiscoveryStages, DEFAULT_CANDIDATE_LIMIT,
+  durableScanProjection, inboxRecheckCandidates, promptCandidate, runScanPipeline, SCAN_ASSESSMENT_SCHEMA,
   verificationCandidates, writeScanArtifacts,
 } from '../ui/lib/scanPipeline.mjs';
 import { loadPublishedSearchProfile, migrateSearchProfile } from '../ui/lib/searchProfile.mjs';
@@ -552,6 +552,7 @@ export async function runScanWith(root, provider, mode, {
   let staleInboxEntries = [];
   let inboxRechecked = 0;
   let verificationScoped = false;
+  let assessmentFailures = [];
   let discovery = null;
   let publishedProfile = null;
   let funnel = null;
@@ -661,6 +662,7 @@ export async function runScanWith(root, provider, mode, {
           hardExcluded,
           closedAdverts,
           livenessSummary,
+          assessmentFailures,
           verificationScoped,
           funnel,
           selection,
@@ -680,7 +682,7 @@ export async function runScanWith(root, provider, mode, {
         assertFence();
         return backupHookOutcome(status);
       },
-      async finalize({ lease, stageOutputs }) {
+      async finalize({ run, lease, stageOutputs }) {
         collected = stageOutputs.collect;
         publishedProfile = publishedAtStart;
         const tracker = JSON.parse(fs.readFileSync(workspacePaths(root).tracker, 'utf8'));
@@ -762,22 +764,42 @@ export async function runScanWith(root, provider, mode, {
           if (candidates.length) {
             onProgress({ phase: `Scoring ${candidates.length} candidates`, current: 3, total: 5 });
             const paths = workspacePaths(root);
-            const context = buildScanContext(paths, config, candidates.map(promptCandidate));
-            const prompt = [
-              'Assess only the supplied Scout candidates. Return one assessment per candidate and only the required JSON schema.',
-              'Use a 100-point evidence-led breakdown. Treat every supplied normalized requirement signal, plus advert words such as required, essential, must and non-negotiable, as mandatory requirements.',
-              'Cover every supplied mandatorySignals item and copy its id into advertEvidenceId. For an additional mandatory requirement you identify, use a concise provider-<slug> advertEvidenceId.',
-              'Every met mandatory requirement needs explicit profile evidence. Use unknown when evidence is absent or ambiguous.',
-              'Apply hard exclusions before scoring. Never access files, run commands, browse, write artifacts, apply, or send outreach.',
-              JSON.stringify(context),
-            ].join('\n\n');
-            const turn = await runStructuredTurnFn({
-              provider, status, schema: SCAN_ASSESSMENT_SCHEMA, prompt,
-              model,
-              validate: (value) => validateAssessments(value, candidates), timeoutMs: 20 * 60 * 1000, maxInputTokens: 75_000,
+            const emptyContext = buildScanContext(paths, config, []);
+            const assessed = await assessScanCandidates({
+              run,
+              lease,
+              candidates,
+              compatibility,
+              contextBudgetCharacters: MAX_SCAN_CONTEXT_CHARS,
+              contextOverheadCharacters: JSON.stringify(emptyContext).length,
+              async invokeProvider({ kind, jobs, validationFailures, timeoutMs, maxInputTokens }) {
+                const context = buildScanContext(paths, config, jobs.map(promptCandidate));
+                const repairInstruction = kind === 'repair'
+                  ? `Repair only the supplied invalid jobs against these bounded validation codes: ${JSON.stringify(validationFailures)}`
+                  : kind === 'retry'
+                    ? 'This is one clean per-job retry. Produce a fresh assessment without relying on any previous provider response.'
+                    : 'This is the initial assessment batch.';
+                const prompt = [
+                  'Assess only the supplied Scout candidates. Return one assessment per candidate and only the required JSON schema.',
+                  'Use a 100-point evidence-led breakdown. Treat every supplied normalized requirement signal, plus advert words such as required, essential, must and non-negotiable, as mandatory requirements.',
+                  'Cover every supplied mandatorySignals item and copy its id into advertEvidenceId. For an additional mandatory requirement you identify, use a concise provider-<slug> advertEvidenceId.',
+                  'Every met mandatory requirement needs explicit profile evidence. Use unknown when evidence is absent or ambiguous.',
+                  'Apply hard exclusions before scoring. Never access files, run commands, browse, write artifacts, apply, or send outreach.',
+                  repairInstruction,
+                  JSON.stringify(context),
+                ].join('\n\n');
+                return runStructuredTurnFn({
+                  provider, status, schema: SCAN_ASSESSMENT_SCHEMA, prompt,
+                  model, validate: (value) => value, timeoutMs, maxInputTokens,
+                });
+              },
             });
-            assessmentResult = turn.value;
-            usage = turn.usage;
+            assessmentFailures = assessed.failures;
+            if (!assessed.assessments.length && assessmentFailures.length) {
+              throw new Error('all candidate assessments exhausted their bounded provider retries');
+            }
+            assessmentResult = { assessments: assessed.assessments };
+            usage = assessed.usage;
           }
           if (funnel) {
             funnel = {
@@ -792,6 +814,7 @@ export async function runScanWith(root, provider, mode, {
           const artifacts = assertCurrentFence(lease, synchronousFenceCallback(() => writeScanArtifacts(root, {
             provider, mode, sources: collected.sources, queries: collected.queries, candidates, assessmentResult,
             policy: config.triage, startedAt,
+            assessmentFailures,
             dropped, hardExcluded, closedAdverts, exclusions: discovery?.exclusions || [], livenessSummary, verificationScoped, funnel, selection, discoveryEngine, profileId: publishedProfile?.id || null,
             staleInboxEntries, inboxRechecked,
           })));
@@ -806,6 +829,7 @@ export async function runScanWith(root, provider, mode, {
             const artifacts = assertCurrentFence(lease, synchronousFenceCallback(() => writeScanArtifacts(root, {
               provider, mode, sources: collected?.sources || {}, queries: collected?.queries || [], candidates,
               assessmentResult: null, policy: config.triage, startedAt, error: error.message,
+              assessmentFailures,
               dropped, hardExcluded, closedAdverts, livenessSummary, verificationScoped, funnel, selection, discoveryEngine,
               exclusions: discovery?.exclusions || [], profileId: publishedProfile?.id || null,
               staleInboxEntries, inboxRechecked,

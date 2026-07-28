@@ -4,7 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { test } from 'node:test';
 import {
-  assessmentCandidatesForSelection, compactCandidates, createRankedDiscoveryStages, DEFAULT_CANDIDATE_LIMIT, gateAssessment, inboxRecheckCandidates, prepareRankedDiscovery, promptCandidate,
+  assessScanCandidates, assessmentCandidatesForSelection, compactCandidates, createRankedDiscoveryStages, DEFAULT_CANDIDATE_LIMIT, gateAssessment, inboxRecheckCandidates, prepareRankedDiscovery, promptCandidate,
   filterVacancies, PipelineInterruptedError, runScanPipeline, validateAssessments, validateWrittenScanArtifacts,
   verificationCandidates, writeScanArtifacts,
 } from './scanPipeline.mjs';
@@ -593,6 +593,69 @@ function durableStageHarness(calls) {
     };
   }]));
 }
+
+test('durable scan finalisation assesses real candidates in recoverable batches with partial repair', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'scout-real-assessment-batches-'));
+  const candidates = Array.from({ length: 12 }, (_, index) => ({
+    candidateId: `candidate-${String(index + 1).padStart(3, '0')}`,
+    company: `Synthetic ${index + 1}`,
+    role: 'Engineer',
+    url: `https://example.test/jobs/${index + 1}`,
+    description: 'Advert responsibility: build synthetic systems.',
+    mandatorySignals: [{ id: 'mandatory-01', text: 'Advert mandatory requirement: systems evidence.' }],
+  }));
+  const makeAssessment = (candidateId, valid = true) => ({
+    candidateId,
+    categoryId: null,
+    summary: 'Evidence-led fit.',
+    hardExclusionMatches: [],
+    mandatoryRequirements: valid ? [{
+      requirement: 'Systems evidence',
+      advertEvidence: 'The advert requires systems evidence.',
+      advertEvidenceId: 'mandatory-01',
+      status: 'met',
+      profileEvidence: 'The profile supplies systems evidence.',
+    }] : [],
+    dimensions: [{ name: 'fit', score: 80, maximum: 100, evidence: 'Bounded evidence.' }],
+    recommendation: 'keep',
+  });
+  const calls = [];
+  try {
+    const durable = await runScanPipeline({
+      root,
+      compatibility: RECOVERY_COMPATIBILITY,
+      stages: durableStageHarness(new Map()),
+      async finalize({ run, lease }) {
+        return assessScanCandidates({
+          run,
+          lease,
+          candidates,
+          compatibility: RECOVERY_COMPATIBILITY,
+          contextBudgetCharacters: 100_000,
+          contextOverheadCharacters: 1_000,
+          async invokeProvider({ kind, jobs }) {
+            calls.push({ kind, ids: jobs.map((job) => job.candidateId) });
+            return {
+              assessments: jobs.map((job) => makeAssessment(
+                job.candidateId,
+                !(kind === 'batch' && job.candidateId === 'candidate-012'),
+              )),
+            };
+          },
+        });
+      },
+    });
+    assert.equal(durable.outcome, 'complete');
+    assert.equal(durable.stageOutputs.finalize.assessments.length, 12);
+    assert.equal(durable.stageOutputs.finalize.failures.length, 0);
+    assert.deepEqual(calls.map((call) => call.ids.length), [10, 2, 1]);
+    assert.deepEqual(calls.at(-1), { kind: 'repair', ids: ['candidate-012'] });
+    assert.equal(durable.manifest.assessmentBatches.length, 2);
+    assert.equal(durable.manifest.assessmentJobs.length, 12);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
 
 for (const interruptedAfter of DURABLE_STAGES) {
   test(`recovery reuses every committed artifact after interruption following ${interruptedAfter}`, async () => {

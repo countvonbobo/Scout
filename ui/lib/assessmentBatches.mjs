@@ -1,0 +1,726 @@
+import { createHash } from 'node:crypto';
+import {
+  ASSESSMENT_ARTIFACT_SCHEMA_VERSION,
+  commitRunArtifact,
+  readRunArtifact,
+  validateManifestAgreement,
+} from './runArtifacts.mjs';
+import { appendRunEvent } from './runJournal.mjs';
+
+const MAX_BATCH_JOBS = 10;
+const DEFAULT_TIMEOUT_MS = 20 * 60 * 1000;
+const MAX_TIMEOUT_MS = 30 * 60 * 1000;
+const DEFAULT_MAX_INPUT_TOKENS = 75_000;
+const SHA256 = /^[a-f0-9]{64}$/;
+const SAFE_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
+const PRIVATE_REQUEST_KEY = /^(?:access[-_]?token|advert[-_]?body|api[-_]?(?:key|token)|auth(?:orization)?|body|cookies?|credentials?|cv|description|headers?|html|master[-_]?cv|password|payload|profile[-_]?evidence|prompt|raw[-_]?(?:html|response)|requirements?|response|secret(?:[-_]?(?:key|token))?|token|transcript)$/i;
+const CREDENTIAL_VALUE = /(?:https?:\/\/[^/\s:@]+:[^/\s@]+@)|(?:\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b)|(?:\b(?:api[-_ ]?key|authorization|password|secret|session[-_ ]?id|token)\s*[:=]\s*\S+)/i;
+const ASSESSMENT_KEYS = Object.freeze([
+  'candidateId', 'categoryId', 'summary', 'hardExclusionMatches',
+  'mandatoryRequirements', 'dimensions', 'recommendation',
+]);
+const REQUIREMENT_KEYS = Object.freeze([
+  'requirement', 'advertEvidence', 'advertEvidenceId', 'status', 'profileEvidence',
+]);
+const DIMENSION_KEYS = Object.freeze(['name', 'score', 'maximum', 'evidence']);
+
+export const ASSESSMENT_RESPONSE_SCHEMA = Object.freeze({
+  type: 'object',
+  additionalProperties: false,
+  properties: {
+    assessments: {
+      type: 'array',
+      items: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          candidateId: { type: 'string', maxLength: 128 },
+          categoryId: { type: ['string', 'null'], maxLength: 80 },
+          summary: { type: 'string', maxLength: 600 },
+          hardExclusionMatches: {
+            type: 'array', maxItems: 20, items: { type: 'string', maxLength: 300 },
+          },
+          mandatoryRequirements: {
+            type: 'array',
+            maxItems: 24,
+            items: {
+              type: 'object',
+              additionalProperties: false,
+              properties: {
+                requirement: { type: 'string', maxLength: 300 },
+                advertEvidence: { type: 'string', maxLength: 600 },
+                advertEvidenceId: { type: 'string', maxLength: 128 },
+                status: { type: 'string', enum: ['met', 'unmet', 'unknown'] },
+                profileEvidence: { type: ['string', 'null'], maxLength: 600 },
+              },
+              required: REQUIREMENT_KEYS,
+            },
+          },
+          dimensions: {
+            type: 'array',
+            minItems: 1,
+            maxItems: 20,
+            items: {
+              type: 'object',
+              additionalProperties: false,
+              properties: {
+                name: { type: 'string', maxLength: 100 },
+                score: { type: 'number' },
+                maximum: { type: 'number' },
+                evidence: { type: 'string', maxLength: 600 },
+              },
+              required: DIMENSION_KEYS,
+            },
+          },
+          recommendation: { type: 'string', enum: ['keep', 'discard'] },
+        },
+        required: ASSESSMENT_KEYS,
+      },
+    },
+  },
+  required: ['assessments'],
+});
+
+function stableJson(value) {
+  if (value === null || typeof value === 'boolean' || typeof value === 'string') return JSON.stringify(value);
+  if (typeof value === 'number') {
+    if (!Number.isFinite(value)) throw new TypeError('assessment batch values must be finite JSON');
+    return JSON.stringify(value);
+  }
+  if (Array.isArray(value)) return `[${value.map(stableJson).join(',')}]`;
+  if (!value || typeof value !== 'object' || Object.getPrototypeOf(value) !== Object.prototype) {
+    throw new TypeError('assessment batch values must be plain JSON');
+  }
+  return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${stableJson(value[key])}`).join(',')}}`;
+}
+
+function digest(value) {
+  return createHash('sha256').update(stableJson(value)).digest('hex');
+}
+
+function exactKeys(value, keys) {
+  return value && typeof value === 'object' && !Array.isArray(value)
+    && Object.keys(value).sort().join(',') === [...keys].sort().join(',');
+}
+
+function safeId(value, name) {
+  if (typeof value !== 'string' || !SAFE_ID.test(value)) throw new TypeError(`${name} must be a bounded identifier`);
+  return value;
+}
+
+function positiveInteger(value, name, maximum = Number.MAX_SAFE_INTEGER) {
+  if (!Number.isSafeInteger(value) || value < 1 || value > maximum) {
+    throw new TypeError(`${name} must be a bounded positive integer`);
+  }
+  return value;
+}
+
+function boundedString(value, name, maximum, { nullable = false, empty = false } = {}) {
+  if (nullable && value === null) return value;
+  if (typeof value !== 'string' || (!empty && !value.trim()) || value.length > maximum
+    || CREDENTIAL_VALUE.test(value)) {
+    throw new TypeError(`${name} must be a bounded string`);
+  }
+  return value;
+}
+
+function jobId(job) {
+  return safeId(job?.jobId || job?.candidateId, 'assessment job ID');
+}
+
+function validateProvenance(value) {
+  const keys = [
+    'profileVersion', 'promptVersion', 'assessmentSchemaVersion',
+    'pipelineVersion', 'provider', 'model',
+  ];
+  if (!exactKeys(value, keys)) throw new TypeError('assessment provenance is invalid');
+  for (const key of ['profileVersion', 'promptVersion', 'pipelineVersion', 'provider', 'model']) {
+    safeId(value[key], `assessment provenance ${key}`);
+  }
+  positiveInteger(value.assessmentSchemaVersion, 'assessment schema version');
+  return value;
+}
+
+function inspectPrivateRequestKeys(value, seen = new Set()) {
+  if (value === null || ['boolean', 'number', 'string'].includes(typeof value)) return;
+  if (!value || typeof value !== 'object' || seen.has(value)) throw new TypeError('assessment request must be acyclic JSON');
+  seen.add(value);
+  if (Array.isArray(value)) {
+    for (const item of value) inspectPrivateRequestKeys(item, seen);
+  } else {
+    if (Object.getPrototypeOf(value) !== Object.prototype) throw new TypeError('assessment request must use plain objects');
+    for (const [key, item] of Object.entries(value)) {
+      if (PRIVATE_REQUEST_KEY.test(key)) throw new TypeError(`private assessment request property is not allowed: ${key}`);
+      inspectPrivateRequestKeys(item, seen);
+    }
+  }
+  seen.delete(value);
+}
+
+export function assertMinimalAssessmentRequest(request) {
+  inspectPrivateRequestKeys(request);
+  if (!exactKeys(request, ['schemaVersion', 'batchId', 'runId', 'jobReferences', 'parameters', 'provenance'])
+    || request.schemaVersion !== 1) {
+    throw new TypeError('minimal assessment request is invalid');
+  }
+  safeId(request.batchId, 'assessment batch ID');
+  safeId(request.runId, 'assessment run ID');
+  if (!Array.isArray(request.jobReferences) || !request.jobReferences.length || request.jobReferences.length > MAX_BATCH_JOBS) {
+    throw new TypeError('assessment request job references are invalid');
+  }
+  const seen = new Set();
+  for (const reference of request.jobReferences) {
+    if (!exactKeys(reference, ['jobId', 'inputDigest'])) throw new TypeError('assessment job reference is invalid');
+    safeId(reference.jobId, 'assessment job reference ID');
+    if (seen.has(reference.jobId)) throw new TypeError('assessment job reference is duplicated');
+    seen.add(reference.jobId);
+    if (typeof reference.inputDigest !== 'string' || !SHA256.test(reference.inputDigest)) {
+      throw new TypeError('assessment job input digest is invalid');
+    }
+  }
+  if (!exactKeys(request.parameters, ['maxJobs', 'maxInputTokens', 'timeoutMs', 'contextBudgetCharacters'])) {
+    throw new TypeError('assessment request parameters are invalid');
+  }
+  positiveInteger(request.parameters.maxJobs, 'assessment request maximum jobs', MAX_BATCH_JOBS);
+  positiveInteger(request.parameters.maxInputTokens, 'assessment request token cap', 1_000_000);
+  positiveInteger(request.parameters.timeoutMs, 'assessment request timeout', MAX_TIMEOUT_MS);
+  positiveInteger(request.parameters.contextBudgetCharacters, 'assessment request context budget', 10_000_000);
+  validateProvenance(request.provenance);
+  return request;
+}
+
+function contextCharacters(job) {
+  const explicit = Number(job?.contextCharacters);
+  return Number.isSafeInteger(explicit) && explicit > 0
+    ? explicit
+    : JSON.stringify(job).length;
+}
+
+export function planAssessmentBatches({
+  runId,
+  jobs = [],
+  provenance,
+  contextBudgetCharacters,
+  contextOverheadCharacters = 0,
+  timeoutMs = DEFAULT_TIMEOUT_MS,
+  maxInputTokens = DEFAULT_MAX_INPUT_TOKENS,
+  maxJobs = MAX_BATCH_JOBS,
+} = {}) {
+  safeId(runId, 'assessment run ID');
+  validateProvenance(provenance);
+  positiveInteger(contextBudgetCharacters, 'assessment context budget', 10_000_000);
+  if (!Number.isSafeInteger(contextOverheadCharacters) || contextOverheadCharacters < 0
+    || contextOverheadCharacters >= contextBudgetCharacters) {
+    throw new TypeError('assessment context overhead must fit within the context budget');
+  }
+  positiveInteger(timeoutMs, 'assessment timeout', MAX_TIMEOUT_MS);
+  positiveInteger(maxInputTokens, 'assessment input-token cap', 1_000_000);
+  maxJobs = positiveInteger(Math.min(maxJobs, MAX_BATCH_JOBS), 'assessment maximum jobs', MAX_BATCH_JOBS);
+  if (!Array.isArray(jobs)) throw new TypeError('assessment jobs must be an array');
+  const ids = new Set();
+  const prepared = jobs.map((job) => {
+    const id = jobId(job);
+    if (ids.has(id)) throw new TypeError(`assessment job is duplicated: ${id}`);
+    ids.add(id);
+    return { job, id, inputDigest: digest(job), characters: contextCharacters(job) };
+  });
+  const groups = [];
+  let current = [];
+  let characters = contextOverheadCharacters;
+  for (const item of prepared) {
+    const wouldOverflow = current.length > 0
+      && (current.length >= maxJobs || characters + item.characters > contextBudgetCharacters);
+    if (wouldOverflow) {
+      groups.push(current);
+      current = [];
+      characters = contextOverheadCharacters;
+    }
+    current.push(item);
+    characters += item.characters;
+  }
+  if (current.length) groups.push(current);
+  return groups.map((group) => {
+    const identity = {
+      runId,
+      jobIds: group.map((item) => item.id),
+      provenance,
+    };
+    const id = `assessment-${digest(identity).slice(0, 32)}`;
+    const request = assertMinimalAssessmentRequest({
+      schemaVersion: 1,
+      batchId: id,
+      runId,
+      jobReferences: group.map((item) => ({ jobId: item.id, inputDigest: item.inputDigest })),
+      parameters: {
+        maxJobs,
+        maxInputTokens,
+        timeoutMs,
+        contextBudgetCharacters,
+      },
+      provenance: { ...provenance },
+    });
+    return Object.freeze({
+      id,
+      runId,
+      jobs: Object.freeze(group.map((item) => item.job)),
+      request: Object.freeze(request),
+    });
+  });
+}
+
+function validationFailure(code) {
+  return Object.freeze([code]);
+}
+
+export function validateAssessmentJob(value, job) {
+  const expectedId = jobId(job);
+  if (!exactKeys(value, ASSESSMENT_KEYS)) return validationFailure('assessment-shape-invalid');
+  if (value.candidateId !== expectedId) return validationFailure('candidate-id-mismatch');
+  try {
+    boundedString(value.candidateId, 'assessment candidate ID', 128);
+    boundedString(value.categoryId, 'assessment category ID', 80, { nullable: true });
+    boundedString(value.summary, 'assessment summary', 600);
+    if (!Array.isArray(value.hardExclusionMatches) || value.hardExclusionMatches.length > 20) {
+      return validationFailure('hard-exclusions-invalid');
+    }
+    for (const match of value.hardExclusionMatches) boundedString(match, 'hard exclusion match', 300);
+    if (!Array.isArray(value.mandatoryRequirements) || value.mandatoryRequirements.length > 24) {
+      return validationFailure('mandatory-requirements-invalid');
+    }
+    const knownSignals = new Set((job?.mandatorySignals || []).map((signal) => signal.id));
+    const covered = new Set();
+    for (const requirement of value.mandatoryRequirements) {
+      if (!exactKeys(requirement, REQUIREMENT_KEYS)) return validationFailure('mandatory-requirement-shape-invalid');
+      boundedString(requirement.requirement, 'mandatory requirement', 300);
+      boundedString(requirement.advertEvidence, 'mandatory advert evidence', 600);
+      boundedString(requirement.advertEvidenceId, 'mandatory advert evidence ID', 128);
+      if (!['met', 'unmet', 'unknown'].includes(requirement.status)) return validationFailure('mandatory-status-invalid');
+      boundedString(requirement.profileEvidence, 'mandatory profile evidence', 600, { nullable: true, empty: true });
+      if (!knownSignals.has(requirement.advertEvidenceId)
+        && !/^provider-[a-z0-9]+(?:-[a-z0-9]+)*$/i.test(requirement.advertEvidenceId)) {
+        return validationFailure('advert-evidence-id-unknown');
+      }
+      if (requirement.status === 'met' && !String(requirement.profileEvidence || '').trim()) {
+        return validationFailure('profile-evidence-required');
+      }
+      covered.add(requirement.advertEvidenceId);
+    }
+    if ([...knownSignals].some((id) => !covered.has(id))) return validationFailure('mandatory-advert-evidence-omitted');
+    if (!Array.isArray(value.dimensions) || !value.dimensions.length || value.dimensions.length > 20) {
+      return validationFailure('dimensions-required');
+    }
+    let maximum = 0;
+    for (const dimension of value.dimensions) {
+      if (!exactKeys(dimension, DIMENSION_KEYS)) return validationFailure('dimension-shape-invalid');
+      boundedString(dimension.name, 'assessment dimension name', 100);
+      boundedString(dimension.evidence, 'assessment dimension evidence', 600);
+      if (!Number.isFinite(dimension.score) || !Number.isFinite(dimension.maximum)
+        || dimension.maximum <= 0 || dimension.score < 0 || dimension.score > dimension.maximum) {
+        return validationFailure('dimension-score-invalid');
+      }
+      maximum += dimension.maximum;
+    }
+    if (Math.abs(maximum - 100) > 0.001) return validationFailure('dimension-maximum-invalid');
+    if (!['keep', 'discard'].includes(value.recommendation)) return validationFailure('recommendation-invalid');
+  } catch {
+    return validationFailure('assessment-value-invalid');
+  }
+  return Object.freeze([]);
+}
+
+function assessmentState(run) {
+  const state = {
+    completed: new Map(),
+    failed: new Map(),
+    completedBatches: new Set(),
+    attempts: new Map(),
+  };
+  for (const event of run.events || []) {
+    if (!event.type.startsWith('assessment.')) continue;
+    if (event.type === 'assessment.batch-attempted') {
+      const stored = readRunArtifact({ ...event.payload.artifact, directory: run.directory });
+      const ids = stored.data.request.jobReferences.map((reference) => reference.jobId);
+      const attempts = state.attempts.get(event.payload.reference.id) || new Map();
+      attempts.set(event.payload.attempt, new Set(ids));
+      state.attempts.set(event.payload.reference.id, attempts);
+    } else if (event.type === 'assessment.job-completed') {
+      const stored = readRunArtifact({ ...event.payload.artifact, directory: run.directory });
+      state.completed.set(event.payload.reference.id, stored.data);
+    } else if (event.type === 'assessment.job-failed') {
+      const stored = readRunArtifact({ ...event.payload.artifact, directory: run.directory });
+      state.failed.set(event.payload.reference.id, stored.data);
+    } else if (event.type === 'assessment.batch-completed') {
+      state.completedBatches.add(event.payload.reference.id);
+    }
+  }
+  return state;
+}
+
+function artifact(run, lease, id, type, stableIds, data) {
+  return commitRunArtifact(run, {
+    id,
+    schemaVersion: ASSESSMENT_ARTIFACT_SCHEMA_VERSION,
+  }, {
+    schemaVersion: ASSESSMENT_ARTIFACT_SCHEMA_VERSION,
+    type,
+    stableIds,
+    data,
+  }, lease);
+}
+
+function appendAttempt(batch, subset, kind, context) {
+  const request = assertMinimalAssessmentRequest({
+    ...batch.request,
+    jobReferences: subset.map((job) => {
+      const id = jobId(job);
+      const source = batch.request.jobReferences.find((reference) => reference.jobId === id);
+      return { ...source };
+    }),
+  });
+  const ref = artifact(
+    context.run,
+    context.lease,
+    `${batch.id}-${kind}-request`,
+    'request',
+    request.jobReferences.map((reference) => reference.jobId),
+    { request },
+  );
+  appendRunEvent(context.run, {
+    type: 'assessment.batch-attempted',
+    stageId: 'assessment',
+    idempotencyKey: `${batch.id}-${kind}-attempted`,
+    payload: {
+      schemaVersion: 1,
+      reference: { kind: 'batch', id: batch.id },
+      count: subset.length,
+      attempt: kind,
+      artifact: ref,
+    },
+  }, context.lease);
+}
+
+function commitAssessment(batch, job, value, context) {
+  const id = jobId(job);
+  const provenance = {
+    provider: batch.request.provenance.provider,
+    model: batch.request.provenance.model,
+    promptVersion: batch.request.provenance.promptVersion,
+    assessmentSchemaVersion: batch.request.provenance.assessmentSchemaVersion,
+  };
+  const ref = artifact(
+    context.run,
+    context.lease,
+    `${batch.id}-${id}-result`,
+    'result',
+    [id],
+    { batchId: batch.id, jobId: id, assessment: value, provenance },
+  );
+  appendRunEvent(context.run, {
+    type: 'assessment.job-completed',
+    stageId: 'assessment',
+    idempotencyKey: `${batch.id}-${id}-completed`,
+    payload: {
+      schemaVersion: 1,
+      reference: { kind: 'vacancy', id },
+      artifact: ref,
+    },
+  }, context.lease);
+  return { batchId: batch.id, jobId: id, assessment: value, provenance };
+}
+
+function commitFailure(batch, job, failure, context) {
+  const id = jobId(job);
+  const data = { batchId: batch.id, jobId: id, ...failure };
+  const ref = artifact(
+    context.run,
+    context.lease,
+    `${batch.id}-${id}-failure`,
+    'failure',
+    [id],
+    data,
+  );
+  appendRunEvent(context.run, {
+    type: 'assessment.job-failed',
+    stageId: 'assessment',
+    idempotencyKey: `${batch.id}-${id}-failed`,
+    payload: {
+      schemaVersion: 1,
+      reference: { kind: 'vacancy', id },
+      artifact: ref,
+    },
+  }, context.lease);
+  return data;
+}
+
+async function boundedProviderCall(batch, kind, subset, validationFailures, context) {
+  const timeoutMs = batch.request.parameters.timeoutMs;
+  const cancellationGraceMs = Math.min(1_000, Math.max(25, Math.floor(timeoutMs * 0.05)));
+  const heartbeatIntervalMs = Math.max(1, Number(context.heartbeatIntervalMs || 1_000));
+  let timer;
+  let timeout;
+  const heartbeat = typeof context.heartbeat === 'function'
+    ? setInterval(() => {
+      Promise.resolve(context.heartbeat()).catch(() => {});
+    }, heartbeatIntervalMs)
+    : null;
+  try {
+    const deadline = new Promise((resolve) => {
+      timer = setTimeout(() => resolve({
+        ok: false,
+        code: 'provider-timeout',
+      }), timeoutMs + cancellationGraceMs);
+    });
+    const call = Promise.resolve().then(() => context.invokeProvider({
+      batchId: batch.id,
+      kind,
+      jobs: subset,
+      validationFailures,
+      timeoutMs,
+      maxInputTokens: batch.request.parameters.maxInputTokens,
+      provenance: batch.request.provenance,
+    })).then(
+      (value) => ({ ok: true, value }),
+      () => ({ ok: false, code: 'provider-call-failed' }),
+    );
+    timeout = await Promise.race([call, deadline]);
+    return timeout;
+  } finally {
+    clearTimeout(timer);
+    if (heartbeat) clearInterval(heartbeat);
+  }
+}
+
+function classifyProviderOutput(call, subset) {
+  const issues = new Map();
+  const valid = new Map();
+  if (!call.ok) {
+    for (const job of subset) issues.set(jobId(job), [call.code]);
+    return { valid, issues, providerFailed: true };
+  }
+  const output = call.value?.value ?? call.value;
+  if (!output || !Array.isArray(output.assessments)) {
+    for (const job of subset) issues.set(jobId(job), ['assessments-array-required']);
+    return { valid, issues, providerFailed: false };
+  }
+  const returned = new Map();
+  for (const assessment of output.assessments) {
+    const id = assessment?.candidateId;
+    if (!subset.some((job) => jobId(job) === id) || returned.has(id)) {
+      if (subset.some((job) => jobId(job) === id)) issues.set(id, ['candidate-duplicate']);
+      continue;
+    }
+    returned.set(id, assessment);
+  }
+  for (const job of subset) {
+    const id = jobId(job);
+    if (issues.has(id)) continue;
+    if (!returned.has(id)) {
+      issues.set(id, ['assessment-missing']);
+      continue;
+    }
+    const failures = validateAssessmentJob(returned.get(id), job);
+    if (failures.length) issues.set(id, failures);
+    else valid.set(id, returned.get(id));
+  }
+  return { valid, issues, providerFailed: false, usage: call.value?.usage || {} };
+}
+
+async function commitValid(batch, subset, classified, context, completed) {
+  for (const job of subset) {
+    const id = jobId(job);
+    if (!classified.valid.has(id) || completed.has(id)) continue;
+    completed.set(id, commitAssessment(batch, job, classified.valid.get(id), context));
+    if (typeof context.onJobCommitted === 'function') {
+      await context.onJobCommitted({ batchId: batch.id, jobId: id });
+    }
+  }
+}
+
+function mergeUsage(target, usage) {
+  for (const [key, value] of Object.entries(usage || {})) {
+    if (Number.isFinite(Number(value))) target[key] = Number(target[key] || 0) + Number(value);
+  }
+}
+
+export async function executeAssessmentBatch(batch, context = {}) {
+  if (!batch || !Array.isArray(batch.jobs) || !context.run || !context.lease) {
+    throw new TypeError('assessment batch execution requires a batch, run and lease');
+  }
+  if (typeof context.invokeProvider !== 'function') throw new TypeError('assessment provider callback is required');
+  assertMinimalAssessmentRequest(batch.request);
+  let state = assessmentState(context.run);
+  const completed = new Map(state.completed);
+  const failed = new Map(state.failed);
+  const usage = {};
+  if (state.completedBatches.has(batch.id)) {
+    return batchResult(batch, completed, failed, usage);
+  }
+  const pending = batch.jobs.filter((job) => !completed.has(jobId(job)) && !failed.has(jobId(job)));
+  if (!pending.length) return completeBatch(batch, context, completed, failed);
+  const attempts = state.attempts.get(batch.id) || new Map();
+  let issues = new Map();
+  let providerFailed = false;
+  if (!attempts.has('batch')) {
+    appendAttempt(batch, pending, 'batch', context);
+    const classified = classifyProviderOutput(
+      await boundedProviderCall(batch, 'batch', pending, {}, context),
+      pending,
+    );
+    mergeUsage(usage, classified.usage);
+    await commitValid(batch, pending, classified, context, completed);
+    issues = classified.issues;
+    providerFailed = classified.providerFailed;
+  } else {
+    for (const job of pending) issues.set(jobId(job), ['interrupted-attempt']);
+    providerFailed = false;
+  }
+
+  let invalid = pending.filter((job) => !completed.has(jobId(job)));
+  if (invalid.length && !providerFailed && !attempts.has('repair')) {
+    appendAttempt(batch, invalid, 'repair', context);
+    const classified = classifyProviderOutput(
+      await boundedProviderCall(batch, 'repair', invalid, Object.fromEntries(issues), context),
+      invalid,
+    );
+    mergeUsage(usage, classified.usage);
+    await commitValid(batch, invalid, classified, context, completed);
+    issues = classified.issues;
+    providerFailed = classified.providerFailed;
+  }
+
+  invalid = pending.filter((job) => !completed.has(jobId(job)));
+  for (const job of invalid) {
+    const id = jobId(job);
+    const retryAttempt = `retry-${id}`;
+    if (attempts.has(retryAttempt)) continue;
+    appendAttempt(batch, [job], retryAttempt, context);
+    const classified = classifyProviderOutput(
+      await boundedProviderCall(batch, 'retry', [job], { [id]: issues.get(id) || ['assessment-invalid'] }, context),
+      [job],
+    );
+    mergeUsage(usage, classified.usage);
+    await commitValid(batch, [job], classified, context, completed);
+    if (!completed.has(id)) issues.set(id, classified.issues.get(id) || ['assessment-invalid']);
+  }
+
+  state = assessmentState(context.run);
+  for (const job of pending) {
+    const id = jobId(job);
+    if (completed.has(id) || failed.has(id)) continue;
+    const failures = issues.get(id) || ['assessment-invalid'];
+    const allProviderFailures = failures.every((failure) => (
+      failure === 'provider-timeout' || failure === 'provider-call-failed' || failure === 'interrupted-attempt'
+    ));
+    const data = commitFailure(batch, job, {
+      code: allProviderFailures ? 'assessment-provider-exhausted' : 'assessment-validation-exhausted',
+      attempts: state.attempts.get(batch.id)
+        ? [...state.attempts.get(batch.id).values()].filter((ids) => ids.has(id)).length
+        : 0,
+      validationFailures: failures,
+    }, context);
+    failed.set(id, data);
+  }
+  return completeBatch(batch, context, completed, failed, usage);
+}
+
+function completeBatch(batch, context, completed, failed, usage = {}) {
+  const completedJobIds = batch.jobs.map(jobId).filter((id) => completed.has(id));
+  const failedJobIds = batch.jobs.map(jobId).filter((id) => failed.has(id));
+  const ref = artifact(
+    context.run,
+    context.lease,
+    `${batch.id}-complete`,
+    'batch',
+    [...completedJobIds, ...failedJobIds],
+    {
+      batchId: batch.id,
+      completedJobIds,
+      failedJobIds,
+      provenance: batch.request.provenance,
+    },
+  );
+  appendRunEvent(context.run, {
+    type: 'assessment.batch-completed',
+    stageId: 'assessment',
+    idempotencyKey: `${batch.id}-completed`,
+    payload: {
+      schemaVersion: 1,
+      reference: { kind: 'batch', id: batch.id },
+      count: batch.jobs.length,
+      artifact: ref,
+    },
+  }, context.lease);
+  validateManifestAgreement(context.run, context.lease);
+  return batchResult(batch, completed, failed, usage);
+}
+
+function batchResult(batch, completed, failed, usage = {}) {
+  const assessments = [];
+  const failures = [];
+  const provenanceByJob = {};
+  for (const job of batch.jobs) {
+    const id = jobId(job);
+    if (completed.has(id)) {
+      const data = completed.get(id);
+      assessments.push(data.assessment);
+      provenanceByJob[id] = data.provenance;
+    } else if (failed.has(id)) {
+      const data = failed.get(id);
+      failures.push({
+        jobId: data.jobId,
+        code: data.code,
+        attempts: data.attempts,
+        validationFailures: data.validationFailures,
+      });
+    }
+  }
+  return { assessments, failures, provenanceByJob, usage };
+}
+
+function effectiveProvenance(run) {
+  const started = run.events.find((event) => event.type === 'run.started')?.payload?.compatibility || {};
+  const substituted = [...run.events].reverse().find((event) => event.type === 'recovery.provider-substituted')?.payload;
+  return {
+    provider: substituted?.nextProvider || started.provider,
+    model: substituted?.nextModel || started.model,
+  };
+}
+
+function assertOrRecordSubstitution(run, batches, context) {
+  if (!batches.length) return;
+  const current = effectiveProvenance(run);
+  const next = batches[0].request.provenance;
+  if (current.provider === next.provider && current.model === next.model) return;
+  const decision = context.providerSubstitution;
+  if (!decision
+    || decision.previousProvider !== current.provider
+    || decision.previousModel !== current.model
+    || decision.nextProvider !== next.provider
+    || decision.nextModel !== next.model) {
+    throw new Error('assessment recovery requires an explicit provider substitution decision');
+  }
+  appendRunEvent(run, {
+    type: 'recovery.provider-substituted',
+    stageId: 'assessment',
+    idempotencyKey: `assessment-provider-substitution-${next.provider}-${next.model}`,
+    payload: { schemaVersion: 1, ...decision },
+  }, context.lease);
+}
+
+export async function resumeAssessments(run, context = {}) {
+  const batches = context.batches || [];
+  if (!run || !Array.isArray(batches) || !context.lease) {
+    throw new TypeError('assessment resume requires a run, batches and lease');
+  }
+  assertOrRecordSubstitution(run, batches, context);
+  const combined = { assessments: [], failures: [], provenanceByJob: {}, usage: {} };
+  for (const batch of batches) {
+    const result = await executeAssessmentBatch(batch, { ...context, run });
+    combined.assessments.push(...result.assessments);
+    combined.failures.push(...result.failures);
+    Object.assign(combined.provenanceByJob, result.provenanceByJob);
+    mergeUsage(combined.usage, result.usage);
+  }
+  validateManifestAgreement(run, context.lease);
+  return combined;
+}

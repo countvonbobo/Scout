@@ -14,6 +14,25 @@ function parseJsonResult(text) {
   return value;
 }
 
+async function awaitBoundedTurn(turn, timeoutMs, provider) {
+  if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 30 * 60 * 1000) {
+    throw new TypeError('structured turn timeout must be between 1 ms and 30 minutes');
+  }
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => {
+      try { turn.stop?.(); } catch { /* the bounded failure remains authoritative */ }
+      const duration = timeoutMs % 60_000 === 0 ? `${timeoutMs / 60_000} minutes` : `${timeoutMs} ms`;
+      reject(new Error(`${provider} structured turn timed out after ${duration}`));
+    }, timeoutMs);
+  });
+  try {
+    return await Promise.race([turn.finished, timeout]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 export function buildStructuredCodexArgs(schemaFile, options = {}) {
   const effort = options.reasoningEffort || 'medium';
   if (!['low', 'medium', 'high', 'xhigh'].includes(effort)) throw new Error(`invalid reasoning effort: ${effort}`);
@@ -62,7 +81,7 @@ export async function runStructuredTurn({
       parseLine: provider === 'codex' ? parseCodexLine : parseClaudeLine,
       timeoutMs,
     });
-    const result = await turn.finished;
+    const result = await awaitBoundedTurn(turn, timeoutMs, provider);
     if (!result.ok) throw new Error(result.error || `${provider} structured turn failed`);
     const inputTokens = Number(result.usage?.input_tokens ?? result.usage?.inputTokens ?? 0);
     if (maxInputTokens != null && inputTokens > maxInputTokens) {

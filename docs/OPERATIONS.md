@@ -51,6 +51,13 @@ The maintained beta deployment uses one private, single-owner Ubuntu VPS:
   origin/path only. Semantic scan artifacts preserve bounded ordered clauses
   and operators, redact credential-shaped values as a whole fact, and retain
   a fact for every non-empty description clause.
+- Assessment work is split into stable provider batches of at most ten jobs,
+  with smaller deterministic batches when the context budget requires them.
+  Valid job results are committed independently; invalid jobs receive one
+  focused schema repair and one clean per-job retry. Recovery never resubmits
+  completed jobs or batches. Durable request records contain only stable job
+  references, input digests, bounded parameters and versioned provenance, not
+  CVs, adverts, prompts, transcripts or raw provider responses.
 - Normal tracked career files remain readable only inside the private repository; ignored sensitive recovery state is encrypted under `.scout-backup/v1`.
 
 Do not assume a developer computer's local application checkout or workspace is live. Diagnose the VPS for production-like bugs unless the user explicitly reports a local-only installation.

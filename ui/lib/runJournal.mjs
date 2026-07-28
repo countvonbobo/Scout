@@ -46,6 +46,30 @@ const EVENT_PAYLOAD_SCHEMAS = Object.freeze({
       required: Object.freeze(new Set(['schemaVersion', 'reference', 'digest'])),
     }),
   }),
+  'assessment.batch-attempted': Object.freeze({
+    1: Object.freeze({
+      allowed: Object.freeze(new Set(['schemaVersion', 'reference', 'count', 'attempt', 'artifact'])),
+      required: Object.freeze(new Set(['schemaVersion', 'reference', 'count', 'attempt', 'artifact'])),
+    }),
+  }),
+  'assessment.job-completed': Object.freeze({
+    1: Object.freeze({
+      allowed: Object.freeze(new Set(['schemaVersion', 'reference', 'artifact'])),
+      required: Object.freeze(new Set(['schemaVersion', 'reference', 'artifact'])),
+    }),
+  }),
+  'assessment.job-failed': Object.freeze({
+    1: Object.freeze({
+      allowed: Object.freeze(new Set(['schemaVersion', 'reference', 'artifact'])),
+      required: Object.freeze(new Set(['schemaVersion', 'reference', 'artifact'])),
+    }),
+  }),
+  'assessment.batch-completed': Object.freeze({
+    1: Object.freeze({
+      allowed: Object.freeze(new Set(['schemaVersion', 'reference', 'count', 'artifact'])),
+      required: Object.freeze(new Set(['schemaVersion', 'reference', 'count', 'artifact'])),
+    }),
+  }),
   'recovery.stage-decided': Object.freeze({
     1: Object.freeze({
       allowed: Object.freeze(new Set(['schemaVersion', 'action', 'reason', 'artifact'])),
@@ -257,6 +281,7 @@ function validatePayload(type, payload, ErrorType = TypeError) {
   }
   if (value.outcome !== undefined && !RUN_OUTCOMES.has(value.outcome)) throw new ErrorType('journal payload outcome is invalid');
   if (value.digest !== undefined && (typeof value.digest !== 'string' || !SHA256.test(value.digest))) throw new ErrorType('journal payload digest is invalid');
+  if (value.attempt !== undefined) requireSafeToken(value.attempt, 'assessment attempt', ErrorType);
   if (type === 'run.failure-recorded') {
     requireSafeToken(value.code, 'failure code', ErrorType);
     requireSafeToken(value.reason, 'failure reason', ErrorType);

@@ -317,8 +317,9 @@ test('closed selected adverts are replaced by the next ranked eligible vacancy',
       summary: { checked: items.length, gone: items.some((item) => item.url.endsWith('/0')) ? 1 : 0, unverified: 0 },
     }),
     runStructuredTurnFn: async ({ prompt, validate }) => {
-      assessed = JSON.parse(prompt.split('\n\n').at(-1)).candidates;
-      const value = assessmentFor(assessed);
+      const batch = JSON.parse(prompt.split('\n\n').at(-1)).candidates;
+      assessed.push(...batch);
+      const value = assessmentFor(batch);
       validate(value);
       return { value, usage: {} };
     },
@@ -412,6 +413,112 @@ test('ranked second-pass candidates are renumbered and match persisted selection
   assert.equal(result.scan.funnel.assessed, prompted.length);
 });
 
+test('real scan execution uses stable assessment batches of at most ten', async () => {
+  const root = readyScanRoot();
+  const sourceJobs = Array.from({ length: 12 }, (_, index) => ({
+    company: `Synthetic ${index + 1}`,
+    title: 'Engineer',
+    url: `https://example.test/jobs/${index + 1}`,
+    providerId: `job-${index + 1}`,
+    description: 'Build synthetic systems.',
+  }));
+  const batchSizes = [];
+  try {
+    const result = await runScanWith(root, 'codex', 'primary', {
+      providerStatusFn: authenticated,
+      collectSourcesFn: async () => ({
+        generatedAt: '2026-07-28T10:00:00Z',
+        queries: ['engineer'],
+        sources: {
+          synthetic: {
+            configured: true,
+            status: 'healthy',
+            count: sourceJobs.length,
+            jobs: sourceJobs,
+          },
+        },
+      }),
+      checkLivenessFn: async (items) => ({
+        live: items,
+        removed: [],
+        summary: { checked: items.length, gone: 0, unverified: 0 },
+      }),
+      runStructuredTurnFn: async ({ prompt, validate }) => {
+        const batch = JSON.parse(prompt.split('\n\n').at(-1)).candidates;
+        batchSizes.push(batch.length);
+        const value = assessmentFor(batch);
+        validate(value);
+        return { value, usage: { input_tokens: batch.length } };
+      },
+      acquireLockFn: () => ({ ok: true, lock: { token: 'assessment-batch-test' } }),
+      releaseLockFn: () => ({ ok: true }),
+      queueWorkspaceSyncFn: async () => ({ ok: true }),
+    });
+    assert.equal(result.ok, true, result.error);
+    assert.deepEqual(batchSizes, [10, 2]);
+    assert.equal(result.scan.candidates_found, 12);
+    assert.equal(result.scan.reviewed.length, 12);
+    assert.equal(result.durable.manifest.assessmentBatches.length, 2);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('real scan execution keeps valid siblings and reports exhausted jobs precisely', async () => {
+  const root = readyScanRoot();
+  try {
+    const result = await runScanWith(root, 'codex', 'primary', {
+      providerStatusFn: authenticated,
+      collectSourcesFn: async () => ({
+        generatedAt: '2026-07-28T10:00:00Z',
+        queries: ['engineer'],
+        sources: {
+          synthetic: {
+            configured: true,
+            status: 'healthy',
+            count: 2,
+            jobs: [
+              { company: 'Able', title: 'Engineer', url: 'https://example.test/jobs/able', providerId: 'able' },
+              { company: 'Baker', title: 'Engineer', url: 'https://example.test/jobs/baker', providerId: 'baker' },
+            ],
+          },
+        },
+      }),
+      checkLivenessFn: async (items) => ({
+        live: items,
+        removed: [],
+        summary: { checked: items.length, gone: 0, unverified: 0 },
+      }),
+      runStructuredTurnFn: async ({ prompt, validate }) => {
+        const batch = JSON.parse(prompt.split('\n\n').at(-1)).candidates;
+        const value = assessmentFor(batch);
+        for (const item of value.assessments) {
+          if (item.candidateId === 'candidate-002') item.dimensions = [];
+        }
+        validate(value);
+        return { value, usage: {} };
+      },
+      acquireLockFn: () => ({ ok: true, lock: { token: 'assessment-partial-test' } }),
+      releaseLockFn: () => ({ ok: true }),
+      queueWorkspaceSyncFn: async () => ({ ok: true }),
+    });
+    assert.equal(result.ok, true, result.error);
+    assert.equal(result.status, 'degraded');
+    assert.equal(result.scan.reviewed.length, 1);
+    assert.deepEqual(result.scan.assessment_failures, [{
+      jobId: 'candidate-002',
+      code: 'assessment-validation-exhausted',
+      attempts: 3,
+      validationFailures: ['dimensions-required'],
+    }]);
+    const tracker = JSON.parse(fs.readFileSync(path.join(root, 'data', 'opportunities.json'), 'utf8'));
+    assert.equal(tracker.opportunities.length, 1);
+    assert.equal(tracker.opportunities[0].company, 'Able');
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test('runtime scan model is independent from the job-work model', async () => {
   const root = scanRoot();
   writeWorkspaceConfig(root, {
@@ -470,13 +577,13 @@ test('runtime scan records provider failure truthfully and always releases its l
   assert.equal(result.ok, false);
   assert.equal(result.status, 'failed');
   assert.equal(result.scan.degraded, true);
-  assert.deepEqual(result.scan.errors, ['bounded provider failed']);
+  assert.deepEqual(result.scan.errors, ['all candidate assessments exhausted their bounded provider retries']);
   assert.equal(released, true);
   const events = replayRunJournal(path.join(root, '.scout', 'runs', result.runId, 'journal.jsonl'));
   assert.equal(events.at(-1).type, 'run.completed');
   assert.equal(events.at(-1).payload.outcome, 'failed');
   assert.equal(fs.existsSync(path.join(root, '.scout', 'scan-lease.json')), false);
-  assert.match(fs.readFileSync(path.join(root, 'data', 'scan-runs.jsonl'), 'utf8'), /bounded provider failed/);
+  assert.match(fs.readFileSync(path.join(root, 'data', 'scan-runs.jsonl'), 'utf8'), /all candidate assessments exhausted/);
 });
 
 test('runtime records a canonical failure when collection fails before finalization', async () => {

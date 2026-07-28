@@ -58,3 +58,19 @@ test('structured turns reject malformed output and unsupported CLIs', async () =
     runTurnFn: () => ({ finished: Promise.resolve({ ok: true, text: '{"answer":"x"}', usage: { input_tokens: 11 } }) }),
   }), /exceeded its 10 input-token cap/);
 });
+
+test('structured turns enforce their own bounded deadline and stop an unresponsive adapter', { timeout: 1_000 }, async () => {
+  let stopped = false;
+  await assert.rejects(runStructuredTurn({
+    provider: 'codex',
+    status: { installed: true, authenticated: true, executable: 'codex', capabilities: { structuredOutput: true } },
+    schema,
+    prompt: 'synthetic',
+    timeoutMs: 25,
+    runTurnFn: () => ({
+      finished: new Promise(() => {}),
+      stop() { stopped = true; },
+    }),
+  }), /timed out after 25 ms/);
+  assert.equal(stopped, true);
+});
