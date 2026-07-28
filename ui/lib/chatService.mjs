@@ -93,6 +93,35 @@ export function registerChatRoutes({
   providerCataloguesFn = detectProviderModelCataloguesAsync,
   runCvQualityFn = runCvQuality, runStructuredTurnFn = runStructuredTurn, onCheckpoint = () => {},
 }) {
+  const catalogueReasonCodes = new Set([
+    'catalogue-check-failed',
+    'command-failed',
+    'command-unsupported',
+    'enumeration-unsupported',
+    'invalid-output',
+    'output-too-large',
+    'provider-unavailable',
+    'timeout',
+  ]);
+  const rejectedModels = new Map(Object.keys(ENGINES).map((engine) => [engine, new Set()]));
+  const safeCheckedAt = (value) => {
+    if (!value || Number.isNaN(Date.parse(value))) return null;
+    return new Date(value).toISOString();
+  };
+  const providerRejectedModel = (value, model) => {
+    const message = String(value || '').slice(0, 1_000);
+    if (!message.toLowerCase().includes(String(model || '').toLowerCase())) return false;
+    return /\b(?:invalid|unknown|unsupported)\s+model\b/i.test(message)
+      || /\bmodel\b.{0,120}\b(?:does not exist|not found|not available|unavailable|unsupported|access denied)\b/i.test(message)
+      || /\b(?:do not have|doesn't have|not have)\s+access\b.{0,80}\bmodel\b/i.test(message);
+  };
+  const rememberRejectedModel = (engine, model) => {
+    if (!isSafeModelId(model)) return;
+    const values = rejectedModels.get(engine);
+    values.delete(model);
+    values.add(model);
+    while (values.size > 100) values.delete(values.values().next().value);
+  };
   function checkpoint(reason) { Promise.resolve(onCheckpoint(reason)).catch(() => {}); }
   // A conversation may pin its own model. Without one it follows the provider
   // default from settings, so existing chats keep working unchanged.
@@ -248,6 +277,10 @@ export function registerChatRoutes({
           ...rawCatalogue,
           configured,
           detected: detected[engine] || [],
+          rejected: [
+            ...(Array.isArray(rawCatalogue.rejected) ? rawCatalogue.rejected : []),
+            ...rejectedModels.get(engine),
+          ],
         });
         const effectiveModel = effectiveProviderModel(engine, { configured }, models);
         return [engine, {
@@ -257,8 +290,10 @@ export function registerChatRoutes({
           effectiveModel,
           catalogue: {
             state: rawCatalogue.state === 'refreshed' ? 'refreshed' : 'fallback',
-            reasonCode: rawCatalogue.reasonCode || null,
-            checkedAt: rawCatalogue.checkedAt || null,
+            reasonCode: catalogueReasonCodes.has(rawCatalogue.reasonCode)
+              ? rawCatalogue.reasonCode
+              : rawCatalogue.reasonCode ? 'catalogue-check-failed' : null,
+            checkedAt: safeCheckedAt(rawCatalogue.checkedAt),
           },
         }];
       }));
@@ -450,6 +485,7 @@ export function registerChatRoutes({
       sseSend(res, 'error', { message: e.message });
       return sseEnd(res);
     }
+    const attemptedModel = model || modelForProvider(loadWorkspaceConfig(repoRoot), engine);
     const turn = runTurnFn({
       ...built,
       prompt: entry.id === ONBOARDING_CHAT_ID
@@ -473,6 +509,10 @@ export function registerChatRoutes({
       r = { ok: false, error: `turn failed: ${e.message}` };
     } finally {
       running.delete(id);
+    }
+    if (attemptedModel && isSafeModelId(attemptedModel)) {
+      if (r.ok) rejectedModels.get(engine).delete(attemptedModel);
+      else if (providerRejectedModel(r.error, attemptedModel)) rememberRejectedModel(engine, attemptedModel);
     }
 
     appendMessage(chat, 'user', text, nowIso());

@@ -377,6 +377,19 @@ test('switching chats rejects late usage and engine results from the previous ch
   await expect(page.locator('[data-engine-model="claude"]')).not.toContainText('Stale only');
 });
 
+test('model-picker draft state does not leak between chats', async ({ page }) => {
+  await page.evaluate(() => window.Scout.openChat('chat-a', 'ask'));
+  await page.waitForSelector('[data-engine-model="codex"]');
+  await page.selectOption('[data-engine-model="codex"]', '__other__');
+  await page.fill('[data-engine-model-custom="codex"]', 'private-custom-model');
+
+  await page.evaluate(() => window.Scout.openChat('chat-b', 'ask'));
+  await page.waitForSelector('[data-engine-model="codex"]');
+  await expect(page.locator('[data-engine-model="codex"]')).toHaveValue('');
+  await expect(page.locator('[data-engine-model-custom="codex"]')).toBeHidden();
+  await expect(page.locator('[data-engine-model-custom="codex"]')).toHaveValue('');
+});
+
 test('closing the drawer rejects late usage and engine results', async ({ page }) => {
   await page.unroute('**/api/usage');
   await page.unroute('**/api/engines');

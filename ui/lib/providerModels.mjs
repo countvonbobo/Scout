@@ -15,7 +15,7 @@ const CURATED = Object.freeze({
   codex: Object.freeze([]),
 });
 
-const SAFE_MODEL = /^[A-Za-z0-9._:-]+$/;
+const SAFE_MODEL = /^[A-Za-z0-9._:-]{1,128}$/;
 // The current Codex catalogue is just under 300 KiB because each record also
 // carries instructions and capability metadata. Keep enough headroom for that
 // supported payload while still enforcing a firm pre-parse ceiling.

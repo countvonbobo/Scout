@@ -106,7 +106,7 @@ test('a provider-rejected model is unavailable and a deliberate safe custom ID s
   const catalogue = providerModelCatalogue('codex', {
     state: 'refreshed',
     configured: 'gpt-5.6-terra',
-    custom: ['safe-custom:model'],
+    custom: ['safe-custom:model', 'x'.repeat(129)],
     rejected: ['gpt-5.6-terra'],
     models: [{ id: 'gpt-5.6-terra' }],
   });
@@ -123,6 +123,7 @@ test('a provider-rejected model is unavailable and a deliberate safe custom ID s
     selected: false,
   });
   assert.equal(catalogue.some((model) => model.id === 'bad;command'), false);
+  assert.equal(catalogue.some((model) => model.id === 'x'.repeat(129)), false);
 });
 
 test('Codex session-log models never become catalogue availability evidence', () => {

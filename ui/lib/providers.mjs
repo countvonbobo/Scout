@@ -347,7 +347,7 @@ export const detectProvidersAsync = createProviderDetector();
 
 export function assertSafeModel(value) {
   if (value == null || value === '') return null;
-  if (!/^[A-Za-z0-9._:-]+$/.test(value)) throw new Error('invalid model identifier');
+  if (!/^[A-Za-z0-9._:-]{1,128}$/.test(value)) throw new Error('invalid model identifier');
   return value;
 }
 

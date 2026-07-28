@@ -1862,6 +1862,8 @@ const Scout = {
       mode: prefillKey === 'fit' ? 'fit-assessment' : null,
     };
     this.chat = c;
+    this.enginePicks = {};
+    this.engineOptions = null;
     this.chatDrawerState = createChatDrawerState(id, openSeq);
     this.renderChatDrawer();
     let prefill = c.prefills[prefillKey] || '';
@@ -2068,7 +2070,7 @@ const Scout = {
           ${option('__other__', 'Other…')}
         </select>
       </label>
-      <input class="engine-model-custom ${selected === '__other__' ? '' : 'hidden'}" data-engine-model-custom="${this.esc(engine)}" type="text" placeholder="Exact model id" pattern="[A-Za-z0-9._:\-]+">
+      <input class="engine-model-custom ${selected === '__other__' ? '' : 'hidden'}" data-engine-model-custom="${this.esc(engine)}" type="text" placeholder="Exact model id" maxlength="128" pattern="[A-Za-z0-9._:\-]{1,128}">
       <div class="engine-model-spend">${this.modelSpendHtml(engine, info?.usage, selected)}</div>
       ${unavailableExplanation}
       <div class="engine-model-status meta" role="status" aria-live="polite"></div>
@@ -2388,7 +2390,7 @@ const Scout = {
       return;
     }
     const model = this.selectedEngineModel(engine);
-    if (selection === '__other__' && !/^[A-Za-z0-9._:-]+$/.test(String(model || ''))) {
+    if (selection === '__other__' && !/^[A-Za-z0-9._:-]{1,128}$/.test(String(model || ''))) {
       if (status) status.textContent = 'Enter a safe exact model ID.';
       return;
     }
