@@ -103,6 +103,12 @@ test('assessment artifacts enforce their kind-specific privacy envelope', () => 
     schemaVersion: 1,
     batchId: 'batch-1',
     runId: 'run-1',
+    contextDigests: {
+      scoringConfigDigest: '1'.repeat(64),
+      profileDigest: '2'.repeat(64),
+      calibrationDigest: '3'.repeat(64),
+      masterCvDigest: '4'.repeat(64),
+    },
     jobReferences: [{ jobId: 'candidate-001', inputDigest: 'a'.repeat(64) }],
     parameters: { maxJobs: 10, maxInputTokens: 75_000, timeoutMs: 60_000, contextBudgetCharacters: 280_000 },
     provenance: {
@@ -134,6 +140,65 @@ test('assessment artifacts enforce their kind-specific privacy envelope', () => 
     }, lease),
     /private assessment artifact property/i,
   );
+});
+
+test('assessment result artifacts reject URL-bearing and secret-shaped evidence before writing', () => {
+  const run = openRunJournal(temp(), 'run-1');
+  const unsafeValues = [
+    'https://example.test/evidence?access_token=PRIVATE_QUERY_SECRET',
+    'https://example.test/evidence#PRIVATE_FRAGMENT_SECRET',
+    'https://PRIVATE_USER:PRIVATE_PASSWORD@example.test/evidence',
+    'Bearer PRIVATE_BEARER_SECRET_123456789',
+    'sk-PRIVATE_OPENAI_SECRET_1234567890',
+  ];
+  const baseAssessment = {
+    candidateId: 'candidate-001',
+    categoryId: null,
+    summary: 'Safe bounded summary.',
+    hardExclusionMatches: [],
+    mandatoryRequirements: [],
+    dimensions: [{ name: 'fit', score: 80, maximum: 100, evidence: 'Safe bounded evidence.' }],
+    recommendation: 'keep',
+  };
+
+  for (const [index, unsafe] of unsafeValues.entries()) {
+    assert.throws(
+      () => commitRunArtifact(run, {
+        id: `assessment-unsafe-${index}`,
+        schemaVersion: 3,
+      }, {
+        schemaVersion: 3,
+        type: 'result',
+        stableIds: ['vacancy-001'],
+        data: {
+          batchId: 'batch-1',
+          jobId: 'vacancy-001',
+          inputDigest: 'a'.repeat(64),
+          fencingGeneration: 1,
+          assessment: {
+            ...baseAssessment,
+            dimensions: [{ ...baseAssessment.dimensions[0], evidence: unsafe }],
+          },
+          provenance: {
+            provider: 'codex',
+            model: 'provider-default',
+            promptVersion: 'prompt-v1',
+            assessmentSchemaVersion: 1,
+          },
+        },
+      }, lease),
+      /assessment artifact (?:URLs?|credentials) are not allowed/i,
+    );
+  }
+
+  const durableText = fs.existsSync(path.join(run.directory, 'artifacts'))
+    ? fs.readdirSync(path.join(run.directory, 'artifacts'), { recursive: true })
+      .map((entry) => path.join(run.directory, 'artifacts', entry))
+      .filter((file) => fs.statSync(file).isFile())
+      .map((file) => fs.readFileSync(file, 'utf8'))
+      .join('\n')
+    : '';
+  for (const unsafe of unsafeValues) assert.equal(durableText.includes(unsafe), false);
 });
 
 test('the larger pipeline bound does not loosen the legacy artifact schema', () => {

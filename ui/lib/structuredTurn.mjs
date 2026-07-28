@@ -14,23 +14,42 @@ function parseJsonResult(text) {
   return value;
 }
 
-async function awaitBoundedTurn(turn, timeoutMs, provider) {
+export function structuredTurnCancellationGraceMs(timeoutMs) {
   if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 30 * 60 * 1000) {
     throw new TypeError('structured turn timeout must be between 1 ms and 30 minutes');
   }
+  return Math.min(2_000, Math.max(100, Math.floor(timeoutMs * 0.05)));
+}
+
+function delayOutcome(milliseconds, value) {
   let timer;
-  const timeout = new Promise((_, reject) => {
-    timer = setTimeout(() => {
-      try { turn.stop?.(); } catch { /* the bounded failure remains authoritative */ }
-      const duration = timeoutMs % 60_000 === 0 ? `${timeoutMs / 60_000} minutes` : `${timeoutMs} ms`;
-      reject(new Error(`${provider} structured turn timed out after ${duration}`));
-    }, timeoutMs);
-  });
-  try {
-    return await Promise.race([turn.finished, timeout]);
-  } finally {
-    clearTimeout(timer);
+  const promise = new Promise((resolve) => { timer = setTimeout(() => resolve(value), milliseconds); });
+  return { promise, cancel: () => clearTimeout(timer) };
+}
+
+async function awaitBoundedTurn(turn, timeoutMs, provider) {
+  const cancellationGraceMs = structuredTurnCancellationGraceMs(timeoutMs);
+  const settled = Promise.resolve(turn.finished).then(
+    (value) => ({ kind: 'finished', value }),
+    (error) => ({ kind: 'failed', error }),
+  );
+  const deadline = delayOutcome(timeoutMs, { kind: 'timeout' });
+  const first = await Promise.race([settled, deadline.promise]);
+  deadline.cancel();
+  if (first.kind === 'finished') return first.value;
+  if (first.kind === 'failed') throw first.error;
+
+  try { turn.stop?.(); } catch { /* closure observation remains authoritative */ }
+  const closeDeadline = delayOutcome(cancellationGraceMs, { kind: 'close-timeout' });
+  const closed = await Promise.race([settled, closeDeadline.promise]);
+  closeDeadline.cancel();
+  if (closed.kind === 'close-timeout') {
+    throw new Error(
+      `${provider} structured turn did not close within its ${cancellationGraceMs} ms cancellation grace`,
+    );
   }
+  const duration = timeoutMs % 60_000 === 0 ? `${timeoutMs / 60_000} minutes` : `${timeoutMs} ms`;
+  throw new Error(`${provider} structured turn timed out after ${duration}`);
 }
 
 export function buildStructuredCodexArgs(schemaFile, options = {}) {

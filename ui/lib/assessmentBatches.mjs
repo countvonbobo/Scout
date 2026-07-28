@@ -6,6 +6,7 @@ import {
   validateManifestAgreement,
 } from './runArtifacts.mjs';
 import { appendRunEvent } from './runJournal.mjs';
+import { structuredTurnCancellationGraceMs } from './structuredTurn.mjs';
 
 const MAX_BATCH_JOBS = 10;
 const DEFAULT_TIMEOUT_MS = 20 * 60 * 1000;
@@ -14,7 +15,11 @@ const DEFAULT_MAX_INPUT_TOKENS = 75_000;
 const SHA256 = /^[a-f0-9]{64}$/;
 const SAFE_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 const PRIVATE_REQUEST_KEY = /^(?:access[-_]?token|advert[-_]?body|api[-_]?(?:key|token)|auth(?:orization)?|body|cookies?|credentials?|cv|description|headers?|html|master[-_]?cv|password|payload|profile[-_]?evidence|prompt|raw[-_]?(?:html|response)|requirements?|response|secret(?:[-_]?(?:key|token))?|token|transcript)$/i;
-const CREDENTIAL_VALUE = /(?:https?:\/\/[^/\s:@]+:[^/\s@]+@)|(?:\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b)|(?:\b(?:api[-_ ]?key|authorization|password|secret|session[-_ ]?id|token)\s*[:=]\s*\S+)/i;
+const CREDENTIAL_VALUE = /(?:\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b)|(?:\b(?:api[-_ ]?key|authorization|password|secret|session[-_ ]?id|token)\s*[:=]\s*\S+)|(?:\bbearer\s+[A-Za-z0-9._~+/-]{8,})|(?:\bsk-[A-Za-z0-9_-]{16,})|(?:\bgh[pousr]_[A-Za-z0-9]{20,})|(?:\bxox[baprs]-[A-Za-z0-9-]{10,})|(?:\bAKIA[0-9A-Z]{16}\b)/i;
+const URL_VALUE = /\bhttps?:\/\/\S+/i;
+const CONTEXT_DIGEST_KEYS = Object.freeze([
+  'scoringConfigDigest', 'profileDigest', 'calibrationDigest', 'masterCvDigest',
+]);
 const ASSESSMENT_KEYS = Object.freeze([
   'candidateId', 'categoryId', 'summary', 'hardExclusionMatches',
   'mandatoryRequirements', 'dimensions', 'recommendation',
@@ -118,14 +123,28 @@ function positiveInteger(value, name, maximum = Number.MAX_SAFE_INTEGER) {
 function boundedString(value, name, maximum, { nullable = false, empty = false } = {}) {
   if (nullable && value === null) return value;
   if (typeof value !== 'string' || (!empty && !value.trim()) || value.length > maximum
-    || CREDENTIAL_VALUE.test(value)) {
+    || CREDENTIAL_VALUE.test(value) || URL_VALUE.test(value)) {
     throw new TypeError(`${name} must be a bounded string`);
   }
   return value;
 }
 
 function jobId(job) {
-  return safeId(job?.jobId || job?.candidateId, 'assessment job ID');
+  return safeId(job?.assessmentJobId || job?.vacancyId || job?.jobId || job?.candidateId, 'assessment job ID');
+}
+
+function candidateId(job) {
+  return safeId(job?.candidateId || jobId(job), 'assessment candidate ID');
+}
+
+function validateContextDigests(value) {
+  if (!exactKeys(value, CONTEXT_DIGEST_KEYS)) throw new TypeError('assessment context digests are invalid');
+  for (const key of CONTEXT_DIGEST_KEYS) {
+    if (typeof value[key] !== 'string' || !SHA256.test(value[key])) {
+      throw new TypeError(`assessment context digest is invalid: ${key}`);
+    }
+  }
+  return value;
 }
 
 function validateProvenance(value) {
@@ -159,12 +178,15 @@ function inspectPrivateRequestKeys(value, seen = new Set()) {
 
 export function assertMinimalAssessmentRequest(request) {
   inspectPrivateRequestKeys(request);
-  if (!exactKeys(request, ['schemaVersion', 'batchId', 'runId', 'jobReferences', 'parameters', 'provenance'])
+  if (!exactKeys(request, [
+    'schemaVersion', 'batchId', 'runId', 'contextDigests', 'jobReferences', 'parameters', 'provenance',
+  ])
     || request.schemaVersion !== 1) {
     throw new TypeError('minimal assessment request is invalid');
   }
   safeId(request.batchId, 'assessment batch ID');
   safeId(request.runId, 'assessment run ID');
+  validateContextDigests(request.contextDigests);
   if (!Array.isArray(request.jobReferences) || !request.jobReferences.length || request.jobReferences.length > MAX_BATCH_JOBS) {
     throw new TypeError('assessment request job references are invalid');
   }
@@ -196,6 +218,24 @@ function contextCharacters(job) {
     : JSON.stringify(job).length;
 }
 
+function canonicalJobInput(job) {
+  if (job?.assessmentInput && typeof job.assessmentInput === 'object') return job.assessmentInput;
+  const {
+    assessmentJobId: _assessmentJobId,
+    assessmentInput: _assessmentInput,
+    contextCharacters: _contextCharacters,
+    ...input
+  } = job;
+  return input;
+}
+
+const EMPTY_CONTEXT_DIGESTS = Object.freeze({
+  scoringConfigDigest: digest(''),
+  profileDigest: digest(''),
+  calibrationDigest: digest(''),
+  masterCvDigest: digest(''),
+});
+
 export function planAssessmentBatches({
   runId,
   jobs = [],
@@ -205,9 +245,11 @@ export function planAssessmentBatches({
   timeoutMs = DEFAULT_TIMEOUT_MS,
   maxInputTokens = DEFAULT_MAX_INPUT_TOKENS,
   maxJobs = MAX_BATCH_JOBS,
+  contextDigests = EMPTY_CONTEXT_DIGESTS,
 } = {}) {
   safeId(runId, 'assessment run ID');
   validateProvenance(provenance);
+  validateContextDigests(contextDigests);
   positiveInteger(contextBudgetCharacters, 'assessment context budget', 10_000_000);
   if (!Number.isSafeInteger(contextOverheadCharacters) || contextOverheadCharacters < 0
     || contextOverheadCharacters >= contextBudgetCharacters) {
@@ -222,7 +264,15 @@ export function planAssessmentBatches({
     const id = jobId(job);
     if (ids.has(id)) throw new TypeError(`assessment job is duplicated: ${id}`);
     ids.add(id);
-    return { job, id, inputDigest: digest(job), characters: contextCharacters(job) };
+    return {
+      job,
+      id,
+      inputDigest: digest({
+        job: canonicalJobInput(job),
+        contextDigests,
+      }),
+      characters: contextCharacters(job),
+    };
   });
   const groups = [];
   let current = [];
@@ -240,9 +290,18 @@ export function planAssessmentBatches({
   }
   if (current.length) groups.push(current);
   return groups.map((group) => {
+    const parameters = {
+      maxJobs,
+      maxInputTokens,
+      timeoutMs,
+      contextBudgetCharacters,
+    };
+    const jobReferences = group.map((item) => ({ jobId: item.id, inputDigest: item.inputDigest }));
     const identity = {
       runId,
-      jobIds: group.map((item) => item.id),
+      contextDigests,
+      jobReferences,
+      parameters,
       provenance,
     };
     const id = `assessment-${digest(identity).slice(0, 32)}`;
@@ -250,13 +309,9 @@ export function planAssessmentBatches({
       schemaVersion: 1,
       batchId: id,
       runId,
-      jobReferences: group.map((item) => ({ jobId: item.id, inputDigest: item.inputDigest })),
-      parameters: {
-        maxJobs,
-        maxInputTokens,
-        timeoutMs,
-        contextBudgetCharacters,
-      },
+      contextDigests: { ...contextDigests },
+      jobReferences,
+      parameters,
       provenance: { ...provenance },
     });
     return Object.freeze({
@@ -273,7 +328,7 @@ function validationFailure(code) {
 }
 
 export function validateAssessmentJob(value, job) {
-  const expectedId = jobId(job);
+  const expectedId = candidateId(job);
   if (!exactKeys(value, ASSESSMENT_KEYS)) return validationFailure('assessment-shape-invalid');
   if (value.candidateId !== expectedId) return validationFailure('candidate-id-mismatch');
   try {
@@ -328,29 +383,87 @@ export function validateAssessmentJob(value, job) {
   return Object.freeze([]);
 }
 
-function assessmentState(run) {
+function assessmentRecoveryBoundary(run) {
+  let boundary = { sequence: 0, fencingGeneration: 1 };
+  for (const event of run.events || []) {
+    let restart = false;
+    if (event.type === 'recovery.started') {
+      restart = event.payload.schemaVersion === 1
+        || event.payload.decisions?.some((decision) => (
+          ['assess', 'assessment'].includes(decision.stageId) && decision.action === 'restart'
+        ));
+    } else if (event.type === 'recovery.stage-decided') {
+      restart = ['assess', 'assessment'].includes(event.stageId) && event.payload.action === 'restart';
+    }
+    if (restart) {
+      boundary = {
+        sequence: event.sequence,
+        fencingGeneration: event.fencingGeneration,
+      };
+    }
+  }
+  return boundary;
+}
+
+function batchReference(batch, id) {
+  return batch.request.jobReferences.find((reference) => reference.jobId === id);
+}
+
+function artifactMatchesFence(data, event, boundary) {
+  return data.fencingGeneration === event.fencingGeneration
+    && event.fencingGeneration >= boundary.fencingGeneration;
+}
+
+function assessmentState(run, batch) {
   const state = {
     completed: new Map(),
     failed: new Map(),
     completedBatches: new Set(),
     attempts: new Map(),
   };
+  const boundary = assessmentRecoveryBoundary(run);
   for (const event of run.events || []) {
-    if (!event.type.startsWith('assessment.')) continue;
+    if (!event.type.startsWith('assessment.') || event.sequence <= boundary.sequence
+      || event.fencingGeneration < boundary.fencingGeneration) continue;
     if (event.type === 'assessment.batch-attempted') {
+      if (event.payload.reference.id !== batch.id) continue;
       const stored = readRunArtifact({ ...event.payload.artifact, directory: run.directory });
-      const ids = stored.data.request.jobReferences.map((reference) => reference.jobId);
-      const attempts = state.attempts.get(event.payload.reference.id) || new Map();
+      const request = assertMinimalAssessmentRequest(stored.data.request);
+      if (request.batchId !== batch.id
+        || stableJson(request.contextDigests) !== stableJson(batch.request.contextDigests)
+        || stableJson(request.parameters) !== stableJson(batch.request.parameters)
+        || stableJson(request.provenance) !== stableJson(batch.request.provenance)
+        || request.jobReferences.some((reference) => (
+          batchReference(batch, reference.jobId)?.inputDigest !== reference.inputDigest
+        ))) continue;
+      const ids = request.jobReferences.map((reference) => reference.jobId);
+      const attempts = state.attempts.get(batch.id) || new Map();
       attempts.set(event.payload.attempt, new Set(ids));
-      state.attempts.set(event.payload.reference.id, attempts);
+      state.attempts.set(batch.id, attempts);
     } else if (event.type === 'assessment.job-completed') {
       const stored = readRunArtifact({ ...event.payload.artifact, directory: run.directory });
-      state.completed.set(event.payload.reference.id, stored.data);
+      const data = stored.data;
+      const reference = batchReference(batch, data.jobId);
+      if (data.batchId === batch.id && reference?.inputDigest === data.inputDigest
+        && artifactMatchesFence(data, event, boundary)
+        && event.payload.reference.id === data.jobId) {
+        state.completed.set(data.jobId, data);
+      }
     } else if (event.type === 'assessment.job-failed') {
       const stored = readRunArtifact({ ...event.payload.artifact, directory: run.directory });
-      state.failed.set(event.payload.reference.id, stored.data);
+      const data = stored.data;
+      const reference = batchReference(batch, data.jobId);
+      if (data.batchId === batch.id && reference?.inputDigest === data.inputDigest
+        && artifactMatchesFence(data, event, boundary)
+        && event.payload.reference.id === data.jobId) {
+        state.failed.set(data.jobId, data);
+      }
     } else if (event.type === 'assessment.batch-completed') {
-      state.completedBatches.add(event.payload.reference.id);
+      if (event.payload.reference.id !== batch.id) continue;
+      const stored = readRunArtifact({ ...event.payload.artifact, directory: run.directory });
+      if (stored.data.batchId === batch.id && artifactMatchesFence(stored.data, event, boundary)) {
+        state.completedBatches.add(batch.id);
+      }
     }
   }
   return state;
@@ -368,6 +481,20 @@ function artifact(run, lease, id, type, stableIds, data) {
   }, lease);
 }
 
+function executionIdentity(run, lease) {
+  const boundary = assessmentRecoveryBoundary(run);
+  return `g${lease.generation}-e${boundary.sequence}`;
+}
+
+function durableOperationId(batch, context, kind, id = '') {
+  return `assessment-${digest({
+    batchId: batch.id,
+    execution: executionIdentity(context.run, context.lease),
+    kind,
+    id,
+  }).slice(0, 48)}`;
+}
+
 function appendAttempt(batch, subset, kind, context) {
   const request = assertMinimalAssessmentRequest({
     ...batch.request,
@@ -380,7 +507,7 @@ function appendAttempt(batch, subset, kind, context) {
   const ref = artifact(
     context.run,
     context.lease,
-    `${batch.id}-${kind}-request`,
+    durableOperationId(batch, context, 'request', kind),
     'request',
     request.jobReferences.map((reference) => reference.jobId),
     { request },
@@ -388,7 +515,7 @@ function appendAttempt(batch, subset, kind, context) {
   appendRunEvent(context.run, {
     type: 'assessment.batch-attempted',
     stageId: 'assessment',
-    idempotencyKey: `${batch.id}-${kind}-attempted`,
+    idempotencyKey: durableOperationId(batch, context, 'attempted', kind),
     payload: {
       schemaVersion: 1,
       reference: { kind: 'batch', id: batch.id },
@@ -401,6 +528,7 @@ function appendAttempt(batch, subset, kind, context) {
 
 function commitAssessment(batch, job, value, context) {
   const id = jobId(job);
+  const inputDigest = batchReference(batch, id).inputDigest;
   const provenance = {
     provider: batch.request.provenance.provider,
     model: batch.request.provenance.model,
@@ -410,31 +538,51 @@ function commitAssessment(batch, job, value, context) {
   const ref = artifact(
     context.run,
     context.lease,
-    `${batch.id}-${id}-result`,
+    durableOperationId(batch, context, 'result', id),
     'result',
     [id],
-    { batchId: batch.id, jobId: id, assessment: value, provenance },
+    {
+      batchId: batch.id,
+      jobId: id,
+      inputDigest,
+      fencingGeneration: context.lease.generation,
+      assessment: value,
+      provenance,
+    },
   );
   appendRunEvent(context.run, {
     type: 'assessment.job-completed',
     stageId: 'assessment',
-    idempotencyKey: `${batch.id}-${id}-completed`,
+    idempotencyKey: durableOperationId(batch, context, 'completed', id),
     payload: {
       schemaVersion: 1,
       reference: { kind: 'vacancy', id },
       artifact: ref,
     },
   }, context.lease);
-  return { batchId: batch.id, jobId: id, assessment: value, provenance };
+  return {
+    batchId: batch.id,
+    jobId: id,
+    inputDigest,
+    fencingGeneration: context.lease.generation,
+    assessment: value,
+    provenance,
+  };
 }
 
 function commitFailure(batch, job, failure, context) {
   const id = jobId(job);
-  const data = { batchId: batch.id, jobId: id, ...failure };
+  const data = {
+    batchId: batch.id,
+    jobId: id,
+    inputDigest: batchReference(batch, id).inputDigest,
+    fencingGeneration: context.lease.generation,
+    ...failure,
+  };
   const ref = artifact(
     context.run,
     context.lease,
-    `${batch.id}-${id}-failure`,
+    durableOperationId(batch, context, 'failure', id),
     'failure',
     [id],
     data,
@@ -442,7 +590,7 @@ function commitFailure(batch, job, failure, context) {
   appendRunEvent(context.run, {
     type: 'assessment.job-failed',
     stageId: 'assessment',
-    idempotencyKey: `${batch.id}-${id}-failed`,
+    idempotencyKey: durableOperationId(batch, context, 'failed', id),
     payload: {
       schemaVersion: 1,
       reference: { kind: 'vacancy', id },
@@ -454,7 +602,7 @@ function commitFailure(batch, job, failure, context) {
 
 async function boundedProviderCall(batch, kind, subset, validationFailures, context) {
   const timeoutMs = batch.request.parameters.timeoutMs;
-  const cancellationGraceMs = Math.min(1_000, Math.max(25, Math.floor(timeoutMs * 0.05)));
+  const cancellationGraceMs = structuredTurnCancellationGraceMs(timeoutMs);
   const heartbeatIntervalMs = Math.max(1, Number(context.heartbeatIntervalMs || 1_000));
   let timer;
   let timeout;
@@ -468,7 +616,7 @@ async function boundedProviderCall(batch, kind, subset, validationFailures, cont
       timer = setTimeout(() => resolve({
         ok: false,
         code: 'provider-timeout',
-      }), timeoutMs + cancellationGraceMs);
+      }), timeoutMs + cancellationGraceMs + 10);
     });
     const call = Promise.resolve().then(() => context.invokeProvider({
       batchId: batch.id,
@@ -505,11 +653,13 @@ function classifyProviderOutput(call, subset) {
   const returned = new Map();
   for (const assessment of output.assessments) {
     const id = assessment?.candidateId;
-    if (!subset.some((job) => jobId(job) === id) || returned.has(id)) {
-      if (subset.some((job) => jobId(job) === id)) issues.set(id, ['candidate-duplicate']);
+    const job = subset.find((candidate) => candidateId(candidate) === id);
+    const durableId = job ? jobId(job) : null;
+    if (!job || returned.has(durableId)) {
+      if (durableId) issues.set(durableId, ['candidate-duplicate']);
       continue;
     }
-    returned.set(id, assessment);
+    returned.set(durableId, assessment);
   }
   for (const job of subset) {
     const id = jobId(job);
@@ -548,7 +698,7 @@ export async function executeAssessmentBatch(batch, context = {}) {
   }
   if (typeof context.invokeProvider !== 'function') throw new TypeError('assessment provider callback is required');
   assertMinimalAssessmentRequest(batch.request);
-  let state = assessmentState(context.run);
+  let state = assessmentState(context.run, batch);
   const completed = new Map(state.completed);
   const failed = new Map(state.failed);
   const usage = {};
@@ -603,7 +753,7 @@ export async function executeAssessmentBatch(batch, context = {}) {
     if (!completed.has(id)) issues.set(id, classified.issues.get(id) || ['assessment-invalid']);
   }
 
-  state = assessmentState(context.run);
+  state = assessmentState(context.run, batch);
   for (const job of pending) {
     const id = jobId(job);
     if (completed.has(id) || failed.has(id)) continue;
@@ -629,20 +779,21 @@ function completeBatch(batch, context, completed, failed, usage = {}) {
   const ref = artifact(
     context.run,
     context.lease,
-    `${batch.id}-complete`,
+    durableOperationId(batch, context, 'batch-complete'),
     'batch',
     [...completedJobIds, ...failedJobIds],
     {
       batchId: batch.id,
       completedJobIds,
       failedJobIds,
+      fencingGeneration: context.lease.generation,
       provenance: batch.request.provenance,
     },
   );
   appendRunEvent(context.run, {
     type: 'assessment.batch-completed',
     stageId: 'assessment',
-    idempotencyKey: `${batch.id}-completed`,
+    idempotencyKey: durableOperationId(batch, context, 'batch-completed'),
     payload: {
       schemaVersion: 1,
       reference: { kind: 'batch', id: batch.id },
@@ -660,14 +811,15 @@ function batchResult(batch, completed, failed, usage = {}) {
   const provenanceByJob = {};
   for (const job of batch.jobs) {
     const id = jobId(job);
+    const outputId = candidateId(job);
     if (completed.has(id)) {
       const data = completed.get(id);
       assessments.push(data.assessment);
-      provenanceByJob[id] = data.provenance;
+      provenanceByJob[outputId] = data.provenance;
     } else if (failed.has(id)) {
       const data = failed.get(id);
       failures.push({
-        jobId: data.jobId,
+        jobId: outputId,
         code: data.code,
         attempts: data.attempts,
         validationFailures: data.validationFailures,

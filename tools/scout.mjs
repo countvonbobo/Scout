@@ -112,9 +112,10 @@ function queueConfigFingerprint(config, tracker) {
 }
 
 function scanCompatibility({
-  config, mode, model, profile, provider, tracker,
+  config, mode, model, profile, provider, root, tracker,
   requester = 'manual', scheduleId = null, logicalWindowId = null,
 }) {
+  const contextDigests = assessmentContextDigests(workspacePaths(root), config);
   return {
     schemaVersion: 2,
     mode,
@@ -126,7 +127,7 @@ function scanCompatibility({
     stageArtifactSchemaVersion: PIPELINE_STAGE_ARTIFACT_SCHEMA_VERSION,
     pipelineVersion: 'scan-pipeline-v3-semantic-stage-artifacts',
     rankingVersion: `ranked-discovery-v1-${scanDigest(tracker).slice(0, 32)}`,
-    promptVersion: 'assessment-prompt-v1',
+    promptVersion: `assessment-prompt-v1-${scanDigest(contextDigests).slice(0, 32)}`,
     assessmentSchemaVersion: 1,
     provider,
     model: model || 'provider-default',
@@ -175,6 +176,7 @@ function verifyQueuedScanCompatibility(root, request, manifest = null) {
   const currentRun = scanCompatibility({
     config,
     profile,
+    root,
     tracker,
     provider: execution.provider,
     mode: execution.mode,
@@ -465,6 +467,15 @@ function buildScanContext(paths, config, candidates) {
   return context;
 }
 
+function assessmentContextDigests(paths, config) {
+  return Object.freeze({
+    scoringConfigDigest: scanDigest(scoringConfig(config)),
+    profileDigest: scanDigest(readBounded(path.join(paths.profile, 'context.md'), 'profile/context.md')),
+    calibrationDigest: scanDigest(readBounded(path.join(paths.profile, 'calibration.md'), 'profile/calibration.md')),
+    masterCvDigest: scanDigest(readBounded(path.join(paths.cv, 'master-cv.md'), 'cv/master-cv.md')),
+  });
+}
+
 function vacancyKey(vacancy) {
   return String(vacancy?.vacancyId || vacancy?.canonicalUrl || vacancy?.url || '');
 }
@@ -562,7 +573,7 @@ export async function runScanWith(root, provider, mode, {
   const publishedAtStart = loadPublishedSearchProfile(root);
   const trackerAtStart = JSON.parse(fs.readFileSync(workspacePaths(root).tracker, 'utf8'));
   const compatibility = scanCompatibility({
-    config, mode, model, profile: publishedAtStart, provider, tracker: trackerAtStart,
+    config, mode, model, profile: publishedAtStart, provider, root, tracker: trackerAtStart,
     requester, scheduleId, logicalWindowId,
   });
   const request = claimedLease === null
@@ -765,6 +776,7 @@ export async function runScanWith(root, provider, mode, {
             onProgress({ phase: `Scoring ${candidates.length} candidates`, current: 3, total: 5 });
             const paths = workspacePaths(root);
             const emptyContext = buildScanContext(paths, config, []);
+            const contextDigests = assessmentContextDigests(paths, config);
             const assessed = await assessScanCandidates({
               run,
               lease,
@@ -772,6 +784,7 @@ export async function runScanWith(root, provider, mode, {
               compatibility,
               contextBudgetCharacters: MAX_SCAN_CONTEXT_CHARS,
               contextOverheadCharacters: JSON.stringify(emptyContext).length,
+              contextDigests,
               async invokeProvider({ kind, jobs, validationFailures, timeoutMs, maxInputTokens }) {
                 const context = buildScanContext(paths, config, jobs.map(promptCandidate));
                 const repairInstruction = kind === 'repair'

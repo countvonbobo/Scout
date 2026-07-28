@@ -633,6 +633,12 @@ test('durable scan finalisation assesses real candidates in recoverable batches 
           compatibility: RECOVERY_COMPATIBILITY,
           contextBudgetCharacters: 100_000,
           contextOverheadCharacters: 1_000,
+          contextDigests: {
+            scoringConfigDigest: '1'.repeat(64),
+            profileDigest: '2'.repeat(64),
+            calibrationDigest: '3'.repeat(64),
+            masterCvDigest: '4'.repeat(64),
+          },
           async invokeProvider({ kind, jobs }) {
             calls.push({ kind, ids: jobs.map((job) => job.candidateId) });
             return {

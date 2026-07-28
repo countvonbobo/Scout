@@ -59,8 +59,10 @@ test('structured turns reject malformed output and unsupported CLIs', async () =
   }), /exceeded its 10 input-token cap/);
 });
 
-test('structured turns enforce their own bounded deadline and stop an unresponsive adapter', { timeout: 1_000 }, async () => {
-  let stopped = false;
+test('structured turns wait for adapter closure after stopping a timed-out turn', { timeout: 1_000 }, async () => {
+  const lifecycle = [];
+  let finish;
+  const finished = new Promise((resolve) => { finish = resolve; });
   await assert.rejects(runStructuredTurn({
     provider: 'codex',
     status: { installed: true, authenticated: true, executable: 'codex', capabilities: { structuredOutput: true } },
@@ -68,9 +70,16 @@ test('structured turns enforce their own bounded deadline and stop an unresponsi
     prompt: 'synthetic',
     timeoutMs: 25,
     runTurnFn: () => ({
-      finished: new Promise(() => {}),
-      stop() { stopped = true; },
+      finished,
+      stop() {
+        lifecycle.push('stop');
+        setTimeout(() => {
+          lifecycle.push('closed');
+          finish({ ok: false, error: 'stopped' });
+        }, 20);
+      },
     }),
   }), /timed out after 25 ms/);
-  assert.equal(stopped, true);
+  lifecycle.push('rejected');
+  assert.deepEqual(lifecycle, ['stop', 'closed', 'rejected']);
 });

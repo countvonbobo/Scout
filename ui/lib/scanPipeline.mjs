@@ -749,6 +749,15 @@ function safeSourceUrl(value) {
 
 export const SCAN_ASSESSMENT_SCHEMA = ASSESSMENT_RESPONSE_SCHEMA;
 
+function stableAssessmentJobId(candidate) {
+  const supplied = String(candidate?.vacancyId || '');
+  if (/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(supplied)) return supplied;
+  return `vacancy-${createHash('sha256')
+    .update(JSON.stringify(jobIdentity(candidate)))
+    .digest('hex')
+    .slice(0, 32)}`;
+}
+
 export async function assessScanCandidates({
   run,
   lease,
@@ -762,9 +771,17 @@ export async function assessScanCandidates({
   providerSubstitution = null,
   heartbeat = null,
   heartbeatIntervalMs,
+  contextDigests,
 } = {}) {
   if (!run || !lease || !compatibility || !Array.isArray(candidates)) {
     throw new TypeError('scan assessment requires a run, lease, compatibility and candidates');
+  }
+  const requiredContextDigests = [
+    'scoringConfigDigest', 'profileDigest', 'calibrationDigest', 'masterCvDigest',
+  ];
+  if (!contextDigests || Object.keys(contextDigests).sort().join(',') !== requiredContextDigests.sort().join(',')
+    || requiredContextDigests.some((key) => !/^[a-f0-9]{64}$/.test(contextDigests[key]))) {
+    throw new TypeError('scan assessment requires complete privacy-safe context digests');
   }
   const provenance = {
     profileVersion: compatibility.profileVersion,
@@ -778,6 +795,8 @@ export async function assessScanCandidates({
     runId: run.runId,
     jobs: candidates.map((candidate) => ({
       ...candidate,
+      assessmentJobId: stableAssessmentJobId(candidate),
+      assessmentInput: promptCandidate(candidate),
       // One extra character accounts for the comma between adjacent JSON
       // array items, so planning never underestimates the assembled context.
       contextCharacters: JSON.stringify(promptCandidate(candidate)).length + 1,
@@ -787,6 +806,7 @@ export async function assessScanCandidates({
     contextOverheadCharacters,
     timeoutMs,
     maxInputTokens,
+    contextDigests,
   });
   return resumeAssessments(run, {
     batches,

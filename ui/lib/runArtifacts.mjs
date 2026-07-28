@@ -22,13 +22,20 @@ const SAFE_TOKEN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 const SHA256 = /^[a-f0-9]{64}$/;
 const PRIVATE_PIPELINE_KEYS = /^(?:access[-_]?token|advert[-_]?body|api[-_]?(?:key|token)|auth(?:orization)?|body|cookies?|credentials?|cv|description|headers?|html|master[-_]?cv|password|payload|profile[-_]?evidence|prompt|raw[-_]?(?:html|response)|requirements?|response|secret(?:[-_]?(?:key|token))?|token|transcript)$/i;
 const PRIVATE_ASSESSMENT_KEYS = /^(?:access[-_]?token|advert[-_]?body|api[-_]?(?:key|token)|auth(?:orization)?|body|cookies?|credentials?|cv|headers?|html|master[-_]?cv|password|prompt|raw[-_]?(?:html|response)|response|secret(?:[-_]?(?:key|token))?|token|transcript)$/i;
-const CREDENTIAL_VALUE = /(?:https?:\/\/[^/\s:@]+:[^/\s@]+@)|(?:\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b)|(?:\b(?:api[-_ ]?key|authorization|password|secret|session[-_ ]?id|token)\s*[:=]\s*\S+)/i;
+const CREDENTIAL_VALUE = /(?:\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b)|(?:\b(?:api[-_ ]?key|authorization|password|secret|session[-_ ]?id|token)\s*[:=]\s*\S+)|(?:\bbearer\s+[A-Za-z0-9._~+/-]{8,})|(?:\bsk-[A-Za-z0-9_-]{16,})|(?:\bgh[pousr]_[A-Za-z0-9]{20,})|(?:\bxox[baprs]-[A-Za-z0-9-]{10,})|(?:\bAKIA[0-9A-Z]{16}\b)/i;
+const URL_VALUE = /\bhttps?:\/\/\S+/i;
 const ASSESSMENT_ARTIFACT_TYPES = new Set(['request', 'result', 'failure', 'batch']);
 const ASSESSMENT_DATA_KEYS = Object.freeze({
   request: Object.freeze(['request']),
-  result: Object.freeze(['assessment', 'batchId', 'jobId', 'provenance']),
-  failure: Object.freeze(['attempts', 'batchId', 'code', 'jobId', 'validationFailures']),
-  batch: Object.freeze(['batchId', 'completedJobIds', 'failedJobIds', 'provenance']),
+  result: Object.freeze([
+    'assessment', 'batchId', 'fencingGeneration', 'inputDigest', 'jobId', 'provenance',
+  ]),
+  failure: Object.freeze([
+    'attempts', 'batchId', 'code', 'fencingGeneration', 'inputDigest', 'jobId', 'validationFailures',
+  ]),
+  batch: Object.freeze([
+    'batchId', 'completedJobIds', 'failedJobIds', 'fencingGeneration', 'provenance',
+  ]),
 });
 
 export class ArtifactIntegrityError extends Error {
@@ -107,6 +114,7 @@ function validateAssessmentData(value, ErrorType, seen = new Set()) {
   if (typeof value === 'string') {
     if (value.length > 2_000) throw new ErrorType('assessment artifact strings must be bounded');
     if (CREDENTIAL_VALUE.test(value)) throw new ErrorType('assessment artifact credentials are not allowed');
+    if (URL_VALUE.test(value)) throw new ErrorType('assessment artifact URLs are not allowed');
     return;
   }
   if (!value || typeof value !== 'object' || seen.has(value)) {
@@ -137,6 +145,18 @@ function validateAssessmentArtifactData(type, value, ErrorType) {
     throw new ErrorType(`assessment ${type} artifact shape is invalid`);
   }
   validateAssessmentData(value, ErrorType);
+  if (type !== 'request') {
+    requireSafeToken(value.batchId, 'assessment batch ID', ErrorType);
+    if (!Number.isSafeInteger(value.fencingGeneration) || value.fencingGeneration < 1) {
+      throw new ErrorType('assessment artifact fencing generation is invalid');
+    }
+  }
+  if (type === 'result' || type === 'failure') {
+    requireSafeToken(value.jobId, 'assessment job ID', ErrorType);
+    if (typeof value.inputDigest !== 'string' || !SHA256.test(value.inputDigest)) {
+      throw new ErrorType('assessment artifact input digest is invalid');
+    }
+  }
 }
 
 function validateArtifactValue(descriptor, value, ErrorType = TypeError) {

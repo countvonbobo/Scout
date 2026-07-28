@@ -21,6 +21,13 @@ const provenance = Object.freeze({
   model: 'provider-default',
 });
 
+const contextDigests = Object.freeze({
+  scoringConfigDigest: '1'.repeat(64),
+  profileDigest: '2'.repeat(64),
+  calibrationDigest: '3'.repeat(64),
+  masterCvDigest: '4'.repeat(64),
+});
+
 function jobs(count) {
   return Array.from({ length: count }, (_, index) => ({
     candidateId: `candidate-${String(index + 1).padStart(3, '0')}`,
@@ -128,7 +135,7 @@ test('persistable requests contain only stable references, digests, bounds and p
     maxInputTokens: 5_000,
   });
   assert.deepEqual(Object.keys(batch.request).sort(), [
-    'batchId', 'jobReferences', 'parameters', 'provenance', 'runId', 'schemaVersion',
+    'batchId', 'contextDigests', 'jobReferences', 'parameters', 'provenance', 'runId', 'schemaVersion',
   ]);
   assert.deepEqual(Object.keys(batch.request.jobReferences[0]).sort(), ['inputDigest', 'jobId']);
   const persisted = JSON.stringify(batch.request);
@@ -142,6 +149,36 @@ test('persistable requests contain only stable references, digests, bounds and p
       /private assessment request property is not allowed/,
     );
   }
+});
+
+test('batch identity covers ordered input digests, execution parameters and provenance', () => {
+  const base = {
+    runId: 'run-identity',
+    jobs: jobs(2),
+    provenance,
+    contextDigests,
+    contextBudgetCharacters: 2_000,
+    contextOverheadCharacters: 100,
+  };
+  const [original] = planAssessmentBatches(base);
+  const [changedInput] = planAssessmentBatches({
+    ...base,
+    jobs: [{ ...base.jobs[0], description: 'Changed selected advert.' }, base.jobs[1]],
+  });
+  const [changedParameters] = planAssessmentBatches({ ...base, timeoutMs: 12_000 });
+  const [changedProvenance] = planAssessmentBatches({
+    ...base,
+    provenance: { ...provenance, promptVersion: 'prompt-v2' },
+  });
+  const [changedContext] = planAssessmentBatches({
+    ...base,
+    contextDigests: { ...contextDigests, masterCvDigest: '5'.repeat(64) },
+  });
+
+  assert.notEqual(changedInput.id, original.id);
+  assert.notEqual(changedParameters.id, original.id);
+  assert.notEqual(changedProvenance.id, original.id);
+  assert.notEqual(changedContext.id, original.id);
 });
 
 test('valid siblings persist while only invalid jobs receive one focused repair', async () => {
@@ -184,12 +221,18 @@ test('valid siblings persist while only invalid jobs receive one focused repair'
   }
 });
 
-test('credential-shaped provider evidence is isolated to its job and never persisted', async () => {
+test('URL and secret-shaped provider evidence is isolated and never persisted', async () => {
   const fixture = runFixture();
-  const privateValue = 'PRIVATE_ASSESSMENT_SECRET';
+  const privateValues = [
+    'https://example.test/evidence?access_token=PRIVATE_QUERY_SECRET',
+    'https://example.test/evidence#PRIVATE_FRAGMENT_SECRET',
+    'https://PRIVATE_USER:PRIVATE_PASSWORD@example.test/evidence',
+    'Bearer PRIVATE_BEARER_SECRET_123456789',
+    'sk-PRIVATE_OPENAI_SECRET_1234567890',
+  ];
   try {
     const [batch] = planAssessmentBatches({
-      runId: fixture.run.runId, jobs: jobs(2), provenance,
+      runId: fixture.run.runId, jobs: jobs(privateValues.length + 1), provenance,
       contextBudgetCharacters: 5_000, contextOverheadCharacters: 100,
     });
     const calls = [];
@@ -199,17 +242,27 @@ test('credential-shaped provider evidence is isolated to its job and never persi
       async invokeProvider({ kind, jobs: requested }) {
         calls.push({ kind, ids: requested.map((job) => job.candidateId) });
         if (kind === 'batch') {
-          const unsafe = assessment('candidate-002');
-          unsafe.mandatoryRequirements[0].profileEvidence = `token=${privateValue}`;
-          return { assessments: [assessment('candidate-001'), unsafe] };
+          return {
+            assessments: [
+              assessment('candidate-001'),
+              ...privateValues.map((privateValue, index) => {
+                const unsafe = assessment(`candidate-${String(index + 2).padStart(3, '0')}`);
+                unsafe.mandatoryRequirements[0].profileEvidence = privateValue;
+                return unsafe;
+              }),
+            ],
+          };
         }
-        return { assessments: [assessment('candidate-002')] };
+        return { assessments: requested.map((job) => assessment(job.candidateId)) };
       },
     });
-    assert.deepEqual(result.assessments.map((item) => item.candidateId), ['candidate-001', 'candidate-002']);
+    assert.deepEqual(
+      result.assessments.map((item) => item.candidateId),
+      jobs(privateValues.length + 1).map((job) => job.candidateId),
+    );
     assert.deepEqual(calls, [
-      { kind: 'batch', ids: ['candidate-001', 'candidate-002'] },
-      { kind: 'repair', ids: ['candidate-002'] },
+      { kind: 'batch', ids: jobs(privateValues.length + 1).map((job) => job.candidateId) },
+      { kind: 'repair', ids: jobs(privateValues.length).map((_, index) => `candidate-${String(index + 2).padStart(3, '0')}`) },
     ]);
     const durableText = fs.readdirSync(fixture.run.directory, { recursive: true })
       .filter((entry) => typeof entry === 'string')
@@ -217,7 +270,7 @@ test('credential-shaped provider evidence is isolated to its job and never persi
       .filter((file) => fs.statSync(file).isFile())
       .map((file) => fs.readFileSync(file, 'utf8'))
       .join('\n');
-    assert.equal(durableText.includes(privateValue), false);
+    for (const privateValue of privateValues) assert.equal(durableText.includes(privateValue), false);
   } finally {
     fixture.cleanup();
   }
@@ -291,6 +344,195 @@ test('resume returns committed jobs and never invokes completed batches again', 
     assert.equal(repeatedCalls, 0);
     assert.deepEqual(resumed.assessments.map((item) => item.candidateId), ['candidate-001', 'candidate-002']);
     assert.deepEqual(resumed.failures, []);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test('resume does not reuse a positional candidate assessment when the stable vacancy input changes', async () => {
+  const fixture = runFixture();
+  try {
+    const originalJobs = [{
+      ...jobs(1)[0],
+      assessmentJobId: 'vacancy-stable-001',
+    }];
+    const originalBatches = planAssessmentBatches({
+      runId: fixture.run.runId, jobs: originalJobs, provenance, contextDigests,
+      contextBudgetCharacters: 5_000, contextOverheadCharacters: 100,
+    });
+    await resumeAssessments(fixture.run, {
+      batches: originalBatches,
+      lease: fixture.lease,
+      invokeProvider: async () => ({ assessments: [assessment('candidate-001', { summary: 'Original assessment.' })] }),
+    });
+
+    const changedJobs = [{
+      ...originalJobs[0],
+      company: 'A different selected employer',
+      role: 'A different selected role',
+      url: 'https://example.test/jobs/replaced',
+      description: 'A different selected advert body.',
+    }];
+    const changedBatches = planAssessmentBatches({
+      runId: fixture.run.runId, jobs: changedJobs, provenance, contextDigests,
+      contextBudgetCharacters: 5_000, contextOverheadCharacters: 100,
+    });
+    let calls = 0;
+    const resumed = await resumeAssessments(fixture.run, {
+      batches: changedBatches,
+      lease: fixture.lease,
+      invokeProvider: async () => {
+        calls += 1;
+        return { assessments: [assessment('candidate-001', { summary: 'Changed assessment.' })] };
+      },
+    });
+
+    assert.notEqual(changedBatches[0].id, originalBatches[0].id);
+    assert.equal(calls, 1);
+    assert.equal(resumed.assessments[0].summary, 'Changed assessment.');
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test('an assessment-stage recovery restart invalidates otherwise identical completed work', async () => {
+  const fixture = runFixture();
+  try {
+    const selectedJobs = [{ ...jobs(1)[0], assessmentJobId: 'vacancy-stable-001' }];
+    const batches = planAssessmentBatches({
+      runId: fixture.run.runId, jobs: selectedJobs, provenance, contextDigests,
+      contextBudgetCharacters: 5_000, contextOverheadCharacters: 100,
+    });
+    await resumeAssessments(fixture.run, {
+      batches,
+      lease: fixture.lease,
+      invokeProvider: async () => ({ assessments: [assessment('candidate-001', { summary: 'Before restart.' })] }),
+    });
+    const completedBatch = [...fixture.run.events].reverse()
+      .find((event) => event.type === 'assessment.batch-completed');
+    appendRunEvent(fixture.run, {
+      type: 'stage.completed',
+      stageId: 'assess',
+      idempotencyKey: 'assessment-stage-completed-g1',
+      payload: {
+        schemaVersion: 1,
+        reference: { kind: 'stage', id: 'assess' },
+        count: 1,
+        version: { kind: 'prompt', value: provenance.promptVersion },
+        artifact: completedBatch.payload.artifact,
+      },
+    }, fixture.lease);
+
+    releaseScanLease(fixture.lease);
+    const recoveryLease = acquireScanLease(fixture.root, currentLeaseOwner(), {
+      kind: 'scan', runId: fixture.run.runId, provider: 'codex', model: 'provider-default',
+      mode: 'primary', phase: 'assessment-recovery',
+    });
+    appendRunEvent(fixture.run, {
+      type: 'recovery.started',
+      stageId: 'recovery',
+      idempotencyKey: 'assessment-recovery-started-g2',
+      payload: {
+        schemaVersion: 2,
+        compatibility: {
+          ...fixture.run.events[0].payload.compatibility,
+          promptVersion: 'prompt-v2',
+        },
+        requestFingerprint: 'b'.repeat(64),
+        selectionFingerprint: 'c'.repeat(64),
+        providerSubstitution: null,
+        decisions: [{
+          stageId: 'assess',
+          action: 'restart',
+          reason: 'prompt-version-mismatch',
+          artifact: completedBatch.payload.artifact,
+        }],
+      },
+    }, recoveryLease);
+
+    let calls = 0;
+    const resumed = await resumeAssessments(fixture.run, {
+      batches,
+      lease: recoveryLease,
+      invokeProvider: async () => {
+        calls += 1;
+        return { assessments: [assessment('candidate-001', { summary: 'After restart.' })] };
+      },
+    });
+    releaseScanLease(recoveryLease);
+
+    assert.equal(calls, 1);
+    assert.equal(resumed.assessments[0].summary, 'After restart.');
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test('an assessment-stage compatible recovery reuses identical completed work', async () => {
+  const fixture = runFixture();
+  try {
+    const selectedJobs = [{ ...jobs(1)[0], assessmentJobId: 'vacancy-stable-001' }];
+    const batches = planAssessmentBatches({
+      runId: fixture.run.runId, jobs: selectedJobs, provenance, contextDigests,
+      contextBudgetCharacters: 5_000, contextOverheadCharacters: 100,
+    });
+    await resumeAssessments(fixture.run, {
+      batches,
+      lease: fixture.lease,
+      invokeProvider: async () => ({ assessments: [assessment('candidate-001', { summary: 'Reusable assessment.' })] }),
+    });
+    const completedBatch = [...fixture.run.events].reverse()
+      .find((event) => event.type === 'assessment.batch-completed');
+    appendRunEvent(fixture.run, {
+      type: 'stage.completed',
+      stageId: 'assess',
+      idempotencyKey: 'assessment-stage-completed-reuse-g1',
+      payload: {
+        schemaVersion: 1,
+        reference: { kind: 'stage', id: 'assess' },
+        count: 1,
+        version: { kind: 'prompt', value: provenance.promptVersion },
+        artifact: completedBatch.payload.artifact,
+      },
+    }, fixture.lease);
+
+    releaseScanLease(fixture.lease);
+    const recoveryLease = acquireScanLease(fixture.root, currentLeaseOwner(), {
+      kind: 'scan', runId: fixture.run.runId, provider: 'codex', model: 'provider-default',
+      mode: 'primary', phase: 'assessment-recovery',
+    });
+    appendRunEvent(fixture.run, {
+      type: 'recovery.started',
+      stageId: 'recovery',
+      idempotencyKey: 'assessment-compatible-recovery-started-g2',
+      payload: {
+        schemaVersion: 2,
+        compatibility: fixture.run.events[0].payload.compatibility,
+        requestFingerprint: 'd'.repeat(64),
+        selectionFingerprint: 'e'.repeat(64),
+        providerSubstitution: null,
+        decisions: [{
+          stageId: 'assess',
+          action: 'reuse',
+          reason: 'compatible',
+          artifact: completedBatch.payload.artifact,
+        }],
+      },
+    }, recoveryLease);
+
+    let calls = 0;
+    const resumed = await resumeAssessments(fixture.run, {
+      batches,
+      lease: recoveryLease,
+      invokeProvider: async () => {
+        calls += 1;
+        throw new Error('compatible completed work must not repeat');
+      },
+    });
+    releaseScanLease(recoveryLease);
+
+    assert.equal(calls, 0);
+    assert.equal(resumed.assessments[0].summary, 'Reusable assessment.');
   } finally {
     fixture.cleanup();
   }
