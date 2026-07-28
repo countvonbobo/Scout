@@ -4,7 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { test } from 'node:test';
 import {
-  compactCandidates, createRankedDiscoveryStages, DEFAULT_CANDIDATE_LIMIT, gateAssessment, inboxRecheckCandidates, prepareRankedDiscovery, promptCandidate,
+  assessmentCandidatesForSelection, compactCandidates, createRankedDiscoveryStages, DEFAULT_CANDIDATE_LIMIT, gateAssessment, inboxRecheckCandidates, prepareRankedDiscovery, promptCandidate,
   filterVacancies, PipelineInterruptedError, runScanPipeline, validateAssessments, validateWrittenScanArtifacts,
   verificationCandidates, writeScanArtifacts,
 } from './scanPipeline.mjs';
@@ -1163,7 +1163,11 @@ test('ranked stage artifacts contain semantic facts and no complete advert, diag
                 company: 'Able',
                 title: 'Platform Engineer',
                 providerId: 'able-1',
-                url: 'https://example.test/jobs/able?utm_source=private&access_token=secret',
+                url: 'https://PRIVATE_USER:PRIVATE_PASSWORD@example.test/jobs/able'
+                  + '?session=PRIVATE_SESSION&jwt=PRIVATE_JWT&code=PRIVATE_CODE&key=PRIVATE_KEY'
+                  + '&sig=PRIVATE_SIG&ref=PRIVATE_REF&source=PRIVATE_SOURCE'
+                  + '&redirect=https%3A%2F%2Fnested-user%3Anested-pass%40private.test%2Fsecret'
+                  + '&utm_source=private&access_token=secret#PRIVATE_FRAGMENT',
                 description: `Public bounded opening. ${privateTail}`,
                 requirements: `AWS required. ${privateTail}`,
                 rawHtml: `<html>${privateTail}</html>`,
@@ -1184,7 +1188,15 @@ test('ranked stage artifacts contain semantic facts and no complete advert, diag
     const persisted = fs.readdirSync(artifactDirectory)
       .map((name) => fs.readFileSync(path.join(artifactDirectory, name), 'utf8'))
       .join('\n');
-    assert.doesNotMatch(persisted, /PRIVATE_ACCESS_TOKEN|PRIVATE_COOKIE|rawHtml|accessToken|utm_source|access_token/);
+    assert.doesNotMatch(
+      persisted,
+      /PRIVATE_ACCESS_TOKEN|PRIVATE_COOKIE|rawHtml|accessToken|utm_source|access_token/,
+    );
+    assert.doesNotMatch(
+      persisted,
+      /PRIVATE_USER|PRIVATE_PASSWORD|PRIVATE_SESSION|PRIVATE_JWT|PRIVATE_CODE|PRIVATE_KEY|PRIVATE_SIG|PRIVATE_REF|PRIVATE_SOURCE|PRIVATE_FRAGMENT|nested-user|nested-pass|redirect/,
+    );
+    assert.match(persisted, /https:\/\/example\.test\/jobs\/able/);
     assert.doesNotMatch(persisted, /PRIVATE_DIAGNOSTIC_TOKEN|Authorization|Bearer|request failed at/);
     assert.doesNotMatch(persisted, new RegExp(privateTail.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
     assert.doesNotMatch(persisted, /"description"|"requirements"/);
@@ -1245,14 +1257,75 @@ test('legacy stage artifacts preserve source order with exact semantic evidence 
       ['First Co', 'Second Co'],
     );
     assert.equal(result.stageOutputs.select.candidates[0].mandatorySignals.length, 1);
-    assert.match(result.stageOutputs.select.candidates[0].mandatorySignals[0].text, /^[a-z-]+:[a-f0-9]{64}$/);
+    assert.equal(
+      result.stageOutputs.select.candidates[0].mandatorySignals[0].text,
+      'Advert mandatory requirement: aws.',
+    );
     const artifactDirectory = path.join(root, '.scout', 'runs', result.runId, 'artifacts');
     const persisted = fs.readdirSync(artifactDirectory)
       .map((name) => fs.readFileSync(path.join(artifactDirectory, name), 'utf8'))
       .join('\n');
-    assert.doesNotMatch(persisted, /PRIVATE_LEGACY_ADVERT|Kubernetes required|utm_source/);
+    assert.doesNotMatch(persisted, /PRIVATE_LEGACY_ADVERT|private legacy advert|Kubernetes required|utm_source/i);
     assert.doesNotMatch(persisted, /"description"|"requirements"/);
     assert.match(persisted, /descriptionDigest|mandatorySignals/);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('semantic artifacts provide bounded readable assessment facts without complete advert sentences', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'scout-readable-semantic-evidence-'));
+  const description = 'Build distributed platforms for public services.';
+  const requirement = 'Kubernetes is mandatory for production clusters.';
+  const profile = {
+    version: 1, status: 'published', id: 'profile-readable-evidence',
+    target: {
+      primaryTitles: [{ value: 'Platform Engineer', strength: 'strong-preference', provenance: 'explicit' }],
+      sectors: [{ value: 'distributed platforms', strength: 'nice-to-have', provenance: 'explicit' }],
+    },
+    negative: {},
+    compensation: { currency: null, period: 'year', minimum: null, minimumStrength: 'neutral', unknownPolicy: 'include' },
+  };
+  try {
+    const result = await runScanPipeline({
+      root,
+      compatibility: RECOVERY_COMPATIBILITY,
+      stages: createRankedDiscoveryStages({
+        collect: async () => ({
+          generatedAt: '2026-07-28T09:00:00.000Z',
+          queries: [],
+          sources: {
+            ats: {
+              configured: true,
+              status: 'healthy',
+              count: 1,
+              jobs: [{
+                company: 'Readable Co',
+                title: 'Platform Engineer',
+                url: 'https://example.test/jobs/readable',
+                description,
+                requirements: requirement,
+              }],
+            },
+          },
+        }),
+        profile,
+      }),
+    });
+
+    const candidate = assessmentCandidatesForSelection(result.stageOutputs.select.selection.selected)[0];
+    assert.match(candidate.description, /Advert responsibility: distributed platforms\./);
+    assert.equal(
+      candidate.mandatorySignals[0].text,
+      'Advert mandatory requirement: kubernetes production clusters.',
+    );
+    const artifactDirectory = path.join(root, '.scout', 'runs', result.runId, 'artifacts');
+    const persisted = fs.readdirSync(artifactDirectory)
+      .map((name) => fs.readFileSync(path.join(artifactDirectory, name), 'utf8'))
+      .join('\n');
+    assert.doesNotMatch(persisted, new RegExp(description.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+    assert.doesNotMatch(persisted, new RegExp(requirement.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+    assert.match(persisted, /distributed platforms|kubernetes production clusters/);
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }
@@ -1395,6 +1468,105 @@ test('terminal evidence validation failure retains the lease for fenced recovery
       // intentionally not available to this test process as a forged handle.
       fs.rmSync(path.join(root, '.scout', 'scan-lease.json'), { force: true });
     }
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('post-success work requires a durable mutation receipt and remains under the live scan fence', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'scout-receipted-post-success-'));
+  let hookCalls = 0;
+  try {
+    const result = await runScanPipeline({
+      root,
+      compatibility: RECOVERY_COMPATIBILITY,
+      stages: durableStageHarness(new Map()),
+      finalize: async () => ({
+        schemaVersion: 1,
+        result: { ok: true },
+        mutationReceipt: {
+          schemaVersion: 1,
+          id: 'scan-tracker-report',
+          digest: 'd'.repeat(64),
+        },
+      }),
+      async postTerminalSuccess({ lease, manifest, mutationReceipt }) {
+        hookCalls += 1;
+        const current = readScanLease(root);
+        assert.equal(current.leaseId, lease.leaseId);
+        assert.equal(current.generation, lease.generation);
+        assert.equal(manifest.outcome, 'complete');
+        assert.deepEqual(manifest.receipts, [{
+          sequence: 8,
+          stageId: 'finalise',
+          reference: { kind: 'mutation', id: 'scan-tracker-report' },
+          digest: 'd'.repeat(64),
+        }]);
+        assert.equal(mutationReceipt.digest, 'd'.repeat(64));
+      },
+    });
+
+    assert.equal(result.outcome, 'complete');
+    assert.equal(hookCalls, 1);
+    assert.deepEqual(result.failures, []);
+    assert.equal(readScanLease(root), null);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('post-success backup is not attempted without receipt evidence', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'scout-unreceipted-post-success-'));
+  let hookCalls = 0;
+  try {
+    const result = await runScanPipeline({
+      root,
+      compatibility: RECOVERY_COMPATIBILITY,
+      stages: durableStageHarness(new Map()),
+      finalize: async () => ({ ok: true }),
+      postTerminalSuccess: async () => { hookCalls += 1; },
+    });
+
+    assert.equal(result.outcome, 'complete');
+    assert.equal(hookCalls, 0);
+    assert.deepEqual(result.failures, [{
+      code: 'backup-pending',
+      stage: 'post-success',
+      reason: 'mutation-receipt-missing',
+    }]);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('post-success backup failure preserves the successful scan and reports pending backup state', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'scout-failed-post-success-'));
+  try {
+    const result = await runScanPipeline({
+      root,
+      compatibility: RECOVERY_COMPATIBILITY,
+      stages: durableStageHarness(new Map()),
+      finalize: async () => ({
+        schemaVersion: 1,
+        result: { ok: true },
+        mutationReceipt: {
+          schemaVersion: 1,
+          id: 'scan-tracker-report',
+          digest: 'e'.repeat(64),
+        },
+      }),
+      postTerminalSuccess: async () => {
+        throw new Error('PRIVATE_BACKUP_TRANSPORT_FAILURE');
+      },
+    });
+
+    assert.equal(result.outcome, 'complete');
+    assert.deepEqual(result.failures, [{
+      code: 'backup-pending',
+      stage: 'post-success',
+      reason: 'backup-failed',
+    }]);
+    assert.doesNotMatch(JSON.stringify(result), /PRIVATE_BACKUP_TRANSPORT_FAILURE/);
+  } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }
 });

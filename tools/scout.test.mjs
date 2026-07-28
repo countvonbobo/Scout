@@ -10,7 +10,7 @@ import { DEFAULT_WORKSPACE_CONFIG, loadWorkspaceConfig, writeWorkspaceConfig } f
 import { publishSearchProfile } from '../ui/lib/searchProfile.mjs';
 import { replayRunJournal } from '../ui/lib/runJournal.mjs';
 import { projectScanQueue } from '../ui/lib/scanQueue.mjs';
-import { acquireScanLease, currentLeaseOwner, releaseScanLease } from '../ui/lib/scanLease.mjs';
+import { acquireScanLease, currentLeaseOwner, readScanLease, releaseScanLease } from '../ui/lib/scanLease.mjs';
 
 function scanRoot() {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'scout-runtime-scan-'));
@@ -561,18 +561,24 @@ test('an overlap loser only appends its queue request and performs no managed or
   }
 });
 
-test('runScan queues workspace backup only after its own scan terminalises successfully', async () => {
+test('runScan delegates backup authority to the fenced runtime and never backs up a queued result itself', async () => {
   const root = readyScanRoot();
   enableRankedDiscovery(root);
   const reasons = [];
+  let delegatedBackup = null;
+  const queueWorkspaceSyncFn = async (_root, reason) => {
+    reasons.push(reason);
+  };
   const queued = await runScan(root, 'codex', 'primary', {
     assertScanReadyFn: () => {},
-    runScanWithFn: async () => ({ ok: false, status: 'queued', durable: { outcome: 'queued' } }),
-    queueWorkspaceSyncFn: async (_root, reason) => {
-      reasons.push(reason);
+    runScanWithFn: async (_root, _provider, _mode, options) => {
+      delegatedBackup = options.queueWorkspaceSyncFn;
+      return { ok: false, status: 'queued', durable: { outcome: 'queued' } };
     },
+    queueWorkspaceSyncFn,
   });
   assert.equal(queued.status, 'queued');
+  assert.equal(delegatedBackup, queueWorkspaceSyncFn);
   assert.deepEqual(reasons, []);
 
   const complete = await runScan(root, 'codex', 'primary', {
@@ -583,16 +589,161 @@ test('runScan queues workspace backup only after its own scan terminalises succe
       scan: { funnel: { selected: 0 }, degraded: false },
       durable: { outcome: 'complete' },
     }),
-    queueWorkspaceSyncFn: async (_root, reason) => {
-      reasons.push(reason);
-    },
+    queueWorkspaceSyncFn,
   });
   assert.equal(complete.ok, true);
-  assert.deepEqual(reasons, ['complete primary scan']);
+  assert.deepEqual(reasons, []);
   fs.rmSync(root, { recursive: true, force: true });
 });
 
-test('a real scheduled overlap keeps scheduled queue semantics and executes after terminal release', async () => {
+test('runtime backup consumes a mutation receipt while the successful scan fence is current', async () => {
+  const root = scanRoot();
+  let backupCalls = 0;
+  try {
+    const result = await runScanWith(root, 'codex', 'primary', {
+      providerStatusFn: authenticated,
+      collectSourcesFn: async () => ({
+        generatedAt: '2026-07-28T09:00:00.000Z',
+        queries: [],
+        sources: { hiring_cafe: { configured: true, status: 'healthy', count: 0, jobs: [] } },
+      }),
+      async queueWorkspaceSyncFn(_root, reason) {
+        backupCalls += 1;
+        const lease = readScanLease(root);
+        assert.ok(lease);
+        const events = replayRunJournal(path.join(root, '.scout', 'runs', lease.runId, 'journal.jsonl'));
+        assert.equal(events.at(-2).type, 'mutation.receipted');
+        assert.equal(events.at(-1).type, 'run.completed');
+        assert.equal(events.at(-1).payload.outcome, 'complete');
+        assert.equal(reason, 'complete primary scan');
+      },
+    });
+
+    assert.equal(result.ok, true);
+    assert.equal(result.durable.outcome, 'complete');
+    assert.deepEqual(result.durable.failures, []);
+    assert.equal(backupCalls, 1);
+    assert.equal(readScanLease(root), null);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('runtime backup failure leaves the receipted scan successful with pending backup state', async () => {
+  const root = scanRoot();
+  try {
+    const result = await runScanWith(root, 'codex', 'primary', {
+      providerStatusFn: authenticated,
+      collectSourcesFn: async () => ({
+        generatedAt: '2026-07-28T09:00:00.000Z',
+        queries: [],
+        sources: { hiring_cafe: { configured: true, status: 'healthy', count: 0, jobs: [] } },
+      }),
+      queueWorkspaceSyncFn: async () => {
+        throw new Error('PRIVATE_BACKUP_FAILURE');
+      },
+    });
+
+    assert.equal(result.ok, true);
+    assert.equal(result.durable.outcome, 'complete');
+    assert.deepEqual(result.durable.failures, [{
+      code: 'backup-pending',
+      stage: 'post-success',
+      reason: 'backup-failed',
+    }]);
+    assert.doesNotMatch(JSON.stringify(result), /PRIVATE_BACKUP_FAILURE/);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('each terminally successful manual overlap run receives its own fenced backup', async () => {
+  const root = scanRoot();
+  let collectionCalls = 0;
+  let overlap;
+  const backedUpRuns = [];
+  const options = {
+    providerStatusFn: authenticated,
+    collectSourcesFn: async () => {
+      collectionCalls += 1;
+      if (collectionCalls === 1) overlap = await runScanWith(root, 'codex', 'primary', options);
+      return {
+        generatedAt: '2026-07-28T09:00:00.000Z',
+        queries: [],
+        sources: { hiring_cafe: { configured: true, status: 'healthy', count: 0, jobs: [] } },
+      };
+    },
+    async queueWorkspaceSyncFn() {
+      const lease = readScanLease(root);
+      assert.ok(lease);
+      backedUpRuns.push(lease.runId);
+    },
+  };
+  try {
+    const primary = await runScanWith(root, 'codex', 'primary', options);
+
+    assert.equal(primary.ok, true);
+    assert.equal(overlap.status, 'queued');
+    assert.equal(collectionCalls, 2);
+    assert.equal(new Set(backedUpRuns).size, 2);
+    assert.equal(projectScanQueue(root).requests[0].status, 'succeeded');
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('startup-drained success is backed up even when the following direct run fails', async () => {
+  const root = scanRoot();
+  const active = acquireScanLease(root, currentLeaseOwner(), {
+    kind: 'scan',
+    runId: 'startup-backup-seed',
+    provider: 'claude',
+    mode: 'primary',
+    phase: 'collect',
+  });
+  try {
+    const queued = await runScanWith(root, 'codex', 'primary', {
+      providerStatusFn: authenticated,
+      collectSourcesFn: async () => {
+        throw new Error('overlap loser must not collect');
+      },
+    });
+    assert.equal(queued.status, 'queued');
+  } finally {
+    releaseScanLease(active);
+  }
+
+  let collectionCalls = 0;
+  const backedUpRuns = [];
+  try {
+    const result = await runScanWith(root, 'codex', 'primary', {
+      providerStatusFn: authenticated,
+      collectSourcesFn: async () => {
+        collectionCalls += 1;
+        if (collectionCalls === 2) throw new Error('direct collection failed');
+        return {
+          generatedAt: '2026-07-28T09:00:00.000Z',
+          queries: [],
+          sources: { hiring_cafe: { configured: true, status: 'healthy', count: 0, jobs: [] } },
+        };
+      },
+      async queueWorkspaceSyncFn() {
+        const lease = readScanLease(root);
+        assert.ok(lease);
+        backedUpRuns.push(lease.runId);
+      },
+    });
+
+    assert.equal(result.ok, false);
+    assert.equal(collectionCalls, 2);
+    assert.equal(backedUpRuns.length, 1);
+    assert.equal(projectScanQueue(root).requests[0].status, 'succeeded');
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('a real scheduled success durably covers its same-window overlap without rerunning it', async () => {
   const root = scanRoot();
   let collectionCalls = 0;
   let overlap;
@@ -628,9 +779,9 @@ test('a real scheduled overlap keeps scheduled queue semantics and executes afte
 
     assert.equal(overlap.status, 'queued');
     assert.equal(primary.ok, true);
-    assert.equal(collectionCalls, 2);
+    assert.equal(collectionCalls, 1);
     const queued = projectScanQueue(root).requests[0];
-    assert.equal(queued.status, 'succeeded');
+    assert.equal(queued.status, 'skipped');
     assert.equal(queued.requester, 'scheduled');
     assert.equal(queued.execution.scheduleId, 'codex-primary');
     assert.equal(queued.execution.logicalWindowId, options.logicalWindowId);
@@ -639,7 +790,7 @@ test('a real scheduled overlap keeps scheduled queue semantics and executes afte
       Math.min(Date.parse(queued.requestedAt) + 12 * 60 * 60 * 1000, Date.parse(queued.windowAt)),
     );
     const runs = fs.readdirSync(path.join(root, '.scout', 'runs'));
-    assert.equal(runs.length, 2);
+    assert.equal(runs.length, 1);
     for (const runId of runs) {
       const events = replayRunJournal(path.join(root, '.scout', 'runs', runId, 'journal.jsonl'));
       assert.equal(events[0].type, 'run.started');
@@ -652,7 +803,7 @@ test('a real scheduled overlap keeps scheduled queue semantics and executes afte
   }
 });
 
-test('a scheduled queued run becomes stale when complete live compatibility changes before terminal recheck', async () => {
+test('a scheduled queued run remains bound to its claimed inputs when workspace config changes during execution', async () => {
   const root = scanRoot();
   let collectionCalls = 0;
   let overlap;
@@ -665,7 +816,10 @@ test('a scheduled queued run becomes stale when complete live compatibility chan
     collectSourcesFn: async () => {
       collectionCalls += 1;
       if (collectionCalls === 1) {
-        overlap = await runScanWith(root, 'codex', 'primary', options);
+        overlap = await runScanWith(root, 'codex', 'primary', {
+          ...options,
+          logicalWindowId: new Date(Date.now() - 2 * 60 * 1000).toISOString(),
+        });
       } else {
         const config = loadWorkspaceConfig(root);
         writeWorkspaceConfig(root, {
@@ -695,7 +849,78 @@ test('a scheduled queued run becomes stale when complete live compatibility chan
     assert.equal(overlap.status, 'queued');
     assert.equal(primary.ok, true);
     assert.equal(collectionCalls, 2);
-    assert.equal(projectScanQueue(root).requests[0].status, 'stale');
+    assert.equal(projectScanQueue(root).requests[0].status, 'succeeded');
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('a queued keeper run completes against its claim-time tracker input instead of staling on its own mutation', async () => {
+  const root = scanRoot();
+  enableRankedDiscovery(root);
+  let collectionCalls = 0;
+  let overlap;
+  const options = {
+    providerStatusFn: authenticated,
+    collectSourcesFn: async () => {
+      collectionCalls += 1;
+      if (collectionCalls === 1) {
+        overlap = await runScanWith(root, 'codex', 'primary', options);
+        return {
+          generatedAt: '2026-07-28T09:00:00.000Z',
+          queries: [],
+          sources: { hiring_cafe: { configured: true, status: 'healthy', count: 0, jobs: [] } },
+        };
+      }
+      return {
+        generatedAt: '2026-07-28T09:01:00.000Z',
+        queries: [],
+        sources: {
+          hiring_cafe: {
+            configured: true,
+            status: 'healthy',
+            count: 1,
+            jobs: [{
+              company: 'Keeper Co',
+              title: 'Ideal Role',
+              url: 'https://PRIVATE_USER:PRIVATE_PASSWORD@example.test/jobs/keeper'
+                + '?session=PRIVATE_SESSION&redirect=https%3A%2F%2Fnested-user%3Anested-pass%40private.test%2Fpath'
+                + '#PRIVATE_FRAGMENT',
+            }],
+          },
+        },
+      };
+    },
+    runStructuredTurnFn: async ({ prompt, validate }) => {
+      const context = JSON.parse(prompt.split('\n\n').at(-1));
+      const value = assessmentFor(context.candidates);
+      validate(value);
+      return { value, usage: {} };
+    },
+    checkLivenessFn: async (candidates) => ({
+      live: candidates,
+      removed: [],
+      summary: { checked: candidates.length, gone: 0, unverified: 0 },
+    }),
+    queueWorkspaceSyncFn: async () => {},
+  };
+  try {
+    const primary = await runScanWith(root, 'codex', 'primary', options);
+
+    assert.equal(primary.ok, true);
+    assert.equal(overlap.status, 'queued');
+    assert.equal(collectionCalls, 2);
+    assert.equal(projectScanQueue(root).requests[0].status, 'succeeded');
+    const tracker = JSON.parse(fs.readFileSync(path.join(root, 'data', 'opportunities.json'), 'utf8'));
+    assert.equal(tracker.opportunities[0].company, 'Keeper Co');
+    const scanInput = fs.readdirSync(path.join(root, '.scout', 'scan-input'))
+      .map((name) => fs.readFileSync(path.join(root, '.scout', 'scan-input', name), 'utf8'))
+      .join('\n');
+    assert.match(scanInput, /https:\/\/example\.test\/jobs\/keeper/);
+    assert.doesNotMatch(
+      scanInput,
+      /PRIVATE_USER|PRIVATE_PASSWORD|PRIVATE_SESSION|PRIVATE_FRAGMENT|nested-user|nested-pass|[?#]session=/,
+    );
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }

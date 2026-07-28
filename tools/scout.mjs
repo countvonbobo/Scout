@@ -37,6 +37,7 @@ import { runRemoteHostingPreflight } from './remote-hosting-preflight.mjs';
 import { assertCurrentFence, synchronousFenceCallback } from '../ui/lib/scanLease.mjs';
 import { PIPELINE_STAGE_ARTIFACT_SCHEMA_VERSION, RUN_ARTIFACT_SCHEMA_VERSION } from '../ui/lib/runArtifacts.mjs';
 import { compatibilityFingerprint } from '../ui/lib/runRecovery.mjs';
+import { coverScheduledScanWindow } from '../ui/lib/scanQueue.mjs';
 
 const APP_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const MAX_SCAN_FILE_CHARS = 100_000;
@@ -52,6 +53,19 @@ function stableJson(value) {
 
 function scanDigest(value) {
   return createHash('sha256').update(stableJson(value)).digest('hex');
+}
+
+function scanMutationReceipt(root, artifacts) {
+  const paths = workspacePaths(root);
+  return Object.freeze({
+    schemaVersion: 1,
+    id: 'scan-tracker-report',
+    digest: scanDigest({
+      tracker: fs.readFileSync(paths.tracker, 'utf8'),
+      report: fs.readFileSync(artifacts.report, 'utf8'),
+      run: artifacts.run,
+    }),
+  });
 }
 
 function sourceConfigFingerprint(config) {
@@ -120,6 +134,9 @@ function currentScanQueueCompatibility(root) {
 function verifyQueuedScanCompatibility(root, request, manifest = null) {
   const execution = request?.execution;
   if (execution?.schemaVersion !== 2) return false;
+  if (manifest !== null) {
+    return compatibilityFingerprint(manifest.compatibility) === execution.compatibilityFingerprint;
+  }
   const config = loadWorkspaceConfig(root);
   const profile = loadPublishedSearchProfile(root);
   const tracker = JSON.parse(fs.readFileSync(workspacePaths(root).tracker, 'utf8'));
@@ -142,8 +159,7 @@ function verifyQueuedScanCompatibility(root, request, manifest = null) {
     logicalWindowId: execution.logicalWindowId,
   });
   if (compatibilityFingerprint(currentRun) !== execution.compatibilityFingerprint) return false;
-  return manifest === null
-    || compatibilityFingerprint(manifest.compatibility) === execution.compatibilityFingerprint;
+  return true;
 }
 
 function scanQueueRequest(compatibility, profile, {
@@ -331,7 +347,7 @@ export async function runScan(root, provider, mode, {
   onProgress({ phase: 'Validating approved evidence', current: 1, total: 5 });
   assertScanReadyFn(root, provider);
   const initial = await runScanWithFn(root, provider, mode, {
-    onProgress, model, requester, windowAt, scheduleId, logicalWindowId,
+    onProgress, model, requester, windowAt, scheduleId, logicalWindowId, queueWorkspaceSyncFn,
   });
   let result = initial;
   if (shouldAutoBroaden(initial, mode, autoBroaden)) {
@@ -348,11 +364,10 @@ export async function runScan(root, provider, mode, {
       ...progress, total: 10,
       current: Number.isFinite(progress.current) ? Math.min(10, 5 + progress.current) : 6,
     });
-    const broadened = await runScanWithFn(root, provider, 'broadened', { onProgress: retryProgress, model });
+    const broadened = await runScanWithFn(root, provider, 'broadened', {
+      onProgress: retryProgress, model, queueWorkspaceSyncFn,
+    });
     result = { ...broadened, automaticBroadened: true, initialScan: initial.scan };
-  }
-  if (result.ok && result.durable?.outcome === 'complete') {
-    await queueWorkspaceSyncFn(root, `complete ${mode || 'primary'} scan`).catch(() => {});
   }
   return result;
 }
@@ -481,6 +496,7 @@ export async function runScanWith(root, provider, mode, {
   windowAt = null,
   scheduleId = null,
   logicalWindowId = null,
+  queueWorkspaceSyncFn = queueWorkspaceSync,
 } = {}) {
   if (!['codex', 'claude'].includes(provider)) throw new Error('provider must be codex or claude');
   if (!['primary', 'second-pass', 'broadened'].includes(mode)) throw new Error('mode must be primary, broadened or second-pass');
@@ -570,6 +586,16 @@ export async function runScanWith(root, provider, mode, {
           queuedRequest,
           context.phase === 'terminal' ? context.manifest : null,
         ),
+        ...(claimedLease === null && requester === 'scheduled' ? {
+          cover({ lease }) {
+            return coverScheduledScanWindow(root, {
+              scheduleId: request.execution.scheduleId,
+              logicalWindowId: request.execution.logicalWindowId,
+              purpose: request.purpose,
+              compatibilityFingerprint: request.execution.compatibilityFingerprint,
+            }, lease);
+          },
+        } : {}),
         ...(claimedLease === null ? { request } : {}),
         async run(queuedRequest, context) {
           const execution = queuedRequest.execution;
@@ -588,6 +614,7 @@ export async function runScanWith(root, provider, mode, {
             windowAt: queuedRequest.windowAt,
             scheduleId: execution.scheduleId,
             logicalWindowId: execution.logicalWindowId,
+            queueWorkspaceSyncFn,
           });
           return queued.durable?.outcome === 'complete' ? 'succeeded'
             : queued.status === 'skipped' ? 'skipped' : 'failed';
@@ -620,6 +647,11 @@ export async function runScanWith(root, provider, mode, {
         })));
         result = { ok: false, status: 'failed', error: error.message, scan: artifacts.run };
         return result;
+      },
+      async postTerminalSuccess({ lease }) {
+        assertCurrentFence(lease, synchronousFenceCallback(() => true));
+        await queueWorkspaceSyncFn(root, `complete ${mode} scan`);
+        assertCurrentFence(lease, synchronousFenceCallback(() => true));
       },
       async finalize({ lease, stageOutputs }) {
         collected = stageOutputs.collect;
@@ -737,7 +769,11 @@ export async function runScanWith(root, provider, mode, {
             staleInboxEntries, inboxRechecked,
           })));
           result = { ok: true, status: artifacts.run.degraded ? 'degraded' : candidates.length ? 'completed' : 'healthy-empty', scan: artifacts.run, usage };
-          return result;
+          return {
+            schemaVersion: 1,
+            result,
+            mutationReceipt: scanMutationReceipt(root, artifacts),
+          };
         } catch (error) {
           try {
             const artifacts = assertCurrentFence(lease, synchronousFenceCallback(() => writeScanArtifacts(root, {

@@ -100,7 +100,9 @@ function structuredExclusions(vacancy, profile) {
 
 function responsibilityExclusions(vacancy, profile) {
   const description = String(vacancy?.description || '');
-  const semanticMatches = new Set(vacancy?.semanticEvidence?.profileRuleMatches || []);
+  const semanticMatches = new Set((vacancy?.semanticEvidence?.profileRuleMatches || []).map((item) => (
+    typeof item === 'string' ? item : item.id
+  )));
   return (profile?.negative?.excludedResponsibilities || []).flatMap((rule) => {
     const matched = semanticMatches.has(ruleId(rule)) || phraseMatches(description, rule.value);
     if (!hardRule(rule) || !matched) return [];

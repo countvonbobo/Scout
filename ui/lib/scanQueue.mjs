@@ -314,6 +314,35 @@ export function enqueueScanRequest(root, input) {
   return fenced(root, lease, () => appendEnqueueTransition(root, request, digest));
 }
 
+export function coverScheduledScanWindow(root, input, lease) {
+  exactKeys(
+    input,
+    ['compatibilityFingerprint', 'logicalWindowId', 'purpose', 'scheduleId'],
+    'scheduled scan window coverage',
+  );
+  if (!REQUEST_KEY.test(input.scheduleId || '')
+    || !PURPOSE.test(input.purpose || '')
+    || !FINGERPRINT.test(input.compatibilityFingerprint || '')) {
+    throw new TypeError('scheduled scan window coverage contains an invalid identifier');
+  }
+  timestamp(input.logicalWindowId, 'scheduled scan coverage logical window');
+  return fenced(root, lease, () => {
+    const matches = stateFromEvents(readEvents(root)).items.filter((item) => (
+      item.status === 'queued'
+      && item.requester === 'scheduled'
+      && item.purpose === input.purpose
+      && item.execution?.schemaVersion === 2
+      && item.execution.scheduleId === input.scheduleId
+      && item.execution.logicalWindowId === input.logicalWindowId
+      && item.execution.compatibilityFingerprint === input.compatibilityFingerprint
+    ));
+    for (const item of matches) {
+      appendEvent(root, event('window-covered', { requestId: item.id }));
+    }
+    return matches.map((item) => publicItem({ ...item, status: 'skipped' }));
+  });
+}
+
 function appendEnqueueTransition(root, request, digest = requestDigest(request)) {
   const transition = enqueueTransition(readEvents(root), request, digest);
   if (transition.record) appendEvent(root, transition.record);

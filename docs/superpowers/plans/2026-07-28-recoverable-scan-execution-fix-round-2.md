@@ -30,15 +30,15 @@
 - Consumes: finalizer return `{ result, mutationReceipt }` or existing finalizer value.
 - Produces: `postTerminalSuccess({ run, lease, manifest, mutationReceipt })` and bounded `backup-pending` durable failures.
 
-- [ ] Write failing tests proving no receipt means no backup, a valid receipt
+- [x] Write failing tests proving no receipt means no backup, a valid receipt
   backs up while the lease is current, queued successes back up independently,
   and backup failure leaves the scan complete with `backup-pending`.
-- [ ] Run the named tests and confirm the current post-release behavior fails.
-- [ ] Add exact receipt validation and invoke the hook after complete terminal
+- [x] Run the named tests and confirm the current post-release behavior fails.
+- [x] Add exact receipt validation and invoke the hook after complete terminal
   validation but before heartbeat stop/release.
-- [ ] Move Scout backup dispatch into the hook and remove `runScan`'s
+- [x] Move Scout backup dispatch into the hook and remove `runScan`'s
   post-return backup.
-- [ ] Run the focused tests to GREEN.
+- [x] Run the focused tests to GREEN.
 
 ### Task 2: Canonical durable URL privacy
 
@@ -49,12 +49,12 @@
 **Interfaces:**
 - Produces: canonical HTTP(S) URL strings containing origin and pathname only.
 
-- [ ] Add an adversarial artifact test with user-info, password, session/JWT
+- [x] Add an adversarial artifact test with user-info, password, session/JWT
   params, nested credential redirect, tracking/referrer params, and fragment.
-- [ ] Run it and observe credential/query leakage.
-- [ ] Replace query deny-listing with origin/path canonicalization and clear
+- [x] Run it and observe credential/query leakage.
+- [x] Replace query deny-listing with origin/path canonicalization and clear
   user-info, search, and fragment.
-- [ ] Run privacy tests to GREEN.
+- [x] Run privacy tests to GREEN.
 
 ### Task 3: Assessment-ready semantic facts
 
@@ -68,14 +68,14 @@
 - Produces: `semanticEvidence.descriptionPresent`, bounded normalized
   `profileRuleMatches[].fact`, and `mandatorySignals[].fact`.
 
-- [ ] Add failing tests proving empty descriptions lower confidence and
+- [x] Add failing tests proving empty descriptions lower confidence and
   provider candidates contain readable normalized facts without complete
   source sentences.
-- [ ] Run tests and observe the known-empty and opaque-digest failures.
-- [ ] Extract bounded canonical fact tokens from complete in-memory evidence,
+- [x] Run tests and observe the known-empty and opaque-digest failures.
+- [x] Extract bounded canonical fact tokens from complete in-memory evidence,
   persist them with digest/completeness metadata, and render them into
   assessment candidates.
-- [ ] Run semantic and ranking tests to GREEN.
+- [x] Run semantic and ranking tests to GREEN.
 
 ### Task 4: Claim-time terminal compatibility
 
@@ -87,12 +87,12 @@
 - Terminal verifier consumes the request execution fingerprint and terminal
   manifest; claim verifier still consumes live workspace state.
 
-- [ ] Add a real queued keeper test whose own tracker mutation changes the
+- [x] Add a real queued keeper test whose own tracker mutation changes the
   tracker digest but completes `succeeded`.
-- [ ] Run it and observe the current `stale` result.
-- [ ] Split claim and terminal verification so only claim re-reads workspace
+- [x] Run it and observe the current `stale` result.
+- [x] Split claim and terminal verification so only claim re-reads workspace
   inputs and terminal compares recorded fingerprints.
-- [ ] Run the real runtime test to GREEN.
+- [x] Run the real runtime test to GREEN.
 
 ### Task 5: Direct scheduled-window coverage
 
@@ -107,13 +107,13 @@
 - Produces: `coverScheduledScanWindow(root, execution, lease)` for an exact
   schedule/logical-window/execution fingerprint.
 
-- [ ] Change the real scheduled overlap expectation to one collection and a
+- [x] Change the real scheduled overlap expectation to one collection and a
   durable skipped/covered request; run it RED.
-- [ ] Add queue-level adversarial coverage tests for mismatched job, window,
+- [x] Add queue-level adversarial coverage tests for mismatched job, window,
   and fingerprint.
-- [ ] Implement the exact fenced coverage transition and invoke it after direct
+- [x] Implement the exact fenced coverage transition and invoke it after direct
   terminal success before backup/release.
-- [ ] Run queue, pipeline, and Scout tests to GREEN.
+- [x] Run queue, pipeline, and Scout tests to GREEN.
 
 ### Task 6: Verification and handoff
 
@@ -121,8 +121,8 @@
 - Modify: `docs/OPERATIONS.md` if the ownership or scheduling description changes.
 - Modify: `.superpowers/sdd/2026-07-27-recoverable-scan-execution/task-6-report.md`
 
-- [ ] Run affected test files and record pass counts.
-- [ ] Run `npm.cmd test`.
-- [ ] Run `npm.cmd run release:audit`, syntax checks, and `git diff --check`.
-- [ ] Append exact RED/GREEN and verification evidence to the ignored Task 6 report.
-- [ ] Commit the reviewed tracked changes with a focused message.
+- [x] Run affected test files and record pass counts.
+- [x] Run `npm.cmd test`.
+- [x] Run `npm.cmd run release:audit`, syntax checks, and `git diff --check`.
+- [x] Append exact RED/GREEN and verification evidence to the ignored Task 6 report.
+- [x] Commit the reviewed tracked changes with a focused message.

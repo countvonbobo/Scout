@@ -36,6 +36,7 @@ const DURABLE_DISCOVERY_STAGES = Object.freeze([
   'collect', 'normalise', 'deduplicate', 'filter', 'rank', 'select',
 ]);
 const SAFE_ARTIFACT_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
+const SHA256_DIGEST = /^[a-f0-9]{64}$/;
 
 export class PipelineInterruptedError extends Error {
   constructor(message = 'scan pipeline was interrupted after a durable stage') {
@@ -148,6 +149,24 @@ function resultWithOutputs(result, outputs) {
     enumerable: false,
   });
   return Object.freeze(result);
+}
+
+function finalizationOutcome(value) {
+  const envelope = value?.schemaVersion === 1
+    && Object.getPrototypeOf(value) === Object.prototype
+    && Object.keys(value).sort().join(',') === 'mutationReceipt,result,schemaVersion'
+    ? value
+    : null;
+  if (!envelope) return { result: value, mutationReceipt: null };
+  const receipt = envelope.mutationReceipt;
+  if (!receipt || Object.getPrototypeOf(receipt) !== Object.prototype
+    || Object.keys(receipt).sort().join(',') !== 'digest,id,schemaVersion'
+    || receipt.schemaVersion !== 1
+    || !SAFE_ARTIFACT_ID.test(receipt.id || '')
+    || !SHA256_DIGEST.test(receipt.digest || '')) {
+    throw new TypeError('scan finalizer mutation receipt is invalid');
+  }
+  return { result: envelope.result, mutationReceipt: Object.freeze({ ...receipt }) };
 }
 
 async function drainScanQueue(root, queue, compatibility, leaseOptions, initialLease = null) {
@@ -319,6 +338,7 @@ export async function runScanPipeline({
   onStageCommitted = () => {},
   prepare = null,
   finalize = null,
+  postTerminalSuccess = null,
   recordFailure = null,
   queue = null,
   claimedLease = null,
@@ -329,6 +349,9 @@ export async function runScanPipeline({
   }
   if (prepare !== null && typeof prepare !== 'function') {
     throw new TypeError('scan pipeline prepare callback must be a function');
+  }
+  if (postTerminalSuccess !== null && typeof postTerminalSuccess !== 'function') {
+    throw new TypeError('scan pipeline post-success callback must be a function');
   }
   const functions = stageFunctions(stages);
   const ownsLease = claimedLease === null;
@@ -426,6 +449,7 @@ export async function runScanPipeline({
   let heartbeat = null;
   const failures = [];
   const outputs = new Map();
+  let mutationReceipt = null;
   try {
     const mayRecoverClaimedRun = !ownsLease && openRunJournal(root, provisionalRunId).events.length > 0;
     const candidates = ownsLease || mayRecoverClaimedRun
@@ -496,11 +520,26 @@ export async function runScanPipeline({
     }
     if (finalize !== null) {
       if (typeof finalize !== 'function') throw new TypeError('scan pipeline finalizer must be a function');
-      outputs.set('finalize', await finalize({
+      const finalized = finalizationOutcome(await finalize({
         run,
         lease,
         stageOutputs: Object.freeze(Object.fromEntries(outputs)),
       }));
+      outputs.set('finalize', finalized.result);
+      mutationReceipt = finalized.mutationReceipt;
+      if (mutationReceipt) {
+        appendRunEvent(run, {
+          type: 'mutation.receipted',
+          stageId: 'finalise',
+          idempotencyKey: `scan-mutation-receipt-g${lease.generation}`,
+          payload: {
+            schemaVersion: 1,
+            reference: { kind: 'mutation', id: mutationReceipt.id },
+            digest: mutationReceipt.digest,
+          },
+        }, lease);
+        manifest = validateManifestAgreement(run, lease).manifest;
+      }
     }
 
     appendRunEvent(run, {
@@ -511,6 +550,36 @@ export async function runScanPipeline({
     }, lease);
     manifest = validateManifestAgreement(run, lease).manifest;
     terminal = true;
+    if (typeof queue?.cover === 'function') {
+      try {
+        await queue.cover({ run, lease, manifest, mutationReceipt });
+      } catch {
+        failures.push(Object.freeze({
+          code: 'queue-coverage-pending',
+          stage: 'post-success',
+          reason: 'window-coverage-failed',
+        }));
+      }
+    }
+    if (postTerminalSuccess !== null) {
+      if (!mutationReceipt) {
+        failures.push(Object.freeze({
+          code: 'backup-pending',
+          stage: 'post-success',
+          reason: 'mutation-receipt-missing',
+        }));
+      } else {
+        try {
+          await postTerminalSuccess({ run, lease, manifest, mutationReceipt });
+        } catch {
+          failures.push(Object.freeze({
+            code: 'backup-pending',
+            stage: 'post-success',
+            reason: 'backup-failed',
+          }));
+        }
+      }
+    }
   } catch (error) {
     if (error instanceof PipelineInterruptedError) {
       retainInterruptedLease = true;
@@ -702,10 +771,19 @@ function candidateFromSelected(vacancy, index) {
   const semantic = candidate.semanticEvidence || null;
   const semanticSignals = (semantic?.mandatorySignals || []).map((signal) => ({
     id: signal.id,
-    text: `Advert contains a ${signal.kind} requirement (${signal.digest.slice(0, 16)}).`,
+    text: `Advert mandatory requirement: ${signal.fact || 'requirement disclosed'}.`,
   }));
+  const semanticDescriptionFacts = semantic ? [
+    ...(semantic.profileRuleMatches || []).map((rule) => (
+      typeof rule === 'string' ? null : rule.fact
+    )),
+    ...(semantic.responsibilityFacts || []),
+  ].filter(Boolean) : [];
   const semanticDescription = semantic
-    ? (semantic.profileRuleMatches || []).map((rule) => `Structured advert match: ${rule}.`).join(' ')
+    ? (semantic.descriptionPresent === false
+      ? ''
+      : [...new Set(semanticDescriptionFacts)]
+        .map((fact) => `Advert responsibility: ${fact}.`).join(' '))
     : null;
   return {
     ...candidate,
@@ -809,17 +887,15 @@ const RANKED_STAGE_ARTIFACT_FIELDS = Object.freeze({
 });
 const OMIT_PRIVATE_STAGE_KEY = /^(?:access[-_]?token|advert[-_]?body|api[-_]?(?:key|token)|auth(?:orization)?|body|cookies?|credentials?|cv|description|headers?|html|master[-_]?cv|password|payload|profile[-_]?evidence|prompt|raw[-_]?(?:html|response)|requirements|response|secret(?:[-_]?(?:key|token))?|token|transcript)$/i;
 const URL_STAGE_KEY = /(?:^url$|url$)/i;
-const PRIVATE_QUERY_PARAMETER = /^(?:utm_.+|gclid|fbclid|mc_.+|access[-_]?token|api[-_]?key|auth(?:orization)?|signature|token)$/i;
 
 function privacySafeStageUrl(value) {
   try {
     const parsed = new URL(String(value || ''));
     if (!['http:', 'https:'].includes(parsed.protocol)) return null;
-    for (const key of [...parsed.searchParams.keys()]) {
-      if (PRIVATE_QUERY_PARAMETER.test(key)) parsed.searchParams.delete(key);
-    }
+    parsed.username = '';
+    parsed.password = '';
+    parsed.search = '';
     parsed.hash = '';
-    parsed.searchParams.sort();
     return parsed.toString().replace(/\/$/, '').slice(0, 2_048);
   } catch {
     return null;
@@ -846,6 +922,30 @@ function encodeRankedStageValue(value) {
 function semanticText(value) {
   return String(value || '').normalize('NFKD').replace(/[\u0300-\u036f]/g, '')
     .toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
+}
+
+const SEMANTIC_FACT_STOPWORDS = new Set([
+  'a', 'an', 'and', 'are', 'be', 'for', 'from', 'in', 'is', 'must', 'mandatory',
+  'non', 'negotiable', 'of', 'on', 'or', 'required', 'requirement', 'requirements',
+  'role', 'the', 'this', 'to', 'with', 'you', 'your',
+  'advert', 'authorization', 'bearer', 'credential', 'credentials', 'jwt', 'key',
+  'legacy', 'password', 'private', 'secret', 'session', 'signature', 'token',
+]);
+const RESPONSIBILITY_LANGUAGE = /\b(?:analyse|analyze|build|coordinate|create|deliver|design|develop|implement|improve|lead|maintain|manage|operate|own|support|work)\b/i;
+
+function semanticFact(value) {
+  const tokens = semanticText(value).split(' ')
+    .filter((token) => token && !SEMANTIC_FACT_STOPWORDS.has(token))
+    .slice(0, 16);
+  return tokens.join(' ').slice(0, 160);
+}
+
+function responsibilityFacts(description) {
+  return [...new Set(String(description || '').split(/(?:\r?\n|[.;]\s+)/)
+    .map((sentence) => sentence.trim())
+    .filter((sentence) => sentence && RESPONSIBILITY_LANGUAGE.test(sentence))
+    .map(semanticFact)
+    .filter(Boolean))].slice(0, 6);
 }
 
 function semanticRuleId(rule) {
@@ -878,11 +978,12 @@ function semanticObservation(job, sourceName, source, profile) {
   ];
   const profileRuleMatches = descriptionRules
     .filter((rule) => semanticPhraseMatches(description, rule?.value))
-    .map(semanticRuleId);
+    .map((rule) => ({ id: semanticRuleId(rule), fact: semanticFact(rule.value) }));
   const signals = mandatorySignals(description, requirements).map((signal) => ({
     id: signal.id,
     digest: digestText(signal.text),
     kind: 'mandatory-language',
+    fact: semanticFact(signal.text) || 'requirement disclosed',
   }));
   const {
     description: omittedDescription,
@@ -903,9 +1004,11 @@ function semanticObservation(job, sourceName, source, profile) {
       evidenceTokenDigests: identity.evidenceTokens.map(digestText),
     },
     semanticEvidence: {
+      descriptionPresent: Boolean(description.trim()),
       descriptionDigest: digestText(description),
       descriptionLength: description.length,
       profileRuleMatches,
+      responsibilityFacts: responsibilityFacts(description),
       mandatorySignals: signals,
     },
   };
@@ -945,14 +1048,17 @@ function legacySemanticJob(job, sourceName) {
       url: privacySafeStageUrl(reference.url),
     })),
     semanticEvidence: {
+      descriptionPresent: Boolean(description.trim()),
       descriptionDigest: digestText(description),
       descriptionLength: description.length,
       requirementsDigest: digestText(requirements),
       requirementsLength: requirements.length,
+      responsibilityFacts: responsibilityFacts(description),
       mandatorySignals: mandatorySignals(description, requirements).map((signal) => ({
         id: signal.id,
         digest: digestText(signal.text),
         kind: 'mandatory-language',
+        fact: semanticFact(signal.text) || 'requirement disclosed',
       })),
     },
   };
@@ -1284,13 +1390,14 @@ export function compactCandidates(sources, maximum = DEFAULT_CANDIDATE_LIMIT) {
     ...job,
     candidateId: `candidate-${String(index + 1).padStart(3, '0')}`,
     description: job.semanticEvidence
-      ? `advert-semantic:${job.semanticEvidence.descriptionDigest}`
+      ? (job.semanticEvidence.responsibilityFacts || [])
+        .map((fact) => `Advert responsibility: ${fact}.`).join(' ')
       : job.description.slice(0, 1200),
     sources: [...new Set(job.sourceReferences.map((reference) => reference.url).filter(Boolean))],
     mandatorySignals: job.semanticEvidence
       ? (job.semanticEvidence.mandatorySignals || []).map((signal) => ({
         id: signal.id,
-        text: `${signal.kind}:${signal.digest}`,
+        text: `Advert mandatory requirement: ${signal.fact || 'requirement disclosed'}.`,
       }))
       : mandatorySignals(job.description, job.requirements),
   }));

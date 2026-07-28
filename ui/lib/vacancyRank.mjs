@@ -73,9 +73,16 @@ function evidenceFor(source, rule, matched, unknown = false) {
 function scoreRules(vacancy, name, sourceName, mode, rules) {
   const source = sourceName === 'description' ? vacancy?.description : field(vacancy, sourceName);
   const actual = valueOf(source);
-  const semanticEvidence = sourceName === 'description' ? vacancy?.semanticEvidence : null;
+  const suppliedSemanticEvidence = sourceName === 'description' ? vacancy?.semanticEvidence : null;
+  const semanticEvidence = suppliedSemanticEvidence
+    && (suppliedSemanticEvidence.descriptionPresent
+      ?? Number(suppliedSemanticEvidence.descriptionLength || 0) > 0)
+    ? suppliedSemanticEvidence
+    : null;
   const semanticMatches = semanticEvidence
-    ? new Set(semanticEvidence.profileRuleMatches || [])
+    ? new Set((semanticEvidence.profileRuleMatches || []).map((item) => (
+      typeof item === 'string' ? item : item.id
+    )))
     : null;
   const unknown = semanticMatches ? false : actual === null || actual === undefined || actual === '';
   const positiveRules = rules.filter((rule) => (STRENGTH_WEIGHT[rule?.strength] || 0) > 0);

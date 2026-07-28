@@ -7,7 +7,7 @@ import { spawn } from 'node:child_process';
 import { test } from 'node:test';
 import { acquireScanLease, currentLeaseOwner, readScanLease, releaseScanLease } from './scanLease.mjs';
 import {
-  claimNextScanRequest, completeScanRequest, enqueueOverlappingScanRequest, enqueueScanRequest,
+  claimNextScanRequest, completeScanRequest, coverScheduledScanWindow, enqueueOverlappingScanRequest, enqueueScanRequest,
   projectScanQueue, recoverOrphanedScanRequest,
 } from './scanQueue.mjs';
 
@@ -245,6 +245,69 @@ test('scheduled equivalence and window coverage require the same job and logical
     }));
 
     assert.deepEqual(projectScanQueue(root).ready.map((item) => item.id), ['morning-b', 'morning-a']);
+  } finally {
+    releaseScanLease(activeLease);
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('direct scheduled success covers only the exact queued job window and execution fingerprint', () => {
+  const root = workspace();
+  const activeLease = lease(root, 'direct-window-coverage');
+  const execution = (scheduleId, logicalWindowId, fingerprint = 'd'.repeat(64)) => ({
+    schemaVersion: 2,
+    provider: 'codex',
+    mode: 'primary',
+    model: null,
+    scheduleId,
+    logicalWindowId,
+    compatibilityFingerprint: fingerprint,
+  });
+  const scheduled = (id, executionContract) => request({
+    id,
+    key: id,
+    requester: 'scheduled',
+    requestedAt: '2026-07-27T08:00:00.000Z',
+    windowAt: '2026-07-27T20:00:00.000Z',
+    expiresAt: '2026-07-27T20:00:00.000Z',
+    execution: executionContract,
+    lease: activeLease,
+  });
+  try {
+    enqueueScanRequest(root, scheduled(
+      'exact-window',
+      execution('morning-job', '2026-07-27T06:30:00.000Z'),
+    ));
+    enqueueScanRequest(root, scheduled(
+      'different-job',
+      execution('evening-job', '2026-07-27T06:30:00.000Z'),
+    ));
+    enqueueScanRequest(root, scheduled(
+      'different-window',
+      execution('morning-job', '2026-07-28T06:30:00.000Z'),
+    ));
+    enqueueScanRequest(root, scheduled(
+      'different-fingerprint',
+      execution('morning-job', '2026-07-27T06:30:00.000Z', 'e'.repeat(64)),
+    ));
+
+    const covered = coverScheduledScanWindow(root, {
+      scheduleId: 'morning-job',
+      logicalWindowId: '2026-07-27T06:30:00.000Z',
+      purpose: 'daily-scan',
+      compatibilityFingerprint: 'd'.repeat(64),
+    }, activeLease);
+
+    assert.deepEqual(covered.map((item) => item.id), ['exact-window']);
+    assert.deepEqual(
+      projectScanQueue(root).requests.map((item) => [item.id, item.status]),
+      [
+        ['exact-window', 'skipped'],
+        ['different-job', 'queued'],
+        ['different-window', 'queued'],
+        ['different-fingerprint', 'queued'],
+      ],
+    );
   } finally {
     releaseScanLease(activeLease);
     fs.rmSync(root, { recursive: true, force: true });

@@ -28,12 +28,14 @@ function field(value, provenance = 'explicit-source') {
 function vacancy({
   vacancyId, title, employer = 'Example Ltd', location = 'London', workingPattern = 'hybrid',
   employmentType = 'permanent', description = '', compensation = null, postedAt = '2026-07-20T00:00:00.000Z',
+  semanticEvidence = null,
 } = {}) {
   return {
     vacancyId, canonicalUrl: `https://jobs.example/${vacancyId}`, description, postedAt,
     employer: field(employer), title: field(title), location: field(location),
     workingPattern: field(workingPattern), employmentType: field(employmentType),
     compensation: compensation === null ? field(null, 'unknown') : field(compensation),
+    ...(semanticEvidence ? { semanticEvidence } : {}),
   };
 }
 
@@ -149,6 +151,28 @@ test('unknown negative-rule evidence lowers confidence without receiving a penal
 
   assert.equal(negative.score, 0);
   assert.equal(negative.confidence, 0);
+  assert.ok(result.preRankConfidence < 100);
+});
+
+test('a semantic artifact with no description preserves unknown ranking evidence', () => {
+  const result = rankVacancies([vacancy({
+    vacancyId: 'semantic-description-missing',
+    title: 'Data Analyst',
+    description: '',
+    semanticEvidence: {
+      descriptionPresent: false,
+      descriptionDigest: 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855',
+      descriptionLength: 0,
+      profileRuleMatches: [],
+      mandatorySignals: [],
+    },
+  })], profile({
+    sectors: [rule('public health', 'strong-preference')],
+  }))[0];
+  const sector = result.dimensions.find((dimension) => dimension.name === 'sectors');
+
+  assert.equal(sector.score, 0);
+  assert.equal(sector.confidence, 0);
   assert.ok(result.preRankConfidence < 100);
 });
 

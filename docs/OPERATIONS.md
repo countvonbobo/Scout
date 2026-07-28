@@ -28,8 +28,14 @@ The maintained beta deployment uses one private, single-owner Ubuntu VPS:
   before beginning new unqueued work, and interrupted claims resume under their
   original run identity.
 - Only successfully terminalised mutations and scans queue encrypted
-  private-repository backup checkpoints. A queued, stale, lease-lost, or failed
-  preflight scan has no backup authority.
+  private-repository backup checkpoints. The scan keeps its fenced lease and
+  heartbeat through the receipt-gated checkpoint; each successfully drained
+  queued run owns its own checkpoint. A queued contender, stale, lease-lost,
+  receipted-backup-pending, or failed preflight scan has no unfenced backup
+  authority.
+- A successful direct scheduled run durably covers only queued overlaps for
+  the same schedule job, logical window, purpose, and execution fingerprint.
+  Other windows and jobs remain queued.
 - Normal tracked career files remain readable only inside the private repository; ignored sensitive recovery state is encrypted under `.scout-backup/v1`.
 
 Do not assume a developer computer's local application checkout or workspace is live. Diagnose the VPS for production-like bugs unless the user explicitly reports a local-only installation.
