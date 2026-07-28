@@ -1,9 +1,9 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { spawn, spawnSync } from 'node:child_process';
 import { atomicWriteFile } from './atomicWrite.mjs';
-import { markerFreeMutationContent } from './mutationCoordinator.mjs';
 import {
   initializeRecoveryBackup, loadRecoveryHeader, RECOVERY_DIR, restoreRecoveryBackup, restoreRecoveryBackupWithKey,
   restoreRecoveryBackupWithKeyAsync, rotateRecoveryPassphrase, writeRecoveryBackup, writeRecoveryBackupAsync,
@@ -16,6 +16,14 @@ const DEFAULT_COMMAND_TIMEOUT_MS = 30_000;
 const COMMAND_OUTPUT_LIMIT = 64 * 1024;
 const PROCESS_TREE_KILL_GRACE_MS = 100;
 const RUNTIME_FENCE_FAILURE = Symbol('runtime-fence-failure');
+const MARKER_FILTER = 'scout-marker';
+const MARKER_FILTER_PATHS = Object.freeze([
+  'data/opportunities.json',
+  'data/scan-runs.jsonl',
+  'reports/*.md',
+]);
+const MARKER_CLEANER = fileURLToPath(new URL('../../tools/scout-marker-clean.mjs', import.meta.url))
+  .replaceAll('\\', '/');
 
 class RuntimeCommandTimeoutError extends Error {}
 
@@ -415,113 +423,45 @@ function sameGithubRepository(left, right) {
   catch { return left === right; }
 }
 
-function markerBearingBackupFiles(root) {
-  // Recovery markers remain in the live workspace so an interrupted scan can
-  // reconcile against its journal. Git stores the canonical marker-free
-  // projection instead; a restored workspace therefore starts from ordinary
-  // user content and never infers a receipt that was not restored with it.
-  const candidates = [
-    { relative: 'data/opportunities.json', kind: 'tracker' },
-    { relative: 'data/scan-runs.jsonl', kind: 'run-log' },
-  ];
-  const reports = path.join(root, 'reports');
-  if (fs.existsSync(reports)) {
-    if (fs.lstatSync(reports).isSymbolicLink()) {
-      throw new Error('Private backup refuses a symlinked reports directory');
-    }
-    for (const name of fs.readdirSync(reports).filter((entry) => /^\d{4}-\d{2}-\d{2}\.md$/.test(entry))) {
-      candidates.push({ relative: `reports/${name}`, kind: 'report' });
-    }
-  }
-  return candidates.flatMap((candidate) => {
-    const file = path.join(root, ...candidate.relative.split('/'));
-    if (!fs.existsSync(file)) return [];
-    if (fs.lstatSync(file).isSymbolicLink()) {
-      throw new Error(`Private backup refuses a symlinked mutation target: ${candidate.relative}`);
-    }
-    const content = fs.readFileSync(file, 'utf8');
-    const hasMarker = candidate.kind === 'report'
-      ? content.includes('<!-- scout-mutation:')
-      : content.includes('_scoutMutation');
-    if (!hasMarker) return [];
-    return [{ ...candidate, content: markerFreeMutationContent(candidate.kind, content) }];
-  });
+function markerFilterAttributes(root) {
+  const file = path.join(root, '.git', 'info', 'attributes');
+  const managed = [
+    '# scout marker clean filter begin',
+    'data/opportunities.json filter=scout-marker',
+    'data/scan-runs.jsonl filter=scout-marker',
+    'reports/*.md filter=scout-marker',
+    '# scout marker clean filter end',
+  ].join('\n');
+  const current = fs.existsSync(file) ? fs.readFileSync(file, 'utf8') : '';
+  const withoutManaged = current.replace(
+    /(?:^|\n)# scout marker clean filter begin[\s\S]*?# scout marker clean filter end\n?/g,
+    '\n',
+  ).trim();
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  atomicWriteFile(file, `${withoutManaged ? `${withoutManaged}\n` : ''}${managed}\n`, { mode: 0o600 });
 }
 
-function withProjectionFile(root, content, commit) {
-  const directory = path.join(root, '.scout', `backup-projection-${crypto.randomUUID()}`);
-  const file = path.join(directory, 'content');
-  fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
-  atomicWriteFile(file, content, { mode: 0o600 });
-  try {
-    return commit(file);
-  } finally {
-    if (fs.existsSync(file)) fs.unlinkSync(file);
-    if (fs.existsSync(directory)) fs.rmdirSync(directory);
-  }
+function markerFilterTrackedPaths(root, options) {
+  const tracked = runGit(root, ['ls-files', '--', ...MARKER_FILTER_PATHS], options);
+  if (!tracked.ok) throw new Error(tracked.error);
+  return tracked.stdout.split(/\r?\n/).filter(Boolean);
 }
 
-function stageMarkerFreeBackupProjection(root, options) {
-  for (const projection of markerBearingBackupFiles(root)) {
-    withProjectionFile(root, projection.content, (file) => {
-      const object = runGit(root, ['hash-object', '-w', '--', file], options);
-      if (!object.ok) throw new Error(object.error);
-      const staged = runGit(root, [
-        'update-index',
-        '--add',
-        '--cacheinfo',
-        `100644,${object.stdout},${projection.relative}`,
-      ], options);
-      if (!staged.ok) throw new Error(staged.error);
-    });
+function ensureMarkerCleanFilter(root, options = {}) {
+  markerFilterAttributes(root);
+  const command = `node "${MARKER_CLEANER}"`;
+  for (const [key, value] of [
+    [`filter.${MARKER_FILTER}.clean`, command],
+    [`filter.${MARKER_FILTER}.required`, 'true'],
+  ]) {
+    const configured = runGit(root, ['config', key, value], options);
+    if (!configured.ok) throw new Error(configured.error);
   }
-}
-
-function setMarkerProjectionVisibility(root, options, hidden) {
-  for (const projection of markerBearingBackupFiles(root)) {
-    const tracked = runGit(root, ['ls-files', '--error-unmatch', '--', projection.relative], options);
-    if (!tracked.ok) continue;
-    const flag = hidden ? '--assume-unchanged' : '--no-assume-unchanged';
-    const updated = runGit(root, ['update-index', flag, '--', projection.relative], options);
-    if (!updated.ok) throw new Error(updated.error);
-  }
-}
-
-async function stageMarkerFreeBackupProjectionAsync(root, options) {
-  for (const projection of markerBearingBackupFiles(root)) {
-    const directory = path.join(root, '.scout', `backup-projection-${crypto.randomUUID()}`);
-    const file = path.join(directory, 'content');
-    fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
-    atomicWriteFile(file, projection.content, { mode: 0o600 });
-    try {
-      const object = await runtimeGit(root, ['hash-object', '-w', '--', file], options, { mutation: true });
-      if (!object.ok) throw new Error(object.error);
-      const staged = await runtimeGit(root, [
-        'update-index',
-        '--add',
-        '--cacheinfo',
-        `100644,${object.stdout},${projection.relative}`,
-      ], options, { mutation: true });
-      if (!staged.ok) throw new Error(staged.error);
-    } finally {
-      if (fs.existsSync(file)) fs.unlinkSync(file);
-      if (fs.existsSync(directory)) fs.rmdirSync(directory);
-    }
-  }
-}
-
-async function setMarkerProjectionVisibilityAsync(root, options, hidden) {
-  for (const projection of markerBearingBackupFiles(root)) {
-    const tracked = await runtimeGit(root, ['ls-files', '--error-unmatch', '--', projection.relative], options);
-    if (!tracked.ok) continue;
-    const flag = hidden ? '--assume-unchanged' : '--no-assume-unchanged';
-    const updated = await runtimeGit(
-      root,
-      ['update-index', flag, '--', projection.relative],
-      options,
-      { mutation: true },
-    );
-    if (!updated.ok) throw new Error(updated.error);
+  const paths = markerFilterTrackedPaths(root, options);
+  if (!paths.length) return;
+  for (const flag of ['--no-assume-unchanged', '--no-skip-worktree']) {
+    const cleared = runGit(root, ['update-index', flag, '--', ...paths], options);
+    if (!cleared.ok) throw new Error(cleared.error);
   }
 }
 
@@ -529,7 +469,7 @@ function commitAll(root, message, options = {}) {
   untrackLegacyChats(root, options);
   untrackLegacyManagedInstructions(root, options);
   assertNoTrackedSecrets(root, options);
-  setMarkerProjectionVisibility(root, options, false);
+  ensureMarkerCleanFilter(root, options);
   const update = runGit(root, ['add', '-u'], options);
   if (!update.ok) throw new Error(update.error);
   const untracked = runGit(root, ['ls-files', '--others', '--exclude-standard', '-z'], options);
@@ -539,12 +479,10 @@ function commitAll(root, message, options = {}) {
     const add = runGit(root, ['add', '--', ...files.slice(index, index + 100)], options);
     if (!add.ok) throw new Error(add.error);
   }
-  stageMarkerFreeBackupProjection(root, options);
   const commit = runGit(root, ['commit', '-m', message], options);
   if (!commit.ok && !/nothing to commit|nothing added|no changes added/i.test(commit.error)) {
     throw new Error(commit.error);
   }
-  setMarkerProjectionVisibility(root, options, true);
 }
 
 function assertRuntimeFence(options) {
@@ -637,11 +575,38 @@ async function assertNoTrackedSecretsAsync(root, options) {
   }
 }
 
+async function ensureMarkerCleanFilterAsync(root, options) {
+  assertRuntimeFence(options);
+  markerFilterAttributes(root);
+  assertRuntimeFence(options);
+  const command = `node "${MARKER_CLEANER}"`;
+  for (const [key, value] of [
+    [`filter.${MARKER_FILTER}.clean`, command],
+    [`filter.${MARKER_FILTER}.required`, 'true'],
+  ]) {
+    const configured = await runtimeGit(root, ['config', key, value], options, { mutation: true });
+    if (!configured.ok) throw new Error(configured.error);
+  }
+  const tracked = await runtimeGit(root, ['ls-files', '--', ...MARKER_FILTER_PATHS], options);
+  if (!tracked.ok) throw new Error(tracked.error);
+  const paths = tracked.stdout.split(/\r?\n/).filter(Boolean);
+  if (!paths.length) return;
+  for (const flag of ['--no-assume-unchanged', '--no-skip-worktree']) {
+    const cleared = await runtimeGit(
+      root,
+      ['update-index', flag, '--', ...paths],
+      options,
+      { mutation: true },
+    );
+    if (!cleared.ok) throw new Error(cleared.error);
+  }
+}
+
 async function commitAllAsync(root, message, options) {
   await untrackLegacyChatsAsync(root, options);
   await untrackLegacyManagedInstructionsAsync(root, options);
   await assertNoTrackedSecretsAsync(root, options);
-  await setMarkerProjectionVisibilityAsync(root, options, false);
+  await ensureMarkerCleanFilterAsync(root, options);
   const update = await runtimeGit(root, ['add', '-u'], options, { mutation: true });
   if (!update.ok) throw new Error(update.error);
   const untracked = await runtimeGit(root, ['ls-files', '--others', '--exclude-standard', '-z'], options);
@@ -656,34 +621,16 @@ async function commitAllAsync(root, message, options) {
     );
     if (!add.ok) throw new Error(add.error);
   }
-  await stageMarkerFreeBackupProjectionAsync(root, options);
   const commit = await runtimeGit(root, ['commit', '-m', message], options, { mutation: true });
   if (!commit.ok && !/nothing to commit|nothing added|no changes added/i.test(commit.error)) {
     throw new Error(commit.error);
   }
-  await setMarkerProjectionVisibilityAsync(root, options, true);
 }
 
 async function worktreeDirtyAsync(root, options) {
   const status = await runtimeGit(root, ['status', '--porcelain', '--untracked-files=normal'], options);
   if (!status.ok) throw new Error(status.error);
-  if (status.stdout) return true;
-  for (const projection of markerBearingBackupFiles(root)) {
-    const directory = path.join(root, '.scout', `backup-projection-${crypto.randomUUID()}`);
-    const file = path.join(directory, 'content');
-    fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
-    atomicWriteFile(file, projection.content, { mode: 0o600 });
-    try {
-      const worktreeObject = await runtimeGit(root, ['hash-object', '--no-filters', '--', file], options);
-      if (!worktreeObject.ok) throw new Error(worktreeObject.error);
-      const headObject = await runtimeGit(root, ['rev-parse', `HEAD:${projection.relative}`], options);
-      if (!headObject.ok || headObject.stdout !== worktreeObject.stdout) return true;
-    } finally {
-      if (fs.existsSync(file)) fs.unlinkSync(file);
-      if (fs.existsSync(directory)) fs.rmdirSync(directory);
-    }
-  }
-  return false;
+  return Boolean(status.stdout);
 }
 
 async function checkpointLocallyAsync(root, settings, options, reason) {
@@ -730,6 +677,7 @@ export async function runWorkspaceSync(root, reason = 'workspace update', option
     const settings = loadSyncSettings(root);
     if (!await repoReadyAsync(root, options)) return setState(root, 'disabled', { enabled: false });
     await ensureRepoAsync(root, options);
+    await ensureMarkerCleanFilterAsync(root, options);
     await untrackLegacyChatsAsync(root, options);
     await untrackLegacyManagedInstructionsAsync(root, options);
     await assertNoTrackedSecretsAsync(root, options);

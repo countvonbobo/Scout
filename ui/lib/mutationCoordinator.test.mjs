@@ -17,6 +17,7 @@ import {
   acquireScanLease, currentLeaseOwner, releaseScanLease,
 } from './scanLease.mjs';
 import { appendRunEvent, openRunJournal, replayRunJournal } from './runJournal.mjs';
+import { runLogAppendRecipe, scanReportRecipe, trackerMergeRecipe } from './scanMutationProjection.mjs';
 
 const roots = [];
 
@@ -46,7 +47,8 @@ function fixture() {
   return { root, lease, handle };
 }
 
-function mutationInput() {
+function mutationInput(root) {
+  const intendedTracker = '{\n  "updated": "2026-07-28",\n  "opportunities": [{"id":"valid-sibling","company":"Valid Co","role":"Engineer"}]\n}\n';
   return {
     target: {
       id: 'scan-tracker-report',
@@ -57,15 +59,30 @@ function mutationInput() {
       ],
     },
     content: {
-      tracker: '{\n  "updated": "2026-07-28",\n  "opportunities": [{"id":"valid-sibling"}]\n}\n',
-      'report:2026-07-28': '# Scout report\n\n## Headline\n\nOne valid sibling; one bounded assessment failure.\n',
+      tracker: trackerMergeRecipe(
+        fs.readFileSync(path.join(root, 'data', 'opportunities.json'), 'utf8'),
+        intendedTracker,
+      ),
+      'report:2026-07-28': scanReportRecipe({
+        date: '2026-07-28',
+        degraded: true,
+        coverage: [],
+        actions: [],
+        checks: [],
+        keeperCount: 1,
+        discarded: {},
+        nearMisses: [],
+        errors: ['assessment-retries-exhausted'],
+        runs: [],
+      }),
     },
   };
 }
 
 test('a matching post-replacement identity reconciles without replay and appends one receipt', () => {
   const { root, lease, handle } = fixture();
-  const { target, content } = mutationInput();
+  const { target, content } = mutationInput(root);
+  content.tracker.rawProviderResponse = 'Unlabelled complete candidate history from provider.';
   const plan = prepareMutation({ handle, lease }, target, content);
   let replacements = 0;
 
@@ -95,7 +112,7 @@ test('a matching post-replacement identity reconciles without replay and appends
 
 test('crashes before replacement and after one replacement resume only pending targets', () => {
   const { root, lease, handle } = fixture();
-  const { target, content } = mutationInput();
+  const { target, content } = mutationInput(root);
   const plan = prepareMutation({ handle, lease }, target, content);
 
   assert.throws(
@@ -133,7 +150,7 @@ test('crashes before replacement and after one replacement resume only pending t
 
 test('conflicting and unverifiable target states fail closed', () => {
   const { root, lease, handle } = fixture();
-  const { target, content } = mutationInput();
+  const { target, content } = mutationInput(root);
   const plan = prepareMutation({ handle, lease }, target, content);
   fs.writeFileSync(path.join(root, 'data', 'opportunities.json'), '{"opportunities":[{"id":"operator-edit"}]}\n');
   assert.throws(() => reconcileMutation(plan), MutationConflictError);
@@ -146,7 +163,7 @@ test('conflicting and unverifiable target states fail closed', () => {
 
 test('a stale fencing generation cannot mutate or append a receipt', () => {
   const { root, lease, handle } = fixture();
-  const { target, content } = mutationInput();
+  const { target, content } = mutationInput(root);
   const plan = prepareMutation({ handle, lease }, target, content);
   releaseScanLease(lease);
   const successor = acquireScanLease(root, currentLeaseOwner(), { kind: 'scan', runId: 'successor-run' });
@@ -169,7 +186,7 @@ test('the shared OS-level coordinator excludes another mutation boundary', () =>
 
 test('the shared coordinator remains held until the durable receipt is appended', () => {
   const { root, lease, handle } = fixture();
-  const { target, content } = mutationInput();
+  const { target, content } = mutationInput(root);
   const plan = prepareMutation({ handle, lease }, target, content);
 
   applyPreparedMutation(plan, lease, {
@@ -184,8 +201,8 @@ test('the shared coordinator remains held until the durable receipt is appended'
 });
 
 test('the canonical run, target revision and intended content produce one stable prepared plan', () => {
-  const { lease, handle } = fixture();
-  const { target, content } = mutationInput();
+  const { root, lease, handle } = fixture();
+  const { target, content } = mutationInput(root);
   const first = prepareMutation({ handle, lease }, target, content);
   const second = prepareMutation({ handle, lease }, target, structuredClone(content));
 
@@ -196,8 +213,8 @@ test('the canonical run, target revision and intended content produce one stable
 });
 
 test('the journal rejects a self-consistent prepared artifact forged after preparation', () => {
-  const { lease, handle } = fixture();
-  const { target, content } = mutationInput();
+  const { root, lease, handle } = fixture();
+  const { target, content } = mutationInput(root);
   const plan = prepareMutation({ handle, lease }, target, content);
   const artifactFile = path.join(handle.directory, 'mutations', `${plan.mutationId}.json`);
   const envelope = JSON.parse(fs.readFileSync(artifactFile, 'utf8'));
@@ -212,8 +229,8 @@ test('the journal rejects a self-consistent prepared artifact forged after prepa
 });
 
 test('coordinator fails closed when one mutation identity has duplicate receipts', () => {
-  const { lease, handle } = fixture();
-  const { target, content } = mutationInput();
+  const { root, lease, handle } = fixture();
+  const { target, content } = mutationInput(root);
   const plan = prepareMutation({ handle, lease }, target, content);
   applyPreparedMutation(plan, lease);
   appendRunEvent(handle, {
@@ -230,9 +247,9 @@ test('coordinator fails closed when one mutation identity has duplicate receipts
   assert.throws(() => reconcileMutation(plan), /duplicate mutation receipt/i);
 });
 
-test('prepared mutation artifacts reject credentials and forbidden private payload fields', () => {
-  const { lease, handle } = fixture();
-  const { target, content } = mutationInput();
+test('prepared mutation artifacts reject opaque target bodies', () => {
+  const { root, lease, handle } = fixture();
+  const { target, content } = mutationInput(root);
   const unsafe = structuredClone(content);
   unsafe.tracker = JSON.stringify({
     opportunities: [],
@@ -241,93 +258,25 @@ test('prepared mutation artifacts reject credentials and forbidden private paylo
 
   assert.throws(
     () => prepareMutation({ handle, lease }, target, unsafe),
-    /private mutation content|credential/i,
+    /mutation recipe|recipe is missing|plain object/i,
   );
   assert.equal(replayRunJournal(handle.file).length, 0);
   assert.equal(fs.existsSync(path.join(handle.directory, 'mutations')), false);
 });
 
-test('prepared mutation artifacts reject paths, private source bodies and non-canonical URLs', () => {
-  const unsafeValues = [
-    'C:\\Users\\private\\candidate-cv.md',
-    '/home/private/candidate-cv.md',
-    '/srv/scout/private-candidate-cv.md',
-    '\\private\\candidate-cv.md',
-    'full private prompt for assessing this candidate',
-    'curriculum vitae: private employment history',
-    'full advert text copied from the provider',
-    'raw provider output: private source response',
-    'https://user:password@example.test/job',
-    'https://example.test/job#candidate-private-fragment',
-    'https://example.test/job?utm_source=private',
-  ];
-
-  for (const unsafeValue of unsafeValues) {
-    const { lease, handle } = fixture();
-    const { target, content } = mutationInput();
-    const unsafe = structuredClone(content);
-    unsafe.tracker = JSON.stringify({
-      updated: '2026-07-28',
-      opportunities: [{ id: 'candidate-001', notes: unsafeValue }],
-    });
-    assert.throws(
-      () => prepareMutation({ handle, lease }, target, unsafe),
-      /private mutation content|absolute path|canonical url|tracking|credential/i,
-      `structured mutation payload admitted: ${unsafeValue}`,
-    );
-    assert.equal(fs.existsSync(path.join(handle.directory, 'mutations')), false);
-  }
-});
-
-test('opaque report bodies reject paths, source bodies and non-canonical URLs', () => {
-  const unsafeValues = [
-    'C:\\Users\\private\\candidate-cv.md',
-    '/home/private/candidate-cv.md',
-    '/srv/scout/private-candidate-cv.md',
-    '\\private\\candidate-cv.md',
-    'Full private prompt for assessing this candidate.',
-    'Curriculum vitae: private employment history.',
-    'Full advert text copied from the provider.',
-    'Raw provider response copied without projection.',
-    'https://user:password@example.test/job',
-    'https://example.test/job#candidate-private-fragment',
-    'https://example.test/job?gclid=private',
-  ];
-
-  for (const unsafeValue of unsafeValues) {
-    const { lease, handle } = fixture();
-    const { target, content } = mutationInput();
-    const unsafe = structuredClone(content);
-    unsafe['report:2026-07-28'] = `# Scout report\n\n## Headline\n\n${unsafeValue}\n`;
-    assert.throws(
-      () => prepareMutation({ handle, lease }, target, unsafe),
-      /private mutation content|absolute path|canonical url|tracking|credential/i,
-      `opaque report admitted: ${unsafeValue}`,
-    );
-    assert.equal(fs.existsSync(path.join(handle.directory, 'mutations')), false);
-  }
-});
-
 test('prepared artifacts use resolver-backed opaque keys and one canonical content copy', () => {
-  const { lease, handle } = fixture();
-  const plan = prepareMutation({ handle, lease }, {
-    id: 'scan-tracker-report',
-    schemaVersion: 1,
-    files: [
-      { kind: 'tracker', key: 'tracker' },
-      { kind: 'report', key: 'report:2026-07-28' },
-    ],
-  }, {
-    tracker: '{\n  "updated": "2026-07-28",\n  "opportunities": []\n}\n',
-    'report:2026-07-28': '# Scout report\n\n## Headline\n\nSafe bounded summary.\n',
-  });
+  const { root, lease, handle } = fixture();
+  const { target, content } = mutationInput(root);
+  const plan = prepareMutation({ handle, lease }, target, content);
   const artifact = fs.readFileSync(
     path.join(handle.directory, 'mutations', `${plan.mutationId}.json`),
     'utf8',
   );
 
   assert.doesNotMatch(artifact, /data[\\/]opportunities|reports[\\/]2026|intendedContent|preparedContent|"path"/);
-  assert.equal((artifact.match(/"content":/g) || []).length, 2);
+  assert.doesNotMatch(artifact, /Unlabelled complete candidate history/);
+  assert.doesNotMatch(artifact, /"content":/);
+  assert.equal((artifact.match(/"recipe":/g) || []).length, 2);
   assert.deepEqual(plan.files.map((file) => file.key), ['tracker', 'report:2026-07-28']);
 });
 
@@ -346,7 +295,12 @@ test('resolver rejects a tracker file reached through an escaping junction', { s
       schemaVersion: 1,
       files: [{ kind: 'tracker', key: 'tracker' }],
     }, {
-      tracker: '{"updated":"2026-07-28","opportunities":[]}\n',
+      tracker: {
+        schemaVersion: 1,
+        operation: 'tracker-merge',
+        updated: '2026-07-28',
+        upserts: [],
+      },
     }),
     /symlink|junction|outside its workspace/i,
   );
@@ -363,7 +317,18 @@ test('replacement rechecks containment after a directory is swapped for a juncti
     schemaVersion: 1,
     files: [{ kind: 'report', key: 'report:2026-07-28' }],
   }, {
-    'report:2026-07-28': '# Scout report\n\n## Headline\n\nInside only.\n',
+    'report:2026-07-28': scanReportRecipe({
+      date: '2026-07-28',
+      degraded: false,
+      coverage: [],
+      actions: [],
+      checks: [],
+      keeperCount: 0,
+      discarded: {},
+      nearMisses: [],
+      errors: [],
+      runs: [],
+    }),
   });
 
   assert.throws(
@@ -462,4 +427,135 @@ test('a later scan strips mutation markers from historical run-log records', () 
   assert.equal(records.length, 2);
   assert.equal(Object.hasOwn(records[0], '_scoutMutation'), false);
   assert.equal(Object.hasOwn(records[1], '_scoutMutation'), true);
+});
+
+test('real prepared recipe excludes unlabelled private bodies while preserving tracker semantics', () => {
+  const { root, lease, handle } = fixture();
+  const privateBodies = {
+    cv: 'Led the Acme migration from 2020 to 2024 across three business units.',
+    advert: 'About the role, you will own the platform roadmap and mentor the engineering group.',
+    prompt: 'Compare every requirement against the candidate and return a strict JSON decision.',
+    provider: 'The candidate demonstrates unusually strong ownership across the supplied evidence.',
+    response: 'Upstream returned the complete candidate document in a successful response.',
+  };
+  fs.writeFileSync(path.join(root, 'data', 'opportunities.json'), `${JSON.stringify({
+    updated: '2026-07-01',
+    opportunities: [{
+      id: 'existing-user-entry',
+      company: 'Existing Co',
+      role: 'Engineer',
+      status: 'shortlist',
+      notes: privateBodies.cv,
+      contacts: [{ name: 'Private Contact' }],
+      log: [{ date: '2026-07-01', event: 'user note' }],
+    }],
+  }, null, 2)}\n`);
+  const artifacts = coordinateScanArtifacts(root, {
+    provider: 'codex',
+    mode: 'primary',
+    sources: {
+      ats: {
+        configured: true,
+        status: 'healthy',
+        count: 1,
+        reason: privateBodies.response,
+      },
+    },
+    candidates: [{
+      candidateId: 'candidate-001',
+      company: 'Valid Co',
+      role: 'Platform Engineer',
+      url: 'https://example.test/valid',
+      source: 'ats',
+      description: privateBodies.advert,
+    }],
+    assessmentResult: {
+      assessments: [{
+        candidateId: 'candidate-001',
+        categoryId: 'software',
+        summary: privateBodies.provider,
+        hardExclusionMatches: [],
+        mandatoryRequirements: [{
+          requirement: privateBodies.prompt,
+          advertEvidence: privateBodies.advert,
+          advertEvidenceId: 'provider-platform',
+          status: 'met',
+          profileEvidence: privateBodies.cv,
+        }],
+        dimensions: [{ name: 'Fit', score: 90, maximum: 100, evidence: privateBodies.provider }],
+        recommendation: 'keep',
+      }],
+    },
+    assessmentFailures: [{
+      jobId: 'stable-job-002',
+      code: 'assessment-exhausted',
+      attempts: 3,
+      validationFailures: ['missing-required-field'],
+    }],
+    policy: { actionScore: 70, checkScore: 55 },
+    startedAt: '2026-07-28T09:00:00.000Z',
+  }, { run: handle, lease });
+  const prepared = handle.events.find((event) => event.type === 'mutation.prepared');
+  const durable = fs.readFileSync(
+    path.join(handle.directory, 'mutations', `${prepared.payload.reference.id}.json`),
+    'utf8',
+  );
+
+  for (const body of Object.values(privateBodies)) {
+    assert.doesNotMatch(durable, new RegExp(body.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+  }
+  assert.match(durable, /Valid Co|Platform Engineer/);
+  assert.match(durable, /assessment-exhausted|missing-required-field/);
+  const tracker = JSON.parse(fs.readFileSync(path.join(root, 'data', 'opportunities.json'), 'utf8'));
+  assert.equal(tracker.opportunities.find((item) => item.id === 'existing-user-entry').notes, privateBodies.cv);
+  assert.deepEqual(
+    tracker.opportunities.find((item) => item.id === 'existing-user-entry').contacts,
+    [{ name: 'Private Contact' }],
+  );
+  assert.equal(tracker.opportunities.some((item) => item.company === 'Valid Co'), true);
+  assert.equal(artifacts.mutationReceipt.id, prepared.payload.reference.id);
+});
+
+test('run-log recipes project funnel counters without copying nested source prose', () => {
+  const privateBody = 'Unlabelled provider response containing a complete candidate history.';
+  const recipe = runLogAppendRecipe({
+    timestamp: '2026-07-28T09:00:00.000Z',
+    funnel: {
+      sourceRecords: 1,
+      selected: 1,
+      privateProviderBody: privateBody,
+      bySource: {
+        ats: {
+          count: 1,
+          failedRecords: 0,
+          sourceErrors: 0,
+          response: privateBody,
+        },
+      },
+    },
+    selection_summary: {
+      selected: 1,
+      assessed: 1,
+      assessmentFailed: 0,
+      explanation: privateBody,
+    },
+    profile_id: privateBody,
+    assessment_failures: [{ jobId: privateBody, code: 'assessment-failed' }],
+    explanations: [{ vacancy_id: privateBody, assessment_status: 'failed' }],
+  });
+  const durable = JSON.stringify(recipe);
+
+  assert.doesNotMatch(durable, new RegExp(privateBody));
+  assert.deepEqual(recipe.record.funnel, {
+    sourceRecords: 1,
+    selected: 1,
+    bySource: {
+      ats: { count: 1, failedRecords: 0, sourceErrors: 0 },
+    },
+  });
+  assert.deepEqual(recipe.record.selection_summary, {
+    selected: 1,
+    assessed: 1,
+    assessmentFailed: 0,
+  });
 });

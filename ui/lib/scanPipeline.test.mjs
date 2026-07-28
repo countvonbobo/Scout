@@ -13,6 +13,7 @@ import { acquireScanLease, currentLeaseOwner, readScanLease, releaseScanLease } 
 import { appendRunEvent, openRunJournal, replayRunJournal } from './runJournal.mjs';
 import { ProviderLifecycleUnclosedError } from './structuredTurn.mjs';
 import { applyPreparedMutation, prepareMutation } from './mutationCoordinator.mjs';
+import { scanReportRecipe } from './scanMutationProjection.mjs';
 
 const dimensions = [{ name: 'Fit', score: 90, maximum: 100, evidence: 'Advert and profile' }];
 const assessment = (status = 'met') => ({
@@ -1865,7 +1866,18 @@ test('pipeline accepts a coordinator-journalled receipt without projecting a dup
           schemaVersion: 1,
           files: [{ kind: 'report', key: 'report:2026-07-28' }],
         }, {
-          'report:2026-07-28': '# Report\n\n## Headline\n\nAfter.\n',
+          'report:2026-07-28': scanReportRecipe({
+            date: '2026-07-28',
+            degraded: false,
+            coverage: [],
+            actions: [],
+            checks: [],
+            keeperCount: 0,
+            discarded: {},
+            nearMisses: [],
+            errors: [],
+            runs: [],
+          }),
         });
         return {
           schemaVersion: 1,

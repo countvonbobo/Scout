@@ -10,6 +10,8 @@ import {
   verifyPrivateGithubRemote,
 } from './workspaceSync.mjs';
 import { initializeRecoveryBackup } from './recoveryBackup.mjs';
+import { mutateTrackerSnapshot } from './trackerPersistence.mjs';
+import { serializeTracker } from './tracker.mjs';
 
 const EXAMPLE_ENV = ['SECRET', 'example'].join('=') + '\n';
 const CHANGED_ENV = ['SECRET', 'dummy'].join('=') + '\n';
@@ -156,6 +158,98 @@ test('committed backup payload is marker-free while the live workspace retains r
   assert.deepEqual(laterBackup.opportunities.map((item) => item.id), ['kept', 'later-semantic-change']);
   assert.equal(Object.hasOwn(laterBackup, '_scoutMutation'), false);
   assert.equal(git(f.root, 'status', '--porcelain'), '');
+  fs.rmSync(f.base, { recursive: true, force: true });
+});
+
+test('marker-free backup survives a real tracker mutation and restores the semantic edit', async () => {
+  const f = fixture();
+  const marker = {
+    schemaVersion: 1,
+    mutationId: 'mutation-real-edit',
+    mutationKey: '1'.repeat(64),
+    runKey: '2'.repeat(64),
+    intendedDigest: '3'.repeat(64),
+    targetKey: '4'.repeat(64),
+  };
+  const trackerFile = path.join(f.root, 'data', 'opportunities.json');
+  fs.writeFileSync(trackerFile, `${JSON.stringify({
+    updated: '2026-07-28',
+    opportunities: [{ id: 'before-edit', status: 'new' }],
+    _scoutMutation: marker,
+  }, null, 2)}\n`);
+  git(f.root, 'init');
+  await runWorkspaceSync(f.root, 'first marker-free backup');
+
+  mutateTrackerSnapshot(
+    trackerFile,
+    (tracker) => ({
+      ...tracker,
+      opportunities: [
+        ...tracker.opportunities,
+        { id: 'edited-through-real-api', status: 'shortlist' },
+      ],
+    }),
+    serializeTracker,
+  );
+  await queueWorkspaceSync(f.root, 'real tracker edit backup');
+
+  const committed = git(f.root, 'show', 'HEAD:data/opportunities.json');
+  assert.match(committed, /edited-through-real-api/);
+  assert.doesNotMatch(committed, /_scoutMutation/);
+  const restored = path.join(f.base, 'restored');
+  git(f.base, 'clone', f.root, restored);
+  const restoredTracker = JSON.parse(fs.readFileSync(path.join(restored, 'data', 'opportunities.json'), 'utf8'));
+  assert.deepEqual(
+    restoredTracker.opportunities.map((item) => item.id),
+    ['before-edit', 'edited-through-real-api'],
+  );
+  assert.equal(git(f.root, 'status', '--porcelain'), '');
+  assert.doesNotMatch(git(f.root, 'ls-files', '-v'), /^[a-z] /m);
+  fs.rmSync(f.base, { recursive: true, force: true });
+});
+
+test('marker projection cleanup leaves no hidden or temporary Git state after commit failure', async () => {
+  const f = fixture();
+  const marker = {
+    schemaVersion: 1,
+    mutationId: 'mutation-cleanup',
+    mutationKey: '5'.repeat(64),
+    runKey: '6'.repeat(64),
+    intendedDigest: '7'.repeat(64),
+    targetKey: '8'.repeat(64),
+  };
+  const trackerFile = path.join(f.root, 'data', 'opportunities.json');
+  fs.writeFileSync(trackerFile, `${JSON.stringify({
+    updated: '2026-07-28',
+    opportunities: [{ id: 'before-failure' }],
+    _scoutMutation: marker,
+  }, null, 2)}\n`);
+  git(f.root, 'init');
+  await runWorkspaceSync(f.root, 'seed marker-free backup');
+  mutateTrackerSnapshot(
+    trackerFile,
+    (tracker) => ({
+      ...tracker,
+      opportunities: [...tracker.opportunities, { id: 'visible-after-failure' }],
+    }),
+    serializeTracker,
+  );
+  const failingSpawn = (command, args, options) => (
+    args[0] === 'commit'
+      ? { status: 1, stdout: '', stderr: 'synthetic commit interruption' }
+      : spawnSync(command, args, options)
+  );
+
+  await assert.rejects(
+    runWorkspaceSync(f.root, 'interrupted marker projection', { spawn: failingSpawn }),
+    /synthetic commit interruption/,
+  );
+  assert.doesNotMatch(git(f.root, 'ls-files', '-v'), /^[a-z] /m);
+  const scoutState = path.join(f.root, '.scout');
+  assert.equal(fs.existsSync(scoutState) && fs.readdirSync(scoutState).some((name) => (
+    name.startsWith('backup-projection-') || name.includes('index')
+  )), false);
+  assert.match(git(f.root, 'status', '--porcelain'), /opportunities\.json/);
   fs.rmSync(f.base, { recursive: true, force: true });
 });
 

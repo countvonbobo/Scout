@@ -37,6 +37,9 @@ import { ProviderLifecycleUnclosedError } from './structuredTurn.mjs';
 import {
   applyPreparedMutation, loadPreparedMutation, markerFreeMutationContent, prepareMutation,
 } from './mutationCoordinator.mjs';
+import {
+  renderMutationRecipe, runLogAppendRecipe, scanReportRecipe, trackerMergeRecipe,
+} from './scanMutationProjection.mjs';
 export { filterVacancies } from './vacancyFilter.mjs';
 
 const EMPTY_DISCARDED = Object.freeze({ hard_exclusion: 0, mandatory_unmet: 0, below_threshold: 0, provider_discarded: 0 });
@@ -860,15 +863,18 @@ function boundedText(value, maximum = 220) {
   return String(value || '').replace(/[\r\n\t]+/g, ' ').replace(/\s{2,}/g, ' ').trim().slice(0, maximum);
 }
 
-const PRIVATE_DIAGNOSTIC_VALUE = /(?:\b[A-Za-z]:[\\/]|\\\\[^\\\s]+\\[^\\\s]+|(?:^|[\s"'(])(?:\/(?!\/)|\\(?!\\))\S+|\b(?:(?:full|complete)\s+(?:private\s+)?(?:prompt|advert(?:isement)?(?:\s+text)?|cv)|curriculum vitae|master cv|raw provider (?:output|response))\b|https?:\/\/[^/\s:@]+:[^/\s@]+@|https?:\/\/[^\s"'<>]+[?#])/i;
-
-function safeDiagnostic(value, maximum = 220) {
-  const text = boundedText(value?.message ?? value, maximum);
+function safeDiagnostic(value) {
+  const text = boundedText(value?.message ?? value, 220).toLowerCase();
   if (!text) return null;
-  if (PRIVATE_DIAGNOSTIC_VALUE.test(text) || credentialShapedSemanticText(text)) {
-    return '[redacted diagnostic]';
-  }
-  return text;
+  if (/no job sources are configured/.test(text)) return 'no-sources-configured';
+  if (/not configured|without credentials|no supported .* enabled/.test(text)) return 'source-not-configured';
+  if (/another scan is already running/.test(text)) return 'scan-overlap';
+  if (/assessment.*(?:retry|retries|exhausted)|all candidate assessments/.test(text)) return 'assessment-retries-exhausted';
+  if (/timed? ?out|timeout/.test(text)) return 'source-timeout';
+  if (/authentication|unauthori[sz]ed|forbidden/.test(text)) return 'source-authentication-failed';
+  if (/provider.*fail/.test(text)) return 'provider-failed';
+  if (/unavailable|offline|network|connection/.test(text)) return 'source-unavailable';
+  return 'redacted-diagnostic';
 }
 
 function safeSourceUrl(value) {
@@ -1915,25 +1921,65 @@ function buildScanArtifacts(root, {
     : [];
   const dayRuns = [...earlierRuns, run];
   const dayErrors = [...new Set(dayRuns.flatMap((item) => item.errors || []).map((item) => safeDiagnostic(item)).filter(Boolean))];
-  const baseReport = reportText({
+  const reportRecipe = scanReportRecipe({
     date,
     degraded: dayRuns.some((item) => item.degraded),
-    source_health: health,
-    kept: durableTracker.opportunities,
+    coverage: Object.entries(health).map(([source, value]) => ({
+      source,
+      status: value.status,
+      count: value.count,
+      reasonCode: value.reason,
+      configured: value.configured,
+    })),
+    actions: durableTracker.opportunities.filter((item) => item.eligibility?.status === 'eligible')
+      .map((item) => ({
+        company: item.company,
+        role: item.role,
+        score: item.score,
+        url: item.sources?.[0],
+      })),
+    checks: durableTracker.opportunities.filter((item) => item.eligibility?.status === 'check')
+      .map((item) => ({
+        company: item.company,
+        role: item.role,
+        score: item.score,
+        reasonCodes: ['check-required'],
+      })),
+    keeperCount: durableTracker.opportunities.length,
     discarded: merged.discarded,
-    reviewed: durableReviewed,
+    nearMisses: durableReviewed.filter((item) => item.outcome !== 'kept' && item.outcome !== 'hard_exclusion')
+      .sort((left, right) => Number(right.score || 0) - Number(left.score || 0))
+      .slice(0, 5)
+      .map((item) => ({
+        company: item.company,
+        role: item.role,
+        score: item.score,
+        reasonCodes: [String(item.outcome || 'not-kept').replaceAll('_', '-')],
+        sourceUrl: item.sourceUrl,
+      })),
     errors: dayErrors,
+    runs: dayRuns.map((item) => ({
+      agent: item.agent,
+      mode: item.mode,
+      timestamp: item.timestamp,
+      skipped: item.skipped,
+      degraded: item.degraded,
+      candidatesFound: item.candidates_found,
+      keepersAdded: item.keepers_added,
+      keepersUpdated: item.keepers_updated,
+      sources: Object.entries(item.source_health || {}).map(([name, value]) => ({
+        name,
+        status: value.status,
+      })),
+    })),
   });
-  const runLines = dayRuns.map((item) => {
-    const sourcesSummary = Object.entries(item.source_health || {}).map(([name, value]) => `${name}: ${value.status}`).join(', ') || 'no sources';
-    return `- **${item.agent} ${item.mode}** at ${String(item.timestamp || '').slice(11, 16) || 'unknown time'} UTC - ${item.skipped ? 'skipped because another scan was running' : item.degraded ? 'degraded' : 'healthy'}; ${item.candidates_found || 0} candidate(s), ${item.keepers_added || 0} added, ${item.keepers_updated || 0} updated; ${sourcesSummary}.`;
-  }).join('\n');
-  const report = baseReport.replace('## Action today', `## Scan runs\n\n${runLines}\n\n## Action today`);
+  const report = renderMutationRecipe('report', '', reportRecipe);
   const reportPath = path.join(paths.reports, `${date}.md`);
   const priorRuns = fs.existsSync(paths.scanRuns)
     ? markerFreeMutationContent('run-log', fs.readFileSync(paths.scanRuns, 'utf8')).trimEnd()
     : '';
-  const scanRuns = `${priorRuns ? `${priorRuns}\n` : ''}${JSON.stringify(run)}\n`;
+  const runRecipe = runLogAppendRecipe(run);
+  const scanRuns = renderMutationRecipe('run-log', priorRuns, runRecipe);
   return {
     run,
     tracker: durableTracker,
@@ -1942,6 +1988,10 @@ function buildScanArtifacts(root, {
       ...(error ? {} : { tracker: serializeTracker(durableTracker) }),
       report,
       scanRuns,
+    },
+    recipes: {
+      report: reportRecipe,
+      runLog: runRecipe,
     },
   };
 }
@@ -1964,9 +2014,9 @@ function coordinatedArtifactsFromPlan(root, plan) {
   if (!reportTarget || !runTarget) {
     throw new Error('prepared scan mutation does not contain report and run-log targets');
   }
-  const tracker = JSON.parse(trackerTarget?.content ?? fs.readFileSync(paths.tracker, 'utf8'));
+  const tracker = JSON.parse(fs.readFileSync(paths.tracker, 'utf8'));
   delete tracker._scoutMutation;
-  const lines = runTarget.content.trim().split(/\r?\n/);
+  const lines = fs.readFileSync(paths.scanRuns, 'utf8').trim().split(/\r?\n/);
   const scanRun = JSON.parse(lines.at(-1));
   delete scanRun._scoutMutation;
   return {
@@ -2002,9 +2052,14 @@ export function coordinateScanArtifacts(root, input, { run, lease, hooks = {} })
       ],
     };
     plan = prepareMutation({ handle: run, lease }, target, {
-      ...(hasTracker ? { tracker: artifacts.contents.tracker } : {}),
-      [`report:${date}`]: artifacts.contents.report,
-      'scan-log': artifacts.contents.scanRuns,
+      ...(hasTracker ? {
+        tracker: trackerMergeRecipe(
+          fs.readFileSync(workspacePaths(root).tracker, 'utf8'),
+          artifacts.contents.tracker,
+        ),
+      } : {}),
+      [`report:${date}`]: artifacts.recipes.report,
+      'scan-log': artifacts.recipes.runLog,
     });
   }
   const mutationReceipt = applyPreparedMutation(plan, lease, hooks);

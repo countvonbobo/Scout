@@ -11,6 +11,7 @@ import {
   synchronousFenceCallback,
 } from './scanLease.mjs';
 import { workspacePaths } from './workspace.mjs';
+import { canonicalMutationRecipe, renderMutationRecipe } from './scanMutationProjection.mjs';
 
 export const MUTATION_SCHEMA_VERSION = 1;
 const MUTATION_GUARD = 'mutation.guard';
@@ -18,22 +19,6 @@ const MAX_MUTATION_BYTES = 16 * 1024 * 1024;
 const SAFE_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 const SHA256 = /^[a-f0-9]{64}$/;
 const REPORT_MARKER = /\n?<!-- scout-mutation:([A-Za-z0-9%._~-]+) -->\s*$/;
-const PRIVATE_CONTENT_KEY = /^(?:access[-_]?token|advert[-_]?(?:body|description)|api[-_]?(?:key|token)|auth(?:orization)?|body|cookies?|credentials?|cv|description|headers?|html|master[-_]?cv|password|profile[-_]?evidence|prompt|raw[-_]?(?:html|output|provider(?:[-_]?response)?|response)|response|secret(?:[-_]?(?:key|token))?|token|transcript)$/i;
-const CREDENTIAL_VALUE = /(?:\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b)|(?:\b(?:api[-_ ]?key|authorization|password|secret|session[-_ ]?id|token)\s*[:=]\s*\S+)|(?:\bbearer\s+[A-Za-z0-9._~+/-]{8,})|(?:\bsk-[A-Za-z0-9_-]{16,})|(?:\bgh[pousr]_[A-Za-z0-9]{20,})|(?:\bxox[baprs]-[A-Za-z0-9-]{10,})|(?:\bAKIA[0-9A-Z]{16}\b)/i;
-const TRANSIENT_TRACKING_VALUE = /https?:\/\/[^\s"'<>]+[?&](?:fbclid|gclid|mc_[a-z]+|utm_[a-z]+)=/i;
-const ABSOLUTE_PATH_VALUE = /(?:\b[A-Za-z]:[\\/]|\\\\[^\\\s]+\\[^\\\s]+|(?:^|[\s"'(])(?:\/(?!\/)|\\(?!\\))\S+)/i;
-const PRIVATE_SOURCE_BODY_VALUE = /\b(?:(?:full|complete)\s+(?:private\s+)?(?:prompt|advert(?:isement)?(?:\s+text)?|cv)|curriculum vitae|master cv|raw provider (?:output|response))\b/i;
-const URL_VALUE = /https?:\/\/[^\s"'<>]+/gi;
-const TRACKER_TOP_LEVEL_KEYS = new Set(['opportunities', 'updated']);
-const RUN_LOG_TOP_LEVEL_KEYS = new Set([
-  '_scoutMutation', 'adverts_checked', 'adverts_closed', 'adverts_unverified',
-  'agent', 'assessment_failures', 'candidates_dropped', 'candidates_dropped_by_source',
-  'candidates_found', 'degraded', 'discarded', 'discovery_engine', 'duplicates_collapsed',
-  'errors', 'explanations', 'funnel', 'inbox_archived', 'inbox_rechecked',
-  'keepers_added', 'keepers_updated', 'mode', 'profile_id', 'queries_checked',
-  'reviewed', 'schemaVersion', 'selection', 'selection_summary', 'skipped',
-  'source_health', 'sources_checked', 'started_at', 'timestamp', 'verification_scoped',
-]);
 const MARKER_KEYS = [
   'intendedDigest', 'mutationId', 'mutationKey', 'runKey',
   'schemaVersion', 'targetKey',
@@ -240,71 +225,6 @@ function embedMarker(kind, content, marker) {
   throw new TypeError(`unsupported mutation target kind: ${kind}`);
 }
 
-function validatePrivateValues(value, seen = new Set()) {
-  if (value === null || typeof value === 'boolean' || typeof value === 'number') return;
-  if (typeof value === 'string') {
-    if (CREDENTIAL_VALUE.test(value)) throw new TypeError('mutation content contains credential-shaped data');
-    if (TRANSIENT_TRACKING_VALUE.test(value)) throw new TypeError('mutation content contains transient tracking data');
-    if (ABSOLUTE_PATH_VALUE.test(value)) throw new TypeError('mutation content contains an absolute path');
-    if (PRIVATE_SOURCE_BODY_VALUE.test(value)) throw new TypeError('private mutation content contains a source body');
-    for (const matched of value.matchAll(URL_VALUE)) {
-      const candidate = matched[0].replace(/[),.;]+$/, '');
-      try {
-        const parsed = new URL(candidate);
-        if (parsed.username || parsed.password || parsed.search || parsed.hash) {
-          throw new TypeError('mutation content contains a non-canonical URL');
-        }
-      } catch (error) {
-        if (error instanceof TypeError && error.message.includes('non-canonical')) throw error;
-        throw new TypeError('mutation content contains a non-canonical URL');
-      }
-    }
-    return;
-  }
-  if (!value || typeof value !== 'object' || seen.has(value)) {
-    throw new TypeError('mutation content must be acyclic JSON');
-  }
-  seen.add(value);
-  if (Array.isArray(value)) {
-    for (const item of value) validatePrivateValues(item, seen);
-  } else {
-    if (Object.getPrototypeOf(value) !== Object.prototype) {
-      throw new TypeError('mutation content must use plain JSON objects');
-    }
-    for (const [key, item] of Object.entries(value)) {
-      if (PRIVATE_CONTENT_KEY.test(key)) throw new TypeError(`private mutation content property is not allowed: ${key}`);
-      validatePrivateValues(item, seen);
-    }
-  }
-  seen.delete(value);
-}
-
-function validateMutationContent(kind, content) {
-  if (content.includes('<!-- scout-mutation:')) throw new TypeError('mutation content already contains a receipt marker');
-  if (kind === 'report') {
-    validatePrivateValues(content);
-    return;
-  }
-  if (kind === 'run-log') {
-    for (const line of content.split(/\r?\n/).filter(Boolean)) {
-      const value = JSON.parse(line);
-      for (const key of Object.keys(value)) {
-        if (!RUN_LOG_TOP_LEVEL_KEYS.has(key)) throw new TypeError(`private mutation content property is not allowlisted: ${key}`);
-      }
-      validatePrivateValues(value);
-    }
-    return;
-  }
-  const value = JSON.parse(content);
-  if (kind === 'tracker') {
-    for (const key of Object.keys(value)) {
-      if (!TRACKER_TOP_LEVEL_KEYS.has(key)) throw new TypeError(`private mutation content property is not allowlisted: ${key}`);
-    }
-    if (!Array.isArray(value.opportunities)) throw new TypeError('tracker mutation must contain opportunities');
-  }
-  validatePrivateValues(value);
-}
-
 function exactMarker(value) {
   if (!value || typeof value !== 'object' || Array.isArray(value)
     || Object.getPrototypeOf(value) !== Object.prototype
@@ -387,36 +307,40 @@ function validateTarget(target) {
   requireId(target.id, 'mutation target ID');
 }
 
-export function prepareMutation(run, target, content) {
+export function prepareMutation(run, target, recipes) {
   const { handle, lease } = mutationContext(run);
   validateTarget(target);
-  if (!content || Object.getPrototypeOf(content) !== Object.prototype) {
-    throw new TypeError('mutation content map is required');
+  if (!recipes || Object.getPrototypeOf(recipes) !== Object.prototype) {
+    throw new TypeError('mutation recipe map is required');
   }
   const paths = new Set();
   const intended = target.files.map((descriptor) => {
     if (!descriptor || Object.getPrototypeOf(descriptor) !== Object.prototype
-      || !['tracker', 'report', 'run-log', 'json'].includes(descriptor.kind)) {
+      || !['tracker', 'report', 'run-log'].includes(descriptor.kind)) {
       throw new TypeError('mutation target file is invalid');
     }
     const key = requireId(descriptor.key, 'mutation target key');
     if (paths.has(key)) throw new TypeError('mutation target key is duplicated');
     paths.add(key);
     const file = resolveTarget(handle.root, key, descriptor.kind);
-    if (typeof content[key] !== 'string') throw new TypeError(`mutation content is missing: ${key}`);
-    validateMutationContent(descriptor.kind, content[key]);
+    if (!recipes[key] || Object.getPrototypeOf(recipes[key]) !== Object.prototype) {
+      throw new TypeError(`mutation recipe is missing: ${key}`);
+    }
     const current = fileContent(file);
     validateCurrentMarker(descriptor.kind, current, key);
+    const recipe = canonicalMutationRecipe(descriptor.kind, JSON.parse(stableJson(recipes[key])));
+    const intendedContent = renderMutationRecipe(descriptor.kind, current, recipe);
     return {
       kind: descriptor.kind,
       key,
       targetRevision: trackerRevision(current),
-      intendedDigest: sha256(content[key]),
-      intendedContent: content[key],
+      intendedDigest: sha256(intendedContent),
+      intendedContent,
+      recipe,
     };
   });
-  if (Object.keys(content).sort().join(',') !== [...paths].sort().join(',')) {
-    throw new TypeError('mutation content does not match its target files');
+  if (Object.keys(recipes).sort().join(',') !== [...paths].sort().join(',')) {
+    throw new TypeError('mutation recipes do not match target files');
   }
   const targetRevision = canonicalDigest(intended.map(({ key, targetRevision: revision }) => ({ key, revision })));
   const intendedDigest = canonicalDigest(intended.map(({ key, intendedDigest: digest }) => ({ key, digest })));
@@ -434,20 +358,19 @@ export function prepareMutation(run, target, content) {
   const mutationId = `mutation-${key.slice(0, 40)}`;
   const runKey = sha256(handle.runId);
   const files = intended.map((entry) => {
-    const marker = {
+    const marker = JSON.parse(stableJson({
       schemaVersion: MUTATION_SCHEMA_VERSION,
       mutationId,
       mutationKey: key,
       runKey,
       intendedDigest: entry.intendedDigest,
       targetKey: sha256(entry.key),
-    };
+    }));
     const preparedContent = embedMarker(entry.kind, entry.intendedContent, marker);
     const { intendedContent: _intendedContent, ...durable } = entry;
     return {
       ...durable,
       marker,
-      content: preparedContent,
       writtenDigest: sha256(preparedContent),
     };
   });
@@ -641,7 +564,18 @@ export function applyPreparedMutation(plan, lease, hooks = {}) {
         if (targetState(plan, target) === 'applied') return;
         hooks.beforeReplacement?.(target);
         const file = resolveTarget(plan.root, target.key, target.kind);
-        atomicWriteFile(file, target.content);
+        const current = fileContent(file);
+        const intended = renderMutationRecipe(target.kind, current, target.recipe);
+        if (sha256(intended) !== target.intendedDigest) {
+          throw new MutationConflictError(
+            `mutation recipe reconstruction changed: ${target.key}: ${sha256(intended)} != ${target.intendedDigest}`,
+          );
+        }
+        const prepared = embedMarker(target.kind, intended, target.marker);
+        if (sha256(prepared) !== target.writtenDigest) {
+          throw new MutationConflictError(`mutation prepared digest changed: ${target.key}`);
+        }
+        atomicWriteFile(file, prepared);
         hooks.afterReplacement?.(target);
         if (targetState(plan, target) !== 'applied') {
           throw new MutationConflictError(`mutation target verification failed: ${target.key}`);
