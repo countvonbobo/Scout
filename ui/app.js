@@ -1,4 +1,5 @@
 import { createChatDrawerState, reduceChatDrawer } from './lib/chatDrawerState.mjs';
+import { openCodexTask as codexTaskLaunchView } from './lib/codexDeepLink.mjs';
 
 // Keep browser orchestration here while pure state machines live in /lib, where
 // deterministic unit tests exercise them without a DOM. Scout character data
@@ -86,12 +87,6 @@ function chooseArtifactSlug(existingSlugs, opportunity, slugOfCompany, opportuni
   if (wanted && (wanted === resolved.slug || wanted === fresh)) return wanted;
   return resolved.slug;
 }
-function codexTaskUrl(sessionId) {
-  const value = String(sessionId || '').trim();
-  if (!/^[A-Za-z0-9-]+$/.test(value)) return null;
-  return `codex://threads/${encodeURIComponent(value)}`;
-}
-
 const ScoutModal = (() => {
   const stack = [];
   const registrations = new WeakMap();
@@ -1902,6 +1897,7 @@ const Scout = {
     document.getElementById('chat-input').value = prefill;
     if (!c.engine) void this.loadEngineOptions(c);
     void this.refreshUsage(c);
+    void this.refreshCodexDeepLink(c);
     if (c.recovering) this.scheduleChatRecovery(c);
   },
 
@@ -1949,6 +1945,7 @@ const Scout = {
     if (input) input.value = draft;
     if (!following) document.getElementById('chat-body').scrollTop = previousScrollTop;
     this.refreshUsage(c);
+    void this.refreshCodexDeepLink(c);
   },
 
   renderChatDrawer() {
@@ -1964,6 +1961,7 @@ const Scout = {
         ? this.usageSummaryView(null)
         : { text: 'Checking AI usage…', title: 'Provider usage is loading' };
     const prep = c.purpose === 'interview-prep';
+    const codexTaskControls = this.codexTaskControlsHtml(c);
     const prepControls = prep ? `<div class="controls" style="padding:8px 12px;flex-wrap:wrap">
       <button class="act bridge" data-action="use-prep-prompt" data-prompt="interviewPrep">generate pack</button>
       <button class="act" data-action="use-prep-prompt" data-prompt="prepRefresh">refresh research</button>
@@ -1979,9 +1977,7 @@ const Scout = {
         ${c.engine && c.data.cliSessionId
           ? '<button class="act" data-action="handoff-chat">summarise &amp; switch</button>'
           : ''}
-        ${c.engine === 'codex' && codexTaskUrl(c.data.cliSessionId)
-          ? '<button class="act" data-action="open-codex-task">open in Codex</button>'
-          : ''}
+        ${codexTaskControls}
         <button class="act" style="margin-left:auto" data-action="close-chat">close</button>
       </div>
       <div class="chat-companion">${scoutMarkup(c.streaming ? 'thinking' : 'listening')}<div class="scout-bubble tail-left"><span id="scout-chat-status">${c.streaming ? 'I’m thinking…' : prep ? 'Build your prep pack, refresh research, or practise here.' : 'Ask me anything about this opportunity.'}</span></div></div>
@@ -2205,6 +2201,56 @@ const Scout = {
     return card.querySelector('[data-engine-model-custom]')?.value.trim() || null;
   },
 
+  codexTaskControlsHtml(chat = this.chat) {
+    const taskId = chat?.engine === 'codex' ? chat?.data?.cliSessionId : null;
+    if (!taskId) return '';
+    const slot = this.chatDrawerState?.codexLink;
+    const capability = slot?.status === 'ready'
+      ? slot.value
+      : {
+          state: slot?.status === 'error' ? 'failed' : 'unknown',
+          canAttempt: false,
+          reasonCode: slot?.status === 'error' ? 'handler-check-failed' : 'handler-status-unknown',
+        };
+    const baseView = codexTaskLaunchView(taskId, capability);
+    const attempt = chat.codexLinkAttempt?.taskId === baseView.taskId ? chat.codexLinkAttempt : null;
+    const view = attempt
+      ? { ...baseView, state: attempt.state, reasonCode: attempt.reasonCode }
+      : baseView;
+    const messages = {
+      remote: 'Opening Codex depends on the device opening this page, not the Scout server. Copy the task ID and resume it in Codex on this device.',
+      unavailable: 'No supported Codex handler was found on this device. Copy the task ID and resume it in Codex.',
+      failed: 'Scout could not verify the Codex handler on this device. Copy the task ID and resume it in Codex.',
+      unknown: 'Checking whether this device can open Codex. The task ID remains copyable.',
+    };
+    let message;
+    if (view.reasonCode === 'invalid-task-id') {
+      message = 'This task identity cannot be opened as a link. Copy it manually only if you recognise it.';
+    } else if (view.reasonCode === 'launch-failed') {
+      message = 'Scout could not open Codex on this device. Copy the task ID and resume it in Codex.';
+    } else if (view.reasonCode === 'copied') {
+      message = 'Task ID copied. Open Codex on this device and resume that task.';
+    } else if (view.reasonCode === 'copy-failed') {
+      message = 'Scout could not copy automatically. Select the visible task ID and resume it in Codex.';
+    } else if (view.state === 'attempting') {
+      message = 'Scout asked this device to open Codex, but the browser cannot confirm success. If Codex did not open, copy the task ID and resume it.';
+    } else {
+      message = messages[capability.state] || messages.unknown;
+    }
+    const open = view.canNavigate
+      ? '<button class="act" data-action="open-codex-task">open in Codex</button>'
+      : '';
+    const copy = view.taskId != null
+      ? '<button class="act" data-action="copy-codex-task">copy task ID</button>'
+      : '';
+    const identity = view.taskId != null
+      ? `<code data-codex-task-id>${this.esc(view.taskId)}</code>`
+      : '<span>Task identity unavailable.</span>';
+    return `<span class="codex-link-status meta" role="status" aria-live="polite">
+      ${open}${copy}${identity}<span>${this.esc(message)}</span>
+    </span>`;
+  },
+
   chatBubble(role, text) {
     const avatar = role === 'assistant' ? scoutMarkup('explaining', 'scout-chat-avatar') : '';
     if (role === 'system' && /(?:error|failed|could not|couldn.t|timed out|not found|spawn|sandbox|refusing|cancelled)/i.test(String(text || ''))) {
@@ -2238,12 +2284,51 @@ const Scout = {
     } catch { /* backup status never blocks the local dashboard */ }
   },
 
+  codexNavigate(href) {
+    window.location.assign(href);
+  },
+
   openCodexTask() {
-    const href = codexTaskUrl(this.chat?.engine === 'codex' ? this.chat?.data?.cliSessionId : null);
-    if (!href) return alert('This Scout chat does not have a resumable Codex task yet.');
-    const link = document.createElement('a');
-    link.href = href;
-    link.click();
+    const c = this.chat;
+    const taskId = c?.engine === 'codex' ? c?.data?.cliSessionId : null;
+    const capability = this.chatDrawerState?.codexLink?.value;
+    const view = codexTaskLaunchView(taskId, capability);
+    if (!view.canNavigate) {
+      if (c) c.codexLinkAttempt = view;
+      this.renderChatDrawerSnapshot();
+      return;
+    }
+    try {
+      this.codexNavigate(view.href);
+      c.codexLinkAttempt = view;
+    } catch {
+      c.codexLinkAttempt = codexTaskLaunchView(taskId, {
+        state: 'failed',
+        canAttempt: false,
+        reasonCode: 'launch-failed',
+      });
+    }
+    this.renderChatDrawerSnapshot();
+  },
+
+  async copyCodexTask() {
+    const c = this.chat;
+    const taskId = c?.engine === 'codex' ? c?.data?.cliSessionId : null;
+    const capability = this.chatDrawerState?.codexLink?.value || { state: 'unknown', canAttempt: false };
+    const view = codexTaskLaunchView(taskId, capability);
+    if (view.taskId == null) return;
+    try {
+      await navigator.clipboard.writeText(view.taskId);
+      if (this.chat === c) {
+        c.codexLinkAttempt = { ...view, reasonCode: 'copied' };
+        this.renderChatDrawerSnapshot();
+      }
+    } catch {
+      if (this.chat === c) {
+        c.codexLinkAttempt = { ...view, reasonCode: 'copy-failed' };
+        this.renderChatDrawerSnapshot();
+      }
+    }
   },
 
   setChatScoutState(state, message) {
@@ -2452,6 +2537,7 @@ const Scout = {
     document.getElementById('chat-input').value = draft;
     if (!following) document.getElementById('chat-body').scrollTop = previousScrollTop;
     this.refreshUsage(c);
+    void this.refreshCodexDeepLink(c);
   },
 
   async refreshInterviewPrepArtifact(target = this.chat) {
@@ -2532,6 +2618,46 @@ const Scout = {
       generation: drawer.generation,
       requestGeneration,
       value: u,
+    });
+    if (this.chatDrawerState !== before) this.renderChatDrawerSnapshot();
+  },
+
+  async refreshCodexDeepLink(target = this.chat) {
+    const drawer = this.chatDrawerState;
+    if (!target || target.engine !== 'codex' || !target.data?.cliSessionId
+        || !drawer || drawer.chatId !== target.id) return;
+    const requestGeneration = drawer.codexLink.requestGeneration + 1;
+    this.chatDrawerState = reduceChatDrawer(drawer, {
+      type: 'codexLink/requested',
+      chatId: drawer.chatId,
+      generation: drawer.generation,
+      requestGeneration,
+    });
+    let value;
+    try {
+      value = await this.api('/api/device/codex-deep-link');
+      if (!value || !['supported', 'unavailable', 'failed', 'remote', 'unknown'].includes(value.state)) {
+        throw new Error('invalid capability');
+      }
+    } catch {
+      const before = this.chatDrawerState;
+      this.chatDrawerState = reduceChatDrawer(before, {
+        type: 'codexLink/rejected',
+        chatId: drawer.chatId,
+        generation: drawer.generation,
+        requestGeneration,
+        error: 'Codex link capability unavailable',
+      });
+      if (this.chatDrawerState !== before) this.renderChatDrawerSnapshot();
+      return;
+    }
+    const before = this.chatDrawerState;
+    this.chatDrawerState = reduceChatDrawer(before, {
+      type: 'codexLink/resolved',
+      chatId: drawer.chatId,
+      generation: drawer.generation,
+      requestGeneration,
+      value,
     });
     if (this.chatDrawerState !== before) this.renderChatDrawerSnapshot();
   },
@@ -2671,6 +2797,7 @@ const Scout = {
       case 'use-prep-prompt': return this.usePrepPrompt(prompt);
       case 'handoff-chat': return this.handoffChat();
       case 'open-codex-task': return this.openCodexTask();
+      case 'copy-codex-task': return this.copyCodexTask();
       case 'close-chat': return this.closeChat();
       case 'send-chat': return this.sendChat();
       case 'stop-chat': return this.stopChat();

@@ -588,6 +588,14 @@
     #usage-meters { flex: 1 1 100%; order: 1; }
     #usage-meters:empty { display: none; }
     .chat-head .act { order: 2; }
+    .codex-link-status {
+      order: 2; flex: 1 1 100%; display: flex; align-items: center; flex-wrap: wrap; gap: 6px;
+      padding-top: 6px; border-top: 1px solid var(--line); color: var(--muted);
+    }
+    .codex-link-status code {
+      max-width: 100%; overflow-wrap: anywhere; padding: 2px 5px; border-radius: 4px; background: var(--soft);
+    }
+    .codex-link-status > span { flex: 1 1 220px; }
     .setup-schedule-row { padding-top: 10px; border-top: 1px solid var(--line); }
     .setup-schedule-row + .setup-schedule-row { margin-top: 12px; }
     .setup-schedule-days {

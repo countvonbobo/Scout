@@ -13,6 +13,7 @@ export function createChatDrawerState(chatId, generation = 1) {
     generation,
     engines: requestSlot(),
     usage: requestSlot(),
+    codexLink: requestSlot(),
   };
 }
 
@@ -43,7 +44,7 @@ export function reduceChatDrawer(state, event) {
     };
   }
 
-  const match = /^(engines|usage)\/(requested|resolved|rejected)$/.exec(event.type);
+  const match = /^(engines|usage|codexLink)\/(requested|resolved|rejected)$/.exec(event.type);
   if (!match || !activeRequest(state, event)) return state;
   const [, slotName, action] = match;
   const slot = state[slotName];

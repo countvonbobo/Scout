@@ -40,6 +40,8 @@ When a new conversation starts, Scout shows a model picker. Codex models come fr
 
 **Other…** is the advanced escape hatch for an exact provider model ID. Scout checks its syntax locally, but the provider remains the authority on whether it is accepted. Raw provider catalogue output, executable paths, account details and diagnostics are never sent to the browser.
 
+For a resumable Codex conversation, Scout checks the device-local `codex://` handler before enabling **open in Codex**. A click is treated only as an attempt because browsers cannot confirm that a desktop app opened. Scout therefore keeps the exact technical task ID visible and copyable with resume instructions. In remote Scout sessions, the server host's handler is deliberately ignored: the integration must exist on the browser's own device, so copy/resume is used instead.
+
 Scan models are separate. Choose an optional model for each job under **Settings → Scans & schedule**. The supervised scan uses the model shown for the primary scan row, and an enabled daily job saves its own model. Leaving it blank uses the provider default rather than the job-conversation model.
 
 In `workspace.json`, the job-work choices are `ai.models.codex` and `ai.models.claude`; scheduled scan choices are stored on each `schedule.jobs[]` item. The singular `ai.model` field is retained only as a compatibility fallback for older workspaces.

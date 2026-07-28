@@ -6,6 +6,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { isMainModule } from './lib/mainModule.mjs';
 import { atomicWriteFile } from './lib/atomicWrite.mjs';
+import { codexDeepLinkCapability } from './lib/codexDeepLink.mjs';
 import { triage } from './lib/derive.mjs';
 import { emptyTrackerView, pipeline } from './lib/pipeline.mjs';
 import { cvPdfPath, listCvFiles, renderCvTarget, safeCvPath } from './lib/cv.mjs';
@@ -65,7 +66,7 @@ export const APP_VERSION = JSON.parse(fs.readFileSync(path.join(APP_ROOT, 'packa
 // clients keep the previous `scout-shell-<id>` cache and the previous ?v= URL.
 export const UI_BUILD_FILES = [
   'index.html', 'app.js', 'setup.js', 'reportView.js', 'service-worker.js', 'manifest.webmanifest',
-  'lib/scoutCharacter.mjs', 'lib/chatDrawerState.mjs',
+  'lib/scoutCharacter.mjs', 'lib/chatDrawerState.mjs', 'lib/codexDeepLink.mjs',
   'assets/scout-icon.ico', 'assets/scout-icon.png', 'assets/scout-idle.png',
   'assets/scout-thinking.png', 'assets/scout-searching.png', 'assets/scout-explaining.png',
   'assets/scout-found.png', 'assets/scout-warning.png',
@@ -400,6 +401,86 @@ function currentDeviceSettings() {
 
 export const providerDetection = { detect: detectProvidersAsync };
 
+function runFixedCapabilityCommand(command, args, {
+  timeoutMs = 2_500,
+  maxOutputBytes = 16 * 1024,
+} = {}) {
+  return new Promise((resolve) => {
+    let child;
+    try {
+      child = spawn(command, args, { shell: false, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] });
+    } catch {
+      resolve({ status: null, failed: true });
+      return;
+    }
+    let bytes = 0;
+    let exceeded = false;
+    let failed = false;
+    let timedOut = false;
+    const stdout = [];
+    const collect = (chunk, output) => {
+      bytes += chunk.length;
+      if (bytes > maxOutputBytes && !exceeded) {
+        exceeded = true;
+        child.kill();
+        return;
+      }
+      if (!exceeded) output.push(chunk);
+    };
+    child.stdout?.on('data', (chunk) => collect(chunk, stdout));
+    child.stderr?.on('data', (chunk) => collect(chunk, []));
+    child.on('error', () => { failed = true; });
+    const timeout = setTimeout(() => {
+      timedOut = true;
+      child.kill();
+    }, timeoutMs);
+    timeout.unref?.();
+    child.on('close', (status) => {
+      clearTimeout(timeout);
+      resolve({
+        status,
+        failed,
+        timedOut,
+        exceeded,
+        stdout: Buffer.concat(stdout).toString('utf8'),
+      });
+    });
+  });
+}
+
+export async function inspectCodexDeepLinkHandler({
+  platform = process.platform,
+  run = runFixedCapabilityCommand,
+} = {}) {
+  if (platform === 'darwin') {
+    const result = await run('/usr/bin/defaults', [
+      'read',
+      'com.apple.LaunchServices/com.apple.launchservices.secure',
+      'LSHandlers',
+    ]);
+    if (result.failed || result.timedOut || result.exceeded) return { failed: true };
+    if (result.status !== 0) return { registered: false };
+    return {
+      registered: /LSHandlerURLScheme\s*=\s*"?codex"?\s*;/i.test(String(result.stdout || '')),
+    };
+  }
+  if (platform === 'win32') {
+    const keys = [
+      'HKCU\\Software\\Classes\\codex\\shell\\open\\command',
+      'HKCR\\codex\\shell\\open\\command',
+    ];
+    for (const key of keys) {
+      const result = await run('reg.exe', ['query', key, '/ve']);
+      if (result.failed || result.timedOut || result.exceeded) return { failed: true };
+      if (result.status === 0) return { registered: true };
+    }
+    return { registered: false };
+  }
+  return { registered: false };
+}
+
+export const codexDeepLinkDetection = { inspect: inspectCodexDeepLinkHandler };
+
 async function handleRead(req, res, url) {
   if (req.method === 'GET' && url.pathname === '/') {
     return serveUiTemplate(res, 'index.html', 'text/html; charset=utf-8');
@@ -517,6 +598,26 @@ async function handleRead(req, res, url) {
     return sendJson(res, 200, {
       name: 'Scout', version: APP_VERSION, uiBuildId: UI_BUILD_ID, appRoot: APP_ROOT, workspaceRoot: WORKSPACE_ROOT,
     });
+  }
+  if (req.method === 'GET' && url.pathname === '/api/device/codex-deep-link') {
+    const checkedAt = new Date().toISOString();
+    if (req.scoutAccess !== 'local') {
+      return sendJson(res, 200, codexDeepLinkCapability({
+        requestAccess: req.scoutAccess,
+        platform: process.platform,
+        handler: null,
+        checkedAt,
+      }));
+    }
+    let handler;
+    try { handler = await codexDeepLinkDetection.inspect(); }
+    catch { handler = { failed: true }; }
+    return sendJson(res, 200, codexDeepLinkCapability({
+      requestAccess: req.scoutAccess,
+      platform: process.platform,
+      handler,
+      checkedAt,
+    }));
   }
   if (req.method === 'GET' && url.pathname === '/api/remote-access/status') {
     return sendJson(res, 200, {

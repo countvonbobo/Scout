@@ -71,6 +71,16 @@ test.beforeEach(async ({ page }) => {
   await page.route('**/api/setup/proposal', (route) => route.fulfill({ contentType: 'application/json', body: JSON.stringify({ proposal: null }) }));
   await page.route('**/api/operations?type=*', (route) => route.fulfill({ contentType: 'application/json', body: JSON.stringify({ operation: null }) }));
   await page.route('**/api/usage', (route) => route.fulfill({ contentType: 'application/json', body: JSON.stringify({ claude: { unknown: true }, codex: { unknown: true } }) }));
+  await page.route('**/api/device/codex-deep-link', (route) => route.fulfill({
+    contentType: 'application/json',
+    body: JSON.stringify({
+      state: 'supported',
+      canAttempt: true,
+      reasonCode: null,
+      checkedAt: '2026-07-28T12:00:00.000Z',
+      platform: 'darwin',
+    }),
+  }));
   await page.route('**/api/engines', async (route) => {
     await route.fulfill({ contentType: 'application/json', body: JSON.stringify(engines) });
   });
@@ -390,4 +400,135 @@ test('closing the drawer rejects late usage and engine results', async ({ page }
   enginesGate.resolve();
   await expect(page.locator('#chat-drawer')).toBeHidden();
   await expect.poll(() => page.evaluate(() => window.Scout.chat)).toBe(null);
+});
+
+test('a supported local Codex handler targets the exact task without claiming success', async ({ page }) => {
+  await page.unroute('**/api/chat?*');
+  await page.route('**/api/chat?*', (route) => route.fulfill({
+    contentType: 'application/json',
+    body: JSON.stringify({
+      chat: {
+        engine: 'codex',
+        model: 'gpt-5.6-sol',
+        cliSessionId: '019f1234-abcd-7890',
+        messages: [],
+        filesTouched: [],
+      },
+      prefills: {},
+      purpose: 'job',
+      busy: false,
+    }),
+  }));
+  await page.evaluate(() => {
+    window.Scout.codexNavigate = (href) => { window.__codexTarget = href; };
+  });
+
+  await page.evaluate((id) => window.Scout.openChat(id, 'ask'), opportunity.id);
+  const open = page.locator('[data-action="open-codex-task"]');
+  await expect(open).toBeEnabled();
+  await expect(page.locator('[data-codex-task-id]')).toHaveText('019f1234-abcd-7890');
+  await open.click();
+  await expect.poll(() => page.evaluate(() => window.__codexTarget))
+    .toBe('codex://threads/019f1234-abcd-7890');
+  await expect(page.locator('.codex-link-status')).toContainText(/cannot confirm|could not open/i);
+  await expect(page.locator('.model-chip')).toHaveText('gpt-5.6-sol');
+  await expect(page.locator('#usage-meters')).toContainText('usage unavailable');
+});
+
+test('missing and remote Codex handlers keep the exact task copyable with resume guidance', async ({ page }) => {
+  await page.unroute('**/api/chat?*');
+  await page.route('**/api/chat?*', (route) => route.fulfill({
+    contentType: 'application/json',
+    body: JSON.stringify({
+      chat: {
+        engine: 'codex',
+        model: null,
+        cliSessionId: 'task-exact-123',
+        messages: [],
+        filesTouched: [],
+      },
+      prefills: {},
+      purpose: 'job',
+      busy: false,
+    }),
+  }));
+  await page.unroute('**/api/device/codex-deep-link');
+  await page.route('**/api/device/codex-deep-link', (route) => route.fulfill({
+    contentType: 'application/json',
+    body: JSON.stringify({
+      state: 'remote',
+      canAttempt: false,
+      reasonCode: 'browser-device-required',
+      checkedAt: '2026-07-28T12:00:00.000Z',
+      platform: null,
+    }),
+  }));
+  await page.evaluate(() => {
+    Object.defineProperty(navigator, 'clipboard', {
+      configurable: true,
+      value: { writeText: async (value) => { window.__copiedTask = value; } },
+    });
+  });
+
+  await page.evaluate((id) => window.Scout.openChat(id, 'ask'), opportunity.id);
+  await expect(page.locator('[data-action="open-codex-task"]')).toHaveCount(0);
+  await expect(page.locator('.codex-link-status')).toContainText(/device opening this page/i);
+  await expect(page.locator('.codex-link-status')).toContainText(/resume/i);
+  await page.click('[data-action="copy-codex-task"]');
+  await expect.poll(() => page.evaluate(() => window.__copiedTask)).toBe('task-exact-123');
+});
+
+test('a failed Codex navigation becomes a visible fallback', async ({ page }) => {
+  await page.unroute('**/api/chat?*');
+  await page.route('**/api/chat?*', (route) => route.fulfill({
+    contentType: 'application/json',
+    body: JSON.stringify({
+      chat: {
+        engine: 'codex',
+        model: null,
+        cliSessionId: 'task-launch-fails',
+        messages: [],
+        filesTouched: [],
+      },
+      prefills: {},
+      purpose: 'job',
+      busy: false,
+    }),
+  }));
+  await page.evaluate(() => {
+    window.Scout.codexNavigate = () => { throw new Error('/Users/private raw launch error'); };
+  });
+  await page.evaluate((id) => window.Scout.openChat(id, 'ask'), opportunity.id);
+  await page.click('[data-action="open-codex-task"]');
+  await expect(page.locator('.codex-link-status')).toContainText(/could not open Codex/i);
+  await expect(page.locator('.codex-link-status')).toContainText('task-launch-fails');
+  await expect(page.locator('.codex-link-status')).not.toContainText('/Users/private');
+});
+
+test('a hostile Codex task identity is escaped, copyable and never launched', async ({ page }) => {
+  const hostile = '<img src=x onerror=alert(1)>';
+  await page.unroute('**/api/chat?*');
+  await page.route('**/api/chat?*', (route) => route.fulfill({
+    contentType: 'application/json',
+    body: JSON.stringify({
+      chat: {
+        engine: 'codex',
+        model: null,
+        cliSessionId: hostile,
+        messages: [],
+        filesTouched: [],
+      },
+      prefills: {},
+      purpose: 'job',
+      busy: false,
+    }),
+  }));
+  await page.evaluate(() => {
+    window.Scout.codexNavigate = (href) => { window.__codexTarget = href; };
+  });
+  await page.evaluate((id) => window.Scout.openChat(id, 'ask'), opportunity.id);
+  await expect(page.locator('[data-codex-task-id]')).toHaveText(hostile);
+  await expect(page.locator('.codex-link-status img')).toHaveCount(0);
+  await expect(page.locator('[data-action="open-codex-task"]')).toHaveCount(0);
+  expect(await page.evaluate(() => window.__codexTarget)).toBeUndefined();
 });
