@@ -1,12 +1,12 @@
 import assert from 'node:assert/strict';
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import {
   adoptExistingWorkspaceFromGithub, confirmRecoveryKey, connectWorkspaceSync, disableWorkspaceSync, loadSyncSettings, pendingRecoveryKey,
-  queueWorkspaceSync, restoreWorkspaceFromGithub, runWorkspaceSync, syncStatus, validateGithubUrl,
+  queueWorkspaceSync, restoreWorkspaceFromGithub, runWorkspaceSync, saveSyncSettings, syncStatus, validateGithubUrl,
   verifyPrivateGithubRemote,
 } from './workspaceSync.mjs';
 import { initializeRecoveryBackup } from './recoveryBackup.mjs';
@@ -132,6 +132,56 @@ test('runtime sync remains asynchronous while a Git mutation is pending', async 
   fs.rmSync(f.base, { recursive: true, force: true });
 });
 
+test('enabled runtime recovery checkpoint yields to an independent heartbeat and fences component mutations', async () => {
+  const f = fixture();
+  git(f.root, 'init');
+  git(f.root, 'config', 'user.name', 'Test');
+  git(f.root, 'config', 'user.email', 'test@example.invalid');
+  const created = initializeRecoveryBackup(f.root, 'correct horse battery staple');
+  saveSyncSettings(f.root, {
+    enabled: true,
+    remoteUrl: 'https://github.com/example/private-workspace.git',
+    dataKey: created.dataKey.toString('base64url'),
+  });
+  fs.mkdirSync(path.join(f.root, 'applications'), { recursive: true });
+  fs.writeFileSync(path.join(f.root, 'applications', 'large-cv.pdf'), Buffer.alloc(8 * 1024 * 1024, 0x61));
+
+  let afterFetch = false;
+  let heartbeatTicks = 0;
+  let heartbeat;
+  let ticksBeforeNextGit = null;
+  let fenceChecks = 0;
+  let checksBeforeNextGit = null;
+  const spawnAsync = async (command, args, options) => {
+    if (args[0] === 'fetch') {
+      afterFetch = true;
+      heartbeat = setInterval(() => { heartbeatTicks += 1; }, 1);
+      return { status: 1, stdout: '', stderr: 'synthetic offline' };
+    }
+    if (afterFetch && ticksBeforeNextGit === null) {
+      ticksBeforeNextGit = heartbeatTicks;
+      checksBeforeNextGit = fenceChecks;
+    }
+    return spawnSync(command, args, options);
+  };
+
+  try {
+    const result = await runWorkspaceSync(f.root, 'large fenced checkpoint', {
+      spawnAsync,
+      assertFence() {
+        fenceChecks += 1;
+      },
+    });
+
+    assert.equal(result.state, 'offline');
+    assert.ok(ticksBeforeNextGit > 0, 'the recovery checkpoint must yield before the next Git command');
+    assert.ok(checksBeforeNextGit > 4, 'recovery component mutations must be fenced individually');
+  } finally {
+    clearInterval(heartbeat);
+    fs.rmSync(f.base, { recursive: true, force: true });
+  }
+});
+
 test('runtime sync command timeout returns bounded needs-attention state', async () => {
   const f = fixture();
   git(f.root, 'init');
@@ -149,6 +199,62 @@ test('runtime sync command timeout returns bounded needs-attention state', async
   assert.equal(result.pending, true);
   assert.doesNotMatch(JSON.stringify(result), /workspace\.json|opportunities\.json/);
   fs.rmSync(f.base, { recursive: true, force: true });
+});
+
+function terminateTestProcessTree(child) {
+  if (!child?.pid || child.exitCode !== null || child.signalCode !== null) return;
+  if (process.platform === 'win32') {
+    spawnSync('taskkill.exe', ['/pid', String(child.pid), '/T', '/F'], {
+      windowsHide: true,
+      stdio: 'ignore',
+    });
+    return;
+  }
+  try { process.kill(-child.pid, 'SIGKILL'); } catch {}
+}
+
+test('runtime command timeout terminates the process tree and awaits parent close', async () => {
+  const f = fixture();
+  const sentinel = path.join(f.base, 'surviving-grandchild.txt');
+  git(f.root, 'init');
+  let commandProcess;
+  let commandClosed = false;
+  const grandchildScript = [
+    "const fs = require('node:fs');",
+    "const destination = process.argv[1];",
+    "setTimeout(() => fs.writeFileSync(destination, 'survived'), 400);",
+  ].join(' ');
+  const parentScript = [
+    "const { spawn } = require('node:child_process');",
+    `spawn(process.execPath, ['-e', ${JSON.stringify(grandchildScript)}, process.argv[1]], { stdio: 'ignore', windowsHide: true });`,
+    'setTimeout(() => process.exit(0), 800);',
+  ].join(' ');
+  const spawnAsync = async (command, args, options) => {
+    if (args[0] !== 'commit') return spawnSync(command, args, options);
+    commandProcess = spawn(process.execPath, ['-e', parentScript, sentinel], {
+      detached: process.platform !== 'win32',
+      windowsHide: true,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    commandProcess.once('close', () => { commandClosed = true; });
+    return commandProcess;
+  };
+
+  try {
+    const result = await runWorkspaceSync(f.root, 'timed process-tree checkpoint', {
+      commandTimeoutMs: 50,
+      spawnAsync,
+    });
+
+    assert.equal(result.state, 'needs-attention');
+    assert.equal(result.pending, true);
+    assert.equal(commandClosed, true, 'sync must await the timed-out parent close event');
+    await new Promise((resolve) => setTimeout(resolve, 550));
+    assert.equal(fs.existsSync(sentinel), false, 'a timed-out transport grandchild must not outlive sync');
+  } finally {
+    terminateTestProcessTree(commandProcess);
+    fs.rmSync(f.base, { recursive: true, force: true });
+  }
 });
 
 test('a stale runtime sync fence prevents the first local mutation', async () => {

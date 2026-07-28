@@ -5,7 +5,7 @@ import { spawn, spawnSync } from 'node:child_process';
 import { atomicWriteFile } from './atomicWrite.mjs';
 import {
   initializeRecoveryBackup, loadRecoveryHeader, RECOVERY_DIR, restoreRecoveryBackup, restoreRecoveryBackupWithKey,
-  rotateRecoveryPassphrase, writeRecoveryBackup,
+  restoreRecoveryBackupWithKeyAsync, rotateRecoveryPassphrase, writeRecoveryBackup, writeRecoveryBackupAsync,
 } from './recoveryBackup.mjs';
 
 const SETTINGS = '.scout/sync.json';
@@ -13,6 +13,7 @@ const STATUS = new Map();
 const GITHUB_ED25519_HOST = 'github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl';
 const DEFAULT_COMMAND_TIMEOUT_MS = 30_000;
 const COMMAND_OUTPUT_LIMIT = 64 * 1024;
+const PROCESS_TREE_KILL_GRACE_MS = 100;
 const RUNTIME_FENCE_FAILURE = Symbol('runtime-fence-failure');
 
 class RuntimeCommandTimeoutError extends Error {}
@@ -35,36 +36,147 @@ function boundedOutput(value) {
   return String(value || '').slice(-COMMAND_OUTPUT_LIMIT);
 }
 
-function defaultSpawnAsync(command, args, spawnOptions, timeoutMs) {
+function isChildProcess(value) {
+  return value && typeof value.once === 'function' && typeof value.kill === 'function';
+}
+
+function delay(milliseconds) {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds));
+}
+
+function waitForAuxiliaryProcess(child) {
   return new Promise((resolve) => {
-    const child = spawn(command, args, {
-      ...spawnOptions,
-      encoding: undefined,
-      stdio: ['ignore', 'pipe', 'pipe'],
+    child.once('error', () => resolve(null));
+    child.once('close', (status) => resolve(status));
+  });
+}
+
+async function terminateProcessTree(child) {
+  if (!child?.pid) {
+    try { child?.kill('SIGKILL'); } catch {}
+    return;
+  }
+  if (process.platform === 'win32') {
+    const killer = spawn('taskkill.exe', ['/pid', String(child.pid), '/T', '/F'], {
+      windowsHide: true,
+      stdio: 'ignore',
     });
+    const status = await waitForAuxiliaryProcess(killer);
+    if (status !== 0 && child.exitCode === null && child.signalCode === null) {
+      try { child.kill('SIGKILL'); } catch {}
+    }
+    return;
+  }
+
+  let signalledGroup = false;
+  try {
+    process.kill(-child.pid, 'SIGTERM');
+    signalledGroup = true;
+  } catch {
+    try { child.kill('SIGTERM'); } catch {}
+  }
+  await delay(PROCESS_TREE_KILL_GRACE_MS);
+  try {
+    process.kill(-child.pid, 'SIGKILL');
+    signalledGroup = true;
+  } catch {
+    if (!signalledGroup) {
+      try { child.kill('SIGKILL'); } catch {}
+    }
+  }
+}
+
+function collectChildProcess(child, timeoutMs) {
+  return new Promise((resolve) => {
     let stdout = '';
     let stderr = '';
     let settled = false;
+    let closed = false;
+    let closeStatus = null;
+    let spawnError = null;
+    let timedOut = false;
+    let terminationComplete = true;
     const finish = (result) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
       resolve(result);
     };
+    const finishAfterClose = () => {
+      if (!closed || (timedOut && !terminationComplete)) return;
+      finish({
+        status: closeStatus,
+        stdout,
+        stderr: timedOut ? 'command timed out' : boundedOutput(spawnError?.message || stderr),
+        ...(timedOut ? { timedOut: true } : {}),
+      });
+    };
     child.stdout?.on('data', (chunk) => { stdout = boundedOutput(stdout + chunk.toString('utf8')); });
     child.stderr?.on('data', (chunk) => { stderr = boundedOutput(stderr + chunk.toString('utf8')); });
-    child.once('error', (error) => finish({
-      status: null,
-      stdout,
-      stderr: boundedOutput(error.message),
-    }));
-    child.once('close', (status) => finish({ status, stdout, stderr }));
+    child.once('error', (error) => {
+      spawnError = error;
+      if (!child.pid) {
+        closed = true;
+        finishAfterClose();
+      }
+    });
+    child.once('close', (status) => {
+      closed = true;
+      closeStatus = status;
+      finishAfterClose();
+    });
     const timer = setTimeout(() => {
-      child.kill();
-      finish({ status: null, stdout, stderr: 'command timed out', timedOut: true });
+      timedOut = true;
+      terminationComplete = false;
+      Promise.resolve()
+        .then(() => terminateProcessTree(child))
+        .finally(() => {
+          terminationComplete = true;
+          finishAfterClose();
+        });
     }, timeoutMs);
     timer.unref?.();
   });
+}
+
+function defaultSpawnAsync(command, args, spawnOptions, timeoutMs) {
+  const child = spawn(command, args, {
+    ...spawnOptions,
+    detached: process.platform !== 'win32',
+    encoding: undefined,
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  return collectChildProcess(child, timeoutMs);
+}
+
+async function adapterSpawnAsync(spawnAdapter, command, args, spawnOptions, timeoutMs) {
+  const startedAt = Date.now();
+  let timer;
+  let value;
+  try {
+    const pending = Promise.resolve().then(() => spawnAdapter(command, args, {
+      ...spawnOptions,
+      encoding: 'utf8',
+    }));
+    value = await Promise.race([
+      pending,
+      new Promise((resolve) => {
+        timer = setTimeout(() => resolve({
+          status: null,
+          stdout: '',
+          stderr: 'command timed out',
+          timedOut: true,
+        }), timeoutMs);
+        timer.unref?.();
+      }),
+    ]);
+  } catch (error) {
+    return { status: null, stdout: '', stderr: boundedOutput(error?.message) };
+  } finally {
+    clearTimeout(timer);
+  }
+  if (!isChildProcess(value)) return value;
+  return collectChildProcess(value, Math.max(1, timeoutMs - (Date.now() - startedAt)));
 }
 
 async function runGitAsync(cwd, args, options = {}) {
@@ -79,23 +191,13 @@ async function runGitAsync(cwd, args, options = {}) {
   };
   let result;
   if (options.spawnAsync || options.spawn) {
-    let timer;
-    const command = Promise.resolve().then(() => (
-      options.spawnAsync
-        ? options.spawnAsync('git', args, { ...spawnOptions, encoding: 'utf8' })
-        : options.spawn('git', args, { ...spawnOptions, encoding: 'utf8' })
-    ));
-    const timeout = new Promise((resolve) => {
-      timer = setTimeout(() => resolve({
-        status: null,
-        stdout: '',
-        stderr: 'command timed out',
-        timedOut: true,
-      }), timeoutMs);
-      timer.unref?.();
-    });
-    result = await Promise.race([command, timeout]);
-    clearTimeout(timer);
+    result = await adapterSpawnAsync(
+      options.spawnAsync || options.spawn,
+      'git',
+      args,
+      spawnOptions,
+      timeoutMs,
+    );
   } else {
     result = await defaultSpawnAsync('git', args, spawnOptions, timeoutMs);
   }
@@ -455,8 +557,9 @@ async function checkpointLocallyAsync(root, settings, options, reason) {
     if (key.length !== 32) throw new Error('Recovery key cache is missing');
     const header = loadRecoveryHeader(root);
     assertRuntimeFence(options);
-    writeRecoveryBackup(root, key, header, {
+    await writeRecoveryBackupAsync(root, key, header, {
       devicePreferences: deviceBackupPreferences(options.deviceSettings),
+      assertFence: () => assertRuntimeFence(options),
     });
     assertRuntimeFence(options);
   }
@@ -592,7 +695,9 @@ export async function runWorkspaceSync(root, reason = 'workspace update', option
       }
       try {
         assertRuntimeFence(options);
-        restoreRecoveryBackupWithKey(root, root, key);
+        await restoreRecoveryBackupWithKeyAsync(root, root, key, null, {
+          assertFence: () => assertRuntimeFence(options),
+        });
         assertRuntimeFence(options);
       } catch (error) {
         if (error?.[RUNTIME_FENCE_FAILURE]) throw error;

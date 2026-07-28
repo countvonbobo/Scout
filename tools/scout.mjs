@@ -70,11 +70,11 @@ function scanMutationReceipt(root, artifacts) {
 
 function backupHookOutcome(status) {
   if (status === undefined) return Object.freeze({ status: 'complete' });
-  if (status?.state === 'needs-attention') {
-    return Object.freeze({ status: 'partial', reason: 'backup-needs-attention' });
-  }
   if (status?.state === 'offline' || status?.state === 'pending' || status?.pending === true) {
     return Object.freeze({ status: 'pending', reason: 'backup-offline' });
+  }
+  if (status?.state === 'needs-attention') {
+    return Object.freeze({ status: 'partial', reason: 'backup-needs-attention' });
   }
   if (['synced', 'disabled'].includes(status?.state) && status?.pending !== true) {
     return Object.freeze({ status: 'complete' });

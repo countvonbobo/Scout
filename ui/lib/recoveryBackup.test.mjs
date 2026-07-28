@@ -7,6 +7,7 @@ import {
   initializeRecoveryBackup, loadRecoveryHeader, recoveryFileList, restoreRecoveryBackup,
   restoreRecoveryBackupWithKey, rotateRecoveryPassphrase, unlockRecoveryKey, writeRecoveryBackup,
 } from './recoveryBackup.mjs';
+import * as recoveryBackup from './recoveryBackup.mjs';
 import crypto from 'node:crypto';
 
 const EXAMPLE_ENV = ['SECRET', 'example'].join('=') + '\n';
@@ -55,6 +56,39 @@ test('recovery backup encrypts only resumable ignored state and restores with ei
     fs.rmSync(target, { recursive: true, force: true });
   }
   fs.rmSync(root, { recursive: true, force: true });
+});
+
+test('scan-owned recovery restore yields to an independent heartbeat and fences component mutations', async () => {
+  const root = fixture();
+  fs.writeFileSync(path.join(root, 'applications', 'example', 'cv.pdf'), Buffer.alloc(8 * 1024 * 1024, 0x62));
+  const created = initializeRecoveryBackup(root, 'correct horse battery staple');
+  const target = fs.mkdtempSync(path.join(os.tmpdir(), 'scout-async-restored-'));
+  let heartbeatTicks = 0;
+  let fenceChecks = 0;
+  const heartbeat = setInterval(() => { heartbeatTicks += 1; }, 1);
+  try {
+    assert.equal(
+      typeof recoveryBackup.restoreRecoveryBackupWithKeyAsync,
+      'function',
+      'the scan-owned restore must expose an asynchronous implementation',
+    );
+    const restored = await recoveryBackup.restoreRecoveryBackupWithKeyAsync(
+      root,
+      target,
+      created.dataKey,
+      created.header,
+      { assertFence() { fenceChecks += 1; } },
+    );
+
+    assert.equal(restored.files, 4);
+    assert.equal(fs.statSync(path.join(target, 'applications', 'example', 'cv.pdf')).size, 8 * 1024 * 1024);
+    assert.ok(heartbeatTicks > 0, 'large recovery restore must yield to the independent heartbeat');
+    assert.ok(fenceChecks >= 8, 'restore component mutations must be fenced individually');
+  } finally {
+    clearInterval(heartbeat);
+    fs.rmSync(target, { recursive: true, force: true });
+    fs.rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test('unchanged encrypted files retain their blob and changed files rotate only their blob', () => {

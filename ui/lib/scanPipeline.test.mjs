@@ -1058,6 +1058,113 @@ test('a terminal queued run is reconciled after its queue completion response is
   }
 });
 
+async function assertOrphanedBackupOutcome(postSuccess, expectedQueueOutcome) {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), `scout-queue-${expectedQueueOutcome}-reconcile-`));
+  const queueCompatibility = {
+    profileFingerprint: 'b'.repeat(64),
+    configFingerprint: 'c'.repeat(64),
+    schemaVersion: 1,
+  };
+  const seed = acquireScanLease(
+    root,
+    currentLeaseOwner(),
+    { kind: 'scan', runId: `seed-${expectedQueueOutcome}`, provider: 'codex', mode: 'primary', phase: 'queue' },
+  );
+  let orphanLease;
+  try {
+    enqueueScanRequest(root, {
+      id: `lost-${expectedQueueOutcome}`,
+      key: `lost-${expectedQueueOutcome}`,
+      requestedAt: '2026-07-27T10:00:00.000Z',
+      expiresAt: '2026-07-28T10:00:00.000Z',
+      requester: 'manual',
+      windowAt: null,
+      purpose: 'manual-discovery',
+      compatibility: queueCompatibility,
+      lease: seed,
+    });
+    releaseScanLease(seed);
+
+    await assert.rejects(
+      runScanPipeline({
+        root,
+        compatibility: RECOVERY_COMPATIBILITY,
+        stages: durableStageHarness(new Map()),
+        queue: {
+          compatibility: queueCompatibility,
+          now: new Date('2026-07-27T10:01:00.000Z'),
+          async verify(_request, { phase }) {
+            if (phase === 'terminal') throw new Error('synthetic lost queue completion response');
+            return true;
+          },
+          async run(_request, context) {
+            orphanLease = context.lease;
+            const result = await runScanPipeline({
+              root,
+              compatibility: RECOVERY_COMPATIBILITY,
+              stages: durableStageHarness(new Map()),
+              claimedLease: context.lease,
+              finalize: async () => ({
+                schemaVersion: 1,
+                result: { ok: true },
+                mutationReceipt: {
+                  schemaVersion: 1,
+                  id: 'scan-tracker-report',
+                  digest: 'f'.repeat(64),
+                },
+              }),
+              postTerminalSuccess: async () => postSuccess,
+            });
+            return result.failures.some((failure) => failure.code === 'backup-partial')
+              ? 'succeeded-partial'
+              : result.failures.some((failure) => failure.code === 'backup-pending')
+                ? 'succeeded-pending'
+                : 'succeeded';
+          },
+        },
+      }),
+      /synthetic lost queue completion response/,
+    );
+    releaseScanLease(orphanLease);
+
+    let reruns = 0;
+    await runScanPipeline({
+      root,
+      compatibility: RECOVERY_COMPATIBILITY,
+      stages: durableStageHarness(new Map()),
+      queue: {
+        compatibility: queueCompatibility,
+        now: new Date('2026-07-27T10:02:00.000Z'),
+        async run() {
+          reruns += 1;
+          return 'succeeded';
+        },
+      },
+    });
+
+    assert.equal(reruns, 0);
+    assert.equal(projectScanQueue(root).requests[0].status, expectedQueueOutcome);
+  } finally {
+    try { releaseScanLease(orphanLease); } catch {}
+    try { releaseScanLease(seed); } catch {}
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+}
+
+test('orphan reconciliation preserves a terminal succeeded-pending backup outcome', async () => {
+  await assertOrphanedBackupOutcome(
+    { status: 'pending', reason: 'backup-offline' },
+    'succeeded-pending',
+  );
+});
+
+test('orphan reconciliation preserves a terminal succeeded-partial backup outcome', async () => {
+  await assertOrphanedBackupOutcome(
+    { status: 'partial', reason: 'backup-needs-attention' },
+    'succeeded-partial',
+  );
+});
+
 test('startup resumes an interrupted orphan claim under its original run id and reuses committed stages', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'scout-queue-orphan-resume-'));
   const queueCompatibility = {
@@ -1348,6 +1455,12 @@ test('credential-shaped semantic values are redacted while operators and account
     'eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJwcml2YXRlIn0.PRIVATE_SIGNATURE',
     'credential-user',
     'credential-pass',
+    'STANDALONE_KEY_VALUE',
+    'PRIVATE_KEY_VALUE',
+    'PRIVATE_DASH_KEY_VALUE',
+    'PRIVATE_SPACE_KEY_VALUE',
+    'SESSION_UNDERSCORE_VALUE',
+    'SESSION_DASH_VALUE',
   ];
   try {
     const result = await runScanPipeline({
@@ -1373,6 +1486,12 @@ test('credential-shaped semantic values are redacted while operators and account
                   'api_token=PRIVATE_TOKEN',
                   'JWT eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJwcml2YXRlIn0.PRIVATE_SIGNATURE required',
                   'credential URL https://credential-user:credential-pass@example.test/private is required',
+                  'key: STANDALONE_KEY_VALUE',
+                  'PRIVATE_KEY=PRIVATE_KEY_VALUE',
+                  'private-key: PRIVATE_DASH_KEY_VALUE',
+                  'Private Key = PRIVATE_SPACE_KEY_VALUE',
+                  'session_id=SESSION_UNDERSCORE_VALUE',
+                  'SESSION-ID: SESSION_DASH_VALUE',
                 ].join('; '),
               }],
             },
@@ -1387,7 +1506,7 @@ test('credential-shaped semantic values are redacted while operators and account
     assert.ok(candidate.mandatorySignals.some((signal) => /non technical applicants/.test(signal.text)));
     assert.equal(
       candidate.mandatorySignals.filter((signal) => /sensitive requirement redacted/.test(signal.text)).length,
-      5,
+      11,
     );
     const artifactDirectory = path.join(root, '.scout', 'runs', result.runId, 'artifacts');
     const persisted = fs.readdirSync(artifactDirectory)

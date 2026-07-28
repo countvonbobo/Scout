@@ -207,6 +207,20 @@ function postSuccessOutcome(value) {
   throw new TypeError('scan post-success result is invalid');
 }
 
+function recordPostSuccessFailure(run, lease, failure) {
+  appendRunEvent(run, {
+    type: 'run.failure-recorded',
+    stageId: 'post-success',
+    idempotencyKey: `post-success-${failure.code}-g${lease.generation}`,
+    payload: {
+      schemaVersion: 1,
+      code: failure.code,
+      reason: failure.reason,
+    },
+  }, lease);
+  return validateManifestAgreement(run, lease).manifest;
+}
+
 async function drainScanQueue(root, queue, compatibility, leaseOptions, initialLease = null) {
   if (!queue) return [];
   if (typeof queue.run !== 'function') throw new TypeError('scan queue drain callback is required');
@@ -290,26 +304,39 @@ async function drainScanQueue(root, queue, compatibility, leaseOptions, initialL
   return drained;
 }
 
-function terminalRunOutcome(root, runId) {
+function terminalRunState(root, runId) {
   const run = openRunJournal(root, runId);
-  if (!run.events.length) return null;
+  if (!run.events.length) return { outcome: null, backupOutcome: null };
   const manifest = projectRunManifest(run.events);
-  return manifest.outcome === 'in-progress' ? null : manifest.outcome;
+  const backupFailures = run.events
+    .filter((event) => event.type === 'run.failure-recorded')
+    .map((event) => event.payload?.code);
+  const backupOutcome = backupFailures.includes('backup-pending') ? 'succeeded-pending'
+    : backupFailures.includes('backup-partial') ? 'succeeded-partial'
+      : null;
+  return {
+    outcome: manifest.outcome === 'in-progress' ? null : manifest.outcome,
+    backupOutcome,
+  };
+}
+
+function terminalRunOutcome(root, runId) {
+  return terminalRunState(root, runId).outcome;
 }
 
 function reconcileOrphanedQueueClaim(root, lease) {
   const orphan = projectScanQueue(root).requests.find((request) => request.status === 'claimed');
   if (!orphan) return null;
-  let outcome = null;
+  let terminal = null;
   try {
-    outcome = terminalRunOutcome(root, orphan.claim.runId);
+    terminal = terminalRunState(root, orphan.claim.runId);
   } catch {
     // A damaged/incomplete run cannot authorize queue completion. Requeue the
     // request under the successor fence so a new journalled attempt can run.
   }
-  if (outcome) {
-    const queueOutcome = outcome === 'complete' ? 'succeeded'
-      : outcome === 'abandoned' ? 'skipped' : 'failed';
+  if (terminal?.outcome) {
+    const queueOutcome = terminal.outcome === 'complete' ? terminal.backupOutcome || 'succeeded'
+      : terminal.outcome === 'abandoned' ? 'skipped' : 'failed';
     completeOrphanedScanRequest(root, orphan.id, queueOutcome, orphan.claim, lease);
     return Object.freeze({ completed: true, request: orphan, outcome: queueOutcome });
   }
@@ -603,31 +630,36 @@ export async function runScanPipeline({
       }
     }
     if (postTerminalSuccess !== null) {
+      let postSuccessFailure = null;
       if (!mutationReceipt) {
-        failures.push(Object.freeze({
+        postSuccessFailure = Object.freeze({
           code: 'backup-pending',
           stage: 'post-success',
           reason: receiptIssue,
-        }));
+        });
       } else {
         try {
           const postSuccess = postSuccessOutcome(
             await postTerminalSuccess({ run, lease, manifest, mutationReceipt }),
           );
           if (postSuccess.status !== 'complete') {
-            failures.push(Object.freeze({
+            postSuccessFailure = Object.freeze({
               code: postSuccess.status === 'partial' ? 'backup-partial' : 'backup-pending',
               stage: 'post-success',
               reason: postSuccess.reason,
-            }));
+            });
           }
         } catch {
-          failures.push(Object.freeze({
+          postSuccessFailure = Object.freeze({
             code: 'backup-pending',
             stage: 'post-success',
             reason: 'backup-failed',
-          }));
+          });
         }
+      }
+      if (postSuccessFailure) {
+        failures.push(postSuccessFailure);
+        manifest = recordPostSuccessFailure(run, lease, postSuccessFailure);
       }
     }
   } catch (error) {
@@ -986,7 +1018,7 @@ const SEMANTIC_FACT_STOPWORDS = new Set([
   'advert', 'authorization', 'bearer', 'credential', 'credentials', 'jwt', 'key',
   'legacy', 'password', 'private', 'secret', 'session', 'signature', 'token',
 ]);
-const CREDENTIAL_ASSIGNMENT = /\b(?:api[-_]?key|api[-_]?token|authorization|cookie|credential|jwt|password|secret|session|token)\b\s*[:=]\s*\S+/i;
+const CREDENTIAL_ASSIGNMENT = /(?:^|[^a-z0-9])(?:(?:api|private|secret|session|access|client|refresh|auth)[\s._-]*(?:key|token|id|secret)|authorization|cookie|credential|jwt|password|secret|session|token|key)(?![a-z0-9])\s*[:=]\s*\S+/i;
 const AUTHORIZATION_VALUE = /\b(?:authorization\s*:?\s*)?(?:basic|bearer)\s+[a-z0-9._~+/=-]+/i;
 const JWT_VALUE = /\beyj[a-z0-9_-]*\.[a-z0-9_-]+\.[a-z0-9_-]+\b/i;
 const URL_USERINFO_VALUE = /https?:\/\/[^/\s:@]+:[^/\s@]+@/i;

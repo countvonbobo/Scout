@@ -32,6 +32,10 @@ The maintained beta deployment uses one private, single-owner Ubuntu VPS:
   heartbeat through the receipt-gated checkpoint. Runtime Git commands are
   asynchronous, time-bounded, and fence-checked around every mutation so the
   heartbeat remains live and a stale owner cannot start another mutation.
+  Recovery-file encryption, writes, and fast-forward restores run in bounded
+  chunks with event-loop yields and component-level fence checks. A timed-out
+  Git command terminates its process tree and reaches `close` before the scan
+  can stop its heartbeat or release the lease.
   Offline backup is retained as `succeeded-pending`; reconciliation requiring
   attention is retained as `succeeded-partial`. Both remain successful scan
   outcomes for exact scheduled-window coverage. Each successfully drained

@@ -688,7 +688,7 @@ test('runtime offline backup status leaves the successful scan explicitly pendin
   }
 });
 
-test('runtime needs-attention backup status leaves the successful scan explicitly partial', async () => {
+test('runtime needs-attention backup with pending work leaves the successful scan explicitly pending', async () => {
   const root = scanRoot();
   try {
     const result = await runScanWith(root, 'codex', 'primary', {
@@ -702,6 +702,37 @@ test('runtime needs-attention backup status leaves the successful scan explicitl
         state: 'needs-attention',
         enabled: true,
         pending: true,
+        error: 'PRIVATE_RECONCILIATION_DETAIL',
+      }),
+    });
+
+    assert.equal(result.ok, true);
+    assert.equal(result.durable.outcome, 'complete');
+    assert.deepEqual(result.durable.failures, [{
+      code: 'backup-pending',
+      stage: 'post-success',
+      reason: 'backup-offline',
+    }]);
+    assert.doesNotMatch(JSON.stringify(result), /PRIVATE_RECONCILIATION_DETAIL/);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('runtime needs-attention backup without pending work leaves the successful scan explicitly partial', async () => {
+  const root = scanRoot();
+  try {
+    const result = await runScanWith(root, 'codex', 'primary', {
+      providerStatusFn: authenticated,
+      collectSourcesFn: async () => ({
+        generatedAt: '2026-07-28T09:00:00.000Z',
+        queries: [],
+        sources: { hiring_cafe: { configured: true, status: 'healthy', count: 0, jobs: [] } },
+      }),
+      queueWorkspaceSyncFn: async () => ({
+        state: 'needs-attention',
+        enabled: true,
+        pending: false,
         error: 'PRIVATE_RECONCILIATION_DETAIL',
       }),
     });

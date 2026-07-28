@@ -13,6 +13,7 @@ const RECOVERY_PREFIX = 'SCOUT-1-';
 const MAX_HEADER_BYTES = 2 * 1024 * 1024;
 const MAX_RECOVERY_FILE_BYTES = 100 * 1024 * 1024;
 const MAX_RECOVERY_FILES = 5000;
+const ASYNC_IO_CHUNK_BYTES = 1024 * 1024;
 
 function b64(buffer) { return Buffer.from(buffer).toString('base64url'); }
 function unb64(value) { return Buffer.from(String(value || ''), 'base64url'); }
@@ -20,6 +21,69 @@ function sha256(buffer) { return crypto.createHash('sha256').update(buffer).dige
 
 function atomicWrite(file, value) {
   atomicWriteFile(file, value, { mode: 0o600 });
+}
+
+function eventLoopTurn() {
+  return new Promise((resolve) => setImmediate(resolve));
+}
+
+function checkFence(assertFence) {
+  if (typeof assertFence === 'function') assertFence();
+}
+
+async function fencedMutation(assertFence, mutation) {
+  checkFence(assertFence);
+  const result = await mutation();
+  checkFence(assertFence);
+  return result;
+}
+
+async function atomicWriteAsync(file, value, { assertFence } = {}) {
+  const directory = path.dirname(file);
+  await fencedMutation(assertFence, () => fs.promises.mkdir(directory, { recursive: true }));
+  const temporary = path.join(directory, `.${path.basename(file)}.${process.pid}.${crypto.randomUUID()}.tmp`);
+  const bytes = Buffer.isBuffer(value) ? value : Buffer.from(value, 'utf8');
+  let descriptor;
+  try {
+    checkFence(assertFence);
+    descriptor = await fs.promises.open(temporary, 'wx', 0o600);
+    checkFence(assertFence);
+    let offset = 0;
+    while (offset < bytes.length) {
+      const length = Math.min(ASYNC_IO_CHUNK_BYTES, bytes.length - offset);
+      checkFence(assertFence);
+      const { bytesWritten } = await descriptor.write(bytes, offset, length, offset);
+      checkFence(assertFence);
+      if (!bytesWritten) throw new Error('Atomic file write made no progress');
+      offset += bytesWritten;
+      await eventLoopTurn();
+    }
+    checkFence(assertFence);
+    await descriptor.sync();
+    checkFence(assertFence);
+    await descriptor.close();
+    descriptor = undefined;
+    await fencedMutation(assertFence, () => fs.promises.rename(temporary, file));
+    let directoryDescriptor;
+    try {
+      directoryDescriptor = await fs.promises.open(directory, 'r');
+      checkFence(assertFence);
+      await directoryDescriptor.sync();
+      checkFence(assertFence);
+    } catch (error) {
+      if (process.platform !== 'win32' || !['EPERM', 'EINVAL', 'EISDIR'].includes(error?.code)) throw error;
+    } finally {
+      await directoryDescriptor?.close();
+    }
+  } catch (error) {
+    try { await descriptor?.close(); } catch {}
+    try {
+      checkFence(assertFence);
+      await fs.promises.rm(temporary, { force: true });
+      checkFence(assertFence);
+    } catch {}
+    throw error;
+  }
 }
 
 function aesEncrypt(key, plaintext, aad = Buffer.alloc(0)) {
@@ -30,11 +94,47 @@ function aesEncrypt(key, plaintext, aad = Buffer.alloc(0)) {
   return { iv: b64(iv), tag: b64(cipher.getAuthTag()), data: b64(ciphertext) };
 }
 
+async function aesEncryptAsync(key, plaintext, aad = Buffer.alloc(0)) {
+  const iv = crypto.randomBytes(12);
+  const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
+  if (aad.length) cipher.setAAD(aad);
+  const ciphertext = [];
+  for (let offset = 0; offset < plaintext.length; offset += ASYNC_IO_CHUNK_BYTES) {
+    ciphertext.push(cipher.update(plaintext.subarray(offset, offset + ASYNC_IO_CHUNK_BYTES)));
+    await eventLoopTurn();
+  }
+  ciphertext.push(cipher.final());
+  return { iv: b64(iv), tag: b64(cipher.getAuthTag()), data: b64(Buffer.concat(ciphertext)) };
+}
+
 function aesDecrypt(key, record, aad = Buffer.alloc(0)) {
   const decipher = crypto.createDecipheriv('aes-256-gcm', key, unb64(record.iv));
   if (aad.length) decipher.setAAD(aad);
   decipher.setAuthTag(unb64(record.tag));
   return Buffer.concat([decipher.update(unb64(record.data)), decipher.final()]);
+}
+
+async function aesDecryptAsync(key, record, aad = Buffer.alloc(0)) {
+  const decipher = crypto.createDecipheriv('aes-256-gcm', key, unb64(record.iv));
+  if (aad.length) decipher.setAAD(aad);
+  decipher.setAuthTag(unb64(record.tag));
+  const encrypted = unb64(record.data);
+  const plaintext = [];
+  for (let offset = 0; offset < encrypted.length; offset += ASYNC_IO_CHUNK_BYTES) {
+    plaintext.push(decipher.update(encrypted.subarray(offset, offset + ASYNC_IO_CHUNK_BYTES)));
+    await eventLoopTurn();
+  }
+  plaintext.push(decipher.final());
+  return Buffer.concat(plaintext);
+}
+
+async function sha256Async(buffer) {
+  const hash = crypto.createHash('sha256');
+  for (let offset = 0; offset < buffer.length; offset += ASYNC_IO_CHUNK_BYTES) {
+    hash.update(buffer.subarray(offset, offset + ASYNC_IO_CHUNK_BYTES));
+    await eventLoopTurn();
+  }
+  return hash.digest('hex');
 }
 
 function passphraseKey(passphrase, salt) {
@@ -100,6 +200,24 @@ function walk(root, relative, out) {
   } else if (stat.isFile()) out.push(relative);
 }
 
+async function walkAsync(root, relative, out) {
+  const absolute = path.join(root, ...relative.split('/'));
+  try {
+    await fs.promises.access(absolute);
+  } catch (error) {
+    if (error?.code === 'ENOENT') return;
+    throw error;
+  }
+  const stat = await fs.promises.lstat(absolute);
+  if (stat.isSymbolicLink()) throw new Error(`Recovery backup does not accept symbolic links: ${relative}`);
+  if (stat.isDirectory()) {
+    for (const name of await fs.promises.readdir(absolute)) {
+      await walkAsync(root, `${relative}/${name}`, out);
+      await eventLoopTurn();
+    }
+  } else if (stat.isFile()) out.push(relative);
+}
+
 export function recoveryFileList(workspaceRoot) {
   const files = [];
   for (const relative of ['.env', '.scout/backups', '.scout/onboarding', 'data/chats']) walk(workspaceRoot, relative, files);
@@ -109,6 +227,24 @@ export function recoveryFileList(workspaceRoot) {
     walk(workspaceRoot, 'applications', candidates);
     files.push(...candidates.filter((file) => /\.(?:pdf|docx)$/i.test(file)));
   }
+  return [...new Set(files)].sort();
+}
+
+async function recoveryFileListAsync(workspaceRoot) {
+  const files = [];
+  for (const relative of ['.env', '.scout/backups', '.scout/onboarding', 'data/chats']) {
+    await walkAsync(workspaceRoot, relative, files);
+  }
+  const applications = path.join(workspaceRoot, 'applications');
+  try {
+    await fs.promises.access(applications);
+  } catch (error) {
+    if (error?.code === 'ENOENT') return [...new Set(files)].sort();
+    throw error;
+  }
+  const candidates = [];
+  await walkAsync(workspaceRoot, 'applications', candidates);
+  files.push(...candidates.filter((file) => /\.(?:pdf|docx)$/i.test(file)));
   return [...new Set(files)].sort();
 }
 
@@ -136,6 +272,19 @@ function readHeader(workspaceRoot) {
   if (!fs.existsSync(file)) throw new Error('This workspace does not contain encrypted recovery data');
   if (fs.statSync(file).size > MAX_HEADER_BYTES) throw new Error('Scout recovery header is too large');
   return JSON.parse(fs.readFileSync(file, 'utf8'));
+}
+
+async function readHeaderAsync(workspaceRoot) {
+  const file = path.join(workspaceRoot, RECOVERY_DIR, HEADER);
+  let stat;
+  try {
+    stat = await fs.promises.stat(file);
+  } catch (error) {
+    if (error?.code === 'ENOENT') throw new Error('This workspace does not contain encrypted recovery data');
+    throw error;
+  }
+  if (stat.size > MAX_HEADER_BYTES) throw new Error('Scout recovery header is too large');
+  return JSON.parse(await fs.promises.readFile(file, 'utf8'));
 }
 
 function readIndex(header, dataKey) {
@@ -207,6 +356,84 @@ export function writeRecoveryBackup(workspaceRoot, dataKey, header, { devicePref
   return { header: next, files: entries.length, changed: true };
 }
 
+export async function writeRecoveryBackupAsync(workspaceRoot, dataKey, header, {
+  devicePreferences,
+  assertFence,
+} = {}) {
+  if (!Buffer.isBuffer(dataKey) || dataKey.length !== 32) throw new Error('Invalid recovery data key');
+  const root = path.join(workspaceRoot, RECOVERY_DIR);
+  const blobRoot = path.join(root, BLOB_DIR);
+  await fencedMutation(assertFence, () => fs.promises.mkdir(blobRoot, { recursive: true }));
+  let previous = { files: [] };
+  try { previous = readIndex(header, dataKey); } catch { /* a new header has no index */ }
+  const previousByPath = new Map(previous.files.map((entry) => [entry.path, entry]));
+  const sourcePaths = await recoveryFileListAsync(workspaceRoot);
+  if (devicePreferences !== undefined && devicePreferences !== null) {
+    sourcePaths.push('__device__/preferences.json');
+  }
+  if (sourcePaths.length > MAX_RECOVERY_FILES) throw new Error('Recovery backup contains too many files');
+
+  const entries = [];
+  for (const sourcePath of sourcePaths) {
+    const relative = safeRecoveryPath(sourcePath);
+    let data;
+    if (relative === '__device__/preferences.json') {
+      data = Buffer.from(`${JSON.stringify({ startWithWindows: Boolean(devicePreferences.startWithWindows) }, null, 2)}\n`);
+    } else {
+      data = await fs.promises.readFile(path.join(workspaceRoot, ...relative.split('/')));
+      if (relative.startsWith('data/chats/') && relative.endsWith('.json')) {
+        const chat = JSON.parse(data.toString('utf8'));
+        chat.cliSessionId = null;
+        data = Buffer.from(`${JSON.stringify(chat, null, 2)}\n`);
+      }
+    }
+    if (data.length > MAX_RECOVERY_FILE_BYTES) throw new Error(`Recovery file is too large: ${relative}`);
+    const hash = await sha256Async(data);
+    const id = opaqueId(dataKey, relative);
+    const blob = path.join(blobRoot, `${id}.json`);
+    const old = previousByPath.get(relative);
+    let blobExists = false;
+    try {
+      await fs.promises.access(blob);
+      blobExists = true;
+    } catch {}
+    if (!old || old.sha256 !== hash || old.id !== id || !blobExists) {
+      const encrypted = await aesEncryptAsync(dataKey, data, Buffer.from(`file:${relative}`));
+      await atomicWriteAsync(blob, `${JSON.stringify(encrypted)}\n`, { assertFence });
+    }
+    entries.push({ path: relative, id, sha256: hash, size: data.length });
+    await eventLoopTurn();
+  }
+  if (devicePreferences === undefined) {
+    const previousDevice = previousByPath.get('__device__/preferences.json');
+    if (previousDevice) {
+      const blob = path.join(blobRoot, `${previousDevice.id}.json`);
+      try { await fs.promises.access(blob); } catch { throw new Error('Recovery data is incomplete: device preferences'); }
+      entries.push(previousDevice);
+    }
+  }
+  entries.sort((left, right) => left.path.localeCompare(right.path));
+  const keep = new Set(entries.map((entry) => `${entry.id}.json`));
+  for (const name of await fs.promises.readdir(blobRoot)) {
+    if (!keep.has(name)) {
+      await fencedMutation(assertFence, () => fs.promises.rm(path.join(blobRoot, name), { force: true }));
+    }
+    await eventLoopTurn();
+  }
+
+  if (header.index && JSON.stringify(entries) === JSON.stringify(previous.files)) {
+    return { header, files: entries.length, changed: false };
+  }
+
+  const next = {
+    ...header,
+    index: await aesEncryptAsync(dataKey, Buffer.from(JSON.stringify({ files: entries })), INDEX_AAD),
+    updatedAt: new Date().toISOString(),
+  };
+  await atomicWriteAsync(path.join(root, HEADER), `${JSON.stringify(next, null, 2)}\n`, { assertFence });
+  return { header: next, files: entries.length, changed: true };
+}
+
 export function initializeRecoveryBackup(workspaceRoot, passphrase, options = {}) {
   const created = createRecoveryKeys(passphrase);
   const written = writeRecoveryBackup(workspaceRoot, created.dataKey, created.header, options);
@@ -245,6 +472,21 @@ function ensureSafeAncestors(root, target) {
   for (const part of relative.split(path.sep).filter(Boolean)) {
     current = path.join(current, part);
     if (fs.existsSync(current) && fs.lstatSync(current).isSymbolicLink()) throw new Error('Recovery destination contains a symbolic link');
+  }
+}
+
+async function ensureSafeAncestorsAsync(root, target) {
+  const relative = path.relative(root, path.dirname(target));
+  let current = root;
+  for (const part of relative.split(path.sep).filter(Boolean)) {
+    current = path.join(current, part);
+    try {
+      if ((await fs.promises.lstat(current)).isSymbolicLink()) {
+        throw new Error('Recovery destination contains a symbolic link');
+      }
+    } catch (error) {
+      if (error?.code !== 'ENOENT') throw error;
+    }
   }
 }
 
@@ -289,6 +531,67 @@ export function restoreRecoveryBackupWithKey(workspaceRoot, destinationRoot, dat
       restoredValue = Buffer.from(`${JSON.stringify(chat, null, 2)}\n`);
     }
     atomicWrite(target, restoredValue);
+  }
+  return { dataKey, files: index.files.length, devicePreferences };
+}
+
+export async function restoreRecoveryBackupWithKeyAsync(
+  workspaceRoot,
+  destinationRoot,
+  dataKey,
+  suppliedHeader = null,
+  { assertFence } = {},
+) {
+  if (!Buffer.isBuffer(dataKey) || dataKey.length !== 32) throw new Error('Invalid recovery data key');
+  const header = suppliedHeader || await readHeaderAsync(workspaceRoot);
+  if (header?.formatVersion !== RECOVERY_FORMAT || header?.cipher !== 'aes-256-gcm') {
+    throw new Error('Unsupported Scout recovery format');
+  }
+  const index = readIndex(header, dataKey);
+  let devicePreferences = null;
+  for (const entry of index.files) {
+    const relative = safeRecoveryPath(entry.path);
+    if (opaqueId(dataKey, relative) !== entry.id) throw new Error('Recovery index was modified');
+    const blobFile = path.join(workspaceRoot, RECOVERY_DIR, BLOB_DIR, `${entry.id}.json`);
+    let blobStat;
+    try {
+      blobStat = await fs.promises.stat(blobFile);
+    } catch (error) {
+      if (error?.code === 'ENOENT') throw new Error(`Recovery data is incomplete: ${relative}`);
+      throw error;
+    }
+    if (blobStat.size > MAX_RECOVERY_FILE_BYTES * 2) throw new Error(`Recovery blob is too large: ${relative}`);
+    const record = JSON.parse(await fs.promises.readFile(blobFile, 'utf8'));
+    const value = await aesDecryptAsync(dataKey, record, Buffer.from(`file:${relative}`));
+    if (await sha256Async(value) !== entry.sha256 || value.length !== entry.size) {
+      throw new Error(`Recovery data was modified: ${relative}`);
+    }
+    if (relative === '__device__/preferences.json') {
+      devicePreferences = JSON.parse(value.toString('utf8'));
+      continue;
+    }
+    const target = path.resolve(destinationRoot, ...relative.split('/'));
+    const root = `${path.resolve(destinationRoot)}${path.sep}`;
+    if (!target.startsWith(root)) throw new Error('Recovery path escaped the workspace');
+    await ensureSafeAncestorsAsync(path.resolve(destinationRoot), target);
+    let restoredValue = value;
+    if (relative.startsWith('data/chats/') && relative.endsWith('.json')) {
+      const chat = JSON.parse(value.toString('utf8'));
+      chat.cliSessionId = null;
+      chat.recovered = { at: new Date().toISOString(), providerSessionReset: true };
+      chat.messages = Array.isArray(chat.messages) ? chat.messages : [];
+      if (!chat.messages.some((message) => message.role === 'system' && message.recoveryNotice === true)) {
+        chat.messages.push({
+          role: 'system',
+          text: 'This transcript was recovered on a new Scout host. Your next message starts a new provider session.',
+          recoveryNotice: true,
+          ts: chat.recovered.at,
+        });
+      }
+      restoredValue = Buffer.from(`${JSON.stringify(chat, null, 2)}\n`);
+    }
+    await atomicWriteAsync(target, restoredValue, { assertFence });
+    await eventLoopTurn();
   }
   return { dataKey, files: index.files.length, devicePreferences };
 }
