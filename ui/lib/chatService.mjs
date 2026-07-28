@@ -12,9 +12,11 @@ import { runCvQuality } from './cvQuality.mjs';
 import { artifactSlugFor, chooseArtifactSlug } from './cvArtifacts.mjs';
 import { listCvFiles } from './cv.mjs';
 import { readUsage } from './usage.mjs';
-import { detectedModels, isSafeModelId, providerModels } from './providerModels.mjs';
+import {
+  detectedModels, effectiveProviderModel, isSafeModelId, providerModelCatalogue,
+} from './providerModels.mjs';
 import { loadWorkspaceConfig, modelForProvider } from './workspace.mjs';
-import { providerStatus } from './providers.mjs';
+import { detectProviderModelCataloguesAsync, providerStatus } from './providers.mjs';
 import { runStructuredTurn } from './structuredTurn.mjs';
 import {
   interviewPrepAgentPrompt, interviewPrepPrefills, readInterviewPrep,
@@ -88,6 +90,7 @@ function stopTurnOnDisconnect(req, res, id) {
 
 export function registerChatRoutes({
   routes, repoRoot, readTracker, runTurnFn = runTurn, saveChatFn = saveChat, providerStatusFn = providerStatus,
+  providerCataloguesFn = detectProviderModelCataloguesAsync,
   runCvQualityFn = runCvQuality, runStructuredTurnFn = runStructuredTurn, onCheckpoint = () => {},
 }) {
   function checkpoint(reason) { Promise.resolve(onCheckpoint(reason)).catch(() => {}); }
@@ -220,21 +223,43 @@ export function registerChatRoutes({
     try { return replyJson(res, 200, readUsage(os.homedir())); } catch (e) { return replyJson(res, 500, { error: e.message }); }
   };
 
-  // What the engine picker needs, in one request: how much of each provider's
-  // allowance is gone, and which models that provider can be asked for. Reads
-  // local logs and configuration only — it never spawns a provider CLI, so
-  // opening a chat stays fast.
-  routes['GET /api/engines'] = (req, res) => {
+  // The public picker receives normalized catalogue records only. Raw provider
+  // output, executable locations, account metadata and diagnostics stay behind
+  // the provider boundary.
+  routes['GET /api/engines'] = async (req, res) => {
     try {
       const usage = readUsage(os.homedir());
       const config = loadWorkspaceConfig(repoRoot);
       const detected = detectedModels(usage);
+      let providerCatalogues;
+      try { providerCatalogues = await providerCataloguesFn(); }
+      catch {
+        providerCatalogues = {
+          codex: { state: 'failed', reasonCode: 'catalogue-check-failed', models: [] },
+          claude: { state: 'unsupported', reasonCode: 'enumeration-unsupported', models: [] },
+        };
+      }
       const engines = Object.fromEntries(Object.keys(ENGINES).map((engine) => {
         const configured = modelForProvider(config, engine);
+        const rawCatalogue = providerCatalogues?.[engine] || {
+          state: 'unsupported', reasonCode: 'enumeration-unsupported', models: [],
+        };
+        const models = providerModelCatalogue(engine, {
+          ...rawCatalogue,
+          configured,
+          detected: detected[engine] || [],
+        });
+        const effectiveModel = effectiveProviderModel(engine, { configured }, models);
         return [engine, {
           usage: usage[engine] || { unknown: true },
-          models: providerModels(engine, { detected: detected[engine] || [], configured }),
-          defaultModel: configured || null,
+          models,
+          defaultModel: configured && effectiveModel.available !== false ? configured : null,
+          effectiveModel,
+          catalogue: {
+            state: rawCatalogue.state === 'refreshed' ? 'refreshed' : 'fallback',
+            reasonCode: rawCatalogue.reasonCode || null,
+            checkedAt: rawCatalogue.checkedAt || null,
+          },
         }];
       }));
       return replyJson(res, 200, { engines, checkedAt: usage.checkedAt });

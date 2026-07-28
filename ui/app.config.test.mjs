@@ -162,6 +162,76 @@ test('chat usage copy keeps unavailable, account estimate, allowance window, mod
   assert.doesNotMatch(spend, /allowance remaining/i);
 });
 
+test('engine picker explains catalogue provenance, effective defaults and unavailable saved choices', () => {
+  const { scout } = loadScout();
+  scout.chat = { id: 'synthetic-chat', purpose: 'job' };
+  scout.chatDrawerState = createChatDrawerState('synthetic-chat', 1);
+
+  const refreshed = scout.engineCardHtml('codex', {
+    usage: { unknown: true },
+    models: [{
+      id: 'gpt-5.6-sol',
+      label: 'GPT-5.6 Sol',
+      tradeoff: 'Most capable for complex work.',
+      source: 'refreshed',
+      available: true,
+      selected: true,
+    }],
+    defaultModel: null,
+    effectiveModel: {
+      id: 'gpt-5.6-sol', label: 'GPT-5.6 Sol', available: true, known: true,
+      state: 'provider-default',
+    },
+    catalogue: { state: 'refreshed' },
+  });
+  assert.match(refreshed, /Provider default — GPT-5\.6 Sol/);
+  assert.match(refreshed, /Most capable for complex work/);
+  assert.match(refreshed, /refreshed catalogue/);
+
+  const stale = scout.engineCardHtml('codex', {
+    usage: { unknown: true },
+    models: [{
+      id: 'gpt-old-stale',
+      label: 'gpt-old-stale',
+      tradeoff: 'Configured model is absent from the refreshed catalogue.',
+      source: 'configured',
+      available: false,
+      selected: false,
+    }],
+    defaultModel: null,
+    effectiveModel: {
+      id: 'gpt-old-stale', label: 'gpt-old-stale', available: false, known: true,
+      state: 'stale',
+    },
+    catalogue: { state: 'refreshed' },
+  });
+  assert.match(stale, /saved default unavailable/i);
+  assert.match(stale, /choose another model/i);
+  assert.match(stale, /value="gpt-old-stale"[^>]*disabled/);
+});
+
+test('engine picker escapes catalogue labels, tradeoffs and IDs and ignores unexpected raw fields', () => {
+  const { scout } = loadScout();
+  const html = scout.engineCardHtml('codex', {
+    usage: { unknown: true },
+    models: [{
+      id: 'safe-model',
+      label: '<img src=x onerror=alert(1)>',
+      tradeoff: '<script>bad()</script>',
+      source: 'refreshed',
+      available: true,
+      selected: false,
+      raw: '/Users/example token=secret',
+    }],
+    effectiveModel: { id: null, label: 'Provider default (model unknown)', available: 'unknown', known: false },
+    catalogue: { state: 'fallback' },
+  });
+  assert.doesNotMatch(html, /<img|<script|Users\/example|token=secret/);
+  assert.match(html, /&lt;img/);
+  assert.match(html, /&lt;script&gt;/);
+  assert.match(html, /bundled fallback/);
+});
+
 test('interview prep is a manual, separate conversation with escaped saved-pack content', () => {
   const { scout } = loadScout();
   let opened;
