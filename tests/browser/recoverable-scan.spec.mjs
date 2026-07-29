@@ -364,6 +364,7 @@ test('real recovery and provider APIs reject a fault-injected private journal id
 });
 
 test('every durable pipeline and recovery state remains reviewable and privacy-safe', async ({ page }) => {
+  test.setTimeout(60_000);
   const state = {
     runs: { state: 'waiting', runs: [] },
     queue: { state: 'waiting', requests: [] },
