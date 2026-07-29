@@ -574,3 +574,26 @@ private paths, account data, CV content, adverts, prompts, or transcripts.
   suites are green.
 - Findings fixed/open: all round-8 findings are fixed; complete-range Spec,
   code-quality and privacy/security re-review is pending.
+
+### Whole-epic review round 9
+
+- Verdicts:
+  - Spec FAIL: 0 Critical, 1 Important.
+  - Code quality PASS: 0 Critical, 0 Important.
+  - Privacy/security PASS: 0 Critical, 0 Important.
+- Review-fix commit: `8b1b6ea`
+  (`fix: detect generic credential token keys`).
+- RED: ordinary quoted `serviceToken`, `providerToken`, `githubToken` and
+  `openaiToken` assignments were absent from audit findings.
+- Finding reproduced and fixed:
+  - classify camel/lower keys ending in `Token` as credential assignments by
+    default, retaining only the exact noncredential coordination-key
+    exclusions for cancellation, CSRF and lock tokens.
+- GREEN after fixes:
+  - release-audit/build/update suite: 43 passed, 0 failed, 0 skipped;
+  - generic token-key regression: passed;
+  - generated public-source audit: passed;
+  - default release audit: passed for 515 files;
+  - diff checks: passed.
+- Findings fixed/open: the round-9 finding is fixed; complete-range Spec,
+  code-quality and privacy/security re-review is pending.
