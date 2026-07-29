@@ -222,6 +222,42 @@ function darwinIdentity(identity) {
   return null;
 }
 
+export function windowsProcessStartIdentity(pid, {
+  spawn = spawnSync,
+  currentPid = process.pid,
+  instanceStart = pid === currentPid ? performance.timeOrigin : null,
+  hostname = os.hostname(),
+} = {}) {
+  if (!Number.isSafeInteger(pid) || pid < 1) return null;
+  const command = `(Get-Process -Id ${pid} -ErrorAction Stop).StartTime.ToUniversalTime().Ticks`;
+  for (const executable of ['pwsh.exe', 'powershell.exe']) {
+    try {
+      const result = spawn(executable, [
+        '-NoLogo', '-NoProfile', '-NonInteractive', '-Command', command,
+      ], { encoding: 'utf8', timeout: 5_000, windowsHide: true });
+      const ticks = result.status === 0 && typeof result.stdout === 'string'
+        ? result.stdout.trim()
+        : '';
+      if (/^\d+$/.test(ticks)) return `windows-${ticks}`;
+    } catch {
+      // Try the other installed shell before using the current-process fallback.
+    }
+  }
+  if (pid !== currentPid || !Number.isFinite(instanceStart)) return null;
+  const instance = createHash('sha256')
+    .update(`${hostname}\0${pid}\0${instanceStart}`)
+    .digest('hex');
+  return requireToken(`windows-fallback-${instance}`, 'process-start identity');
+}
+
+function windowsIdentity(identity) {
+  if (/^windows-\d+$/.test(identity || '')) return { precision: 'kernel' };
+  if (/^windows-fallback-[a-f0-9]{64}$/.test(identity || '')) {
+    return { precision: 'fallback' };
+  }
+  return null;
+}
+
 function processStartIdentity(pid) {
   if (!Number.isSafeInteger(pid) || pid < 1) return null;
   try {
@@ -233,12 +269,7 @@ function processStartIdentity(pid) {
       return requireToken(`linux-${bootId}-${fields[19]}`, 'process-start identity');
     }
     if (process.platform === 'win32') {
-      const command = `(Get-Process -Id ${pid} -ErrorAction Stop).StartTime.ToUniversalTime().Ticks`;
-      const result = spawnSync('powershell.exe', [
-        '-NoLogo', '-NoProfile', '-NonInteractive', '-Command', command,
-      ], { encoding: 'utf8', timeout: 2_000, windowsHide: true });
-      const ticks = result.status === 0 ? result.stdout.trim() : '';
-      return /^\d+$/.test(ticks) ? `windows-${ticks}` : null;
+      return windowsProcessStartIdentity(pid);
     }
     const result = spawnSync('ps', ['-o', 'lstart=', '-p', String(pid)], {
       encoding: 'utf8', timeout: 2_000, env: { ...process.env, LC_ALL: 'C' },
@@ -288,6 +319,12 @@ function ownerIsLive(owner) {
     if (recordedDarwin?.precision === 'fallback' && currentDarwin?.precision === 'fallback') {
       return recordedDarwin.coarse === currentDarwin.coarse;
     }
+    const recordedWindows = windowsIdentity(owner.processStart);
+    const currentWindows = windowsIdentity(currentStart);
+    // A shell-derived process start cannot be compared to the local Node
+    // fallback. Preserve a live PID when the observation precision changes.
+    if (recordedWindows && currentWindows
+      && recordedWindows.precision !== currentWindows.precision) return true;
     return currentStart === owner.processStart;
   }
   // If the platform cannot inspect another live process safely, preserve the

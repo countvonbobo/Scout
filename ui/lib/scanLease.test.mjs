@@ -10,6 +10,7 @@ import {
   LeaseLostError, acquireScanLease, assertCurrentFence, currentLeaseOwner,
   darwinProcessStartIdentity, readScanLease, handoffScanLease, releaseScanLease,
   releaseScanLeaseByToken, renewScanLease, startLeaseHeartbeat, synchronousFenceCallback,
+  windowsProcessStartIdentity,
 } from './scanLease.mjs';
 import { appendRunEvent, openRunJournal } from './runJournal.mjs';
 import {
@@ -974,8 +975,50 @@ test('process-start identities include the platform boot or session boundary', (
   const identity = currentLeaseOwner().processStart;
   if (process.platform === 'linux') assert.match(identity, /^linux-[0-9a-f-]{36}-\d+$/);
   else if (process.platform === 'darwin') assert.match(identity, /^darwin-[A-Za-z0-9_-]+$/);
-  else if (process.platform === 'win32') assert.match(identity, /^windows-\d+$/);
+  else if (process.platform === 'win32') {
+    assert.match(identity, /^windows-(?:\d+|fallback-[a-f0-9]{64})$/);
+  }
   else assert.match(identity, /^posix-[A-Za-z0-9_-]+$/);
+});
+
+test('Windows process identity tries both shells and safely falls back only for this process', () => {
+  const calls = [];
+  const powershellFallback = windowsProcessStartIdentity(1234, {
+    currentPid: 9999,
+    spawn(command) {
+      calls.push(command);
+      if (command === 'pwsh.exe') return { status: null, stdout: '', error: new Error('timeout') };
+      return { status: 0, stdout: '638892241234567890\r\n' };
+    },
+  });
+  assert.equal(powershellFallback, 'windows-638892241234567890');
+  assert.deepEqual(calls, ['pwsh.exe', 'powershell.exe']);
+
+  const ownFallback = windowsProcessStartIdentity(9999, {
+    currentPid: 9999,
+    instanceStart: 1785312345678.125,
+    hostname: 'WIN-RUNNER',
+    spawn: () => ({ status: null, stdout: '', error: new Error('timeout') }),
+  });
+  assert.match(ownFallback, /^windows-fallback-[a-f0-9]{64}$/);
+  assert.equal(ownFallback, windowsProcessStartIdentity(9999, {
+    currentPid: 9999,
+    instanceStart: 1785312345678.125,
+    hostname: 'WIN-RUNNER',
+    spawn: () => ({ status: 1, stdout: '' }),
+  }));
+  assert.notEqual(ownFallback, windowsProcessStartIdentity(9999, {
+    currentPid: 9999,
+    instanceStart: 1785312345678.5,
+    hostname: 'WIN-RUNNER',
+    spawn: () => ({ status: 1, stdout: '' }),
+  }));
+  assert.equal(windowsProcessStartIdentity(1234, {
+    currentPid: 9999,
+    instanceStart: 1785312345678.125,
+    hostname: 'WIN-RUNNER',
+    spawn: () => ({ status: 1, stdout: '' }),
+  }), null, 'another process must never receive this process instance fallback');
 });
 
 test('Darwin process identity remains boot-bound when private kernel process data is unavailable', () => {

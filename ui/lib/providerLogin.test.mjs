@@ -587,7 +587,7 @@ test('output, line, timeout, cancellation, disconnect and shutdown paths termina
     assert.equal(h.login.killed, true);
   });
 
-  await t.test('cancel waits for close and escalates TERM to KILL within a bound', async () => {
+  await t.test('cancel waits for close and uses bounded platform termination', async () => {
     const h = harness({
       closeOnKill: false,
       terminateGraceMs: 5,
@@ -602,10 +602,16 @@ test('output, line, timeout, cancellation, disconnect and shutdown paths termina
       });
     await new Promise((resolve) => setImmediate(resolve));
     assert.equal(settled, false);
-    assert.deepEqual(h.login.killSignals, ['SIGTERM']);
+    assert.deepEqual(
+      h.login.killSignals,
+      process.platform === 'win32' ? ['SIGKILL'] : ['SIGTERM'],
+    );
     const result = await cancelled;
     assert.equal(result.state, 'cancelled');
-    assert.deepEqual(h.login.killSignals, ['SIGTERM', 'SIGKILL']);
+    assert.deepEqual(
+      h.login.killSignals,
+      process.platform === 'win32' ? ['SIGKILL'] : ['SIGTERM', 'SIGKILL'],
+    );
   });
 
   await t.test('shutdown gives a previously stubborn child a fresh bounded close wait', async () => {

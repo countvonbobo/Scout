@@ -142,7 +142,9 @@ test('persists strict schema-v1 provider files with bounded atomic history', (t)
     'at', 'purpose', 'reasonCode', 'source', 'state',
   ]);
   assert.ok(Buffer.byteLength(fs.readFileSync(file)) < 16 * 1024);
-  assert.equal(fs.statSync(file).mode & 0o777, 0o600);
+  if (process.platform !== 'win32') {
+    assert.equal(fs.statSync(file).mode & 0o777, 0o600);
+  }
   assert.deepEqual(
     fs.readdirSync(path.dirname(file)).filter((name) => name.includes('.tmp')),
     [],

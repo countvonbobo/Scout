@@ -127,7 +127,12 @@ after(async () => {
   else process.env.SCOUT_WORKSPACE = previousWorkspace;
   if (previousDeviceSettings === undefined) delete process.env.SCOUT_DEVICE_SETTINGS;
   else process.env.SCOUT_DEVICE_SETTINGS = previousDeviceSettings;
-  fs.rmSync(testWorkspace, { recursive: true, force: true });
+  fs.rmSync(testWorkspace, {
+    recursive: true,
+    force: true,
+    maxRetries: 5,
+    retryDelay: 100,
+  });
 });
 
 function request({ method = 'GET', path = '/', headers = {}, body = '' }) {
