@@ -183,6 +183,31 @@ test('provider setup status projects only bounded readiness fields', () => {
       healthState: 'sign-in-required',
     },
   );
+  assert.deepEqual(
+    publicProviderStatus({ ...raw, authenticated: true }, {
+      state: 'network-unavailable',
+      reasonCode: 'network-failure',
+      remoteAuthBarrier: true,
+    }),
+    {
+      installed: true,
+      authenticated: false,
+      capabilities: { structuredOutput: true },
+      healthState: 'network-unavailable',
+    },
+  );
+  assert.deepEqual(
+    publicProviderStatus({ ...raw, authenticated: true }, {
+      state: 'untrusted-private-state',
+      remoteAuthBarrier: false,
+    }),
+    {
+      installed: true,
+      authenticated: false,
+      capabilities: { structuredOutput: true },
+      healthState: 'provider-error',
+    },
+  );
 });
 
 test('API exception projection uses fixed public copy and never returns diagnostics', () => {

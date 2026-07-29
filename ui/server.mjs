@@ -481,12 +481,12 @@ export const providerDetection = { detect: detectProvidersAsync };
 const PUBLIC_PROVIDER_HEALTH_STATES = new Set(Object.values(PROVIDER_HEALTH_STATES));
 
 export function publicProviderStatus(value, health = null) {
-  const healthState = health === null
-    ? null
-    : PUBLIC_PROVIDER_HEALTH_STATES.has(health?.state)
-      ? health.state
-      : PROVIDER_HEALTH_STATES.PROVIDER_ERROR;
-  const authenticationBlocked = healthState === PROVIDER_HEALTH_STATES.SIGN_IN_REQUIRED;
+  const healthStateIsValid = health === null || PUBLIC_PROVIDER_HEALTH_STATES.has(health?.state);
+  const healthState = health === null ? null
+    : healthStateIsValid ? health.state : PROVIDER_HEALTH_STATES.PROVIDER_ERROR;
+  const authenticationBlocked = !healthStateIsValid
+    || health?.remoteAuthBarrier === true
+    || healthState === PROVIDER_HEALTH_STATES.SIGN_IN_REQUIRED;
   return {
     installed: value?.installed === true,
     authenticated: value?.authenticated === true && !authenticationBlocked,
@@ -506,7 +506,10 @@ function publicProviderStatuses(values, root) {
         try {
           health = readProviderHealth(root, provider);
         } catch {
-          health = { state: PROVIDER_HEALTH_STATES.PROVIDER_ERROR };
+          health = {
+            state: PROVIDER_HEALTH_STATES.PROVIDER_ERROR,
+            remoteAuthBarrier: true,
+          };
         }
         return [provider, publicProviderStatus(values[provider], health)];
       }),
