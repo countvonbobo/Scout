@@ -321,6 +321,12 @@ export function createProviderLoginManager({
   }),
   onHealthSignal = async () => {},
   canClearClaudeCredentials = async () => false,
+  acquireAuthMutation = async (provider, phase) => ({
+    provider,
+    phase,
+    mutationId: randomUUID(),
+  }),
+  releaseAuthMutation = async () => true,
   cwd = process.cwd(),
   env = process.env,
   platform = process.platform,
@@ -338,6 +344,9 @@ export function createProviderLoginManager({
   terminateGraceMs: configuredTerminateGraceMs,
   shutdownDeadlineMs: configuredShutdownDeadlineMs,
 } = {}) {
+  if (typeof acquireAuthMutation !== 'function' || typeof releaseAuthMutation !== 'function') {
+    throw new TypeError('provider authentication mutation authority is invalid');
+  }
   const timeoutMs = checkedPositiveInteger(
     configuredTimeoutMs,
     DEFAULT_TIMEOUT_MS,
@@ -550,6 +559,7 @@ export function createProviderLoginManager({
     const health = reportHealth
       ? persistHealth(session, terminalHealth(reasonCode, state)).catch(() => {})
       : Promise.resolve();
+    const authMutation = session.authMutation;
     session.buffers = { stdout: '', stderr: '' };
     session.codeRequired = false;
     session.userCode = null;
@@ -561,7 +571,12 @@ export function createProviderLoginManager({
       if (sessions.get(session.sessionId) === session) sessions.delete(session.sessionId);
     }, retentionMs);
     retention.unref?.();
-    return Promise.all([cleanup, health]).then(() => undefined);
+    return Promise.all([cleanup, health]).then(async () => {
+      if (authMutation) {
+        await releaseAuthMutation(authMutation);
+        if (session.authMutation === authMutation) session.authMutation = null;
+      }
+    });
   }
 
   function failOutput(session) {
@@ -784,7 +799,13 @@ export function createProviderLoginManager({
       );
     }
     pendingStarts.add(key);
+    let authMutation = null;
+    let mutationAdopted = false;
     try {
+      authMutation = await acquireAuthMutation(provider, 'login');
+      if (!authMutation) {
+        throw createError('provider login is already active', 'LOGIN_ALREADY_ACTIVE');
+      }
       const status = await providerStatus(provider);
       if (shuttingDown) throw createError('provider login manager is shutting down', 'LOGIN_SHUTDOWN');
       const executable = checkedExecutable(status);
@@ -824,6 +845,7 @@ export function createProviderLoginManager({
         process: null,
         processRecord: null,
         confirmation: null,
+        authMutation,
         healthWriteTail: Promise.resolve(),
         outputBytes: 0,
         outputLines: 0,
@@ -837,6 +859,7 @@ export function createProviderLoginManager({
       };
       sessions.set(id, session);
       active.set(key, session);
+      mutationAdopted = true;
       session.timeout = setTimeout(() => {
         void terminal(session, 'expired', 'expired', { kill: true });
       }, timeoutMs);
@@ -858,6 +881,7 @@ export function createProviderLoginManager({
       return publicSnapshot(session);
     } finally {
       pendingStarts.delete(key);
+      if (authMutation && !mutationAdopted) await releaseAuthMutation(authMutation);
     }
   }
 
@@ -975,8 +999,8 @@ export function createProviderLoginManager({
       'provider login start rate limit reached',
       'LOGIN_RATE_LIMIT',
     );
-    sourceSession.clearConsumed = true;
     clearingOwners.add(ownerId);
+    let authMutation = null;
     const signalSession = {
       provider: 'claude',
       ownerId,
@@ -984,6 +1008,11 @@ export function createProviderLoginManager({
     };
     let clearRecord = null;
     try {
+      authMutation = await acquireAuthMutation('claude', 'logout');
+      if (!authMutation) {
+        throw createError('provider login is already active', 'LOGIN_ALREADY_ACTIVE');
+      }
+      sourceSession.clearConsumed = true;
       const status = await providerStatus('claude');
       if (shuttingDown) throw createError('provider login manager is shutting down', 'LOGIN_SHUTDOWN');
       const executable = checkedExecutable(status);
@@ -1110,6 +1139,7 @@ export function createProviderLoginManager({
       if (state !== 'cleared') sourceSession.reasonCode = reasonCode;
       return { provider: 'claude', reasonCode, state };
     } finally {
+      if (authMutation) await releaseAuthMutation(authMutation);
       if (!clearRecord || clearRecord.closed) {
         clearingOwners.delete(ownerId);
       } else {

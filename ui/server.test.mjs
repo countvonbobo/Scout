@@ -1015,7 +1015,8 @@ test('the served shell and offline cache both version the character module', asy
   // module URL and the cache name both carry this build id.
   const worker = await request({ path: '/service-worker.js' });
   assert.match(worker.text, new RegExp(`const BUILD = '${UI_BUILD_ID}'`));
-  assert.match(worker.text, /const CACHE = `scout-shell-\$\{BUILD\}`/);
+  assert.match(worker.text, /const CACHE_PREFIX = 'scout-shell-'/);
+  assert.match(worker.text, /const CACHE = `\$\{CACHE_PREFIX\}\$\{BUILD\}`/);
   assert.match(worker.text, /`\/lib\/scoutCharacter\.mjs\?v=\$\{BUILD\}`/);
   assert.doesNotMatch(worker.text, /__SCOUT_UI_BUILD__/);
 

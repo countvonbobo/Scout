@@ -30,6 +30,9 @@ import {
 import {
   PROVIDER_HEALTH_STATES, providerPreflight, readProviderHealth,
 } from './lib/providerHealth.mjs';
+import {
+  acquireProviderAuthMutation, releaseProviderAuthMutation,
+} from './lib/providerAuthMutation.mjs';
 import { createProviderLoginManager } from './lib/providerLogin.mjs';
 import { runStructuredTurn } from './lib/structuredTurn.mjs';
 import { doctor, publicDoctor } from './lib/doctor.mjs';
@@ -594,6 +597,15 @@ const runtimeProviderLoginManager = createProviderLoginManager({
       source: 'post-auth',
       probe: async () => signal,
     },
+  ),
+  acquireAuthMutation: async (provider, phase) => acquireProviderAuthMutation(
+    WORKSPACE_ROOT,
+    provider,
+    { phase, owner: currentLeaseOwner() },
+  ),
+  releaseAuthMutation: async (capability) => releaseProviderAuthMutation(
+    WORKSPACE_ROOT,
+    capability,
   ),
 });
 

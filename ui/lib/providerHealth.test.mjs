@@ -11,6 +11,10 @@ import {
   readProviderHealth,
   recordProviderHealth as recordProviderHealthWithAuthority,
 } from './providerHealth.mjs';
+import {
+  acquireProviderAuthMutation,
+  releaseProviderAuthMutation,
+} from './providerAuthMutation.mjs';
 
 const STATES = [
   'checking',
@@ -393,6 +397,48 @@ test('provider-health authority serializes unfenced updates around the latest du
   );
   const { shouldNotify: _shouldNotify, ...persisted } = result;
   assert.deepEqual(readProviderHealth(root, 'codex'), persisted);
+});
+
+test('authentication mutation authority blocks only same-provider preflight and health overwrite', async (t) => {
+  const root = temp(t);
+  const base = Date.now();
+  const mutation = acquireProviderAuthMutation(root, 'codex', {
+    owner: { host: 'synthetic-host', pid: 42, processStart: 'synthetic-start' },
+    now: base,
+    durationMs: 5_000,
+    mutationId: 'provider-health-mutation',
+  });
+  let codexProbes = 0;
+  const codex = await providerPreflight(root, 'codex', 'manual-run', {
+    now: () => new Date(base + 1),
+    probe: async () => {
+      codexProbes += 1;
+      return signal('local-credentials-present', 1, 'manual-preflight');
+    },
+  });
+  assert.equal(codex.ok, false);
+  assert.equal(codex.state, 'login-in-progress');
+  assert.equal(codexProbes, 0);
+
+  const overwritten = recordProviderHealth(
+    root,
+    'codex',
+    {
+      kind: 'local-credentials-present',
+      source: 'periodic',
+      checkedAt: new Date(base + 2).toISOString(),
+    },
+    { purpose: 'periodic', _leaseAuthority: immediateLeaseAuthority() },
+  );
+  assert.equal(overwritten.state, 'login-in-progress');
+
+  const claude = await providerPreflight(root, 'claude', 'manual-run', {
+    probe: async () => ({ kind: 'remote-success', source: 'manual-preflight' }),
+    _leaseAuthority: immediateLeaseAuthority(),
+  });
+  assert.equal(claude.ok, true);
+  assert.equal(claude.state, 'ready');
+  releaseProviderAuthMutation(root, mutation);
 });
 
 test('preflight allows only usable provider states and never substitutes providers', async (t) => {

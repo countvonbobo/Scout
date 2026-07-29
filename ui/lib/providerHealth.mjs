@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { atomicWriteFile } from './atomicWrite.mjs';
+import { readProviderAuthMutation } from './providerAuthMutation.mjs';
 import {
   LeaseLostError,
   acquireScanLease,
@@ -437,8 +438,13 @@ export function recordProviderHealth(root, provider, signal, {
 } = {}) {
   providerName(provider);
   const checkedPurpose = purposeName(purpose);
+  const mutation = readProviderAuthMutation(root, provider, { now });
+  const authoritativeSignal = mutation
+    && ['check-started', 'local-credentials-present'].includes(signal?.kind)
+    ? { kind: 'login-started', source: signal.source ?? source ?? inferredSource(checkedPurpose) }
+    : signal;
   const evidence = {
-    ...checkedSignal(signal, source ?? inferredSource(checkedPurpose), now),
+    ...checkedSignal(authoritativeSignal, source ?? inferredSource(checkedPurpose), now),
     purpose: checkedPurpose,
   };
   if (lease === undefined && evidence.source !== 'provider-operation') {
@@ -509,6 +515,20 @@ export async function providerPreflight(root, provider, purpose, {
 } = {}) {
   providerName(provider);
   const checkedPurpose = purposeName(purpose);
+  const mutation = readProviderAuthMutation(root, provider, { now });
+  if (mutation) {
+    return {
+      ok: false,
+      provider,
+      purpose: checkedPurpose,
+      state: PROVIDER_HEALTH_STATES.LOGIN_IN_PROGRESS,
+      reasonCode: 'login-started',
+      checkedAt: new Date(mutation.acquiredAt).toISOString(),
+      verified: false,
+      alertId: expectedAlertId(provider, PROVIDER_HEALTH_STATES.LOGIN_IN_PROGRESS),
+      shouldNotify: false,
+    };
+  }
   let record;
   let shouldNotify = false;
   if (probe !== undefined) {

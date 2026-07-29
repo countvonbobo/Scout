@@ -59,6 +59,8 @@ function harness({
   confirmProviderHealth = async () => ({ kind: 'remote-success', source: 'post-auth' }),
   onHealthSignal = async () => {},
   canClearClaudeCredentials = async () => true,
+  acquireAuthMutation,
+  releaseAuthMutation,
 } = {}) {
   const login = fakeChild({ closeOnKill });
   const validation = fakeChild({ closeOnKill });
@@ -96,6 +98,8 @@ function harness({
     },
     confirmProviderHealth,
     canClearClaudeCredentials,
+    ...(acquireAuthMutation === undefined ? {} : { acquireAuthMutation }),
+    ...(releaseAuthMutation === undefined ? {} : { releaseAuthMutation }),
     onHealthSignal: async (name, signal) => {
       health.push([name, signal]);
       await onHealthSignal(name, signal);
@@ -400,6 +404,35 @@ test('sessions enforce one active login and bounded start rate per owner/provide
     h.manager.startProviderLogin('codex', OWNER),
     /login start rate limit/,
   );
+});
+
+test('login authority is released only after child closure and terminal health persistence', async () => {
+  const healthPersisted = deferred();
+  const events = [];
+  const capability = { provider: 'codex', phase: 'login', mutationId: 'login-authority-0001' };
+  const h = harness({
+    closeOnKill: false,
+    acquireAuthMutation: async (provider, phase) => {
+      events.push(`acquire:${provider}:${phase}`);
+      return capability;
+    },
+    releaseAuthMutation: async (released) => {
+      assert.equal(released, capability);
+      events.push('release');
+    },
+    onHealthSignal: async (_provider, signal) => {
+      if (signal.kind === 'provider-failure') await healthPersisted.promise;
+    },
+    terminateGraceMs: 5,
+    shutdownDeadlineMs: 30,
+  });
+  const started = await h.manager.startProviderLogin('codex', OWNER);
+  const cancellation = h.manager.cancelProviderLogin(started.sessionId, OWNER);
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.deepEqual(events, ['acquire:codex:login']);
+  healthPersisted.resolve();
+  await cancellation;
+  assert.deepEqual(events, ['acquire:codex:login', 'release']);
 });
 
 test('cancel and retry have distinct bounded owner/provider rate limits', async () => {
