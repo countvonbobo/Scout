@@ -454,3 +454,40 @@ private paths, account data, CV content, adverts, prompts, or transcripts.
   - diff checks: passed.
 - Findings fixed/open: the round-5 finding is fixed; complete-range Spec,
   code-quality and privacy/security re-review is pending.
+
+### Whole-epic review round 6
+
+- Verdicts:
+  - Spec FAIL: 0 Critical, 1 Important.
+  - Code quality FAIL: 0 Critical, 1 Important.
+  - Privacy/security PASS: 0 Critical, 0 Important.
+- Review-fix commit: `12c0869`
+  (`fix: close final audit and update handoff gaps`).
+- RED:
+  - the new quoted-credential regression returned `ok: true` for ordinary
+    single- and double-quoted password, auth-token and API-key values
+    containing whitespace;
+  - the new Chromium update-download regression rendered the old
+    `ready at undefined` copy because the UI still expected a local path that
+    the privacy-safe API projection intentionally omits.
+- Findings reproduced and fixed:
+  - parse bounded quoted credential literals through their matching quote,
+    preserve exact placeholder handling, fail closed on missing or oversized
+    closing quotes, and report only the fixed rule and line metadata;
+  - keep private fixture meaning at runtime without placing credential-shaped
+    literals in public test source;
+  - render the validated package name and configured-download-folder
+    instruction after a successful update download without exposing a
+    device-local path.
+- GREEN after fixes:
+  - release-audit/build suite: 33 passed, 0 failed, 0 skipped;
+  - quoted-credential regression: passed;
+  - Chromium update-download regression: passed;
+  - default release audit: passed for 515 files;
+  - diff checks: passed.
+- Local full-suite note: the unchanged macOS host still cannot read
+  `kern.proc.pid.<pid>` process-start identity. The affected artifact and
+  setup suites therefore retain their documented dependent failures; the
+  directly changed setup fixture path passed before those failures.
+- Findings fixed/open: both round-6 findings are fixed; complete-range Spec,
+  code-quality and privacy/security re-review is pending.
