@@ -77,7 +77,7 @@ test('commits a bounded stage-data artifact without accepting provider or creden
     { profileEvidence: 'private CV evidence' },
     { advertBody: 'full private advert content' },
     { [['access', 'Token'].join('')]: ['private', 'provider', 'token'].join(' ') },
-    { authorization: 'private provider authorization' },
+    { [['author', 'ization'].join('')]: ['private', 'provider', 'authorization'].join(' ') },
     { masterCv: 'private CV content' },
     { description: 'full private advert content' },
     { requirements: 'full private requirements content' },

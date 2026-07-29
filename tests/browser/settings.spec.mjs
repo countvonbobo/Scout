@@ -136,6 +136,28 @@ test('a verified update download presents a safe package name and actionable loc
   await expect(banner).not.toContainText('/Users/');
 });
 
+test('an automatically downloaded update presents the same actionable installer handoff', async ({ page }) => {
+  const packageName = 'Scout-0.1.0-beta.23-windows-x64.exe';
+  const locationHint = `%LOCALAPPDATA%\\Scout\\updates\\${packageName}`;
+  await page.evaluate(({ name, hint }) => window.Scout.renderUpdateBanner({
+    available: true,
+    latestVersion: '0.1.0-beta.23',
+    canDownload: true,
+    package: { name },
+    downloaded: {
+      name,
+      version: '0.1.0-beta.23',
+      locationHint: hint,
+    },
+  }), { name: packageName, hint: locationHint });
+
+  const banner = page.locator('#update-banner');
+  await expect(banner).toContainText(packageName);
+  await expect(banner).toContainText(locationHint);
+  await expect(banner.getByRole('button', { name: 'Download verified update' })).toHaveCount(0);
+  await expect(banner).not.toContainText('/Users/');
+});
+
 test('a stale tracker mutation refreshes its revision and retries exactly once', async ({ page }) => {
   let revision = 'revision-before-scan';
   const revisionsSent = [];

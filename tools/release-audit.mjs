@@ -7,7 +7,7 @@ import { isMainModule } from '../ui/lib/mainModule.mjs';
 
 const DEFAULT_BUILD_DIRS = ['dist', path.join('installer', 'output')];
 const IGNORED_DIRECTORY_NAMES = new Set(['.git', 'node_modules']);
-const PLACEHOLDER = /^(?:change-?me|dummy|example|fake|not-?set|placeholder|redacted|replace-?me|test|todo|your[-_][a-z0-9_-]+|<[^>\r\n]+>|\$\{[A-Z][A-Z0-9_]*\}|\$\{\{\s*[A-Z][A-Z0-9_.-]*\s*\}\})$/i;
+const PLACEHOLDER = /^(?:change-?me|dummy|example|fake|not-?set|placeholder|redacted|replace-?me|test|todo|<your-api-key>|<your-password>|\$\{[A-Z][A-Z0-9_]*\}|\$\{\{\s*[A-Z][A-Z0-9_.-]*\s*\}\})$/i;
 
 const SECRET_RULES = Object.freeze([
   { id: 'private-key', regex: /-----BEGIN (?:RSA |EC |OPENSSH |DSA )?PRIVATE KEY-----/g },
@@ -65,11 +65,13 @@ function sensitiveAssignmentKey(key) {
   const text = String(key);
   const normal = text.replace(/[^a-z0-9]/gi, '').toLocaleLowerCase('en-US');
   const specificSuffixes = [
-    'apikey', 'accesstoken', 'authtoken', 'bearertoken', 'clientsecret',
-    'idtoken', 'password', 'refreshtoken', 'sessiontoken',
+    'apikey', 'apisecret', 'apitoken', 'accesstoken', 'authorization',
+    'authtoken', 'bearertoken', 'clientsecret', 'consumersecret', 'credential',
+    'credentials', 'idtoken', 'password', 'privatekey', 'refreshtoken',
+    'sessiontoken',
   ];
   if (specificSuffixes.some((suffix) => normal.endsWith(suffix))) return true;
-  if (normal === 'secret' || normal === 'token') return true;
+  if (normal === 'secret' || normal === 'token' || normal.endsWith('secret')) return true;
   return /^[A-Z][A-Z0-9_-]+$/.test(text)
     && (normal.endsWith('secret') || normal.endsWith('token'));
 }
@@ -85,7 +87,7 @@ function boundedQuotedLiteral(remainder, quote) {
       continue;
     }
     if (character === quote) {
-      if (i > 1 && remainder[i + 1] === quote) {
+      if (remainder[i + 1] === quote) {
         value += quote + quote;
         i += 1;
         continue;

@@ -2936,7 +2936,14 @@ const Scout = {
     if (!update?.available && !update?.error) { banner.classList.add('hidden'); return; }
     banner.classList.remove('hidden');
     const copy = document.createElement('p');
-    copy.textContent = update.error ? `Scout could not check for updates: ${update.error}` : `Scout ${update.latestVersion} is available.${update.downloaded?.version === update.latestVersion ? ' The verified package is ready.' : ''}`;
+    const downloadedReady = update.downloaded?.version === update.latestVersion;
+    const installerHandoff = (downloaded) => downloaded?.name && downloaded?.locationHint
+      ? `Close Scout, then run ${downloaded.name}. Find it at ${downloaded.locationHint}.`
+      : null;
+    const readyHandoff = downloadedReady ? installerHandoff(update.downloaded) : null;
+    copy.textContent = update.error
+      ? `Scout could not check for updates: ${update.error}`
+      : `Scout ${update.latestVersion} is available.${readyHandoff ? ` The package is verified. ${readyHandoff}` : downloadedReady ? ' The verified package is ready.' : ''}`;
     banner.append(copy);
     const actions = document.createElement('div'); actions.className = 'update-banner-actions';
     if (update.url) {
@@ -2950,7 +2957,7 @@ const Scout = {
           const response = await fetch('/api/update/download', { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' });
           const result = await response.json(); if (!response.ok) throw new Error(result.error || 'Download failed');
           if (!result.downloaded?.name || !result.downloaded?.version || !result.downloaded?.locationHint) throw new Error('Downloaded package response was incomplete');
-          copy.textContent = `Scout ${result.downloaded.version} is verified. Close Scout, then run ${result.downloaded.name}. Find it at ${result.downloaded.locationHint}.`;
+          copy.textContent = `Scout ${result.downloaded.version} is verified. ${installerHandoff(result.downloaded)}`;
           download.remove();
         } catch (error) { copy.textContent = `Update download failed: ${error.message}`; download.disabled = false; download.textContent = 'Try again'; }
       });

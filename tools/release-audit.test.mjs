@@ -275,6 +275,25 @@ test('ignores documented placeholder credential assignments', () => {
   assert.equal(result.ok, true);
 });
 
+test('does not exempt plausible credentials merely wrapped as generic placeholders', () => {
+  const root = fixture();
+  const cases = [
+    ['your-value.env', `${'ADZUNA'}_${'API'}_${'KEY'}=your-live-production-token-938472\n`],
+    ['angle-value.env', `${'PASS'}${'WORD'}=<live-production-password>\n`],
+  ];
+  for (const [relative, content] of cases) fs.writeFileSync(path.join(root, relative), content);
+  const result = auditRelease({
+    root,
+    trackedFiles: cases.map(([relative]) => relative),
+    buildDirs: [],
+  });
+  assert.equal(result.ok, false);
+  assert.deepEqual(result.findings.map(({ file, rule }) => ({ file, rule })), cases.map(([file]) => ({
+    file,
+    rule: 'secret-assignment',
+  })).sort((a, b) => a.file.localeCompare(b.file, 'en')));
+});
+
 test('rejects plausible credentials even when their values contain fixture-like words', () => {
   const root = fixture();
   const cases = [
@@ -303,6 +322,7 @@ test('rejects quoted credential assignments containing whitespace without report
     ['api-key.env', `${'API'}_${'KEY'}='long private key value'\n`],
     ['escaped-password.env', `${'PASS'}${'WORD'}="test\\"long private password"\n`],
     ['doubled-api-key.yaml', `${'API'}_${'KEY'}: 'test''long private key value'\n`],
+    ['leading-doubled-password.yaml', `${'PASS'}${'WORD'}: '''long private password'\n`],
     ['static-token.mjs', `const ${'auth'}${'Token'} = \`long private token value\`;\n`],
   ];
   for (const [relative, content] of cases) fs.writeFileSync(path.join(root, relative), content);
@@ -332,6 +352,10 @@ test('rejects namespaced credential assignment families without flagging unrelat
     ['identity.env', `${'ID'}_${'TOKEN'}="opaque identity value"\n`],
     ['session.env', `${'SESSION'}_${'TOKEN'}="opaque session value"\n`],
     ['quoted-key.yaml', `"${'SERVICE'}_${'TOKEN'}": "opaque quoted key value"\n`],
+    ['api-token.mjs', `const ${'api'}${'Token'} = "opaque api token value";\n`],
+    ['api-secret.mjs', `const ${'api'}${'Secret'} = "opaque api secret value";\n`],
+    ['consumer-secret.mjs', `const ${'consumer'}${'Secret'} = "opaque consumer secret";\n`],
+    ['authorization.mjs', `const ${'author'}${'ization'} = "Basic dXNlcjpwYXNzd29yZA==";\n`],
   ];
   for (const [relative, content] of cases) fs.writeFileSync(path.join(root, relative), content);
   fs.writeFileSync(path.join(root, 'source.mjs'), "const cancellationToken = operation.signal;\nconst csrfToken = `csrf-${provider}`;\n");
