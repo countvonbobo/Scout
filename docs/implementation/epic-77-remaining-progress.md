@@ -491,3 +491,45 @@ private paths, account data, CV content, adverts, prompts, or transcripts.
   directly changed setup fixture path passed before those failures.
 - Findings fixed/open: both round-6 findings are fixed; complete-range Spec,
   code-quality and privacy/security re-review is pending.
+
+### Whole-epic review round 7
+
+- Verdicts:
+  - Spec PASS: 0 Critical, 0 Important.
+  - Code quality FAIL: 0 Critical, 2 Important.
+  - Privacy/security FAIL: 0 Critical, 1 Important.
+- Review-fix commit: `8d37127`
+  (`fix: harden credential audit and update handoff`).
+- RED:
+  - escaped and doubled quoted credential literals plus a static backtick
+    literal were omitted from the expected audit findings;
+  - common namespaced credential keys including provider API keys, database
+    passwords and refresh/bearer/ID/session token families returned
+    `ok: true`;
+  - the update browser regression received a fixed package name but not an
+    actionable, privacy-safe location alias.
+- Findings reproduced and fixed:
+  - classify complete bounded assignment identifiers by exact/specific
+    sensitive suffix, including quoted YAML keys, without treating unrelated
+    cancellation, CSRF or lock tokens as credentials;
+  - scan quoted literals through escaped or doubled delimiters, fail closed on
+    malformed/oversized literals and inspect static backticks while leaving
+    interpolated code expressions to normal source review;
+  - preserve only exact documented placeholders, including GitHub Actions
+    expressions, and update the Adzuna documentation to use an exact
+    angle-bracket placeholder;
+  - return a fixed environment-variable or home-alias location hint derived
+    from platform/configuration shape, never the expanded device path, and
+    use it in the successful installer handoff.
+- GREEN after fixes:
+  - release-audit/build/update suite: 42 passed, 0 failed, 0 skipped;
+  - device/update privacy boundaries: 2 passed;
+  - Chromium update handoff regression: passed;
+  - default release audit: passed for 515 files;
+  - diff checks: passed.
+- Preliminary full browser evidence before these narrow fixes: 146 discovered,
+  143 passed, 0 failed and 3 intentional platform/host skips. The affected
+  update test then passed directly with the final location-hint contract; the
+  complete matrix remains to be rerun from the final clean commit.
+- Findings fixed/open: all round-7 findings are fixed; complete-range Spec,
+  code-quality and privacy/security re-review is pending.
