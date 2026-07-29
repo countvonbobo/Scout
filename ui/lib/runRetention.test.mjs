@@ -452,6 +452,10 @@ test('queue compaction repairs a crash after atomic replacement without duplicat
     now: new Date('2026-07-29T12:00:00.000Z'),
     afterQueueReplace() { throw new Error('injected queue crash'); },
   }), /injected queue crash/);
+  const interrupted = measureRunStorage(root);
+  assert.equal(interrupted.queue.recoveryCriticalOperations, 1);
+  assert.equal(interrupted.queue.operationBytes > 0, true);
+  assert.equal(interrupted.queue.bytes > fs.statSync(path.join(root, '.scout', 'scan-queue.jsonl')).size, true);
 
   const resumed = compactScanQueue(root, lease, { now: new Date('2026-07-29T12:00:00.000Z') });
   assert.equal(resumed.reconciled, true);
@@ -459,6 +463,63 @@ test('queue compaction repairs a crash after atomic replacement without duplicat
     .trim().split('\n').map(JSON.parse)
     .filter((event) => event.type === 'queue-compacted');
   assert.equal(audits.length, 1);
+  const operationDirectory = path.join(root, '.scout', 'queue-compactions');
+  const completedDirectory = path.join(operationDirectory, fs.readdirSync(operationDirectory)[0]);
+  assert.deepEqual(fs.readdirSync(completedDirectory), ['manifest.json']);
+  const completed = measureRunStorage(root);
+  assert.equal(completed.queue.recoveryCriticalOperations, 0);
+  assert.equal(completed.queue.operationBytes < interrupted.queue.operationBytes, true);
+});
+
+test('repeated queue compactions retain bounded receipts and never prune an interrupted operation', () => {
+  const root = temp();
+  const lease = acquireScanLease(root, currentLeaseOwner(), {
+    kind: 'scan', runId: 'retention-cleanup', provider: 'codex', mode: 'primary', phase: 'queue',
+  });
+  enqueueScanRequest(root, {
+    ...manualRequest('prepared-old', '2020-01-01T00:00:00.000Z', '2020-01-02T00:00:00.000Z'),
+    lease,
+  });
+  assert.throws(() => compactScanQueue(root, lease, {
+    now: new Date('2026-07-29T12:00:00.000Z'),
+    beforeQueueReplace() { throw new Error('injected prepared crash'); },
+  }), /injected prepared crash/);
+  const operationRoot = path.join(root, '.scout', 'queue-compactions');
+  const preparedId = fs.readdirSync(operationRoot)[0];
+
+  for (let index = 0; index < 25; index += 1) {
+    const id = `terminal-${String(index).padStart(2, '0')}`;
+    enqueueScanRequest(root, {
+      ...manualRequest(id, `2020-02-${String(index + 1).padStart(2, '0')}T00:00:00.000Z`, `2020-02-${String(index + 2).padStart(2, '0')}T00:00:00.000Z`),
+      lease,
+    });
+    compactScanQueue(root, lease, { now: new Date('2026-07-29T12:00:00.000Z') });
+  }
+
+  const operationDirectories = fs.readdirSync(operationRoot);
+  assert.equal(operationDirectories.includes(preparedId), true);
+  const manifests = operationDirectories.map((id) => ({
+    id,
+    directory: path.join(operationRoot, id),
+    manifest: JSON.parse(fs.readFileSync(path.join(operationRoot, id, 'manifest.json'), 'utf8')),
+  }));
+  assert.equal(manifests.filter(({ manifest }) => manifest.status === 'prepared').length, 1);
+  assert.equal(manifests.filter(({ manifest }) => manifest.status === 'completed').length <= 20, true);
+  for (const receipt of manifests.filter(({ manifest }) => manifest.status === 'completed')) {
+    assert.deepEqual(fs.readdirSync(receipt.directory), ['manifest.json']);
+  }
+  assert.deepEqual(
+    fs.readdirSync(path.join(operationRoot, preparedId)).sort(),
+    ['after.jsonl', 'before.jsonl', 'manifest.json'],
+  );
+  const measured = measureRunStorage(root);
+  assert.equal(measured.queue.recoveryCriticalOperations, 1);
+  assert.equal(measured.queue.completedReceipts <= 20, true);
+  assert.equal(measured.queue.bytes < 128 * 1024, true);
+  const audits = fs.readFileSync(path.join(root, '.scout', 'run-retention.jsonl'), 'utf8')
+    .trim().split('\n').map(JSON.parse)
+    .filter((event) => event.type === 'queue-compacted');
+  assert.equal(audits.length <= 20, true);
 });
 
 test('Windows junctions cannot redirect selected runs or the protected archive parent', { skip: process.platform !== 'win32' }, () => {

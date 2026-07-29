@@ -31,6 +31,7 @@ const DEFAULT_WARNING_BYTES = Object.freeze(Object.fromEntries(
 const DEFAULT_RESERVE_BYTES = 64 * 1024;
 const RETENTION_INDEX_SCHEMA_VERSION = 1;
 const ARCHIVE_SCHEMA_VERSION = 1;
+const MAX_COMPLETED_QUEUE_COMPACTION_RECEIPTS = 20;
 
 function sha256(value) {
   return crypto.createHash('sha256').update(value).digest('hex');
@@ -190,16 +191,47 @@ export function measureRunStorage(root) {
     if (run.invalid || run.outcome !== 'complete' || referenced.has(run.runId)) critical.push(run);
   }
   const queueFile = path.join(path.resolve(root), '.scout', 'scan-queue.jsonl');
-  const queueBytes = fs.existsSync(queueFile) ? fs.statSync(queueFile).size : 0;
+  const queueFileBytes = fs.existsSync(queueFile) ? fs.statSync(queueFile).size : 0;
   let queueEvents = 0;
-  if (queueBytes) {
+  if (queueFileBytes) {
     const text = fs.readFileSync(queueFile, 'utf8');
     queueEvents = text.split('\n').filter(Boolean).length;
   }
+  const queueOperationRoot = path.join(path.resolve(root), '.scout', 'queue-compactions');
+  let operationBytes = 0;
+  let recoveryCriticalOperations = 0;
+  let completedReceipts = 0;
+  if (fs.existsSync(queueOperationRoot)) {
+    validatePhysicalWorkspacePath(root, queueOperationRoot, 'queue compaction store');
+    operationBytes = walkFiles(queueOperationRoot)
+      .reduce((sum, file) => sum + file.size, 0);
+    for (const name of fs.readdirSync(queueOperationRoot).sort()) {
+      const manifestFile = path.join(queueOperationRoot, name, 'manifest.json');
+      if (!fs.existsSync(manifestFile)) {
+        recoveryCriticalOperations += 1;
+        continue;
+      }
+      validatePhysicalWorkspacePath(root, manifestFile, 'queue compaction manifest');
+      try {
+        const manifest = checkedQueueOperationManifest(root, name, manifestFile);
+        if (manifest.status === 'completed') completedReceipts += 1;
+        else recoveryCriticalOperations += 1;
+      } catch {
+        recoveryCriticalOperations += 1;
+      }
+    }
+  }
+  const queueBytes = queueFileBytes + operationBytes;
   return {
     runs: { bytes: runBytes, count: inventory.length },
     artifacts: { bytes: artifactBytes, count: artifactCount },
-    queue: { bytes: queueBytes, events: queueEvents },
+    queue: {
+      bytes: queueBytes,
+      events: queueEvents,
+      operationBytes,
+      recoveryCriticalOperations,
+      completedReceipts,
+    },
     totalBytes: runBytes + artifactBytes + queueBytes,
     recoveryCritical: {
       count: critical.length,
@@ -715,15 +747,96 @@ function queueCompactionDirectory(root, operationId) {
   return path.join(path.resolve(root), '.scout', 'queue-compactions', operationId);
 }
 
+function checkedQueueOperationManifest(root, operationId, manifestFile) {
+  validatePhysicalWorkspacePath(root, manifestFile, 'queue compaction manifest');
+  const manifest = JSON.parse(fs.readFileSync(manifestFile, 'utf8'));
+  const versionOneKeys = ['afterDigest', 'beforeDigest', 'operationId', 'removedEvents', 'schemaVersion', 'status'];
+  const versionTwoKeys = [...versionOneKeys, 'completedAt'];
+  const keys = manifest && Object.keys(manifest).sort().join(',');
+  const expectedKeys = manifest?.schemaVersion === 1 ? versionOneKeys : versionTwoKeys;
+  if (!manifest || keys !== expectedKeys.sort().join(',')
+    || ![1, 2].includes(manifest.schemaVersion)
+    || manifest.operationId !== operationId
+    || !/^[a-f0-9]{64}$/.test(manifest.operationId || '')
+    || !/^[a-f0-9]{64}$/.test(manifest.beforeDigest || '')
+    || !/^[a-f0-9]{64}$/.test(manifest.afterDigest || '')
+    || !['prepared', 'completed'].includes(manifest.status)
+    || !Number.isSafeInteger(manifest.removedEvents) || manifest.removedEvents < 0
+    || (manifest.schemaVersion === 2
+      && manifest.completedAt !== null
+      && (typeof manifest.completedAt !== 'string'
+        || Number.isNaN(Date.parse(manifest.completedAt))))
+    || (manifest.schemaVersion === 2 && manifest.status === 'prepared' && manifest.completedAt !== null)
+    || (manifest.schemaVersion === 2 && manifest.status === 'completed' && manifest.completedAt === null)) {
+    throw new Error('queue compaction manifest is invalid');
+  }
+  return manifest;
+}
+
+function queueOperations(root) {
+  const base = path.join(path.resolve(root), '.scout', 'queue-compactions');
+  if (!fs.existsSync(base)) return [];
+  validatePhysicalWorkspacePath(root, base, 'queue compaction store');
+  return fs.readdirSync(base).sort().map((operationId) => {
+    const directory = queueCompactionDirectory(root, operationId);
+    validatePhysicalWorkspacePath(root, directory, 'queue compaction receipt');
+    const manifestFile = path.join(directory, 'manifest.json');
+    if (!fs.existsSync(manifestFile)) throw new Error('queue compaction manifest is missing');
+    return {
+      directory,
+      manifestFile,
+      manifest: checkedQueueOperationManifest(root, operationId, manifestFile),
+    };
+  });
+}
+
+function reduceCompletedQueueOperations(root) {
+  const operations = queueOperations(root);
+  const completed = operations.filter(({ manifest }) => manifest.status === 'completed');
+  completed.sort((left, right) => {
+    const timeDifference = Date.parse(right.manifest.completedAt || 0)
+      - Date.parse(left.manifest.completedAt || 0);
+    return timeDifference || right.manifest.operationId.localeCompare(left.manifest.operationId);
+  });
+  const retained = new Set(completed.slice(0, MAX_COMPLETED_QUEUE_COMPACTION_RECEIPTS)
+    .map(({ manifest }) => manifest.operationId));
+  for (const operation of completed) {
+    for (const snapshot of ['before.jsonl', 'after.jsonl']) {
+      const file = path.join(operation.directory, snapshot);
+      if (!fs.existsSync(file)) continue;
+      validatePhysicalWorkspacePath(root, file, 'queue compaction snapshot');
+      fs.rmSync(file);
+    }
+    if (!retained.has(operation.manifest.operationId)) {
+      validatePhysicalWorkspacePath(root, operation.directory, 'queue compaction receipt');
+      walkFiles(operation.directory);
+      fs.rmSync(operation.directory, { recursive: true });
+    }
+  }
+
+  const auditFile = path.join(path.resolve(root), '.scout', 'run-retention.jsonl');
+  if (!fs.existsSync(auditFile)) return;
+  const events = auditEvents(root);
+  const kept = events.filter((event) => (
+    event.type !== 'queue-compacted' || retained.has(event.operationId)
+  ));
+  if (kept.length !== events.length) {
+    validatePhysicalWorkspacePath(root, auditFile, 'retention audit');
+    const contents = kept.length ? `${kept.map(stableJson).join('\n')}\n` : '';
+    atomicWriteFile(auditFile, contents, { mode: 0o600 });
+  }
+}
+
 function writeQueueOperation(root, operation) {
   const directory = queueCompactionDirectory(root, operation.operationId);
   validatePhysicalWorkspacePath(root, directory, 'queue compaction snapshot');
   atomicWriteFile(path.join(directory, 'before.jsonl'), operation.beforeContents, { mode: 0o600 });
   atomicWriteFile(path.join(directory, 'after.jsonl'), operation.afterContents, { mode: 0o600 });
   const manifest = {
-    schemaVersion: 1,
+    schemaVersion: 2,
     operationId: operation.operationId,
     status: operation.status,
+    completedAt: null,
     beforeDigest: operation.beforeDigest,
     afterDigest: operation.afterDigest,
     removedEvents: operation.removedEvents,
@@ -747,39 +860,24 @@ function completeQueueOperation(root, lease, operation, manifestFile) {
   }));
   currentFence(lease, () => {
     const completed = {
-      schemaVersion: 1,
+      schemaVersion: 2,
       operationId: operation.operationId,
       status: 'completed',
+      completedAt: new Date().toISOString(),
       beforeDigest: operation.beforeDigest,
       afterDigest: operation.afterDigest,
       removedEvents: operation.removedEvents,
     };
     validatePhysicalWorkspacePath(root, manifestFile, 'queue compaction manifest');
     atomicWriteFile(manifestFile, `${stableJson(completed)}\n`, { mode: 0o600 });
+    reduceCompletedQueueOperations(root);
   });
 }
 
 function reconcileQueueOperation(root, lease, currentDigest) {
-  const base = path.join(path.resolve(root), '.scout', 'queue-compactions');
-  if (!fs.existsSync(base)) return null;
-  validatePhysicalWorkspacePath(root, base, 'queue compaction store');
-  for (const name of fs.readdirSync(base).sort()) {
-    const manifestFile = path.join(base, name, 'manifest.json');
-    if (!fs.existsSync(manifestFile)) continue;
-    validatePhysicalWorkspacePath(root, manifestFile, 'queue compaction manifest');
-    const manifest = JSON.parse(fs.readFileSync(manifestFile, 'utf8'));
-    const keys = ['afterDigest', 'beforeDigest', 'operationId', 'removedEvents', 'schemaVersion', 'status'];
-    if (!manifest || Object.keys(manifest).sort().join(',') !== keys.sort().join(',')
-      || manifest.schemaVersion !== 1
-      || manifest.operationId !== name
-      || !/^[a-f0-9]{64}$/.test(manifest.beforeDigest || '')
-      || !/^[a-f0-9]{64}$/.test(manifest.afterDigest || '')
-      || !['prepared', 'completed'].includes(manifest.status)
-      || !Number.isSafeInteger(manifest.removedEvents) || manifest.removedEvents < 0) {
-      throw new Error('queue compaction manifest is invalid');
-    }
+  for (const { manifestFile, manifest } of queueOperations(root)) {
     if (manifest.afterDigest !== currentDigest || manifest.status === 'completed') continue;
-    const afterFile = path.join(base, name, 'after.jsonl');
+    const afterFile = path.join(path.dirname(manifestFile), 'after.jsonl');
     validatePhysicalWorkspacePath(root, afterFile, 'queue compaction snapshot');
     const afterContents = fs.readFileSync(afterFile, 'utf8');
     if (sha256(afterContents) !== currentDigest) throw new Error('queue compaction snapshot is damaged');
@@ -793,6 +891,7 @@ function reconcileQueueOperation(root, lease, currentDigest) {
 export function compactScanQueue(root, lease, {
   now = new Date(),
   summaryDays = 365,
+  beforeQueueReplace,
   afterQueueReplace,
 } = {}) {
   now = checkedDate(now, 'queue compaction time');
@@ -800,6 +899,7 @@ export function compactScanQueue(root, lease, {
     throw new TypeError('queue summary retention must be a non-negative whole number');
   }
   assertScanLeaseScope(lease, root, lease?.runId);
+  currentFence(lease, () => reduceCompletedQueueOperations(root));
   const snapshot = currentFence(lease, () => queueEvents(root));
   const projection = projectScanQueue(root, now);
   const cutoff = now.getTime() - summaryDays * DAY_MS;
@@ -843,6 +943,7 @@ export function compactScanQueue(root, lease, {
   };
   const manifestFile = currentFence(lease, () => writeQueueOperation(root, operation));
   currentFence(lease, () => {
+    if (typeof beforeQueueReplace === 'function') beforeQueueReplace();
     const current = queueEvents(root);
     if (sha256(current.contents) !== beforeDigest) {
       throw new Error('scan queue changed during compaction');
