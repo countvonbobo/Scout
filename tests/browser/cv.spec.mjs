@@ -19,9 +19,17 @@ test.beforeEach(async ({ page }) => {
   await page.goto('/');
 });
 
-test('CV library exposes legacy sources whose PDF and quality files are absent', async ({ page }) => {
+async function openCvLibrary(page) {
+  // App boot fetches the CV catalogue alongside the opportunity data. Waiting
+  // for that explicit data boundary keeps navigation from racing module boot in
+  // Firefox while still exercising the real asynchronous CV render.
+  await expect.poll(() => page.evaluate(() => Boolean(window.Scout?.state?.cvFiles))).toBe(true);
   await page.getByRole('button', { name: 'CV' }).click();
   await expect(page.getByRole('heading', { name: 'CV library' })).toBeVisible();
+}
+
+test('CV library exposes legacy sources whose PDF and quality files are absent', async ({ page }) => {
+  await openCvLibrary(page);
   const legacy = page.locator('[data-cv-path="applications/legacy-systems/cv.typ"]');
   await expect(legacy).toContainText('Legacy Systems — Hardware Engineer');
   await expect(legacy).toContainText('PDF missing');
@@ -32,7 +40,7 @@ test('CV library exposes legacy sources whose PDF and quality files are absent',
 });
 
 test('master reference PDF uses the real same-origin preview endpoint', async ({ page, request }) => {
-  await page.getByRole('button', { name: 'CV' }).click();
+  await openCvLibrary(page);
   await page.locator('[data-cv-path="cv/master-cv.md"]').click();
   await expect(page.getByRole('button', { name: 'save changes' })).toBeVisible();
   await expect(page.getByRole('button', { name: 'render PDF' })).toBeVisible();
@@ -46,7 +54,7 @@ test('master reference PDF uses the real same-origin preview endpoint', async ({
 });
 
 test('CV creation is available from the library and opportunity card', async ({ page }) => {
-  await page.getByRole('button', { name: 'CV' }).click();
+  await openCvLibrary(page);
   await page.getByRole('button', { name: 'Review CV options' }).click();
   await page.locator('#cv-create-opportunity').selectOption({ label: 'New Systems — Product Engineer' });
   const continueFromLibrary = page.getByRole('button', { name: 'Start tailored CV' }).first();
@@ -72,7 +80,7 @@ test('a generated CV appears after the chat file refresh without reloading', asy
   let cvState = { master: 'cv/master-cv.md', applications: [], outreach: [], entries: [] };
   await page.route('**/api/cv', (route) => route.fulfill({ contentType: 'application/json', body: JSON.stringify(cvState) }));
   await page.reload();
-  await page.getByRole('button', { name: 'CV' }).click();
+  await openCvLibrary(page);
   await expect(page.getByText('No tailored CVs yet. Create one from a tracked opportunity.')).toBeVisible();
   cvState = { master: 'cv/master-cv.md', applications: ['new-systems'], outreach: [], entries: [{ slug: 'new-systems', source: true, pdf: false, outreach: false, evidence: false, quality: false }] };
   await page.evaluate(() => window.Scout.refreshCvFilesIfTouched(['applications/new-systems/cv.typ']));
@@ -80,7 +88,7 @@ test('a generated CV appears after the chat file refresh without reloading', asy
 });
 
 test('an open master CV buffer survives an opportunities refresh', async ({ page }) => {
-  await page.getByRole('button', { name: 'CV' }).click();
+  await openCvLibrary(page);
   await page.locator('[data-cv-path="cv/master-cv.md"]').click();
   const editor = page.locator('#cv-text');
   await expect(editor).toHaveValue(/Master CV/);

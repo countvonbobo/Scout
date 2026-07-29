@@ -258,6 +258,12 @@ private paths, account data, CV content, adverts, prompts, or transcripts.
   - release-audit/build suite: 22 passed, 0 failed, 0 skipped;
   - Chromium Gate 5 acceptance: 5 discovered, 4 passed, 0 failed, 1 known
     macOS process-identity skip;
+  - complete browser matrix after explicit CV-catalogue readiness and
+    Chromium-only DevTools cache isolation: 142 discovered, 139 passed, 0
+    failed, 3 intentional platform/host skips;
+  - focused CV readiness verification: the formerly failing Firefox master
+    reference case passed twice consecutively, then the complete CV file
+    passed 10 of 10 across Chromium and Firefox;
   - character browser acceptance after the module-order repair: Chromium
     11 passed and Firefox 11 passed; the formerly failing held-module case
     also passed twice consecutively;
@@ -271,6 +277,20 @@ private paths, account data, CV content, adverts, prompts, or transcripts.
   binary is absent. It created enough of the stage to validate the real
   wrapper/runtime audit. The required complete packaging paths remain covered
   by build tests and the GitHub release matrix.
+- Local full-Node note: `npm test` discovered 1,080 tests; 822 passed, 253
+  failed and 5 skipped because this sandbox cannot read the macOS
+  `kern.proc.pid.<pid>` process-start identity. The same identity boundary is
+  the only root failure and its dependent server assertions receive 500
+  responses. Linux and the repository's other CI hosts remain the required
+  authoritative full-suite evidence.
+- Browser rerun evidence: an earlier complete run had one Firefox
+  offline-worker failure because the test attempted its Chromium DevTools
+  cache-isolation primitive on Firefox; that test is now explicitly
+  Chromium-scoped. One unchanged rerun then ended in a Chromium browser
+  `SIGSEGV`. A subsequent run exposed a real Firefox CV boot race, which was
+  reproduced in isolation and fixed with an explicit application-data
+  readiness boundary rather than a sleep. The final unchanged complete matrix
+  passed with the counts above.
 - Fresh read-only review rounds:
   - initial Spec FAIL (0 Critical, 1 Important), Quality FAIL (0 Critical,
     4 Important), Privacy FAIL (0 Critical, 3 Important): replaced
@@ -283,6 +303,7 @@ private paths, account data, CV content, adverts, prompts, or transcripts.
   - final Spec PASS, Code quality PASS and Privacy/security PASS; 0 Critical,
     0 Important.
 - Findings fixed/open: every Gate 5 finding fixed; none open.
-- Next exact action: commit this ledger update, run the clean-worktree final
-  verification matrix, push the branch, open the required draft PR and obtain
-  the complete GitHub Actions matrix.
+- Next exact action: commit the final browser-stabilisation and ledger update,
+  run the clean-worktree final verification matrix, complete fresh full-diff
+  reviews, push the branch, open the required draft PR and obtain the complete
+  GitHub Actions matrix.

@@ -46,7 +46,8 @@ async function waitForActiveBuild(page, build) {
   }).toContain(`/offline-rollover/sw.js?build=${build}`);
 }
 
-test('a real A-to-B worker activation keeps the exact app module graph bootable offline', async ({ context, page }) => {
+test('a real A-to-B worker activation keeps the exact app module graph bootable offline', async ({ browserName, context, page }) => {
+  test.skip(browserName !== 'chromium', 'the HTTP-cache isolation uses a Chromium DevTools session');
   let servedBuild = 'build-a';
   // The production app registers its root worker during boot. This harness
   // owns a narrower scope and blocks that unrelated registration so the root
