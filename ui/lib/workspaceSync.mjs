@@ -8,6 +8,8 @@ import {
   initializeRecoveryBackup, loadRecoveryHeader, RECOVERY_DIR, restoreRecoveryBackup, restoreRecoveryBackupWithKey,
   restoreRecoveryBackupWithKeyAsync, rotateRecoveryPassphrase, writeRecoveryBackup, writeRecoveryBackupAsync,
 } from './recoveryBackup.mjs';
+import { withMutationCoordinator } from './mutationCoordinator.mjs';
+import { assertCurrentFence, synchronousFenceCallback } from './scanLease.mjs';
 
 const SETTINGS = '.scout/sync.json';
 const STATUS = new Map();
@@ -411,11 +413,156 @@ function setState(root, state, details = {}) {
   return value;
 }
 
+function affectedArea(file) {
+  const value = String(file || '').replaceAll('\\', '/');
+  if (value.startsWith('.scout-backup/')) return 'encrypted recovery data';
+  if (value.startsWith('applications/')) return 'applications';
+  if (value.startsWith('data/opportunities')) return 'opportunity tracker';
+  if (value.startsWith('data/companies')) return 'company history';
+  if (value.startsWith('reports/')) return 'reports';
+  if (value.startsWith('profile/')) return 'profile and preferences';
+  if (value === 'workspace.json' || value.startsWith('config/')) return 'workspace settings';
+  return 'workspace files';
+}
+
+function divergenceToken(localCommit, remoteCommit, branch) {
+  return crypto.createHash('sha256')
+    .update(`${branch}\n${localCommit}\n${remoteCommit}`)
+    .digest('hex');
+}
+
+function changedPaths(root, range, options = {}) {
+  const result = runGit(root, ['diff', '--name-status', '--find-renames', range], options);
+  if (!result.ok) return { ok: false, paths: [], complex: true };
+  const paths = [];
+  let complex = false;
+  for (const line of result.stdout.split(/\r?\n/).filter(Boolean)) {
+    const [status, ...names] = line.split('\t');
+    if (!/^[AM]$/.test(status)) complex = true;
+    paths.push(...names.filter(Boolean));
+  }
+  return { ok: true, paths: [...new Set(paths)], complex };
+}
+
+function manualDivergence(reason, details = {}) {
+  return {
+    classification: 'manual-required',
+    canResolve: false,
+    reason,
+    localAreas: [],
+    remoteAreas: [],
+    ...details,
+  };
+}
+
+function pathsOverlap(left, right) {
+  const local = String(left).replaceAll('\\', '/').toLowerCase();
+  const remote = String(right).replaceAll('\\', '/').toLowerCase();
+  return local === remote || local.startsWith(`${remote}/`) || remote.startsWith(`${local}/`);
+}
+
+export function analyseBackupDivergence(root, options = {}) {
+  if (!repoReady(root, options)) return manualDivergence('backup repository is not ready');
+  const branchResult = runGit(root, ['branch', '--show-current'], options);
+  if (!branchResult.ok || !branchResult.stdout) {
+    return manualDivergence('backup branch is unavailable');
+  }
+  const branch = branchResult.stdout;
+  const upstream = `refs/remotes/origin/${branch}`;
+  if (!runGit(root, ['show-ref', '--verify', '--quiet', upstream], options).ok) {
+    return manualDivergence('GitHub branch has not been fetched');
+  }
+  const counts = runGit(root, ['rev-list', '--left-right', '--count', `HEAD...${upstream}`], options);
+  if (!counts.ok) return manualDivergence('backup history could not be compared');
+  const [ahead, behind] = counts.stdout.split(/\s+/).map(Number);
+  if (!(ahead > 0 && behind > 0)) return null;
+
+  const local = runGit(root, ['rev-parse', 'HEAD'], options);
+  const remote = runGit(root, ['rev-parse', upstream], options);
+  const base = runGit(root, ['merge-base', 'HEAD', upstream], options);
+  if (!local.ok || !remote.ok || !base.ok) {
+    return manualDivergence('backup branch tips could not be verified', { ahead, behind });
+  }
+  const common = {
+    ahead,
+    behind,
+    analysisToken: divergenceToken(local.stdout, remote.stdout, branch),
+  };
+  const tracked = runGit(root, ['status', '--porcelain', '--untracked-files=no'], options);
+  if (!tracked.ok || tracked.stdout) {
+    return manualDivergence('tracked workspace files have uncommitted changes', common);
+  }
+  const untracked = runGit(root, ['ls-files', '--others', '--exclude-standard', '-z'], options);
+  if (!untracked.ok) {
+    return manualDivergence('untracked workspace files could not be checked', common);
+  }
+  const unsafeUntracked = untracked.stdout.split('\0').filter(Boolean)
+    .filter((file) => !sensitiveTrackedPath(file));
+  if (unsafeUntracked.length) {
+    return manualDivergence('untracked workspace files need review', common);
+  }
+
+  const localChanges = changedPaths(root, `${base.stdout}..HEAD`, options);
+  const remoteChanges = changedPaths(root, `${base.stdout}..${upstream}`, options);
+  if (!localChanges.ok || !remoteChanges.ok) {
+    return manualDivergence('changed workspace areas could not be compared', common);
+  }
+  const details = {
+    ...common,
+    localAreas: [...new Set(localChanges.paths.map(affectedArea))].sort(),
+    remoteAreas: [...new Set(remoteChanges.paths.map(affectedArea))].sort(),
+  };
+  if (localChanges.complex || remoteChanges.complex) {
+    return manualDivergence('renamed, deleted, or non-standard changes need review', details);
+  }
+  if (localChanges.paths.some((localPath) => (
+    remoteChanges.paths.some((remotePath) => pathsOverlap(localPath, remotePath))
+  ))) {
+    return {
+      classification: 'overlapping',
+      canResolve: false,
+      reason: 'the Scout host and GitHub changed at least one of the same files',
+      ...details,
+    };
+  }
+  return {
+    classification: 'disjoint-safe',
+    canResolve: true,
+    reason: 'the Scout host and GitHub changed separate files',
+    ...details,
+  };
+}
+
 export function syncStatus(root, options = {}) {
   const settings = loadSyncSettings(root);
   const git = detectGit(options);
   if (!settings.enabled) return { state: git.installed ? 'disabled' : 'setup-required', enabled: false, git, remoteUrl: remoteUrl(root, options) };
-  return { state: 'pending', enabled: true, git, remoteUrl: settings.remoteUrl, lastSuccessfulAt: settings.lastSuccessfulAt || null, ...(STATUS.get(path.resolve(root)) || {}) };
+  const current = {
+    state: 'pending',
+    enabled: true,
+    git,
+    remoteUrl: settings.remoteUrl,
+    lastSuccessfulAt: settings.lastSuccessfulAt || null,
+    ...(STATUS.get(path.resolve(root)) || {}),
+  };
+  if (current.state === 'pending' || current.state === 'needs-attention') {
+    const resolution = analyseBackupDivergence(root, options);
+    if (resolution) {
+      return {
+        ...current,
+        state: 'needs-attention',
+        pending: true,
+        conflict: true,
+        ahead: resolution.ahead,
+        behind: resolution.behind,
+        error: resolution.classification === 'disjoint-safe'
+          ? 'The Scout host and GitHub both contain new changes that can be safely preserved'
+          : 'The Scout host and GitHub both contain new changes',
+        resolution,
+      };
+    }
+  }
+  return current;
 }
 
 function sameGithubRepository(left, right) {
@@ -742,25 +889,33 @@ export async function runWorkspaceSync(root, reason = 'workspace update', option
     const [ahead, behind] = counts.stdout.split(/\s+/).map(Number);
     if (ahead > 0 && behind > 0) {
       await checkpointLocallyAsync(root, settings, options, reason);
+      const resolution = analyseBackupDivergence(root, options);
       return setState(root, 'needs-attention', {
         enabled: true,
         pending: true,
         conflict: true,
-        ahead,
-        behind,
-        error: 'This device and GitHub both contain new changes',
+        ahead: resolution?.ahead ?? ahead,
+        behind: resolution?.behind ?? behind,
+        error: resolution?.classification === 'disjoint-safe'
+          ? 'The Scout host and GitHub both contain new changes that can be safely preserved'
+          : 'The Scout host and GitHub both contain new changes',
+        ...(resolution ? { resolution } : {}),
       });
     }
     if (behind > 0) {
       if (await worktreeDirtyAsync(root, options)) {
         await checkpointLocallyAsync(root, settings, options, reason);
+        const resolution = analyseBackupDivergence(root, options);
         return setState(root, 'needs-attention', {
           enabled: true,
           pending: true,
           conflict: true,
-          ahead: Math.max(1, ahead),
-          behind,
-          error: 'This device has unsynced work and GitHub contains newer changes',
+          ahead: resolution?.ahead ?? Math.max(1, ahead),
+          behind: resolution?.behind ?? behind,
+          error: resolution?.classification === 'disjoint-safe'
+            ? 'The Scout host and GitHub both contain new changes that can be safely preserved'
+            : 'This device has unsynced work and GitHub contains newer changes',
+          ...(resolution ? { resolution } : {}),
         });
       }
       const ff = await runtimeGit(
@@ -842,6 +997,119 @@ export function queueWorkspaceSync(root, reason, options = {}) {
   const key = path.resolve(root);
   const previous = QUEUES.get(key) || Promise.resolve();
   const next = previous.catch(() => {}).then(() => runWorkspaceSync(root, reason, options));
+  const tracked = next.finally(() => { if (QUEUES.get(key) === tracked) QUEUES.delete(key); });
+  QUEUES.set(key, tracked);
+  return next;
+}
+
+function fencedSyncOptions(lease, options) {
+  return {
+    ...options,
+    assertFence: () => assertCurrentFence(
+      lease,
+      synchronousFenceCallback(() => true),
+    ),
+  };
+}
+
+export async function resolveBackupDivergence(root, analysisToken, lease, options = {}) {
+  if (!/^[a-f0-9]{64}$/.test(String(analysisToken || ''))) {
+    throw new Error('Backup history changed; review the refreshed diagnosis before fixing it');
+  }
+  const settings = loadSyncSettings(root);
+  if (!settings.enabled) throw new Error('Private backup is not enabled');
+  const fenced = fencedSyncOptions(lease, options);
+
+  return withMutationCoordinator(root, lease, async () => {
+    const fetch = await runtimeGit(root, ['fetch', 'origin'], fenced, { mutation: true });
+    if (!fetch.ok) {
+      return setState(root, 'offline', { enabled: true, pending: true, error: fetch.error });
+    }
+    let resolution = analyseBackupDivergence(root, fenced);
+    if (!resolution) return { ...syncStatus(root, fenced), alreadyResolved: true };
+    if (resolution.classification !== 'disjoint-safe' || !resolution.canResolve) {
+      return setState(root, 'needs-attention', {
+        enabled: true,
+        pending: true,
+        conflict: true,
+        ahead: resolution.ahead,
+        behind: resolution.behind,
+        error: 'This backup divergence needs manual review',
+        resolution,
+      });
+    }
+    if (analysisToken !== resolution.analysisToken) {
+      throw new Error('Backup history changed; review the refreshed diagnosis before fixing it');
+    }
+
+    const branchResult = await runtimeGit(root, ['branch', '--show-current'], fenced);
+    const localResult = await runtimeGit(root, ['rev-parse', 'HEAD'], fenced);
+    const remoteResult = branchResult.ok && branchResult.stdout
+      ? await runtimeGit(root, ['rev-parse', `refs/remotes/origin/${branchResult.stdout}`], fenced)
+      : { ok: false };
+    if (!branchResult.ok || !branchResult.stdout || !localResult.ok || !remoteResult.ok
+      || divergenceToken(localResult.stdout, remoteResult.stdout, branchResult.stdout) !== analysisToken) {
+      throw new Error('Backup history changed; review the refreshed diagnosis before fixing it');
+    }
+
+    const stamp = new Date().toISOString().replace(/\D/g, '').slice(0, 17);
+    const refRoot = `refs/scout-recovery/${stamp}-${analysisToken.slice(0, 12)}`;
+    const localSaved = await runtimeGit(
+      root,
+      ['update-ref', `${refRoot}/local`, localResult.stdout],
+      fenced,
+      { mutation: true },
+    );
+    const remoteSaved = await runtimeGit(
+      root,
+      ['update-ref', `${refRoot}/github`, remoteResult.stdout],
+      fenced,
+      { mutation: true },
+    );
+    if (!localSaved.ok || !remoteSaved.ok) {
+      throw new Error('Scout could not create backup recovery references');
+    }
+
+    resolution = analyseBackupDivergence(root, fenced);
+    if (!resolution || resolution.analysisToken !== analysisToken
+      || resolution.classification !== 'disjoint-safe' || !resolution.canResolve) {
+      throw new Error('Backup history changed; review the refreshed diagnosis before fixing it');
+    }
+    const merge = await runtimeGit(
+      root,
+      ['merge', '--no-ff', '--no-edit', `refs/remotes/origin/${branchResult.stdout}`],
+      fenced,
+      { mutation: true },
+    );
+    if (!merge.ok) {
+      const mergeHead = await runtimeGit(root, ['rev-parse', '--verify', '--quiet', 'MERGE_HEAD'], fenced);
+      if (mergeHead.ok) {
+        await runtimeGit(root, ['merge', '--abort'], fenced, { mutation: true });
+      }
+      return setState(root, 'needs-attention', {
+        enabled: true,
+        pending: true,
+        conflict: true,
+        error: 'The safe merge did not complete; both recovery references were preserved',
+        resolution,
+      });
+    }
+
+    const status = await runWorkspaceSync(root, 'resolve backup divergence', fenced);
+    return {
+      ...status,
+      resolved: status.state === 'synced',
+      recoveryRefsCreated: true,
+    };
+  });
+}
+
+export function queueWorkspaceResolution(root, analysisToken, lease, options = {}) {
+  const key = path.resolve(root);
+  const previous = QUEUES.get(key) || Promise.resolve();
+  const next = previous.catch(() => {}).then(
+    () => resolveBackupDivergence(root, analysisToken, lease, options),
+  );
   const tracked = next.finally(() => { if (QUEUES.get(key) === tracked) QUEUES.delete(key); });
   QUEUES.set(key, tracked);
   return next;

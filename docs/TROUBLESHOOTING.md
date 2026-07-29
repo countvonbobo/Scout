@@ -48,7 +48,7 @@ Backup is optional. Confirm Git and Git Credential Manager are installed, restar
 
 ## Backup is offline, pending, or needs attention
 
-**Offline — saved locally** means Scout made a local commit and will retry later. **Needs attention** means both the computer and GitHub have new history; Scout deliberately does not reset, rebase, merge or force-push. Preserve both copies and resolve the Git history manually before selecting **Retry**. Never delete `.git`, `.scout/sync.json` or `.scout-backup/` as a conflict workaround.
+**Offline — saved locally** means Scout made a local commit and will retry later. **Needs attention** can mean both the Scout host and GitHub have new history. Open **Backup details**, then **Advanced backup settings**. Scout offers **Preserve both and sync** only after it has fetched both tips, verified that the worktree is clean, and confirmed that the two histories changed separate ordinary files. The action creates recovery references and uses a normal merge; it never resets, rebases or force-pushes. Overlapping changes, renames, deletions, dirty files, stale confirmations and unusual Git state remain manual-review cases. Never delete `.git`, `.scout/sync.json` or `.scout-backup/` as a conflict workaround.
 
 ## A scan reviewed candidates but kept zero
 

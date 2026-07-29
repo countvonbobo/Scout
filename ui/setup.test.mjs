@@ -165,6 +165,49 @@ test('first-run setup offers optional local create, private backup guidance, and
   assert.doesNotMatch(source, /setup-next'\)\.onclick/);
 });
 
+test('backup details explain safe and manual divergence without exposing paths', async () => {
+  globalThis.window = globalThis.window || {};
+  await import('./setup.js?backup-resolution-harness');
+  const view = Object.create(globalThis.window.ScoutSetup);
+  view.status = {
+    config: { locale: 'en-GB' },
+    git: { installed: true },
+    sync: {
+      enabled: true,
+      state: 'needs-attention',
+      conflict: true,
+      ahead: 1,
+      behind: 4,
+      lastSuccessfulAt: '2026-07-26T12:54:14.254Z',
+      resolution: {
+        classification: 'disjoint-safe',
+        canResolve: true,
+        analysisToken: 'a'.repeat(64),
+        localAreas: ['encrypted recovery data'],
+        remoteAreas: ['applications'],
+      },
+    },
+  };
+  const safe = view.backupPanelHtml();
+  assert.match(safe, /Scout host and GitHub both have new backup history/);
+  assert.match(safe, /Preserve both and sync/);
+  assert.match(safe, /encrypted recovery data/);
+  assert.match(safe, /Retry alone cannot resolve/);
+  assert.doesNotMatch(safe, /\.scout-backup|applications\/synthetic-role/);
+
+  view.status.sync.resolution = {
+    classification: 'overlapping',
+    canResolve: false,
+    reason: 'the Scout host and GitHub changed at least one of the same files',
+    localAreas: ['workspace settings'],
+    remoteAreas: ['workspace settings'],
+  };
+  const manual = view.backupPanelHtml();
+  assert.doesNotMatch(manual, /id="setup-resolve-backup"/);
+  assert.match(manual, /cannot safely resolve/);
+  assert.match(manual, /Do not reset, rebase, force-push/);
+});
+
 // Renders renderFirstScan for real and inspects the output, so a behavioural
 // regression fails here even if the source text is rewritten, and a harmless
 // reformat does not.

@@ -535,17 +535,21 @@ function assertFence(lease) {
 }
 
 export function withMutationCoordinator(root, lease, commit) {
-  if (typeof commit !== 'function' || commit.constructor?.name === 'AsyncFunction') {
-    throw new TypeError('workspace mutation coordinator callback must be synchronous');
-  }
+  if (typeof commit !== 'function') throw new TypeError('workspace mutation coordinator callback is required');
   assertScanLeaseScope(lease, root, lease?.runId);
   assertFence(lease);
   const guard = createGuard(root, lease);
   try {
     assertFence(lease);
-    return commit();
-  } finally {
+    const result = commit();
+    if (result && typeof result.then === 'function') {
+      return Promise.resolve(result).finally(() => releaseGuard(guard));
+    }
     releaseGuard(guard);
+    return result;
+  } catch (error) {
+    releaseGuard(guard);
+    throw error;
   }
 }
 

@@ -14,7 +14,9 @@ import {
   parseScanRuns, readPublicRunSummaries, readPublicScanQueue, readPublicStoragePressure,
   scanHealthFromText,
 } from './lib/scanHealth.mjs';
-import { readScanLease } from './lib/scanLease.mjs';
+import {
+  acquireScanLease, currentLeaseOwner, readScanLease, releaseScanLease, startLeaseHeartbeat,
+} from './lib/scanLease.mjs';
 import { scanEstimate } from './lib/scanEstimate.mjs';
 import { scheduleStatus, scheduleSummary } from './lib/scheduler.mjs';
 import { loadPortals, portalSummary } from './lib/ats.mjs';
@@ -34,7 +36,8 @@ import { disableRemoteAccess, enableRemoteAccess, remoteAccessStatus } from './l
 import { checkForUpdate, downloadVerifiedUpdate } from './lib/updates.mjs';
 import {
   adoptExistingWorkspaceFromGithub, confirmRecoveryKey, connectWorkspaceSync, detectGit, disableWorkspaceSync, loadSyncSettings, pendingRecoveryKey,
-  prepareGithubDeployKey, queueWorkspaceSync, restoreWorkspaceFromGithub, rotateWorkspaceRecoveryPassphrase, syncStatus,
+  prepareGithubDeployKey, queueWorkspaceResolution, queueWorkspaceSync, restoreWorkspaceFromGithub,
+  rotateWorkspaceRecoveryPassphrase, syncStatus,
 } from './lib/workspaceSync.mjs';
 import { completedWorkspaceSections, pendingWorkspaceSections } from './lib/setupSections.mjs';
 import { BoundedUtf8Body } from './lib/requestBody.mjs';
@@ -851,6 +854,41 @@ routes['POST /api/sync/retry'] = async (req, res, body) => {
   const b = parseBody(body); if (!b) return replyJson(res, 400, { error: 'bad json' });
   try { return replyJson(res, 200, await queueCheckpoint('retry backup')); }
   catch (e) { return replyJson(res, 500, { error: e.message }); }
+};
+
+routes['POST /api/sync/resolve'] = async (req, res, body) => {
+  const b = parseBody(body); if (!b) return replyJson(res, 400, { error: 'bad json' });
+  if (b.confirmed !== true) {
+    return replyJson(res, 409, { error: 'Confirm that Scout should preserve both histories' });
+  }
+  const analysisToken = String(b.analysisToken || '');
+  const runId = `backup-${createHash('sha256').update(analysisToken).digest('hex').slice(0, 40)}`;
+  let lease;
+  let heartbeat;
+  try {
+    lease = acquireScanLease(
+      WORKSPACE_ROOT,
+      currentLeaseOwner(),
+      { kind: 'backup-divergence', runId, phase: 'resolve' },
+    );
+    if (!lease) {
+      return replyJson(res, 409, {
+        error: 'A scan or workspace mutation is in progress; refresh Backup details and try again',
+      });
+    }
+    heartbeat = startLeaseHeartbeat(lease);
+    const result = await queueWorkspaceResolution(WORKSPACE_ROOT, analysisToken, lease);
+    return replyJson(res, 200, result);
+  } catch (e) {
+    return replyJson(res, /confirm|changed|in progress|lease/i.test(e.message) ? 409 : 500, {
+      error: e.message,
+    });
+  } finally {
+    heartbeat?.stop();
+    if (lease) {
+      try { releaseScanLease(lease); } catch {}
+    }
+  }
 };
 
 routes['POST /api/sync/disable'] = (req, res, body) => {

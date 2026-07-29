@@ -214,6 +214,14 @@ test('remote owner mutations require HTTPS Origin and administration remains loc
   fs.writeFileSync(path.join(testWorkspace, '.scout', 'sync.json'), JSON.stringify({ version: 1, enabled: true, remoteUrl: 'git@github.com:example/private.git' }));
   const ownerChat = await request({ method: 'POST', path: '/api/chat/stop', headers: { ...remote, origin: 'https://scout-host.example.ts.net' }, body: JSON.stringify({ id: 'none' }) });
   assert.equal(ownerChat.status, 200);
+  const backupResolution = await request({
+    method: 'POST',
+    path: '/api/sync/resolve',
+    headers: { ...remote, origin: 'https://scout-host.example.ts.net' },
+    body: JSON.stringify({ analysisToken: '0'.repeat(64), confirmed: false }),
+  });
+  assert.equal(backupResolution.status, 409);
+  assert.match(JSON.parse(backupResolution.text).error, /Confirm/);
   const localOnly = await request({ method: 'POST', path: '/api/remote-access/disable', headers: { ...remote, origin: 'https://scout-host.example.ts.net' }, body: '{}' });
   assert.equal(localOnly.status, 403);
   assert.match(JSON.parse(localOnly.text).error, /only be changed on the Scout host/);
@@ -228,6 +236,25 @@ test('remote owner mutations require HTTPS Origin and administration remains loc
   assert.match(JSON.parse(rotatePassphrase.text).error, /only be changed on the Scout host/);
   const remoteUpdate = await request({ method: 'POST', path: '/api/update/download', headers: { ...remote, origin: 'https://scout-host.example.ts.net' }, body: '{}' });
   assert.equal(remoteUpdate.status, 403);
+});
+
+test('backup divergence confirmation cannot acquire authority while a scan owns the fence', async () => {
+  const active = acquireScanLease(testWorkspace, currentLeaseOwner(), {
+    kind: 'scan', runId: 'active-scan-during-backup-resolution',
+  });
+  assert.ok(active);
+  try {
+    const response = await request({
+      method: 'POST',
+      path: '/api/sync/resolve',
+      headers: JSON_HEADERS(),
+      body: JSON.stringify({ analysisToken: '1'.repeat(64), confirmed: true }),
+    });
+    assert.equal(response.status, 409);
+    assert.match(JSON.parse(response.text).error, /scan or workspace mutation is in progress/i);
+  } finally {
+    releaseScanLease(active);
+  }
 });
 
 test('local device settings keep update downloads explicitly opt-in', async () => {

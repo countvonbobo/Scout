@@ -1293,7 +1293,21 @@ const Setup = {
       pending: 'Backup pending', 'needs-attention': 'Needs attention', disabled: 'Not enabled', 'setup-required': 'Git setup required',
     };
     if (this.pendingRecoveryKey) return `<section class="setup-callout recovery-key-panel" role="status" aria-labelledby="recovery-key-title"><strong id="recovery-key-title">Save your emergency recovery key</strong><p>This key can restore Scout if you forget the passphrase. It will disappear after you confirm it is saved.</p><code id="setup-recovery-key" class="recovery-key" tabindex="0">${this.escape(this.pendingRecoveryKey)}</code><p><button id="setup-copy-recovery" class="act" type="button">Copy key</button> <button id="setup-save-recovery" class="act" type="button">Save key to file</button></p><label class="setup-field"><span><input id="setup-confirm-recovery" type="checkbox"> I saved the recovery key somewhere secure</span></label><p><button id="setup-finish-recovery" class="act primary" type="button">Finish backup setup</button></p></section>`;
-    if (sync.enabled) return `<div class="setup-callout"><strong>Private backup: Connected</strong><p>Status: ${this.escape(labels[sync.state] || sync.state)}. Your private GitHub repository is connected. Automatic backup can be turned off without deleting local work or GitHub history.</p><p class="meta">Last successful backup: ${this.escape(sync.lastSuccessfulAt ? formatLocalDateTime(sync.lastSuccessfulAt, this.status?.config?.locale) : 'pending')}</p>${sync.error ? `<details><summary>Technical details</summary><pre class="setup-preview">${this.escape(sync.error)}</pre></details>` : ''}<p><button id="setup-backup-now" class="act" type="button">Back up now</button> ${['offline', 'pending', 'needs-attention'].includes(sync.state) ? '<button id="setup-retry-backup" class="act" type="button">Retry</button> ' : ''}<button id="setup-disable-backup" class="act" type="button">Turn off automatic backup</button></p></div>`;
+    if (sync.enabled) {
+      const resolution = sync.resolution;
+      const list = (items) => (items || []).length
+        ? items.map((item) => this.escape(item)).join(', ')
+        : 'none';
+      const divergence = sync.conflict ? `<section class="backup-divergence" role="status">
+        <p><strong>This Scout host and GitHub both have new backup history.</strong> Both copies are preserved. This host is ${this.escape(sync.ahead ?? resolution?.ahead ?? '?')} commit(s) ahead and ${this.escape(sync.behind ?? resolution?.behind ?? '?')} behind GitHub.</p>
+        ${resolution ? `<p class="meta">This host changed: ${list(resolution.localAreas)}.<br>GitHub changed: ${list(resolution.remoteAreas)}.</p>` : ''}
+        ${resolution?.classification === 'disjoint-safe'
+          ? '<p>Scout verified that the two histories changed separate areas. It can create recovery references, preserve both histories in a normal merge, and sync the result.</p><p><button id="setup-resolve-backup" class="act primary" type="button">Preserve both and sync</button></p>'
+          : `<p class="bad">Scout cannot safely resolve this automatically${resolution?.reason ? `: ${this.escape(resolution.reason)}` : ''}. Preserve both copies and review the Git history manually. Do not reset, rebase, force-push, delete <code>.git</code>, or remove Scout recovery data.</p>`}
+        <p class="meta">Retry alone cannot resolve divergent history.</p>
+      </section>` : '';
+      return `<div class="setup-callout"><strong>Private backup: Connected</strong><p>Status: ${this.escape(labels[sync.state] || sync.state)}. Your private GitHub repository is connected. Automatic backup can be turned off without deleting local work or GitHub history.</p><p class="meta">Last successful backup: ${this.escape(sync.lastSuccessfulAt ? formatLocalDateTime(sync.lastSuccessfulAt, this.status?.config?.locale) : 'pending')}</p>${divergence}${sync.error ? `<details><summary>Technical details</summary><pre class="setup-preview">${this.escape(sync.error)}</pre></details>` : ''}<p><button id="setup-backup-now" class="act" type="button">Back up now</button> ${['offline', 'pending', 'needs-attention'].includes(sync.state) ? '<button id="setup-retry-backup" class="act" type="button">Retry</button> ' : ''}<button id="setup-disable-backup" class="act" type="button">Turn off automatic backup</button></p></div>`;
+    }
     return `<div class="setup-callout"><strong>Private backup: Not set up (optional)</strong><p>Scout works fully on this computer without GitHub. Viewing this guide does not enable backup. A private repository lets you restore on another computer. Tracked career files are readable in that private repository; credentials, generated documents and chat transcripts are encrypted.</p><p><button id="setup-show-backup" class="act" type="button">Set up private backup</button> <button id="setup-skip-backup" class="act" type="button">Not now</button></p><div id="setup-backup-form" class="hidden"><p>${gitReady ? 'Git is ready. Desktop HTTPS uses Git Credential Manager; an unattended VPS can use a repository-scoped SSH deploy key.' : 'Install Git before connecting a private repository.'}</p>${gitReady ? '' : '<p><a href="https://git-scm.com/downloads" target="_blank" rel="noreferrer">Install Git</a> <button id="setup-backup-check-git" class="act" type="button">Check again</button></p>'}<p>Use an empty repository named <code>scout-workspace</code> and select <strong>Private</strong>. For VPS SSH, prepare the key here, add the displayed public key to that repository as a write-enabled deploy key, then connect using its SSH URL.</p><p><button id="setup-prepare-deploy-key" class="act" type="button" ${gitReady ? '' : 'disabled'}>Prepare VPS deploy key</button></p><pre id="setup-deploy-public-key" class="setup-preview hidden"></pre><label class="setup-field">Repository HTTPS or SSH URL<input id="setup-backup-url" type="text" placeholder="git@github.com:your-name/scout-workspace.git"></label><label class="setup-field">Recovery passphrase (at least 12 characters)<input id="setup-backup-passphrase" type="password" autocomplete="new-password"></label><label class="setup-field"><span><input id="setup-backup-confirm" type="checkbox"> I understand tracked career files are readable in my private repository and I will save the emergency recovery key.</span></label><p><button id="setup-connect-backup" class="act primary" type="button" ${gitReady ? '' : 'disabled'}>Connect and create first backup</button></p></div></div>`;
   },
 
@@ -1316,6 +1330,7 @@ const Setup = {
     this.el('setup-connect-backup')?.addEventListener('click', () => this.connectBackup());
     this.el('setup-backup-now')?.addEventListener('click', () => this.backupNow());
     this.el('setup-retry-backup')?.addEventListener('click', () => this.retryBackup());
+    this.el('setup-resolve-backup')?.addEventListener('click', () => this.resolveBackup());
     this.el('setup-disable-backup')?.addEventListener('click', () => this.disableBackup());
     this.el('setup-copy-recovery')?.addEventListener('click', () => this.copyRecoveryKey());
     this.el('setup-save-recovery')?.addEventListener('click', () => this.saveRecoveryKey());
@@ -1399,6 +1414,34 @@ const Setup = {
       await this.refreshStatus({ keepOpen: true }); this.render();
       this.setMessage(result.state === 'synced' ? 'Backup is synced.' : 'Scout still needs attention. Your work remains saved locally.', result.state === 'synced' ? 'good' : 'error');
     } catch (error) { this.setMessage(error.message, 'error'); }
+  },
+
+  async resolveBackup() {
+    const resolution = this.status?.sync?.resolution;
+    if (resolution?.classification !== 'disjoint-safe' || !resolution.analysisToken) {
+      return this.setMessage('Refresh Backup details before resolving this history.', 'error');
+    }
+    if (!window.confirm('Preserve both the Scout host and GitHub histories, create recovery references, and sync the merged result?')) return;
+    this.setMessage('Preserving both backup histories and syncing the result…');
+    try {
+      const result = await requestJson('/api/sync/resolve', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ analysisToken: resolution.analysisToken, confirmed: true }),
+      });
+      await this.refreshStatus({ keepOpen: true });
+      this.render();
+      this.setMessage(
+        result.state === 'synced'
+          ? 'Both histories were preserved and the backup is synced.'
+          : 'Both histories remain preserved, but the GitHub backup is still pending.',
+        result.state === 'synced' ? 'good' : 'error',
+      );
+    } catch (error) {
+      await this.refreshStatus({ keepOpen: true });
+      this.render();
+      this.setMessage(error.message, 'error');
+    }
   },
 
   async disableBackup() {

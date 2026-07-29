@@ -67,6 +67,14 @@ The maintained beta deployment uses one private, single-owner Ubuntu VPS:
   stops for review on conflicting or unverifiable state. Backup starts only
   after that receipt; a backup failure does not erase the successful scan.
 - Normal tracked career files remain readable only inside the private repository; ignored sensitive recovery state is encrypted under `.scout-backup/v1`.
+- Backup divergence is automatic only for a clean, fetched, disjoint pair of
+  ordinary additions or modifications. Confirmation is bound to the branch
+  and both analysed tips. Resolution owns the fenced lease and shared mutation
+  coordinator, revalidates the tips, creates local and remote recovery refs,
+  and performs a normal `--no-ff` merge. It never resets, rebases or
+  force-pushes. Merge failure preserves both refs; push failure preserves the
+  local merge as pending. Public status exposes only counts and sanitised
+  affected areas.
 
 Do not assume a developer computer's local application checkout or workspace is live. Diagnose the VPS for production-like bugs unless the user explicitly reports a local-only installation.
 

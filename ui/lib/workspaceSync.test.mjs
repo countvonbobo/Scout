@@ -5,13 +5,18 @@ import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import {
-  adoptExistingWorkspaceFromGithub, confirmRecoveryKey, connectWorkspaceSync, disableWorkspaceSync, loadSyncSettings, pendingRecoveryKey,
-  queueWorkspaceSync, restoreWorkspaceFromGithub, runWorkspaceSync, saveSyncSettings, syncStatus, validateGithubUrl,
+  adoptExistingWorkspaceFromGithub, analyseBackupDivergence, confirmRecoveryKey, connectWorkspaceSync,
+  disableWorkspaceSync, loadSyncSettings, pendingRecoveryKey, queueWorkspaceSync, resolveBackupDivergence,
+  restoreWorkspaceFromGithub, runWorkspaceSync, saveSyncSettings, syncStatus, validateGithubUrl,
   verifyPrivateGithubRemote,
 } from './workspaceSync.mjs';
 import { initializeRecoveryBackup } from './recoveryBackup.mjs';
 import { mutateTrackerSnapshot } from './trackerPersistence.mjs';
 import { serializeTracker } from './tracker.mjs';
+import { withMutationCoordinator } from './mutationCoordinator.mjs';
+import {
+  acquireScanLease, currentLeaseOwner, releaseScanLease,
+} from './scanLease.mjs';
 
 const EXAMPLE_ENV = ['SECRET', 'example'].join('=') + '\n';
 const CHANGED_ENV = ['SECRET', 'dummy'].join('=') + '\n';
@@ -36,6 +41,37 @@ function fixture() {
 }
 
 const fakeCapabilities = (spawn) => ({ spawn });
+
+async function pairedFixture() {
+  const f = fixture();
+  const spawnAdapter = (command, args, options) => {
+    if (args[0] === 'credential-manager') return { status: 0, stdout: 'test-gcm', stderr: '' };
+    return spawnSync(command, args, options);
+  };
+  const connected = await connectWorkspaceSync(f.root, {
+    remoteUrl: 'https://github.com/example/repo', passphrase: 'correct horse battery staple',
+  }, { verifyRemote: async () => ({ url: f.remote, empty: true }), spawn: spawnAdapter });
+  const deviceTwo = path.join(f.base, 'device-two');
+  await restoreWorkspaceFromGithub({
+    remoteUrl: 'https://github.com/example/repo', targetRoot: deviceTwo, secret: connected.recoveryKey,
+  }, { verifyRemote: async () => ({ url: f.remote, empty: false }), spawn: spawnAdapter });
+  return { ...f, spawn: spawnAdapter, deviceTwo };
+}
+
+async function disjointDivergence(pair) {
+  fs.writeFileSync(path.join(pair.root, 'data', 'remote-change.json'), '{}\n');
+  await runWorkspaceSync(pair.root, 'remote change', { spawn: pair.spawn });
+  fs.writeFileSync(path.join(pair.deviceTwo, 'data', 'local-change.json'), '{}\n');
+  return runWorkspaceSync(pair.deviceTwo, 'local change', { spawn: pair.spawn });
+}
+
+function backupLease(root, runId = 'backup-resolution-test') {
+  const lease = acquireScanLease(root, currentLeaseOwner(), {
+    kind: 'backup-divergence', runId, phase: 'resolve',
+  });
+  assert.ok(lease);
+  return lease;
+}
 
 test('GitHub repository URLs reject credentials and non-GitHub remotes', () => {
   assert.equal(validateGithubUrl('https://github.com/example/scout-workspace').url, 'https://github.com/example/scout-workspace.git');
@@ -548,6 +584,210 @@ test('two devices fast-forward safely and divergence never resets, rebases, or f
   assert.equal(fs.existsSync(path.join(deviceTwo, 'data', 'remote-change.json')), false);
   assert.equal(calls.some((args) => args.includes('rebase') || args.includes('reset') || args.some((arg) => /^--force/.test(arg))), false);
   fs.rmSync(f.base, { recursive: true, force: true });
+});
+
+test('disjoint additions and modifications produce a tip-bound sanitised confirmation', async () => {
+  const f = await pairedFixture();
+  try {
+    fs.mkdirSync(path.join(f.root, 'profile'), { recursive: true });
+    fs.writeFileSync(path.join(f.root, 'profile', 'context.md'), 'baseline profile\n');
+    await runWorkspaceSync(f.root, 'shared profile baseline', { spawn: f.spawn });
+    await runWorkspaceSync(f.deviceTwo, 'receive profile baseline', { spawn: f.spawn });
+
+    fs.writeFileSync(path.join(f.root, 'profile', 'context.md'), 'remote profile modification\n');
+    await runWorkspaceSync(f.root, 'remote profile change', { spawn: f.spawn });
+    fs.writeFileSync(
+      path.join(f.deviceTwo, 'data', 'opportunities.json'),
+      '{"opportunities":[],"localModification":true}\n',
+    );
+    const diverged = await runWorkspaceSync(f.deviceTwo, 'local tracker modification', { spawn: f.spawn });
+
+    assert.equal(diverged.resolution.classification, 'disjoint-safe');
+    assert.equal(diverged.resolution.canResolve, true);
+    assert.deepEqual(diverged.resolution.localAreas, ['opportunity tracker']);
+    assert.deepEqual(diverged.resolution.remoteAreas, ['profile and preferences']);
+    assert.match(diverged.resolution.analysisToken, /^[a-f0-9]{64}$/);
+    assert.deepEqual(
+      Object.keys(diverged.resolution).sort(),
+      ['ahead', 'analysisToken', 'behind', 'canResolve', 'classification', 'localAreas', 'reason', 'remoteAreas'].sort(),
+    );
+    assert.doesNotMatch(JSON.stringify(diverged.resolution), /context\.md|opportunities\.json|refs\//i);
+  } finally {
+    fs.rmSync(f.base, { recursive: true, force: true });
+  }
+});
+
+test('overlap, rename, deletion, dirty tracked and unsafe untracked state fail closed', async () => {
+  const overlap = await pairedFixture();
+  try {
+    fs.writeFileSync(path.join(overlap.root, 'workspace.json'), '{"schemaVersion":1,"from":"remote"}\n');
+    await runWorkspaceSync(overlap.root, 'remote overlap', { spawn: overlap.spawn });
+    fs.writeFileSync(path.join(overlap.deviceTwo, 'workspace.json'), '{"schemaVersion":1,"from":"local"}\n');
+    await runWorkspaceSync(overlap.deviceTwo, 'local overlap', { spawn: overlap.spawn });
+    const analysis = analyseBackupDivergence(overlap.deviceTwo, { spawn: overlap.spawn });
+    assert.equal(analysis.classification, 'overlapping');
+    assert.equal(analysis.canResolve, false);
+    assert.deepEqual(analysis.localAreas, ['workspace settings']);
+    assert.deepEqual(analysis.remoteAreas, ['workspace settings']);
+    assert.doesNotMatch(JSON.stringify(analysis), /workspace\.json/);
+  } finally {
+    fs.rmSync(overlap.base, { recursive: true, force: true });
+  }
+
+  for (const change of ['rename', 'delete']) {
+    const f = await pairedFixture();
+    try {
+      fs.writeFileSync(path.join(f.root, 'data', 'remote-change.json'), '{}\n');
+      await runWorkspaceSync(f.root, 'remote change', { spawn: f.spawn });
+      if (change === 'rename') {
+        fs.renameSync(path.join(f.deviceTwo, 'workspace.json'), path.join(f.deviceTwo, 'workspace-renamed.json'));
+      } else {
+        fs.rmSync(path.join(f.deviceTwo, 'workspace.json'));
+      }
+      await runWorkspaceSync(f.deviceTwo, `local ${change}`, { spawn: f.spawn });
+      const analysis = analyseBackupDivergence(f.deviceTwo, { spawn: f.spawn });
+      assert.equal(analysis.classification, 'manual-required');
+      assert.match(analysis.reason, /renamed, deleted|non-standard/i);
+    } finally {
+      fs.rmSync(f.base, { recursive: true, force: true });
+    }
+  }
+
+  const dirty = await pairedFixture();
+  try {
+    await disjointDivergence(dirty);
+    fs.appendFileSync(path.join(dirty.deviceTwo, 'workspace.json'), ' ');
+    assert.match(analyseBackupDivergence(dirty.deviceTwo, { spawn: dirty.spawn }).reason, /uncommitted/);
+    git(dirty.deviceTwo, 'restore', 'workspace.json');
+    fs.writeFileSync(path.join(dirty.deviceTwo, 'review-me.txt'), 'untracked\n');
+    assert.match(analyseBackupDivergence(dirty.deviceTwo, { spawn: dirty.spawn }).reason, /untracked/);
+  } finally {
+    fs.rmSync(dirty.base, { recursive: true, force: true });
+  }
+});
+
+test('resolution refetches, rejects stale tips and creates both recovery refs before a no-ff merge', async () => {
+  const f = await pairedFixture();
+  const calls = [];
+  const spawnAdapter = (command, args, options) => {
+    calls.push([...args]);
+    return f.spawn(command, args, options);
+  };
+  let lease;
+  try {
+    const diverged = await disjointDivergence(f);
+    lease = backupLease(f.deviceTwo);
+    await assert.rejects(
+      resolveBackupDivergence(f.deviceTwo, '0'.repeat(64), lease, { spawn: spawnAdapter }),
+      /history changed/i,
+    );
+    assert.equal(git(f.deviceTwo, 'for-each-ref', '--format=%(refname)', 'refs/scout-recovery'), '');
+
+    const resolved = await resolveBackupDivergence(
+      f.deviceTwo,
+      diverged.resolution.analysisToken,
+      lease,
+      { spawn: spawnAdapter },
+    );
+    assert.equal(resolved.state, 'synced');
+    assert.equal(resolved.resolved, true);
+    assert.equal(resolved.recoveryRefsCreated, true);
+    assert.equal(fs.existsSync(path.join(f.deviceTwo, 'data', 'local-change.json')), true);
+    assert.equal(fs.existsSync(path.join(f.deviceTwo, 'data', 'remote-change.json')), true);
+    assert.equal(git(f.deviceTwo, 'rev-list', '--left-right', '--count', 'HEAD...@{u}'), '0\t0');
+    assert.equal(
+      git(f.deviceTwo, 'for-each-ref', '--format=%(refname)', 'refs/scout-recovery').split('\n').length,
+      2,
+    );
+    assert.equal(calls.some((args) => args[0] === 'fetch'), true);
+    assert.equal(calls.some((args) => args[0] === 'merge' && args.includes('--no-ff')), true);
+    assert.equal(
+      calls.some((args) => args.includes('reset') || args.includes('rebase')
+        || args.some((arg) => /^--force/.test(arg))),
+      false,
+    );
+  } finally {
+    if (lease) releaseScanLease(lease);
+    fs.rmSync(f.base, { recursive: true, force: true });
+  }
+});
+
+test('merge failure keeps both tips and refs while push failure keeps a pending local merge', async () => {
+  const mergeFailure = await pairedFixture();
+  let lease;
+  try {
+    const divergence = await disjointDivergence(mergeFailure);
+    const localBefore = git(mergeFailure.deviceTwo, 'rev-parse', 'HEAD');
+    const remoteBefore = git(mergeFailure.deviceTwo, 'rev-parse', '@{u}');
+    lease = backupLease(mergeFailure.deviceTwo, 'backup-merge-failure');
+    const result = await resolveBackupDivergence(
+      mergeFailure.deviceTwo,
+      divergence.resolution.analysisToken,
+      lease,
+      {
+        spawn: (command, args, options) => (
+          args[0] === 'merge' && args.includes('--no-ff')
+            ? { status: 1, stdout: '', stderr: 'synthetic merge failure' }
+            : mergeFailure.spawn(command, args, options)
+        ),
+      },
+    );
+    assert.equal(result.state, 'needs-attention');
+    assert.equal(git(mergeFailure.deviceTwo, 'rev-parse', 'HEAD'), localBefore);
+    assert.equal(git(mergeFailure.deviceTwo, 'rev-parse', '@{u}'), remoteBefore);
+    assert.equal(
+      git(mergeFailure.deviceTwo, 'for-each-ref', '--format=%(refname)', 'refs/scout-recovery').split('\n').length,
+      2,
+    );
+  } finally {
+    if (lease) releaseScanLease(lease);
+    fs.rmSync(mergeFailure.base, { recursive: true, force: true });
+  }
+
+  const pushFailure = await pairedFixture();
+  lease = null;
+  try {
+    const divergence = await disjointDivergence(pushFailure);
+    lease = backupLease(pushFailure.deviceTwo, 'backup-push-failure');
+    const result = await resolveBackupDivergence(
+      pushFailure.deviceTwo,
+      divergence.resolution.analysisToken,
+      lease,
+      {
+        spawn: (command, args, options) => (
+          args[0] === 'push'
+            ? { status: 1, stdout: '', stderr: 'synthetic offline push' }
+            : pushFailure.spawn(command, args, options)
+        ),
+      },
+    );
+    assert.equal(result.state, 'offline');
+    assert.equal(result.pending, true);
+    assert.equal(fs.existsSync(path.join(pushFailure.deviceTwo, 'data', 'local-change.json')), true);
+    assert.equal(fs.existsSync(path.join(pushFailure.deviceTwo, 'data', 'remote-change.json')), true);
+    assert.equal(Number(git(pushFailure.deviceTwo, 'rev-list', '--left-right', '--count', 'HEAD...@{u}').split('\t')[0]) > 0, true);
+  } finally {
+    if (lease) releaseScanLease(lease);
+    fs.rmSync(pushFailure.base, { recursive: true, force: true });
+  }
+});
+
+test('backup divergence resolution cannot overlap a tracker or report mutation', async () => {
+  const f = await pairedFixture();
+  let lease;
+  try {
+    const divergence = await disjointDivergence(f);
+    lease = backupLease(f.deviceTwo, 'backup-coordinator-race');
+    await withMutationCoordinator(f.deviceTwo, lease, async () => {
+      await assert.rejects(
+        resolveBackupDivergence(f.deviceTwo, divergence.resolution.analysisToken, lease, { spawn: f.spawn }),
+        /another workspace mutation is in progress/i,
+      );
+    });
+  } finally {
+    if (lease) releaseScanLease(lease);
+    fs.rmSync(f.base, { recursive: true, force: true });
+  }
 });
 
 test('offline sync keeps a local commit pending', async () => {

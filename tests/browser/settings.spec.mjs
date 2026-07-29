@@ -145,6 +145,50 @@ test('backup status opens dedicated details and advanced backup settings', async
   await expect(sync).toBeFocused();
 });
 
+test('safe backup divergence requires confirmation and submits only the analysis token', async ({ page }) => {
+  const analysisToken = 'a'.repeat(64);
+  await page.unroute('**/api/setup/status');
+  await page.route('**/api/setup/status', (route) => route.fulfill({
+    contentType: 'application/json',
+    body: JSON.stringify({
+      ...establishedStatus,
+      sync: {
+        state: 'needs-attention',
+        enabled: true,
+        conflict: true,
+        ahead: 2,
+        behind: 1,
+        resolution: {
+          classification: 'disjoint-safe',
+          canResolve: true,
+          analysisToken,
+          localAreas: ['opportunity tracker'],
+          remoteAreas: ['reports'],
+        },
+      },
+    }),
+  }));
+  let submitted;
+  await page.route('**/api/sync/resolve', async (route) => {
+    submitted = route.request().postDataJSON();
+    await route.fulfill({
+      contentType: 'application/json',
+      body: JSON.stringify({ state: 'synced', resolved: true, recoveryRefsCreated: true }),
+    });
+  });
+  await page.reload();
+  await page.locator('#sync-status').click();
+  const dialog = page.getByRole('dialog');
+  await dialog.getByRole('button', { name: 'Advanced backup settings' }).click();
+  await expect(dialog.getByText(/Scout host and GitHub both have new backup history/)).toBeVisible();
+  await expect(dialog.getByText(/opportunity tracker/)).toBeVisible();
+  await expect(dialog.getByText(/reports/)).toBeVisible();
+  page.once('dialog', (confirmation) => confirmation.accept());
+  await dialog.getByRole('button', { name: 'Preserve both and sync' }).click();
+  await expect.poll(() => submitted).toEqual({ analysisToken, confirmed: true });
+  expect(JSON.stringify(submitted)).not.toMatch(/opportunit|reports|refs\/|workspace/i);
+});
+
 test('scan settings offer only the selected provider until verification is requested', async ({ page }) => {
   await page.getByRole('button', { name: 'Settings' }).click();
   const dialog = page.getByRole('dialog');
