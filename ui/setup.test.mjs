@@ -111,6 +111,18 @@ test('provider login panel exposes only accessible state-specific guided actions
     reasonCode: 'credentials-expired',
   });
   assert.match(expired, /Clear expired Claude sign-in/);
+  assert.match(expired, /data-session-id="synthetic-session"/);
+
+  const pending = providerLoginPanelHtml('claude', {
+    installed: true, authenticated: false,
+  }, {
+    provider: 'claude',
+    sessionId: 'synthetic-session',
+    state: 'failed',
+    codeRequired: false,
+    reasonCode: 'credentials-expired',
+  }, true);
+  assert.match(pending, /disabled aria-disabled="true"/);
 
   const succeeded = providerLoginPanelHtml('codex', {
     installed: true, authenticated: false,

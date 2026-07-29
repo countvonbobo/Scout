@@ -71,6 +71,18 @@ test('output byte and individual-line limits stop the provider turn', async () =
   assert.match(result.error, /safe output limit/);
 });
 
+test('stop escalates a stubborn provider process group to forced closure', async () => {
+  const turn = fakeTurn('STUBBORN');
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  turn.stop();
+  const result = await Promise.race([
+    turn.finished,
+    new Promise((resolve) => setTimeout(() => resolve('still-running'), 2_000)),
+  ]);
+  assert.notEqual(result, 'still-running');
+  assert.equal(result.stopped, true);
+});
+
 test('missing binary resolves with a not-found error', async () => {
   const r = await runTurn({
     command: 'definitely-not-a-real-cli-xyz',

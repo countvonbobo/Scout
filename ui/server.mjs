@@ -486,10 +486,20 @@ const runtimeProviderLoginManager = createProviderLoginManager({
   cwd: providerLoginWorkingDirectory,
   providerStatus: async (provider) => (await providerDetection.detect())[provider],
   confirmProviderHealth: confirmProviderLoginHealth,
-  canClearClaudeCredentials: async () => {
+  canClearClaudeCredentials: ({ status }) => {
     const current = readProviderHealth(WORKSPACE_ROOT, 'claude');
-    return current.state === 'sign-in-required'
-      && current.reasonCode === 'authentication-required';
+    if (current.state !== 'sign-in-required'
+      || current.reasonCode !== 'authentication-required') {
+      return Promise.resolve(false);
+    }
+    const confirmation = confirmProviderLoginHealth('claude', status);
+    const result = Promise.resolve(confirmation)
+      .then((signal) => signal.kind === 'remote-auth-failure');
+    Object.defineProperties(result, {
+      stop: { value: () => confirmation?.stop?.() },
+      closed: { value: confirmation?.closed || result.then(() => undefined) },
+    });
+    return result;
   },
   onHealthSignal: async (provider, signal) => providerPreflight(
     WORKSPACE_ROOT,
@@ -924,10 +934,6 @@ function parseBody(body) {
   try { return JSON.parse(body || '{}'); } catch { return null; }
 }
 
-const PROVIDER_LOGIN_TERMINAL_STATES = new Set([
-  'cancelled', 'expired', 'failed', 'succeeded',
-]);
-
 function exactJsonBody(body, keys) {
   const value = parseBody(body);
   if (!value || typeof value !== 'object' || Array.isArray(value)
@@ -967,7 +973,14 @@ function replyProviderLoginError(res, error) {
   if (code.includes('RATE_LIMIT')) {
     return replyJson(res, 429, { error: 'provider login rate limit reached; wait before retrying' });
   }
-  if (['LOGIN_ALREADY_ACTIVE', 'LOGIN_SESSION_TERMINAL', 'LOGIN_CODE_NOT_EXPECTED'].includes(code)) {
+  if ([
+    'CLAUDE_CREDENTIAL_CLEAR_NOT_ALLOWED',
+    'LOGIN_ALREADY_ACTIVE',
+    'LOGIN_CODE_NOT_EXPECTED',
+    'LOGIN_RETRY_NOT_ALLOWED',
+    'LOGIN_RETRY_REPLAYED',
+    'LOGIN_SESSION_TERMINAL',
+  ].includes(code)) {
     return replyJson(res, 409, { error: 'provider login state changed; refresh its status and retry' });
   }
   if (code === 'LOGIN_SHUTDOWN') {
@@ -1062,11 +1075,11 @@ routes['POST /api/provider-login/retry'] = async (req, res, body) => {
   }
   const owner = providerLoginOwnerContext(req, true);
   try {
-    const previous = providerLoginControl.manager.getProviderLoginSession(value.sessionId, owner);
-    if (previous.provider !== value.provider || !PROVIDER_LOGIN_TERMINAL_STATES.has(previous.state)) {
-      return replyJson(res, 409, { error: 'only a terminal provider login can be retried' });
-    }
-    const session = await providerLoginControl.manager.retryProviderLogin(value.provider, owner);
+    const session = await providerLoginControl.manager.retryProviderLogin(
+      value.provider,
+      value.sessionId,
+      owner,
+    );
     return replyJson(res, 202, { session });
   } catch (error) {
     return replyProviderLoginError(res, error);
@@ -1075,15 +1088,16 @@ routes['POST /api/provider-login/retry'] = async (req, res, body) => {
 
 routes['POST /api/provider-login/clear-claude-credentials'] = async (req, res, body) => {
   if (!requireProviderLoginCsrf(req, res)) return;
-  const value = exactJsonBody(body, ['confirmed']);
+  const value = exactJsonBody(body, ['confirmed', 'sessionId']);
   if (!value || value.confirmed !== true) {
     return replyJson(res, 409, { error: 'explicit confirmation is required' });
   }
   try {
     const result = await providerLoginControl.manager.clearClaudeCredentials(
+      value.sessionId,
       providerLoginOwnerContext(req, true),
     );
-    return replyJson(res, 200, { result });
+    return replyJson(res, result.state === 'cleared' ? 200 : 502, { result });
   } catch (error) {
     return replyProviderLoginError(res, error);
   }

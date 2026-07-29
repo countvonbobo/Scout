@@ -642,11 +642,148 @@ test('guided provider login supports code, failure, retry and cancel without bro
   for (const request of requests) {
     expect(request.csrf).toBe('csrf-claude-synthetic-000000000000');
   }
+  expect(requests.find(({ action }) => action === 'clear-claude-credentials').body)
+    .toEqual({
+      confirmed: true,
+      sessionId: '00000000-0000-4000-8000-000000000002',
+    });
   const stored = await page.evaluate(() => ({
     local: Object.entries(localStorage),
     session: Object.entries(sessionStorage),
   }));
   expect(JSON.stringify(stored)).not.toContain('PRIVATE-CODE');
+});
+
+test('guided login preserves failed logout state and reports no false success', async ({ page }) => {
+  await page.unroute('**/api/setup/status');
+  await page.route('**/api/setup/status', (route) => route.fulfill({
+    contentType: 'application/json',
+    body: JSON.stringify({
+      ...establishedStatus,
+      providers: {
+        ...establishedStatus.providers,
+        claude: {
+          installed: true,
+          authenticated: false,
+          capabilities: { structuredOutput: true },
+        },
+      },
+    }),
+  }));
+  let session = {
+    codeRequired: false,
+    createdAt: '2026-07-29T10:00:00.000Z',
+    expiresAt: '2026-07-29T10:10:00.000Z',
+    provider: 'claude',
+    reasonCode: 'credentials-expired',
+    sessionId: '00000000-0000-4000-8000-000000000003',
+    state: 'failed',
+    userCode: null,
+    verificationUrl: null,
+  };
+  await page.route('**/api/provider-login/**', async (route) => {
+    const action = new URL(route.request().url()).pathname.split('/').at(-1);
+    if (action === 'status') {
+      return route.fulfill({
+        contentType: 'application/json',
+        body: JSON.stringify({
+          provider: 'claude',
+          session,
+          csrfToken: 'csrf-claude-synthetic-000000000000',
+        }),
+      });
+    }
+    session = { ...session, reasonCode: 'logout-failed' };
+    return route.fulfill({
+      status: 502,
+      contentType: 'application/json',
+      body: JSON.stringify({
+        result: { provider: 'claude', reasonCode: 'logout-failed', state: 'failed' },
+      }),
+    });
+  });
+  await page.getByRole('button', { name: 'Settings' }).click();
+  const dialog = page.getByRole('dialog');
+  await dialog.getByRole('button', { name: 'AI providers' }).click();
+  page.once('dialog', (confirmation) => confirmation.accept());
+  await dialog.getByRole('button', { name: 'Clear expired Claude sign-in' }).click();
+  await expect(dialog.getByRole('button', { name: 'Retry Claude sign-in' })).toBeVisible();
+  await expect(dialog.getByRole('button', { name: 'Sign in to Claude with Scout' })).toHaveCount(0);
+  await expect(page.locator('#setup-status')).not.toContainText('sign-in cleared');
+});
+
+test('guided login ignores stale polls and suppresses duplicate mutations', async ({ page }) => {
+  await page.unroute('**/api/setup/status');
+  await page.route('**/api/setup/status', (route) => route.fulfill({
+    contentType: 'application/json',
+    body: JSON.stringify({
+      ...establishedStatus,
+      providers: {
+        ...establishedStatus.providers,
+        claude: {
+          installed: true,
+          authenticated: false,
+          capabilities: { structuredOutput: true },
+        },
+      },
+    }),
+  }));
+  let claudeStatusCount = 0;
+  let releaseStaleStatus;
+  const staleStatus = new Promise((resolve) => { releaseStaleStatus = resolve; });
+  let starts = 0;
+  const active = {
+    codeRequired: false,
+    createdAt: '2026-07-29T10:00:00.000Z',
+    expiresAt: '2026-07-29T10:10:00.000Z',
+    provider: 'claude',
+    reasonCode: null,
+    sessionId: '00000000-0000-4000-8000-000000000004',
+    state: 'starting',
+    userCode: null,
+    verificationUrl: null,
+  };
+  await page.route('**/api/provider-login/**', async (route) => {
+    const request = route.request();
+    const url = new URL(request.url());
+    const action = url.pathname.split('/').at(-1);
+    if (action === 'status') {
+      const provider = url.searchParams.get('provider');
+      if (provider === 'claude') {
+        claudeStatusCount += 1;
+        if (claudeStatusCount === 2) await staleStatus;
+      }
+      return route.fulfill({
+        contentType: 'application/json',
+        body: JSON.stringify({
+          provider,
+          session: null,
+          csrfToken: `csrf-${provider}-synthetic-000000000000`,
+        }),
+      });
+    }
+    if (action === 'start') starts += 1;
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    return route.fulfill({
+      status: 202,
+      contentType: 'application/json',
+      body: JSON.stringify({ session: active }),
+    });
+  });
+  await page.getByRole('button', { name: 'Settings' }).click();
+  const dialog = page.getByRole('dialog');
+  await dialog.getByRole('button', { name: 'AI providers' }).click();
+  await page.evaluate(() => { void window.ScoutSetup.refreshProviderLogin('claude'); });
+  const start = dialog.getByRole('button', { name: 'Sign in to Claude with Scout' });
+  await start.evaluate((button) => {
+    button.click();
+    button.click();
+  });
+  await expect(dialog.getByRole('button', { name: 'Cancel Claude sign-in' })).toBeVisible();
+  releaseStaleStatus();
+  await expect.poll(() => claudeStatusCount).toBeGreaterThanOrEqual(2);
+  await expect(dialog.getByRole('button', { name: 'Cancel Claude sign-in' })).toBeVisible();
+  expect(starts).toBe(1);
 });
 
 test('phone All view reaches its rightmost column and keeps strong-match controls on screen', async ({ page }) => {

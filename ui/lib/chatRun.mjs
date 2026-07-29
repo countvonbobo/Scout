@@ -3,7 +3,7 @@ import path from 'node:path';
 import readline from 'node:readline';
 import { commandInvocation } from './providers.mjs';
 
-function killTree(child) {
+function killTree(child, { force = false } = {}) {
   if (process.platform === 'win32') {
     // taskkill is the only built-in way to reliably stop a shell-launched CLI
     // and its descendants, but managed Windows environments can deny it even
@@ -23,7 +23,16 @@ function killTree(child) {
     killer.once('close', (code) => { if (code !== 0) fallback(); });
     setTimeout(fallback, 1000).unref();
   } else {
-    child.kill();
+    const signal = force ? 'SIGKILL' : 'SIGTERM';
+    try {
+      if (Number.isSafeInteger(child?.pid) && child.pid > 0) {
+        process.kill(-child.pid, signal);
+      } else {
+        child.kill(signal);
+      }
+    } catch {
+      try { child.kill(signal); } catch { /* it may already have exited */ }
+    }
   }
 }
 
@@ -53,6 +62,7 @@ export function runTurn({
   let stopped = false;
   let timedOut = false;
   let outputExceeded = false;
+  let terminationTimer = null;
   const finished = new Promise((resolve) => {
     const state = {
       sessionId: null,
@@ -71,10 +81,19 @@ export function runTurn({
       windowsHide: true,
       windowsVerbatimArguments: invocation.windowsVerbatimArguments,
       env,
+      detached: process.platform !== 'win32',
     });
-    const timer = setTimeout(() => { timedOut = true; killTree(child); }, timeoutMs);
+    const stopChild = () => {
+      killTree(child);
+      if (!terminationTimer && process.platform !== 'win32') {
+        terminationTimer = setTimeout(() => killTree(child, { force: true }), 750);
+        terminationTimer.unref?.();
+      }
+    };
+    const timer = setTimeout(() => { timedOut = true; stopChild(); }, timeoutMs);
     child.on('error', (err) => {
       clearTimeout(timer);
+      clearTimeout(terminationTimer);
       resolve({
         ok: false,
         error: err.code === 'ENOENT'
@@ -100,7 +119,7 @@ export function runTurn({
           || Buffer.byteLength(state.partial[stream], 'utf8') > maxLineBytes) {
         outputExceeded = true;
       }
-      if (outputExceeded) killTree(child);
+      if (outputExceeded) stopChild();
     };
     child.stdout.on('data', (chunk) => observeOutput('stdout', chunk));
     child.stderr.on('data', (chunk) => observeOutput('stderr', chunk));
@@ -125,6 +144,7 @@ export function runTurn({
     });
     child.on('close', (code) => {
       clearTimeout(timer);
+      clearTimeout(terminationTimer);
       const filesTouched = [...state.files];
       if (outputExceeded) {
         resolve({
@@ -161,6 +181,15 @@ export function runTurn({
   });
   return {
     finished,
-    stop: () => { stopped = true; if (child) killTree(child); },
+    stop: () => {
+      stopped = true;
+      if (child) {
+        killTree(child);
+        if (!terminationTimer && process.platform !== 'win32') {
+          terminationTimer = setTimeout(() => killTree(child, { force: true }), 750);
+          terminationTimer.unref?.();
+        }
+      }
+    },
   };
 }

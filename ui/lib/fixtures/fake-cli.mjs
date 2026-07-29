@@ -4,7 +4,7 @@ process.stdin.setEncoding('utf8');
 process.stdin.on('data', (c) => { input += c; });
 process.stdin.on('end', () => {
   const prompt = input.trim();
-  const command = ['FAIL', 'HANG', 'DONE_THEN_FAIL', 'OVER_OUTPUT'].find((value) =>
+  const command = ['FAIL', 'HANG', 'STUBBORN', 'DONE_THEN_FAIL', 'OVER_OUTPUT'].find((value) =>
     prompt === value || prompt.endsWith(`User request:\n${value}`));
   if (command === 'FAIL') {
     process.stderr.write('fake failure detail\n');
@@ -12,6 +12,11 @@ process.stdin.on('end', () => {
   }
   if (command === 'HANG') {
     // never emit a result; used for stop/timeout tests
+    setInterval(() => {}, 1000);
+    return;
+  }
+  if (command === 'STUBBORN') {
+    process.on('SIGTERM', () => {});
     setInterval(() => {}, 1000);
     return;
   }

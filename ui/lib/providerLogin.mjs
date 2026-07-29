@@ -317,9 +317,9 @@ export function createProviderLoginManager({
   const cancels = new Map();
   const retries = new Map();
   const clearingOwners = new Set();
-  const credentialClearEligible = new Set();
   const trackedChildren = new Set();
   const pendingClearSettlers = new Map();
+  const pendingClearAuthorizations = new Set();
   const pendingClearOperations = new Set();
   const pendingHealthWrites = new Set();
   let shuttingDown = false;
@@ -622,13 +622,6 @@ export function createProviderLoginManager({
     }
     const confirmed = signal.kind === 'remote-success'
       || signal.kind === 'local-credentials-present';
-    if (session.provider === 'claude') {
-      if (signal.kind === 'remote-auth-failure') {
-        credentialClearEligible.add(session.ownerId);
-      } else if (confirmed) {
-        credentialClearEligible.delete(session.ownerId);
-      }
-    }
     await terminal(
       session,
       confirmed ? 'succeeded' : 'failed',
@@ -741,6 +734,8 @@ export function createProviderLoginManager({
         buffers: { stdout: '', stderr: '' },
         codeSubmitted: false,
         codeAttempts: 0,
+        retryConsumed: false,
+        clearConsumed: false,
         timeout: null,
       };
       sessions.set(id, session);
@@ -773,8 +768,23 @@ export function createProviderLoginManager({
     return start(providerValue, ownerContext, 'start');
   }
 
-  async function retryProviderLogin(providerValue, ownerContext) {
-    return start(providerValue, ownerContext, 'retry');
+  async function retryProviderLogin(providerValue, previousSessionId, ownerContext) {
+    const provider = checkedProvider(providerValue);
+    const previous = sessionForOwner(previousSessionId, ownerContext);
+    if (previous.provider !== provider || !TERMINAL_STATES.has(previous.state)) {
+      throw createError(
+        'only a terminal provider login can be retried',
+        'LOGIN_RETRY_NOT_ALLOWED',
+      );
+    }
+    if (previous.retryConsumed) {
+      throw createError(
+        'provider login retry has already been used',
+        'LOGIN_RETRY_REPLAYED',
+      );
+    }
+    previous.retryConsumed = true;
+    return start(provider, ownerContext, 'retry');
   }
 
   async function submitProviderLoginCode(sessionIdValue, code, ownerContext) {
@@ -836,9 +846,20 @@ export function createProviderLoginManager({
     return publicSnapshot(session);
   }
 
-  async function performClearClaudeCredentials(ownerContext) {
+  async function performClearClaudeCredentials(sessionIdValue, ownerContext) {
     if (shuttingDown) throw createError('provider login manager is shutting down', 'LOGIN_SHUTDOWN');
     const ownerId = checkedOwner(ownerContext);
+    const sourceSession = sessionForOwner(sessionIdValue, ownerContext);
+    if (sourceSession.provider !== 'claude'
+      || sourceSession.state !== 'failed'
+      || sourceSession.reasonCode !== 'credentials-expired'
+      || Number(now()) > Date.parse(sourceSession.expiresAt)
+      || sourceSession.clearConsumed) {
+      throw createError(
+        'expired Claude credentials have not been confirmed',
+        'CLAUDE_CREDENTIAL_CLEAR_NOT_ALLOWED',
+      );
+    }
     const activeKey = ownerProviderKey(ownerId, 'claude');
     if (active.has(activeKey) || pendingStarts.has(activeKey) || clearingOwners.has(ownerId)) {
       throw createError('provider login is already active', 'LOGIN_ALREADY_ACTIVE');
@@ -851,6 +872,7 @@ export function createProviderLoginManager({
       'provider login start rate limit reached',
       'LOGIN_RATE_LIMIT',
     );
+    sourceSession.clearConsumed = true;
     clearingOwners.add(ownerId);
     const signalSession = {
       provider: 'claude',
@@ -859,29 +881,48 @@ export function createProviderLoginManager({
     };
     let clearRecord = null;
     try {
-      let eligible = credentialClearEligible.has(ownerId);
-      if (!eligible) {
-        try {
-          eligible = await canClearClaudeCredentials({
-            access: ownerContext.access,
-            ownerId,
-          }) === true;
-        } catch {
-          eligible = false;
-        }
-      }
-      if (!eligible) {
-        throw createError(
-          'expired Claude credentials have not been confirmed',
-          'CLAUDE_CREDENTIAL_CLEAR_NOT_ALLOWED',
-        );
-      }
       const status = await providerStatus('claude');
       if (shuttingDown) throw createError('provider login manager is shutting down', 'LOGIN_SHUTDOWN');
       const executable = checkedExecutable(status);
       const environment = minimalProviderEnvironment(
         status.env && typeof status.env === 'object' ? status.env : env,
       );
+      const healthStatus = {
+        installed: true,
+        authenticated: true,
+        capabilities: {
+          structuredOutput: status.capabilities?.structuredOutput !== false,
+        },
+      };
+      Object.defineProperties(healthStatus, {
+        executable: { value: executable },
+        env: { value: environment },
+      });
+      let authorization;
+      let eligible = false;
+      try {
+        authorization = canClearClaudeCredentials({
+          access: ownerContext.access,
+          ownerId,
+          sessionId: sourceSession.sessionId,
+          status: healthStatus,
+        });
+        pendingClearAuthorizations.add(authorization);
+        eligible = await authorization === true;
+        await Promise.resolve(authorization?.closed || authorization);
+      } catch {
+        eligible = false;
+      } finally {
+        pendingClearAuthorizations.delete(authorization);
+      }
+      if (shuttingDown) throw createError('provider login manager is shutting down', 'LOGIN_SHUTDOWN');
+      if (!eligible) {
+        sourceSession.reasonCode = 'credentials-no-longer-expired';
+        throw createError(
+          'expired Claude credentials are no longer confirmed',
+          'CLAUDE_CREDENTIAL_CLEAR_NOT_ALLOWED',
+        );
+      }
       const invocation = commandInvocation(executable, ['auth', 'logout'], {
         platform,
         env: environment,
@@ -955,13 +996,14 @@ export function createProviderLoginManager({
           ? { kind: 'local-signed-out', source: 'post-auth' }
           : { kind: 'provider-failure', source: 'post-auth' });
       } catch {
+        sourceSession.reasonCode = 'health-write-failed';
         return {
           provider: 'claude',
           reasonCode: 'health-write-failed',
           state: 'failed',
         };
       }
-      if (state === 'cleared') credentialClearEligible.delete(ownerId);
+      if (state !== 'cleared') sourceSession.reasonCode = reasonCode;
       return { provider: 'claude', reasonCode, state };
     } finally {
       if (!clearRecord || clearRecord.closed) {
@@ -972,8 +1014,8 @@ export function createProviderLoginManager({
     }
   }
 
-  function clearClaudeCredentials(ownerContext) {
-    const operation = performClearClaudeCredentials(ownerContext);
+  function clearClaudeCredentials(sessionIdValue, ownerContext) {
+    const operation = performClearClaudeCredentials(sessionIdValue, ownerContext);
     pendingClearOperations.add(operation);
     operation.finally(() => pendingClearOperations.delete(operation)).catch(() => {});
     return operation;
@@ -1017,6 +1059,16 @@ export function createProviderLoginManager({
     }
     for (const record of [...trackedChildren]) {
       cleanup.push(stopTrackedChild(record, deadlineAt));
+    }
+    for (const authorization of [...pendingClearAuthorizations]) {
+      try { authorization?.stop?.(); } catch {}
+      cleanup.push(Promise.race([
+        Promise.resolve(authorization?.closed || authorization).catch(() => {}),
+        new Promise((resolve) => {
+          const timer = setTimeout(resolve, Math.max(0, deadlineAt - Date.now()));
+          timer.unref?.();
+        }),
+      ]));
     }
     await Promise.all(cleanup);
     await Promise.all(

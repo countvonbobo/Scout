@@ -232,8 +232,8 @@ test('provider login routes require same-origin JSON, ephemeral CSRF and server-
       calls.push(['start', provider, owner]);
       return session;
     },
-    async retryProviderLogin(provider, owner) {
-      calls.push(['retry', provider, owner]);
+    async retryProviderLogin(provider, previousSessionId, owner) {
+      calls.push(['retry', provider, previousSessionId, owner]);
       return session;
     },
     getActiveProviderLogin(provider, owner) {
@@ -252,9 +252,11 @@ test('provider login routes require same-origin JSON, ephemeral CSRF and server-
       calls.push(['get', id, owner]);
       return { ...session, state: 'failed', reasonCode: 'login-failed' };
     },
-    async clearClaudeCredentials(owner) {
-      calls.push(['clear', owner]);
-      return { provider: 'claude', reasonCode: null, state: 'cleared' };
+    async clearClaudeCredentials(previousSessionId, owner) {
+      calls.push(['clear', previousSessionId, owner]);
+      return this.clearResult || {
+        provider: 'claude', reasonCode: null, state: 'cleared',
+      };
     },
     async shutdown() {},
   };
@@ -370,16 +372,29 @@ test('provider login routes require same-origin JSON, ephemeral CSRF and server-
       method: 'POST',
       path: '/api/provider-login/clear-claude-credentials',
       headers: csrfHeaders,
-      body: '{"confirmed":false}',
+      body: JSON.stringify({ confirmed: false, sessionId: session.sessionId }),
     });
     assert.equal(unconfirmedClear.status, 409);
     assert.equal(calls.some(([name]) => name === 'clear'), false);
+
+    providerLoginControl.manager.clearResult = {
+      provider: 'claude', reasonCode: 'logout-failed', state: 'failed',
+    };
+    const failedClear = await request({
+      method: 'POST',
+      path: '/api/provider-login/clear-claude-credentials',
+      headers: csrfHeaders,
+      body: JSON.stringify({ confirmed: true, sessionId: session.sessionId }),
+    });
+    assert.equal(failedClear.status, 502);
+    assert.equal(JSON.parse(failedClear.text).result.state, 'failed');
+    providerLoginControl.manager.clearResult = null;
 
     const cleared = await request({
       method: 'POST',
       path: '/api/provider-login/clear-claude-credentials',
       headers: csrfHeaders,
-      body: '{"confirmed":true}',
+      body: JSON.stringify({ confirmed: true, sessionId: session.sessionId }),
     });
     assert.equal(cleared.status, 200);
     assert.deepEqual(JSON.parse(cleared.text), {

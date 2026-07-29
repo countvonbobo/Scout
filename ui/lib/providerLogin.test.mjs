@@ -55,6 +55,7 @@ function harness({
   shutdownDeadlineMs,
   closeOnKill = true,
   childCount = 2,
+  now = Date.now,
   confirmProviderHealth = async () => ({ kind: 'remote-success', source: 'post-auth' }),
   onHealthSignal = async () => {},
   canClearClaudeCredentials = async () => true,
@@ -100,6 +101,7 @@ function harness({
       await onHealthSignal(name, signal);
     },
     cwd: '/fixed/scout',
+    now,
     timeoutMs,
     maxStarts,
     ...(maxCancels === undefined ? {} : { maxCancels }),
@@ -111,6 +113,26 @@ function harness({
     ...(maxLineBytes === undefined ? {} : { maxLineBytes }),
   });
   return { manager, login, validation, children, calls, health };
+}
+
+async function expiredClaudeHarness(options = {}) {
+  const h = harness({
+    ...options,
+    provider: 'claude',
+    childCount: Math.max(3, options.childCount || 0),
+    confirmProviderHealth: options.confirmProviderHealth || (async () => ({
+      kind: 'remote-auth-failure',
+      source: 'post-auth',
+    })),
+  });
+  const started = await h.manager.startProviderLogin('claude', OWNER);
+  h.login.close(0);
+  await new Promise((resolve) => setImmediate(resolve));
+  h.validation.close(0);
+  await new Promise((resolve) => setImmediate(resolve));
+  const expired = h.manager.getProviderLoginSession(started.sessionId, OWNER);
+  assert.equal(expired.reasonCode, 'credentials-expired');
+  return { ...h, expired };
 }
 
 test('Windows provider cleanup uses only fixed taskkill process-tree arguments', async () => {
@@ -315,7 +337,7 @@ test('cancel and retry have distinct bounded owner/provider rate limits', async 
   const first = await h.manager.startProviderLogin('codex', OWNER);
   await h.manager.cancelProviderLogin(first.sessionId, OWNER);
 
-  const retry = await h.manager.retryProviderLogin('codex', OWNER);
+  const retry = await h.manager.retryProviderLogin('codex', first.sessionId, OWNER);
   await assert.rejects(
     h.manager.cancelProviderLogin(retry.sessionId, OWNER),
     /cancel rate limit/,
@@ -323,8 +345,19 @@ test('cancel and retry have distinct bounded owner/provider rate limits', async 
   retry && h.validation.close(1);
   await new Promise((resolve) => setImmediate(resolve));
 
-  const secondRetry = h.manager.retryProviderLogin('codex', OWNER);
+  const secondRetry = h.manager.retryProviderLogin('codex', retry.sessionId, OWNER);
   await assert.rejects(secondRetry, /retry rate limit/);
+});
+
+test('retry consumes one terminal predecessor and rejects replay', async () => {
+  const h = harness({ childCount: 3 });
+  const first = await h.manager.startProviderLogin('codex', OWNER);
+  await h.manager.cancelProviderLogin(first.sessionId, OWNER);
+  await h.manager.retryProviderLogin('codex', first.sessionId, OWNER);
+  await assert.rejects(
+    h.manager.retryProviderLogin('codex', first.sessionId, OWNER),
+    /already been used/,
+  );
 });
 
 test('simultaneous starts reserve the provider before asynchronous status lookup', async () => {
@@ -390,16 +423,16 @@ test('repeated invalid manual-code attempts terminate the session', async () => 
 });
 
 test('Claude credential clearing is an explicit owner-only fixed logout operation', async () => {
-  const h = harness({ provider: 'claude' });
-  const pending = h.manager.clearClaudeCredentials({
-    ...OWNER,
-    csrfVerified: false,
-  });
+  const h = await expiredClaudeHarness();
+  const pending = h.manager.clearClaudeCredentials(
+    h.expired.sessionId,
+    { ...OWNER, csrfVerified: false },
+  );
   await assert.rejects(pending, /verified owner context/);
 
-  const clearing = h.manager.clearClaudeCredentials(OWNER);
+  const clearing = h.manager.clearClaudeCredentials(h.expired.sessionId, OWNER);
   await new Promise((resolve) => setImmediate(resolve));
-  assert.deepEqual(h.calls[0], {
+  assert.deepEqual(h.calls[2], {
     command: '/trusted/bin/claude',
     args: ['auth', 'logout'],
     options: {
@@ -411,8 +444,8 @@ test('Claude credential clearing is an explicit owner-only fixed logout operatio
       windowsVerbatimArguments: undefined,
     },
   });
-  h.login.stdout.write('Logged out private@example.test token=secret\n');
-  h.login.close(0);
+  h.children[2].stdout.write('Logged out private@example.test token=secret\n');
+  h.children[2].close(0);
   assert.deepEqual(await clearing, {
     provider: 'claude',
     reasonCode: null,
@@ -425,29 +458,28 @@ test('Claude credential clearing is an explicit owner-only fixed logout operatio
 });
 
 test('Claude login cannot start while credential clearing owns the provider', async () => {
-  const h = harness({ provider: 'claude' });
-  const clearing = h.manager.clearClaudeCredentials(OWNER);
+  const h = await expiredClaudeHarness();
+  const clearing = h.manager.clearClaudeCredentials(h.expired.sessionId, OWNER);
   await new Promise((resolve) => setImmediate(resolve));
   await assert.rejects(
     h.manager.startProviderLogin('claude', OWNER),
     /already active/,
   );
-  assert.equal(h.calls.length, 1);
-  h.login.close(0);
+  assert.equal(h.calls.length, 3);
+  h.children[2].close(0);
   await clearing;
 });
 
 test('Claude clear response waits for its durable terminal health transition', async () => {
   const persisted = deferred();
-  const h = harness({
-    provider: 'claude',
+  const h = await expiredClaudeHarness({
     onHealthSignal: async (_provider, signal) => {
       if (signal.kind === 'local-signed-out') await persisted.promise;
     },
   });
-  const clearing = h.manager.clearClaudeCredentials(OWNER);
+  const clearing = h.manager.clearClaudeCredentials(h.expired.sessionId, OWNER);
   await new Promise((resolve) => setImmediate(resolve));
-  h.login.close(0);
+  h.children[2].close(0);
   let settled = false;
   clearing.then(() => { settled = true; });
   await new Promise((resolve) => setImmediate(resolve));
@@ -600,9 +632,11 @@ test('output, line, timeout, cancellation, disconnect and shutdown paths termina
 });
 
 test('shutdown tracks login and explicit Claude-clear children until both close', async () => {
+  const claudeLogin = fakeChild();
+  const claudeValidation = fakeChild();
   const login = fakeChild({ closeOnKill: false });
   const clear = fakeChild({ closeOnKill: false });
-  const children = [login, clear];
+  const children = [claudeLogin, claudeValidation, login, clear];
   const manager = createProviderLoginManager({
     providerStatus: async (provider) => {
       const status = { installed: true, authenticated: false };
@@ -613,13 +647,22 @@ test('shutdown tracks login and explicit Claude-clear children until both close'
       return status;
     },
     spawn: () => children.shift(),
+    confirmProviderHealth: async () => ({
+      kind: 'remote-auth-failure',
+      source: 'post-auth',
+    }),
     canClearClaudeCredentials: async () => true,
     terminateGraceMs: 50,
     shutdownDeadlineMs: 200,
     timeoutMs: 60_000,
   });
+  const expired = await manager.startProviderLogin('claude', OWNER);
+  claudeLogin.close(0);
+  await new Promise((resolve) => setImmediate(resolve));
+  claudeValidation.close(0);
+  await new Promise((resolve) => setImmediate(resolve));
   await manager.startProviderLogin('codex', OWNER);
-  const clearing = manager.clearClaudeCredentials(OWNER);
+  const clearing = manager.clearClaudeCredentials(expired.sessionId, OWNER);
   await new Promise((resolve) => setImmediate(resolve));
 
   let stopped = false;
@@ -636,7 +679,10 @@ test('shutdown tracks login and explicit Claude-clear children until both close'
 });
 
 test('shutdown forcibly settles a stubborn Claude-clear operation at its final deadline', async () => {
+  const login = fakeChild();
+  const validation = fakeChild();
   const clear = fakeChild({ closeOnKill: false });
+  const children = [login, validation, clear];
   const manager = createProviderLoginManager({
     providerStatus: async () => {
       const status = { installed: true, authenticated: false };
@@ -646,13 +692,22 @@ test('shutdown forcibly settles a stubborn Claude-clear operation at its final d
       });
       return status;
     },
-    spawn: () => clear,
+    spawn: () => children.shift(),
+    confirmProviderHealth: async () => ({
+      kind: 'remote-auth-failure',
+      source: 'post-auth',
+    }),
     canClearClaudeCredentials: async () => true,
     terminateGraceMs: 5,
     shutdownDeadlineMs: 20,
     timeoutMs: 60_000,
   });
-  const clearing = manager.clearClaudeCredentials(OWNER);
+  const expired = await manager.startProviderLogin('claude', OWNER);
+  login.close(0);
+  await new Promise((resolve) => setImmediate(resolve));
+  validation.close(0);
+  await new Promise((resolve) => setImmediate(resolve));
+  const clearing = manager.clearClaudeCredentials(expired.sessionId, OWNER);
   await new Promise((resolve) => setImmediate(resolve));
   await manager.shutdown();
   const raced = await Promise.race([
@@ -803,7 +858,7 @@ test('only a real Claude remote-auth failure enables explicit credential clearin
   const h = harness({
     provider: 'claude',
     childCount: 3,
-    canClearClaudeCredentials: async () => false,
+    canClearClaudeCredentials: async () => true,
     confirmProviderHealth: async () => ({
       kind: 'remote-auth-failure',
       source: 'post-auth',
@@ -818,7 +873,7 @@ test('only a real Claude remote-auth failure enables explicit credential clearin
   assert.equal(failed.state, 'failed');
   assert.equal(failed.reasonCode, 'credentials-expired');
 
-  const clearing = h.manager.clearClaudeCredentials(OWNER);
+  const clearing = h.manager.clearClaudeCredentials(failed.sessionId, OWNER);
   await new Promise((resolve) => setImmediate(resolve));
   assert.deepEqual(h.calls.at(-1).args, ['auth', 'logout']);
   assert.equal(h.calls.length, 3);
@@ -826,28 +881,69 @@ test('only a real Claude remote-auth failure enables explicit credential clearin
   assert.equal((await clearing).state, 'cleared');
 });
 
+test('Claude clear consumes its failed session and revalidates expiry before logout', async () => {
+  const h = await expiredClaudeHarness({
+    canClearClaudeCredentials: async () => false,
+  });
+  await assert.rejects(
+    h.manager.clearClaudeCredentials(h.expired.sessionId, OWNER),
+    /no longer confirmed/,
+  );
+  assert.equal(h.calls.length, 2);
+  assert.equal(
+    h.manager.getProviderLoginSession(h.expired.sessionId, OWNER).reasonCode,
+    'credentials-no-longer-expired',
+  );
+  await assert.rejects(
+    h.manager.clearClaudeCredentials(h.expired.sessionId, OWNER),
+    /have not been confirmed/,
+  );
+});
+
+test('Claude clear rejects retained expiry evidence after its session window', async () => {
+  let clock = Date.parse('2026-07-29T10:00:00.000Z');
+  const h = await expiredClaudeHarness({
+    now: () => clock,
+    timeoutMs: 1_000,
+  });
+  clock += 1_001;
+  await assert.rejects(
+    h.manager.clearClaudeCredentials(h.expired.sessionId, OWNER),
+    /have not been confirmed/,
+  );
+  assert.equal(h.calls.length, 2);
+});
+
 test('Claude clear rejects absent expired-credential evidence and bounds full lines', async () => {
   const denied = harness({
     provider: 'claude',
     canClearClaudeCredentials: async () => false,
+    confirmProviderHealth: async () => ({
+      kind: 'network-failure',
+      source: 'post-auth',
+    }),
   });
+  const deniedStarted = await denied.manager.startProviderLogin('claude', OWNER);
+  denied.login.close(0);
+  await new Promise((resolve) => setImmediate(resolve));
+  denied.validation.close(0);
+  await new Promise((resolve) => setImmediate(resolve));
   await assert.rejects(
-    denied.manager.clearClaudeCredentials(OWNER),
+    denied.manager.clearClaudeCredentials(deniedStarted.sessionId, OWNER),
     /expired Claude credentials/,
   );
 
-  const h = harness({
-    provider: 'claude',
+  const h = await expiredClaudeHarness({
     maxLineBytes: 8,
     canClearClaudeCredentials: async () => true,
   });
-  const clearing = h.manager.clearClaudeCredentials(OWNER);
+  const clearing = h.manager.clearClaudeCredentials(h.expired.sessionId, OWNER);
   await new Promise((resolve) => setImmediate(resolve));
-  h.login.stdout.write(`${'x'.repeat(9)}\n`);
+  h.children[2].stdout.write(`${'x'.repeat(9)}\n`);
   const result = await clearing;
   assert.equal(result.state, 'failed');
   assert.equal(result.reasonCode, 'logout-failed');
-  assert.equal(h.login.killed, true);
+  assert.equal(h.children[2].killed, true);
 });
 
 test('spawn failures, untrusted status and nonzero login exits expose no raw diagnostics', async () => {

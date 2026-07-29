@@ -60,7 +60,12 @@ export function splitList(value) {
     .filter(Boolean);
 }
 
-export function providerLoginPanelHtml(provider, providerStatus = {}, session = null) {
+export function providerLoginPanelHtml(
+  provider,
+  providerStatus = {},
+  session = null,
+  pending = false,
+) {
   const name = provider === 'claude' ? 'Claude' : 'Codex';
   const command = provider === 'claude' ? 'claude auth login' : 'codex login --device-auth';
   const guide = provider === 'claude'
@@ -91,6 +96,7 @@ export function providerLoginPanelHtml(provider, providerStatus = {}, session = 
         ? `${name} needs sign-in.`
         : `${name} is not installed.`);
   const sessionId = escapeProfileText(session?.sessionId || '');
+  const disabled = pending ? ' disabled aria-disabled="true"' : '';
   const device = provider === 'codex' && session?.userCode
     ? `<p class="provider-login-device-code">Device code: <strong>${escapeProfileText(session.userCode)}</strong></p>`
     : '';
@@ -101,21 +107,21 @@ export function providerLoginPanelHtml(provider, providerStatus = {}, session = 
     ? `<label class="setup-field" for="provider-login-code-claude">One-time provider code
       <input id="provider-login-code-claude" type="text" maxlength="256" autocomplete="off" autocapitalize="off" spellcheck="false">
       </label>
-      <button class="act primary" type="button" data-provider-login-action="code" data-provider="claude" data-session-id="${sessionId}">Submit code</button>`
+      <button class="act primary" type="button" data-provider-login-action="code" data-provider="claude" data-session-id="${sessionId}"${disabled}>Submit code</button>`
     : '';
   const start = canStart
-    ? `<button class="act primary" type="button" data-provider-login-action="start" data-provider="${provider}">Sign in to ${name} with Scout</button>`
+    ? `<button class="act primary" type="button" data-provider-login-action="start" data-provider="${provider}"${disabled}>Sign in to ${name} with Scout</button>`
     : '';
   const cancel = active
-    ? `<button class="act" type="button" data-provider-login-action="cancel" data-provider="${provider}" data-session-id="${sessionId}">Cancel ${name} sign-in</button>`
+    ? `<button class="act" type="button" data-provider-login-action="cancel" data-provider="${provider}" data-session-id="${sessionId}"${disabled}>Cancel ${name} sign-in</button>`
     : '';
   const retry = retryable
-    ? `<button class="act primary" type="button" data-provider-login-action="retry" data-provider="${provider}" data-session-id="${sessionId}">Retry ${name} sign-in</button>`
+    ? `<button class="act primary" type="button" data-provider-login-action="retry" data-provider="${provider}" data-session-id="${sessionId}"${disabled}>Retry ${name} sign-in</button>`
     : '';
   const clear = provider === 'claude'
     && state === 'failed'
     && session?.reasonCode === 'credentials-expired'
-    ? '<button class="act" type="button" data-provider-login-action="clear" data-provider="claude">Clear expired Claude sign-in</button>'
+    ? `<button class="act" type="button" data-provider-login-action="clear" data-provider="claude" data-session-id="${sessionId}"${disabled}>Clear expired Claude sign-in</button>`
     : '';
   return `<section class="provider-login-panel" data-provider-login="${provider}" aria-label="${name} sign-in">
     <p class="meta" role="status" aria-live="polite">${statusText}</p>
@@ -302,6 +308,7 @@ const Setup = {
   operations: { proposal: null, scan: null },
   operationTimers: {},
   providerLoginState: { codex: null, claude: null },
+  providerLoginGeneration: { codex: 0, claude: 0 },
   providerLoginPollTimer: null,
   backgroundOperations: new Set(),
   showVerificationPass: false,
@@ -853,12 +860,16 @@ const Setup = {
 
   async refreshProviderLogin(provider) {
     const current = this.providerLoginState[provider];
+    if (current?.mutating) return;
+    const generation = (this.providerLoginGeneration[provider] || 0) + 1;
+    this.providerLoginGeneration[provider] = generation;
     this.providerLoginState[provider] = { ...current, loading: true };
     const sessionId = current?.session?.sessionId;
     const query = new URLSearchParams({ provider });
     if (sessionId) query.set('sessionId', sessionId);
     try {
       const result = await requestJson(`/api/provider-login/status?${query}`);
+      if (this.providerLoginGeneration[provider] !== generation) return;
       this.providerLoginState[provider] = { ...result, loading: false };
       const sessionChanged = JSON.stringify(current?.session || null)
         !== JSON.stringify(result.session || null);
@@ -868,6 +879,7 @@ const Setup = {
       }
       this.scheduleProviderLoginPoll();
     } catch (error) {
+      if (this.providerLoginGeneration[provider] !== generation) return;
       this.providerLoginState[provider] = { ...current, loading: false };
       this.setMessage('Guided provider sign-in is unavailable. Use the manual fallback shown below.', 'warning');
     }
@@ -905,11 +917,12 @@ const Setup = {
 
   async providerLoginAction(action, provider, sessionId) {
     let entry = this.providerLoginState[provider];
+    if (entry?.mutating) return;
     if (!entry?.csrfToken) {
       await this.refreshProviderLogin(provider);
       entry = this.providerLoginState[provider];
     }
-    if (!entry?.csrfToken) return;
+    if (!entry?.csrfToken || entry?.mutating) return;
     const headers = {
       'content-type': 'application/json',
       'x-scout-provider-login-csrf': entry.csrfToken,
@@ -927,9 +940,16 @@ const Setup = {
     } else if (action === 'clear') {
       if (!confirm('Clear the expired Claude sign-in on this device? Scout will never do this automatically.')) return;
       endpoint = 'clear-claude-credentials';
-      payload = { confirmed: true };
+      payload = { confirmed: true, sessionId };
     } else return;
 
+    const generation = (this.providerLoginGeneration[provider] || 0) + 1;
+    this.providerLoginGeneration[provider] = generation;
+    this.providerLoginState[provider] = { ...entry, mutating: true };
+    if (this.providerLoginVisible()) {
+      if (this.view === 'section') this.renderProviderSettings();
+      else this.renderProviders();
+    }
     this.setMessage(action === 'cancel' ? 'Cancelling provider sign-in…' : 'Updating provider sign-in…');
     try {
       const result = await requestJson(`/api/provider-login/${endpoint}`, {
@@ -937,10 +957,14 @@ const Setup = {
         headers,
         body: JSON.stringify(payload),
       });
+      if (this.providerLoginGeneration[provider] !== generation) return;
       const session = result.session || null;
-      this.providerLoginState[provider] = { ...entry, session };
+      this.providerLoginState[provider] = { ...entry, mutating: false, session };
       if (action === 'clear') {
-        this.providerLoginState.claude = { ...entry, session: null };
+        if (result.result?.state !== 'cleared') {
+          throw new Error('Claude credential clearing did not complete');
+        }
+        this.providerLoginState.claude = { ...entry, mutating: false, session: null };
         this.setMessage('Expired Claude sign-in cleared. Start a new sign-in when ready.', 'good');
       } else {
         this.setMessage(
@@ -956,6 +980,8 @@ const Setup = {
       }
       this.scheduleProviderLoginPoll();
     } catch (error) {
+      if (this.providerLoginGeneration[provider] !== generation) return;
+      this.providerLoginState[provider] = { ...entry, mutating: false };
       this.setMessage(error.message, 'error');
       await this.refreshProviderLogin(provider);
     }
@@ -1173,7 +1199,12 @@ const Setup = {
         ? '<span class="meta">Update this CLI from its official installation guide, then refresh. Scout requires schema-constrained output for bounded workflows.</span>'
         : '<span class="meta">Scout needs an authenticated command-line provider; a desktop-app login alone is not enough. Your provider account may have separate usage limits or costs.</span>'}
       </label>
-      ${providerLoginPanelHtml(name, provider, this.providerLoginState[name]?.session)}
+      ${providerLoginPanelHtml(
+        name,
+        provider,
+        this.providerLoginState[name]?.session,
+        this.providerLoginState[name]?.mutating === true,
+      )}
     </section>`;
   },
 
