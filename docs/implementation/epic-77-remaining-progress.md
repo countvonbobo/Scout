@@ -208,3 +208,81 @@ private paths, account data, CV content, adverts, prompts, or transcripts.
 - Next exact action: write failing Task 18 browser acceptance and release-audit
   tests, beginning with `tests/browser/recoverable-scan.spec.mjs` and the
   privacy-sensitive release fixture matrix.
+
+## Gate 5 — Task 18 / end-to-end acceptance and release evidence
+
+- Status: review-clean and complete as a candidate implementation.
+- Implementation commit: `964abe4` (`test: add recoverable scan release
+  acceptance`).
+- Review-fix commit: `82a2b9b` (`fix: close recoverable scan release gaps`).
+- RED evidence:
+  - the new release-audit/build regressions discovered 18 tests, with 15
+    passing and 3 failing because private runtime roots, raw serialized
+    recovery/auth payloads and release-path exclusions were not enforced;
+  - the first complete browser run reproduced the held-character-module
+    regression: the earlier character module blocked `app.js`, so
+    `window.Scout` never became ready;
+  - adversarial review probes then reproduced ordinary key variants, Linux
+    paths, staged `app/` wrappers, binary/document payloads, sensitive
+    filenames and production-shaped device-code/run-state schemas passing the
+    audit.
+- Fixes:
+  - add one Chromium release-acceptance boundary over the real journal,
+    recovery, lease, assessment, queue, mutation, backup, retention,
+    provider-health, guided-login and server fault-injection suites; the local
+    macOS host skips only that aggregate when it cannot read its own
+    process-start identity, while Linux CI runs it;
+  - add a real-server corrupt-journal fault injection and assert the run,
+    queue and provider-login HTTP projections, DOM and browser storage never
+    expose the private directory identity;
+  - retain the bounded UI coverage for every durable phase/terminal state,
+    assessment repair progress, overlap expiry/deduplication/handoff and the
+    composed Tasks 12–17 settings/dashboard experience;
+  - reject private runtime trees at source and staged `app/` roots, serialized
+    raw run/auth state, auth/device codes, prompts, CV/ad bodies, provider
+    transcripts, tracking values, macOS/Linux/Windows private paths,
+    unexpected documents/binaries and sensitive filenames without echoing
+    private values or paths;
+  - allow only exact reviewed UI assets, screenshots, platform
+    runtimes/launchers and lockfile-selected production dependencies, while
+    keeping the staged 230 MB runtime audit bounded;
+  - order the independent application module before the character module so a
+    held or failed character module leaves the labelled hydratable fallback
+    usable;
+  - document recovery selection, stage compatibility, overlap expiry,
+    provider health/login, Codex fallback, safe divergence handling,
+    retention/privacy and corrupt-journal, lost-lease, interrupted-cleanup and
+    push-pending operator boundaries without advertising a cleanup control
+    that this release does not expose.
+- GREEN:
+  - release-audit/build suite: 22 passed, 0 failed, 0 skipped;
+  - Chromium Gate 5 acceptance: 5 discovered, 4 passed, 0 failed, 1 known
+    macOS process-identity skip;
+  - character browser acceptance after the module-order repair: Chromium
+    11 passed and Firefox 11 passed; the formerly failing held-module case
+    also passed twice consecutively;
+  - documentation and app-configuration bundle: 64 passed;
+  - `npm run release:audit`: passed for 412 source/build files in the local
+    tree; direct staged-tree audit passed for 180 files and completed in under
+    one second with the 230 MB Node runtime present;
+  - diff checks: passed.
+- Local packaging note: `node tools/build-release.mjs --stage-only` cannot
+  finish in this worktree because the optional local `.scout-runtime/typst`
+  binary is absent. It created enough of the stage to validate the real
+  wrapper/runtime audit. The required complete packaging paths remain covered
+  by build tests and the GitHub release matrix.
+- Fresh read-only review rounds:
+  - initial Spec FAIL (0 Critical, 1 Important), Quality FAIL (0 Critical,
+    4 Important), Privacy FAIL (0 Critical, 3 Important): replaced
+    mocked-only evidence, closed representation/staging gaps and corrected
+    unavailable cleanup and overbroad privacy claims;
+  - adversarial follow-ups found and fixed contextual serialized fields,
+    exact documented-path wrapping, runtime performance, binary/document
+    allowlisting, sensitive filenames, device-code documentation and the
+    exact screenshot allowlist;
+  - final Spec PASS, Code quality PASS and Privacy/security PASS; 0 Critical,
+    0 Important.
+- Findings fixed/open: every Gate 5 finding fixed; none open.
+- Next exact action: commit this ledger update, run the clean-worktree final
+  verification matrix, push the branch, open the required draft PR and obtain
+  the complete GitHub Actions matrix.
