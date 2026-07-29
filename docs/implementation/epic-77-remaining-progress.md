@@ -597,3 +597,30 @@ private paths, account data, CV content, adverts, prompts, or transcripts.
   - diff checks: passed.
 - Findings fixed/open: the round-9 finding is fixed; complete-range Spec,
   code-quality and privacy/security re-review is pending.
+
+### Whole-epic review round 10
+
+- Verdicts:
+  - Spec PASS: 0 Critical, 0 Important.
+  - Code quality FAIL: 0 Critical, 1 Important.
+  - Privacy/security FAIL: 0 Critical, 1 Important.
+- Review-fix commit: `9175bf4` (`fix: audit hard-coded CSRF tokens`).
+- RED: hard-coded `csrfToken` and `providerLoginCsrfToken` assignments returned
+  `ok: true` because the new generic token handling exempted those key names
+  before inspecting their values.
+- Finding reproduced and fixed:
+  - remove both CSRF exclusions so hard-coded CSRF capability tokens fail the
+    publication audit; dynamic expressions continue through the existing
+    expression exclusion, and synthetic browser fixtures construct their
+    values at runtime rather than weakening production scanning.
+- GREEN after fixes:
+  - release-audit/build/update suite: 43 passed, 0 failed, 0 skipped;
+  - hard-coded CSRF/provider-login-CSRF regressions: passed;
+  - generated public-source audit: passed;
+  - default release audit: passed for 515 files;
+  - diff checks: passed.
+- Verification note: the complete browser run started at the preceding commit
+  was deliberately interrupted once this real review finding arrived; its
+  interrupted result is not counted as verification evidence.
+- Findings fixed/open: the round-10 finding is fixed; complete-range Spec,
+  code-quality and privacy/security re-review is pending.
