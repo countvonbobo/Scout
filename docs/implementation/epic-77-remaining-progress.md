@@ -741,3 +741,62 @@ private paths, account data, CV content, adverts, prompts, or transcripts.
 - Findings fixed/open: none open.
 - Next exact action: commit this evidence, push the exact reviewed branch and
   require all seven draft-PR checks to pass before final handoff.
+
+## Whole-epic review round 12 and exact-HEAD verification
+
+- Review-fix commits:
+  - `410527c` (`fix: harden provider authentication boundaries`);
+  - `e1e4b61` (`fix: strengthen final acceptance boundaries`);
+  - `d9eed37` (`test: keep provider auth fixture release-safe`);
+  - `59f68cd` (`test: bound durable state acceptance under load`).
+- RED findings reproduced:
+  - real CLI authentication diagnostics were reduced to a generic provider
+    error before the durable remote-auth classifier could observe them;
+  - POSIX guided-login cancellation signalled only the immediate process;
+  - terminal device-auth sessions retained their code and verification URL;
+  - a failed build-B installation could leave build-B HTML in build A's cache;
+  - cross-provider queued work inherited the outer provider's lease metadata;
+  - the browser release boundary nested unit suites instead of directly
+    injecting crash, takeover, queue, provider, storage, backup and tamper
+    faults;
+  - the release audit rejected a credential-shaped fake CLI diagnostic;
+  - two browser acceptance timeouts were narrower than their own work.
+- GREEN after fixes:
+  - complete provider/server regression group: 149 passed, 1 platform skip;
+  - durable pipeline/lease/queue/journal/backup/retention group: 227 passed,
+    2 platform skips;
+  - changed Chromium acceptance files: 17 passed;
+  - direct interface acceptance: passed;
+  - interrupted offline rollover: passed;
+  - release/build audit tests: 35 passed.
+- Exact reviewed range:
+  `f8732fd005a8b77fa79c7d63abe52c5a08b205bd..59f68cd`.
+- Independent final implementation verdicts:
+  - Spec PASS: 0 Critical, 0 Important, 0 Minor.
+  - Code quality PASS: 0 Critical, 0 Important, 0 Minor.
+  - Privacy/security PASS: 0 Critical, 0 Important, 0 Minor.
+- Full Node run 1 under concurrent independent browser verification:
+  1,108 discovered, 1,098 passed, 5 failed and 5 skipped. The exact five
+  failures were retained and rerun unchanged; all eight selected cases
+  covering those parameterised failures passed. They were classified as
+  concurrent host-load infrastructure failures, not assertion flakes.
+- Full Node run 2, unchanged and without concurrent browser load:
+  1,108 discovered, 1,103 passed, 0 failed and 5 platform skips.
+- Complete browser run:
+  148 discovered, 146 passed, 0 failed and 2 intentional non-Chromium skips.
+- `npm run release:audit`: passed for 515 files.
+- Complete-range `git diff --check`: passed.
+- Worktree before this ledger-only commit: clean.
+- Publication blocker:
+  earlier feature-branch commits contain personal author/committer metadata.
+  The branch was already published before this was found, while the brief
+  forbids rebasing or force-pushing a published branch. Additive commits cannot
+  remove immutable historical metadata, so publication, exact-HEAD CI and the
+  PR privacy confirmation must remain paused until the operator explicitly
+  chooses whether to authorise rewriting this draft branch.
+- Next exact action after that decision:
+  if rewriting is authorised, replace only the feature branch's historical
+  author/committer address with the GitHub noreply identity, re-run exact-HEAD
+  review and verification, update the draft PR and require all seven GitHub
+  Actions checks to pass. Otherwise leave the draft PR unpushed and report the
+  privacy gate as unresolved.
