@@ -533,3 +533,44 @@ private paths, account data, CV content, adverts, prompts, or transcripts.
   complete matrix remains to be rerun from the final clean commit.
 - Findings fixed/open: all round-7 findings are fixed; complete-range Spec,
   code-quality and privacy/security re-review is pending.
+
+### Whole-epic review round 8
+
+- Verdicts:
+  - Spec PASS: 0 Critical, 0 Important.
+  - Code quality FAIL: 0 Critical, 2 Important.
+  - Privacy/security FAIL: 0 Critical, 1 Important.
+- Review-fix commit: `a185912`
+  (`fix: close credential and auto-update edge cases`).
+- RED:
+  - camel/lower API-token, API-secret, consumer-secret and authorization
+    assignments were absent from audit findings;
+  - a leading doubled single quote caused a quoted password to be read as an
+    empty literal;
+  - plausible `your-live-*` and generic angle-bracket values were incorrectly
+    accepted as placeholders;
+  - the already-downloaded browser path rendered only “verified package is
+    ready” and omitted both the package name and safe location alias.
+- Findings reproduced and fixed:
+  - add specific credential/authorization suffixes, handle a doubled
+    delimiter at the start of a bounded literal and retain unrelated token
+    exclusions;
+  - reduce placeholders to fixed generic sentinel words, the two exact
+    documented angle-bracket values, and exact environment/workflow
+    expressions;
+  - keep privacy test values constructed at runtime so the default
+    publication audit scans tests without exemptions;
+  - share the exact package-name/location-alias handoff across manual and
+    automatic downloads.
+- GREEN after fixes:
+  - release-audit/build/update suite: 43 passed, 0 failed, 0 skipped;
+  - manual and automatic Chromium update handoffs: 2 passed;
+  - default release audit: passed for 515 files;
+  - diff checks: passed.
+- Full Node evidence at the preceding clean review commit: 1,101 discovered,
+  840 passed, 256 failed and 5 skipped. All root failures remain the documented
+  inability of this macOS host to read process-start identity, with dependent
+  server/setup assertions receiving fixed 500 responses; affected focused
+  suites are green.
+- Findings fixed/open: all round-8 findings are fixed; complete-range Spec,
+  code-quality and privacy/security re-review is pending.
