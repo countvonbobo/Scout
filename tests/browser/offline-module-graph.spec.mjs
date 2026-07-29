@@ -49,12 +49,18 @@ async function waitForActiveBuild(page, build) {
 test('a real A-to-B worker activation keeps the exact app module graph bootable offline', async ({ browserName, context, page }) => {
   test.skip(browserName !== 'chromium', 'the HTTP-cache isolation uses a Chromium DevTools session');
   let servedBuild = 'build-a';
+  let failedShellPath = null;
+  let networkUnavailable = false;
   // The production app registers its root worker during boot. This harness
   // owns a narrower scope and blocks that unrelated registration so the root
   // worker cannot apply its production-wide old-cache deletion policy to the
   // two synthetic build caches under test.
   await context.route('**/service-worker.js', (route) => route.abort());
   await context.route('**/offline-rollover/**', async (route) => {
+    if (networkUnavailable) {
+      await route.abort();
+      return;
+    }
     const url = new URL(route.request().url());
     const path = url.pathname;
     if (path === '/offline-rollover/sw.js') {
@@ -71,6 +77,10 @@ test('a real A-to-B worker activation keeps the exact app module graph bootable 
       return;
     }
     if (TEMPLATES[path] !== undefined) {
+      if (path === failedShellPath) {
+        await route.fulfill({ status: 503, contentType: 'text/plain', body: 'fault-injected shell failure' });
+        return;
+      }
       const source = TEMPLATES[path]
         .replaceAll('__SCOUT_UI_BUILD__', servedBuild)
         .replaceAll('="/', '="/offline-rollover/');
@@ -95,7 +105,56 @@ test('a real A-to-B worker activation keeps the exact app module graph bootable 
   await waitForActiveBuild(page, 'build-a');
   expect(await page.evaluate(() => caches.has('scout-shell-build-a'))).toBe(true);
 
+  // A live build-A worker may serve newer HTML from the network, but an
+  // interrupted build-B install must leave A's complete offline graph intact.
+  servedBuild = 'build-broken';
+  failedShellPath = '/offline-rollover/lib/chatDrawerState.mjs';
+  await page.goto('/offline-rollover/?preview=build-broken');
+  await expect(page.locator('meta[name="scout-ui-build"]')).toHaveAttribute('content', 'build-broken');
+  const interrupted = await page.evaluate(async () => {
+    const registration = await navigator.serviceWorker.register(
+      '/offline-rollover/sw.js?build=build-broken',
+      { scope: '/offline-rollover/', updateViaCache: 'none' },
+    );
+    const worker = registration.installing;
+    if (worker && !['activated', 'redundant'].includes(worker.state)) {
+      await new Promise((resolve) => worker.addEventListener('statechange', () => {
+        if (['activated', 'redundant'].includes(worker.state)) resolve();
+      }));
+    }
+    return {
+      attempted: worker?.state || null,
+      active: registration.active?.scriptURL || '',
+    };
+  });
+  expect(interrupted).toEqual({
+    attempted: 'redundant',
+    active: expect.stringContaining('/offline-rollover/sw.js?build=build-a'),
+  });
+  const retainedBuild = await page.evaluate(async () => {
+    const cached = await (await caches.open('scout-shell-build-a')).match('/offline-rollover/');
+    const source = await cached.text();
+    return source.match(/name="scout-ui-build" content="([^"]+)"/)?.[1] || null;
+  });
+  expect(retainedBuild).toBe('build-a');
+
+  const interruptedOfflinePage = await context.newPage();
+  const interruptedCdp = await context.newCDPSession(interruptedOfflinePage);
+  await interruptedCdp.send('Network.enable');
+  await interruptedCdp.send('Network.setCacheDisabled', { cacheDisabled: true });
+  networkUnavailable = true;
+  await context.setOffline(true);
+  await interruptedOfflinePage.goto('/offline-rollover/?offline=interrupted', { waitUntil: 'commit' });
+  await expect.poll(() => interruptedOfflinePage.evaluate(() => ({
+    build: document.querySelector('meta[name="scout-ui-build"]')?.content,
+    booted: Boolean(window.Scout),
+  })), { timeout: 15_000 }).toEqual({ build: 'build-a', booted: true });
+  await context.setOffline(false);
+  networkUnavailable = false;
+  await interruptedOfflinePage.close();
+
   servedBuild = 'build-b';
+  failedShellPath = null;
   await page.evaluate(async () => {
     await navigator.serviceWorker.register('/offline-rollover/sw.js?build=build-b', {
       scope: '/offline-rollover/',
@@ -131,6 +190,7 @@ test('a real A-to-B worker activation keeps the exact app module graph bootable 
   const cdp = await context.newCDPSession(offlinePage);
   await cdp.send('Network.enable');
   await cdp.send('Network.setCacheDisabled', { cacheDisabled: true });
+  networkUnavailable = true;
   await context.setOffline(true);
   await offlinePage.goto('/offline-rollover/?offline=build-b', { waitUntil: 'commit' });
   await expect.poll(() => offlinePage.evaluate(() => ({

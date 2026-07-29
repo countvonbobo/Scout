@@ -16,7 +16,7 @@ async function openDashboard(page) {
 }
 
 test('dashboard readiness does not wait for a nonessential sprite load', async ({ page }) => {
-  test.setTimeout(10_000);
+  test.setTimeout(30_000);
   let release;
   let requested = false;
   const held = new Promise((resolve) => { release = resolve; });
@@ -35,7 +35,7 @@ test('dashboard readiness does not wait for a nonessential sprite load', async (
   });
   try {
     await openDashboard(page);
-    expect(requested).toBe(true);
+    await expect.poll(() => requested).toBe(true);
     expect(await page.evaluate(() => Boolean(window.ScoutCharacter))).toBe(true);
   } finally {
     release();

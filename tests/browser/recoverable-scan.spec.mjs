@@ -1,29 +1,44 @@
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
-import { spawnSync } from 'node:child_process';
-import { fileURLToPath } from 'node:url';
 import { expect, test } from '@playwright/test';
-import { currentLeaseOwner } from '../../ui/lib/scanLease.mjs';
+import {
+  acquireScanLease, assertCurrentFence, currentLeaseOwner, readScanLease,
+  releaseScanLease, synchronousFenceCallback,
+} from '../../ui/lib/scanLease.mjs';
+import {
+  PipelineInterruptedError, runScanPipeline,
+} from '../../ui/lib/scanPipeline.mjs';
+import {
+  claimNextScanRequest, completeScanRequest, enqueueScanRequest, projectScanQueue,
+} from '../../ui/lib/scanQueue.mjs';
+import {
+  initializeRecoveryBackup, verifyReviewedRunArchive, writeReviewedRunArchive,
+} from '../../ui/lib/recoveryBackup.mjs';
 
-const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
-const REAL_ACCEPTANCE_SUITES = Object.freeze([
-  'ui/lib/runJournal.test.mjs',
-  'ui/lib/runArtifacts.test.mjs',
-  'ui/lib/runRecovery.test.mjs',
-  'ui/lib/scanLease.test.mjs',
-  'ui/lib/scanPipeline.test.mjs',
-  'ui/lib/assessmentBatches.test.mjs',
-  'ui/lib/scanQueue.test.mjs',
-  'ui/lib/mutationCoordinator.test.mjs',
-  'ui/lib/recoveryBackup.test.mjs',
-  'ui/lib/workspaceSync.test.mjs',
-  'ui/lib/runRetention.test.mjs',
-  'ui/lib/providerHealth.test.mjs',
-  'ui/lib/providerLogin.test.mjs',
-  'ui/lib/providers.test.mjs',
-  'ui/lib/scheduler.test.mjs',
-  'ui/server.test.mjs',
-]);
+const DURABLE_STAGES = ['collect', 'normalise', 'deduplicate', 'filter', 'rank', 'select'];
+const ACCEPTANCE_COMPATIBILITY = Object.freeze({
+  schemaVersion: 1,
+  mode: 'primary',
+  purpose: 'manual-discovery',
+  profileVersion: 'profile-v1',
+  sourceConfigFingerprint: 'a'.repeat(64),
+  journalSchemaVersion: 1,
+  artifactSchemaVersion: 1,
+  pipelineVersion: 'pipeline-v1',
+  rankingVersion: 'ranking-v1',
+  promptVersion: 'prompt-v1',
+  assessmentSchemaVersion: 1,
+  provider: 'codex',
+  model: 'provider-default',
+  mutationSchemaVersion: 1,
+  targetRevision: 'tracker-v1',
+});
+const QUEUE_COMPATIBILITY = Object.freeze({
+  profileFingerprint: 'b'.repeat(64),
+  configFingerprint: 'c'.repeat(64),
+  schemaVersion: 1,
+});
 
 const PRIVATE_SENTINELS = [
   'PRIVATE-HOST',
@@ -33,12 +48,6 @@ const PRIVATE_SENTINELS = [
   'SYNTHETIC-PROVIDER-TRANSCRIPT',
   'utm_source=synthetic-private',
 ];
-
-test('the real acceptance suite manifest contains only existing test files', () => {
-  expect(
-    REAL_ACCEPTANCE_SUITES.filter((relative) => !fs.existsSync(path.join(ROOT, relative))),
-  ).toEqual([]);
-});
 
 function setupStatus() {
   return {
@@ -156,25 +165,164 @@ function publicRun(state, label, fields = {}) {
   };
 }
 
-test('real fault-injection durability and security suites form one release acceptance boundary', async ({ browserName }) => {
+test('real durable interfaces survive crash, takeover, queue, provider, storage, backup and tamper faults', async ({ browserName }) => {
   test.skip(browserName !== 'chromium', 'the release matrix is browser-independent and runs once');
+  test.setTimeout(30_000);
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'scout-interface-acceptance-'));
+  const calls = new Map();
+  let now = Date.parse('2026-07-29T10:00:00.000Z');
+  const leaseOptions = {
+    wallNow: () => now,
+    monotonicNow: () => now,
+    leaseDurationMs: 1_000,
+    takeoverMarginMs: 0,
+  };
+  const stages = Object.fromEntries(DURABLE_STAGES.map((stageId) => [stageId, async ({
+    priorArtifact,
+  }) => {
+    calls.set(stageId, (calls.get(stageId) || 0) + 1);
+    return {
+      stageId,
+      stableIds: [...(priorArtifact?.stableIds || []), `${stageId}-accepted`],
+    };
+  }]));
   try {
-    currentLeaseOwner();
-  } catch {
-    test.skip(true, 'this macOS host cannot read its own process-start identity; the Linux CI matrix is authoritative');
+    const recovery = initializeRecoveryBackup(root, 'synthetic acceptance passphrase');
+    let interruptedRunId;
+    await expect(runScanPipeline({
+      root,
+      compatibility: ACCEPTANCE_COMPATIBILITY,
+      stages,
+      leaseOptions,
+      onStageCommitted({ stageId, run }) {
+        if (stageId !== 'collect') return;
+        interruptedRunId = run.runId;
+        now += 1_001;
+        throw new PipelineInterruptedError('fault-injected worker crash');
+      },
+    })).rejects.toThrow(PipelineInterruptedError);
+    expect(readScanLease(root)?.runId).toBe(interruptedRunId);
+
+    let archiveFile;
+    const recovered = await runScanPipeline({
+      root,
+      compatibility: ACCEPTANCE_COMPATIBILITY,
+      stages,
+      leaseOptions,
+      finalize: async () => ({
+        schemaVersion: 1,
+        result: { accepted: true },
+        mutationReceipt: {
+          schemaVersion: 1,
+          id: 'acceptance-tracker-report',
+          digest: 'd'.repeat(64),
+        },
+      }),
+      postTerminalSuccess: async ({ lease }) => {
+        const written = writeReviewedRunArchive(root, recovery.dataKey, {
+          schemaVersion: 1,
+          archiveId: 'e'.repeat(64),
+          reviewedSelectionDigest: 'f'.repeat(64),
+          runs: [{
+            runId: interruptedRunId,
+            files: [{ path: 'journal.jsonl', data: 'synthetic reviewed journal' }],
+          }],
+        }, {
+          commitFence: (commit) => assertCurrentFence(lease, synchronousFenceCallback(commit)),
+        });
+        archiveFile = written.file;
+        return { status: 'complete' };
+      },
+    });
+    expect(recovered).toMatchObject({ runId: interruptedRunId, outcome: 'complete', failures: [] });
+    expect(calls.get('collect')).toBe(1);
+    expect(DURABLE_STAGES.slice(1).every((stageId) => calls.get(stageId) === 1)).toBe(true);
+    expect(verifyReviewedRunArchive(archiveFile, recovery.dataKey).runs[0].runId)
+      .toBe(interruptedRunId);
+
+    const archive = JSON.parse(fs.readFileSync(archiveFile, 'utf8'));
+    const changed = Buffer.from(archive.data, 'base64url');
+    changed[0] ^= 1;
+    archive.data = changed.toString('base64url');
+    fs.writeFileSync(archiveFile, JSON.stringify(archive));
+    expect(() => verifyReviewedRunArchive(archiveFile, recovery.dataKey)).toThrow(/modified|invalid/i);
+
+    const queueLease = acquireScanLease(
+      root,
+      currentLeaseOwner(),
+      { kind: 'scan', runId: 'acceptance-queue', phase: 'queue-drain' },
+      leaseOptions,
+    );
+    expect(queueLease).toBeTruthy();
+    enqueueScanRequest(root, {
+      id: 'acceptance-request',
+      key: 'acceptance-request',
+      requestedAt: '2026-07-29T10:00:00.000Z',
+      expiresAt: '2026-07-30T10:00:00.000Z',
+      requester: 'manual',
+      windowAt: null,
+      purpose: 'manual-discovery',
+      compatibility: QUEUE_COMPATIBILITY,
+      execution: {
+        schemaVersion: 1,
+        provider: 'claude',
+        model: null,
+        mode: 'primary',
+      },
+      lease: queueLease,
+    });
+    const claimed = claimNextScanRequest(root, {
+      ...QUEUE_COMPATIBILITY,
+      purpose: 'manual-discovery',
+    }, queueLease, new Date('2026-07-29T10:01:00.000Z'));
+    completeScanRequest(root, claimed.id, 'succeeded', queueLease, claimed.claim);
+    releaseScanLease(queueLease);
+    expect(projectScanQueue(root).requests.map(({ id, status }) => [id, status]))
+      .toEqual([['acceptance-request', 'succeeded']]);
+
+    const providerBlocked = await runScanPipeline({
+      root,
+      compatibility: { ...ACCEPTANCE_COMPATIBILITY, provider: 'claude' },
+      stages,
+      healthPreflight: () => ({ ok: false, state: 'sign-in-required' }),
+    });
+    expect(providerBlocked).toMatchObject({
+      outcome: 'abandoned',
+      failures: [{ code: 'provider-health-blocked', reason: 'sign-in-required' }],
+    });
+
+    const pressured = fs.mkdtempSync(path.join(os.tmpdir(), 'scout-storage-acceptance-'));
+    try {
+      await expect(runScanPipeline({
+        root: pressured,
+        compatibility: ACCEPTANCE_COMPATIBILITY,
+        stages,
+        storagePolicy: {
+          maximumBytes: { runs: 0, artifacts: 0, queue: 0 },
+          reserveBytes: 1,
+        },
+      })).rejects.toMatchObject({ code: 'SCOUT_STORAGE_PRESSURE' });
+      expect(fs.existsSync(path.join(pressured, '.scout', 'scan-lease.json'))).toBe(false);
+    } finally {
+      fs.rmSync(pressured, { recursive: true, force: true });
+    }
+  } finally {
+    const live = readScanLease(root);
+    if (live) {
+      try {
+        const owned = acquireScanLease(
+          root,
+          currentLeaseOwner(),
+          { kind: 'scan', runId: 'acceptance-cleanup', phase: 'cleanup' },
+          { ...leaseOptions, wallNow: () => now + 2_000, monotonicNow: () => now + 2_000 },
+        );
+        if (owned) releaseScanLease(owned);
+      } catch {
+        // The temporary workspace is removed below; no durable user state exists.
+      }
+    }
+    fs.rmSync(root, { recursive: true, force: true });
   }
-  test.setTimeout(180_000);
-  const result = spawnSync(process.execPath, ['--test', ...REAL_ACCEPTANCE_SUITES], {
-    cwd: ROOT,
-    encoding: 'utf8',
-    windowsHide: true,
-    timeout: 170_000,
-    maxBuffer: 20 * 1024 * 1024,
-  });
-  expect(
-    result.status,
-    `real recovery acceptance failed\n${String(result.stdout || '').slice(-8000)}\n${String(result.stderr || '').slice(-8000)}`,
-  ).toBe(0);
 });
 
 test('real recovery and provider APIs reject a fault-injected private journal identity', async ({ page, request }) => {

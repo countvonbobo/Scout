@@ -936,6 +936,7 @@ test('a blocked queued provider is skipped while the next healthy provider still
   };
   const healthChecks = [];
   const stageCalls = [];
+  const queueLeaseOperations = [];
   try {
     const result = await runScanPipeline({
       root,
@@ -967,6 +968,7 @@ test('a blocked queued provider is skipped while the next healthy provider still
         now: new Date('2026-07-27T10:05:00.000Z'),
         async run(request, context) {
           const provider = request.id.startsWith('claude') ? 'claude' : 'codex';
+          queueLeaseOperations.push(readScanLease(root).operation);
           const queued = await runScanPipeline({
             root,
             compatibility: { ...RECOVERY_COMPATIBILITY, provider },
@@ -989,6 +991,19 @@ test('a blocked queued provider is skipped while the next healthy provider still
 
     assert.equal(result.outcome, 'complete');
     assert.deepEqual(healthChecks, ['claude', 'codex']);
+    assert.deepEqual(
+      queueLeaseOperations.map((operation) => ({
+        kind: operation.kind,
+        phase: operation.phase,
+        provider: operation.provider ?? null,
+        model: operation.model ?? null,
+        mode: operation.mode ?? null,
+      })),
+      [
+        { kind: 'scan', phase: 'queue-drain', provider: null, model: null, mode: null },
+        { kind: 'scan', phase: 'queue-drain', provider: null, model: null, mode: null },
+      ],
+    );
     assert.equal(stageCalls.some((call) => call.startsWith('claude:')), false);
     assert.equal(stageCalls.filter((call) => call.startsWith('codex:')).length, DURABLE_STAGES.length);
     assert.deepEqual(

@@ -85,6 +85,14 @@ function pipelineOperation(runId, compatibility, phase) {
   };
 }
 
+function queueDrainOperation(runId) {
+  return {
+    kind: 'scan',
+    runId,
+    phase: 'queue-drain',
+  };
+}
+
 function stageFunctions(stages) {
   const entries = Array.isArray(stages)
     ? stages.map((stage) => [stage?.id, stage?.execute ?? stage?.run])
@@ -261,7 +269,7 @@ async function drainScanQueue(root, queue, compatibility, leaseOptions, initialL
     const lease = index === 0 && initialLease ? initialLease : acquireScanLease(
       root,
       currentLeaseOwner(),
-      pipelineOperation(runId, compatibility, 'queue-drain'),
+      queueDrainOperation(runId),
       leaseOptions,
     );
     if (!lease) break;
@@ -557,19 +565,9 @@ export async function runScanPipeline({
   ))) {
     const startupQueueRunId = startupQueueState.find((request) => request.status === 'claimed')?.claim?.runId
       || randomUUID();
-    let startupCompatibility = compatibility;
-    if (startupQueueRunId !== provisionalRunId) {
-      try {
-        const prior = openRunJournal(root, startupQueueRunId);
-        if (prior.events.length) startupCompatibility = projectRunManifest(prior.events).compatibility;
-      } catch {
-        // The resumed run will record bounded recovery evidence under this
-        // successor fence; do not trust damaged compatibility here.
-      }
-    }
     lease = handoffScanLease(
       lease,
-      pipelineOperation(startupQueueRunId, startupCompatibility, 'queue-drain'),
+      queueDrainOperation(startupQueueRunId),
     );
     const startupDrain = await drainScanQueue(root, queue, compatibility, leaseOptions, lease);
     if (startupDrain.paused) {
