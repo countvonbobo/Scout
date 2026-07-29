@@ -185,6 +185,66 @@ test('runtime scan skips AI for a healthy empty source result and needs no Git r
   assert.equal(fs.existsSync(path.join(root, '.git')), false);
 });
 
+test('runtime preflight labels manual and scheduled scans and never requeues a blocked window', async () => {
+  for (const scenario of [
+    { requester: 'manual', purpose: 'manual-run' },
+    {
+      requester: 'scheduled',
+      purpose: 'scheduled-job',
+      scheduleId: 'codex-primary',
+      logicalWindowId: '2026-07-29T07:30:00.000Z',
+      windowAt: '2026-07-29T07:30:00.000Z',
+    },
+  ]) {
+    const root = scanRoot();
+    let collections = 0;
+    const preflights = [];
+    try {
+      const result = await runScanWith(root, 'codex', 'primary', {
+        providerStatusFn: authenticated,
+        collectSourcesFn: async () => {
+          collections += 1;
+          return {
+            generatedAt: '2026-07-29T08:00:00.000Z',
+            queries: [],
+            sources: {},
+          };
+        },
+        providerPreflightFn: async (scanRoot, provider, purpose, options) => {
+          preflights.push({
+            scanRoot,
+            provider,
+            purpose,
+            fenced: Boolean(options.lease),
+            source: options.source,
+          });
+          return { ok: false, state: 'sign-in-required' };
+        },
+        requester: scenario.requester,
+        scheduleId: scenario.scheduleId,
+        logicalWindowId: scenario.logicalWindowId,
+        windowAt: scenario.windowAt,
+      });
+
+      assert.equal(result.ok, false);
+      assert.equal(result.status, 'skipped');
+      assert.equal(result.reason, 'sign-in-required');
+      assert.equal(result.durable.outcome, 'abandoned');
+      assert.equal(collections, 0);
+      assert.deepEqual(preflights, [{
+        scanRoot: root,
+        provider: 'codex',
+        purpose: scenario.purpose,
+        fenced: true,
+        source: scenario.requester === 'scheduled' ? 'scheduled-preflight' : 'manual-preflight',
+      }]);
+      assert.deepEqual(projectScanQueue(root).requests, []);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  }
+});
+
 for (const failedTarget of [2, 3]) {
   test(`runtime finalisation preserves the prepared plan when target ${failedTarget} replacement fails`, async () => {
     const root = scanRoot();

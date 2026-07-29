@@ -541,6 +541,7 @@ export async function runScanWith(root, provider, mode, {
   if (!['codex', 'claude'].includes(provider)) throw new Error('provider must be codex or claude');
   if (!['primary', 'second-pass', 'broadened'].includes(mode)) throw new Error('mode must be primary, broadened or second-pass');
   const status = providerStatusFn(provider);
+  const providerHealthPurpose = requester === 'scheduled' ? 'scheduled-job' : 'manual-run';
   const config = loadWorkspaceConfig(root);
   model = model === undefined
     ? (config.ai?.provider === provider ? assertSafeModel(config.ai?.model) : null)
@@ -611,9 +612,9 @@ export async function runScanWith(root, provider, mode, {
       stages,
       claimedLease,
       heartbeatOptions,
-      healthPreflight({ root: workspaceRoot, provider: selectedProvider, purpose, lease }) {
+      healthPreflight({ root: workspaceRoot, provider: selectedProvider, lease }) {
         const source = requester === 'scheduled' ? 'scheduled-preflight' : 'manual-preflight';
-        return providerPreflightFn(workspaceRoot, selectedProvider, purpose, {
+        return providerPreflightFn(workspaceRoot, selectedProvider, providerHealthPurpose, {
           lease,
           source,
           probe: async () => providerLocalHealthSignal(status, { source }),
@@ -835,13 +836,13 @@ export async function runScanWith(root, provider, mode, {
                     root,
                     provider,
                     providerRemoteHealthSignal(remoteResult, { source: 'provider-operation' }),
-                    { lease, purpose: 'manual-run' },
+                    { lease, purpose: providerHealthPurpose },
                   ),
                   (error) => recordProviderHealthFn(
                     root,
                     provider,
                     providerRemoteHealthSignal(error, { source: 'provider-operation' }),
-                    { lease, purpose: 'manual-run' },
+                    { lease, purpose: providerHealthPurpose },
                   ),
                 ).catch(() => {});
                 return invocation;

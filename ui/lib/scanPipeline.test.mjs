@@ -2231,3 +2231,34 @@ test('provider health preflight durably abandons a blocked run before any scan w
     fs.rmSync(root, { recursive: true, force: true });
   }
 });
+
+test('a provider health preflight exception records a bounded blocked run and releases authority', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'scout-provider-health-preflight-error-'));
+  try {
+    const result = await runScanPipeline({
+      root,
+      compatibility: RECOVERY_COMPATIBILITY,
+      stages: durableStageHarness(new Map()),
+      async healthPreflight() {
+        throw new Error('PRIVATE_PROVIDER_HEALTH_STORAGE_DETAIL');
+      },
+    });
+
+    assert.equal(result.outcome, 'abandoned');
+    assert.deepEqual(result.failures, [{
+      code: 'provider-health-blocked',
+      stage: 'initialise',
+      reason: 'provider-error',
+    }]);
+    assert.doesNotMatch(JSON.stringify(result), /PRIVATE_PROVIDER_HEALTH_STORAGE_DETAIL/);
+    const events = replayRunJournal(openRunJournal(root, result.runId).file);
+    assert.deepEqual(events.map((event) => event.type), [
+      'run.started',
+      'run.failure-recorded',
+      'run.completed',
+    ]);
+    assert.equal(readScanLease(root), null);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});

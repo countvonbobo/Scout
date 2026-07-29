@@ -1538,22 +1538,56 @@ routes['POST /api/shutdown'] = (req, res) => {
 registerCompanyRoutes({ routes, repoRoot: WORKSPACE_ROOT, readTracker, onCheckpoint: queueCheckpoint });
 registerChatRoutes({ routes, repoRoot: WORKSPACE_ROOT, readTracker, onCheckpoint: queueCheckpoint });
 
+export async function runtimeProviderPreflight(root, provider, purpose, {
+  source,
+  detectProvidersFn = detectProvidersAsync,
+  preflightFn = providerPreflight,
+} = {}) {
+  const status = (await detectProvidersFn())[provider];
+  return preflightFn(root, provider, purpose, {
+    source,
+    probe: async () => providerLocalHealthSignal(status, { source }),
+  });
+}
+
+function configuredHealthProviders(config) {
+  return [...new Set([
+    config?.ai?.provider,
+    ...(config?.schedule?.jobs || [])
+      .filter((job) => job?.enabled === true)
+      .map((job) => job.provider),
+  ].filter((provider) => ['codex', 'claude'].includes(provider)))];
+}
+
+export function checkStartupProviderHealth(root, {
+  loadConfigFn = loadWorkspaceConfig,
+  preflight = runtimeProviderPreflight,
+} = {}) {
+  return Promise.all(configuredHealthProviders(loadConfigFn(root)).map((provider) => (
+    preflight(root, provider, 'startup', { source: 'startup' })
+  )));
+}
+
+export function createRuntimeProviderHealthMonitor(root, {
+  loadConfigFn = loadWorkspaceConfig,
+  preflight = runtimeProviderPreflight,
+  intervalMs,
+  setInterval,
+  clearInterval,
+} = {}) {
+  return createProviderHealthMonitor({
+    root,
+    getScheduleJobs: () => loadConfigFn(root).schedule?.jobs || [],
+    preflight,
+    ...(intervalMs === undefined ? {} : { intervalMs }),
+    ...(setInterval === undefined ? {} : { setInterval }),
+    ...(clearInterval === undefined ? {} : { clearInterval }),
+  });
+}
+
 const isMain = isMainModule(import.meta.url);
 if (isMain) {
-  const runtimeProviderPreflight = async (root, provider, purpose, options = {}) => {
-    const status = (await detectProvidersAsync())[provider];
-    return providerPreflight(root, provider, purpose, {
-      ...options,
-      probe: async () => providerLocalHealthSignal(status, {
-        source: options.source,
-      }),
-    });
-  };
-  const providerHealthMonitor = createProviderHealthMonitor({
-    root: WORKSPACE_ROOT,
-    getScheduleJobs: () => loadWorkspaceConfig(WORKSPACE_ROOT).schedule?.jobs || [],
-    preflight: runtimeProviderPreflight,
-  });
+  const providerHealthMonitor = createRuntimeProviderHealthMonitor(WORKSPACE_ROOT);
   if (process.platform === 'win32') {
     try {
       const settings = loadDeviceSettings();
@@ -1581,18 +1615,7 @@ if (isMain) {
     console.log(`Scout UI on http://127.0.0.1:${PORT}`);
     if (workspaceInitialised()) {
       void queueCheckpoint('startup sync');
-      const config = loadWorkspaceConfig(WORKSPACE_ROOT);
-      const configuredProviders = new Set([
-        config.ai?.provider,
-        ...(config.schedule?.jobs || [])
-          .filter((job) => job?.enabled === true)
-          .map((job) => job.provider),
-      ].filter((provider) => ['codex', 'claude'].includes(provider)));
-      for (const provider of configuredProviders) {
-        void runtimeProviderPreflight(WORKSPACE_ROOT, provider, 'startup', {
-          source: 'startup',
-        }).catch(() => {});
-      }
+      void checkStartupProviderHealth(WORKSPACE_ROOT).catch(() => {});
       void providerHealthMonitor.runNow().catch(() => {});
     }
   });

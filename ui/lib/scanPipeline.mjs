@@ -594,13 +594,19 @@ export async function runScanPipeline({
   try {
     if (healthPreflight !== null) {
       heartbeat = startLeaseHeartbeat(lease, heartbeatOptions);
-      const health = await healthPreflight({
-        root,
-        provider: compatibility.provider,
-        purpose: compatibility.purpose,
-        runId: provisionalRunId,
-        lease,
-      });
+      let health;
+      try {
+        health = await healthPreflight({
+          root,
+          provider: compatibility.provider,
+          purpose: compatibility.purpose,
+          runId: provisionalRunId,
+          lease,
+        });
+      } catch (error) {
+        if (error instanceof LeaseLostError) throw error;
+        health = { ok: false, state: 'provider-error' };
+      }
       if (health?.ok !== true) {
         const state = PROVIDER_HEALTH_STATES.has(health?.state)
           ? health.state

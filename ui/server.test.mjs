@@ -13,6 +13,7 @@ process.env.SCOUT_WORKSPACE = testWorkspace;
 process.env.SCOUT_DEVICE_SETTINGS = path.join(testWorkspace, 'device-settings.json');
 const {
   APP_ROOT, APP_VERSION, UI_BUILD_FILES, UI_BUILD_ID, WORKSPACE_ROOT,
+  checkStartupProviderHealth, createRuntimeProviderHealthMonitor,
   codexDeepLinkDetection, computeUiBuildId, createServer,
   inspectCodexDeepLinkHandler, operations, providerDetection, restartControl,
   shutdownControl,
@@ -23,6 +24,52 @@ const { acquireScanLock, releaseScanLock } = await import('../tools/scan-lock.mj
 const { appendRunEvent, openRunJournal } = await import('./lib/runJournal.mjs');
 const { acquireScanLease, currentLeaseOwner, releaseScanLease } = await import('./lib/scanLease.mjs');
 const { enqueueScanRequest } = await import('./lib/scanQueue.mjs');
+
+test('server startup and periodic provider health use the configured runtime entry points', async () => {
+  const config = {
+    ai: { provider: 'codex' },
+    schedule: {
+      jobs: [
+        { id: 'claude-primary', enabled: true, provider: 'claude' },
+        { id: 'claude-second', enabled: true, provider: 'claude' },
+        { id: 'codex-disabled', enabled: false, provider: 'codex' },
+      ],
+    },
+  };
+  const calls = [];
+  const preflight = async (root, provider, purpose, options) => {
+    calls.push([root, provider, purpose, options.source]);
+    return { ok: true, provider, purpose, state: 'ready' };
+  };
+
+  await checkStartupProviderHealth('/synthetic/workspace', {
+    loadConfigFn: () => config,
+    preflight,
+  });
+  assert.deepEqual(calls, [
+    ['/synthetic/workspace', 'codex', 'startup', 'startup'],
+    ['/synthetic/workspace', 'claude', 'startup', 'startup'],
+  ]);
+
+  let cleared = false;
+  const monitor = createRuntimeProviderHealthMonitor('/synthetic/workspace', {
+    loadConfigFn: () => config,
+    preflight,
+    setInterval: () => ({ unref() {} }),
+    clearInterval: () => { cleared = true; },
+  });
+  assert.deepEqual(await monitor.runNow(), [{
+    ok: true,
+    provider: 'claude',
+    purpose: 'periodic',
+    state: 'ready',
+  }]);
+  assert.deepEqual(calls.at(-1), [
+    '/synthetic/workspace', 'claude', 'periodic', 'periodic',
+  ]);
+  monitor.stop();
+  assert.equal(cleared, true);
+});
 
 let server;
 let port;
