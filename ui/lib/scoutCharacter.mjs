@@ -162,13 +162,24 @@ export function applyScoutState(element, state, { reducedMotion = false, definit
   if (!element) return null;
   const def = scoutDefinition(state, definitions);
   const sprite = element.matches?.('.scout-sprite') ? element : element.querySelector?.('.scout-sprite');
-  element.dataset.scoutState = state in definitions ? state : 'idle';
+  const nextState = state in definitions ? state : 'idle';
+  const stateChanged = element.dataset.scoutState !== nextState;
+  element.dataset.scoutState = nextState;
   element.setAttribute('aria-label', def.label);
   if (!sprite) return def;
   const timing = scoutTiming(def);
   const still = frameOffset(def.reducedMotionFrame, def);
   const anchor = scoutAnchor(def);
   const stillAnchor = scoutStillAnchor(def);
+  // Every canonical state currently uses the same 4x4x16 walk name. Browsers
+  // therefore retain the existing CSSAnimation and its current time when only
+  // duration, iteration count and artwork change. Break that lifecycle before
+  // applying a different state so one-shot success/warning walks always begin
+  // at their first cell on the persistent production element.
+  if (stateChanged && !reducedMotion) {
+    sprite.style.setProperty('--scout-walk', 'none');
+    void sprite.offsetWidth;
+  }
   sprite.style.setProperty('--scout-src', `url("${assetUrl(def.src)}")`);
   sprite.style.setProperty('--scout-columns', def.columns);
   sprite.style.setProperty('--scout-rows', def.rows);

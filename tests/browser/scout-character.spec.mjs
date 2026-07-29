@@ -225,6 +225,66 @@ test.describe('Scout character animation', () => {
     }
   });
 
+  test('in-place one-shot transitions restart at frame zero and complete their own walk', async ({ page }) => {
+    await openDashboard(page);
+    await installProbe(page);
+
+    const transitions = await page.evaluate(() => {
+      const character = window.__scoutProbe.mount('thinking', 112);
+      const sprite = character.querySelector('.scout-sprite');
+      const readPosition = () => getComputedStyle(sprite).backgroundPosition.split(',')[0].trim();
+      const results = {};
+
+      for (const target of ['success', 'warning']) {
+        window.ScoutCharacter.applyScoutState(character, 'thinking');
+        const prior = sprite.getAnimations()[0];
+        prior.pause();
+        prior.currentTime = 10_000;
+
+        window.ScoutCharacter.applyScoutState(character, target);
+        const animation = sprite.getAnimations()[0];
+        const definition = window.ScoutCharacter.SCOUT_STATES[target];
+        const duration = (definition.frames / definition.fps) * 1000;
+        const startedAt = animation.currentTime;
+        const reusedPriorAnimation = animation === prior;
+
+        animation.pause();
+        animation.currentTime = 0;
+        const first = readPosition();
+        const visited = [];
+        for (let frame = 0; frame < definition.frames; frame += 1) {
+          animation.currentTime = ((frame + 0.5) * duration) / definition.frames;
+          visited.push(readPosition());
+        }
+        animation.play();
+        animation.finish();
+        results[target] = {
+          startedAt,
+          reusedPriorAnimation,
+          first,
+          visited,
+          final: readPosition(),
+          playState: animation.playState,
+        };
+      }
+      return results;
+    });
+
+    const configured = await states(page);
+    for (const target of ['success', 'warning']) {
+      const result = transitions[target];
+      const definition = configured[target];
+      expect(result.reusedPriorAnimation, `${target} receives a fresh animation lifecycle`).toBe(false);
+      expect(result.startedAt, `${target} starts at frame zero`).toBeLessThan(50);
+      expect(cellNumber(result.first, 112, definition), `${target} first painted cell`).toBe(0);
+      expect(result.visited.map((position) => cellNumber(position, 112, definition)))
+        .toEqual(Array.from({ length: definition.frames }, (_, frame) => frame));
+      expect(cellNumber(result.final, 112, definition), `${target} terminal painted cell`)
+        .toBe(definition.frames - 1);
+      expect(result.playState, `${target} finishes after one pass`).toBe('finished');
+    }
+  });
+
   test('a sheet whose last row is only partly used stops at its final frame', async ({ page }) => {
     await openDashboard(page);
     await installProbe(page);
