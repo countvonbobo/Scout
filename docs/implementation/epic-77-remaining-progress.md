@@ -432,3 +432,25 @@ private paths, account data, CV content, adverts, prompts, or transcripts.
   - diff checks: passed.
 - Findings fixed/open: all round-4 findings fixed; complete-range Spec,
   code-quality and privacy/security re-review is pending.
+
+### Whole-epic review round 5
+
+- Verdicts:
+  - Spec PASS: 0 Critical, 0 Important.
+  - Code quality FAIL: 0 Critical, 1 Important.
+  - Privacy/security PASS: 0 Critical, 0 Important.
+- Review-fix commit: `4564ff7` (`fix: validate public update metadata`).
+- Finding reproduced and fixed:
+  - require canonical ISO UTC timestamps for public device/update status and
+    require a downloaded package name to match both its exact Scout version
+    and one of the supported platform package formats, so corrupted persisted
+    metadata cannot carry private text through otherwise generic fields.
+- GREEN after fixes:
+  - release-audit/build, doctor and update suites: 42 passed, 0 failed,
+    0 skipped;
+  - device/update boundary regression and local update-policy integration:
+    2 passed;
+  - default release audit: passed for 515 files;
+  - diff checks: passed.
+- Findings fixed/open: the round-5 finding is fixed; complete-range Spec,
+  code-quality and privacy/security re-review is pending.
