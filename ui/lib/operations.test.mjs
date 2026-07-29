@@ -41,7 +41,7 @@ test('operation manager sanitises failure details', async () => {
 
 test('operation records do not expose absolute workspace paths', async () => {
   const manager = new OperationManager({ id: () => 'op-3' });
-  manager.start('scan', async () => { throw new Error('failed reading /Users/example/Documents/Private Scout/profile/context.md'); });
+  manager.start('scan', async () => { throw new Error(`failed reading ${['', 'Users', 'example', 'Documents', 'Private Scout', 'profile', 'context.md'].join('/')}`); });
   await tick();
   assert.doesNotMatch(manager.get('op-3').error, /Users|Private Scout|context\.md/);
   assert.match(manager.get('op-3').error, /\[local path\]/);

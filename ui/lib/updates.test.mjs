@@ -4,7 +4,10 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
-import { checkForUpdate, compareVersions, downloadVerifiedUpdate, packageName, parseChecksums } from './updates.mjs';
+import {
+  checkForUpdate, compareVersions, downloadVerifiedUpdate, packageName, parseChecksums,
+  publicDownloadedUpdate,
+} from './updates.mjs';
 
 function streamedResponse(chunks, headers = {}) {
   return {
@@ -24,6 +27,23 @@ test('beta versions compare numerically', () => {
   assert.equal(compareVersions('0.1.0-beta.10', '0.1.0-beta.9'), 1);
   assert.equal(compareVersions('v0.1.0-beta.7', '0.1.0-beta.7'), 0);
   assert.equal(compareVersions('0.1.0', '0.1.0-beta.99'), 1);
+});
+
+test('download projection never exposes its device-local absolute path', () => {
+  const projected = publicDownloadedUpdate({
+    path: ['C:', 'Users', 'Owner', 'AppData', 'Local', 'Scout', 'updates', 'Scout.exe'].join('\\'),
+    name: 'Scout.exe',
+    sha256: 'a'.repeat(64),
+    version: '0.1.0-beta.23',
+    verifiedAt: '2026-07-29T10:00:00.000Z',
+  });
+  assert.deepEqual(projected, {
+    name: 'Scout.exe',
+    sha256: 'a'.repeat(64),
+    version: '0.1.0-beta.23',
+    verifiedAt: '2026-07-29T10:00:00.000Z',
+  });
+  assert.equal('path' in projected, false);
 });
 
 test('update check selects a newer verified Scout release and device package', async () => {

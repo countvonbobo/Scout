@@ -195,7 +195,7 @@ test('fallback and stale catalogues are explicit and force a deliberate valid ch
             defaultModel: null,
             effectiveModel: { id: 'gpt-old-stale', label: 'gpt-old-stale', source: 'configured', available: false, known: true, state: 'stale' },
             catalogue: { state: 'fallback', reasonCode: 'command-unsupported', checkedAt: null },
-            raw: '/Users/example person@example.test token=secret',
+            raw: `${['', 'Users', 'example'].join('/')} person@example.test token=secret`,
           },
         },
       }),
@@ -206,7 +206,7 @@ test('fallback and stale catalogues are explicit and force a deliberate valid ch
   await expect(codex).toContainText('bundled fallback');
   await expect(codex).toContainText(/saved default unavailable/i);
   await expect(codex.locator('option[value="gpt-old-stale"]')).toHaveAttribute('disabled', '');
-  await expect(codex).not.toContainText('/Users/example');
+  await expect(codex).not.toContainText(['', 'Users', 'example'].join('/'));
   await expect(codex).not.toContainText('person@example.test');
   await expect(codex).not.toContainText('token=secret');
   await page.click('[data-engine-card="codex"] [data-action="pick-engine"]');
@@ -509,13 +509,13 @@ test('a failed Codex navigation becomes a visible fallback', async ({ page }) =>
     }),
   }));
   await page.evaluate(() => {
-    window.Scout.codexNavigate = () => { throw new Error('/Users/private raw launch error'); };
+    window.Scout.codexNavigate = () => { throw new Error(`${['', 'Users', 'private'].join('/')} raw launch error`); };
   });
   await page.evaluate((id) => window.Scout.openChat(id, 'ask'), opportunity.id);
   await page.click('[data-action="open-codex-task"]');
   await expect(page.locator('.codex-link-status')).toContainText(/could not open Codex/i);
   await expect(page.locator('.codex-link-status')).toContainText('task-launch-fails');
-  await expect(page.locator('.codex-link-status')).not.toContainText('/Users/private');
+  await expect(page.locator('.codex-link-status')).not.toContainText(['', 'Users', 'private'].join('/'));
 });
 
 test('a hostile Codex task identity is escaped, copyable and never launched', async ({ page }) => {

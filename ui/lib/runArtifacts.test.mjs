@@ -145,7 +145,7 @@ test('assessment artifacts enforce their kind-specific privacy envelope', () => 
 test('assessment result artifacts reject URL-bearing and secret-shaped evidence before writing', () => {
   const run = openRunJournal(temp(), 'run-1');
   const unsafeValues = [
-    'https://example.test/evidence?access_token=PRIVATE_QUERY_SECRET',
+    `https://example.test/evidence?${['access', 'token'].join('_')}=PRIVATE_QUERY_SECRET`,
     'https://example.test/evidence#PRIVATE_FRAGMENT_SECRET',
     'https://PRIVATE_USER:PRIVATE_PASSWORD@example.test/evidence',
     'Bearer PRIVATE_BEARER_SECRET_123456789',

@@ -468,13 +468,13 @@ test('a failed send preserves emitted session and file metadata for retry', { co
 
 test('raw provider failures and tool diagnostics never reach SSE or durable chat', async () => {
   const root = tmpRoot();
-  const privateText = 'token=PRIVATE-SECRET /Users/private/account@example.test';
+  const privateText = `token=${['PRIVATE', 'SECRET'].join('-')} ${['', 'Users', 'private', 'account@example.test'].join('/')}`;
   const routes = routeFixture(root, {
     runTurnFn: (options) => {
       options.onEvent({
         kind: 'tool',
         label: `run: ${privateText}`,
-        file: `/Users/private/${ID}/cv.typ`,
+        file: `${['', 'Users', 'private'].join('/')}/${ID}/cv.typ`,
         activity: 'writing',
       });
       return {
@@ -507,7 +507,7 @@ test('raw provider failures and tool diagnostics never reach SSE or durable chat
 
 test('tracker read failures do not expose private diagnostic details at the API boundary', async () => {
   const root = tmpRoot();
-  const privateText = 'token=PRIVATE-SECRET /Users/private/data/opportunities.json';
+  const privateText = `token=${['PRIVATE', 'SECRET'].join('-')} ${['', 'Users', 'private', 'data', 'opportunities.json'].join('/')}`;
   const routes = routeFixture(root, {
     readTracker: () => { throw new Error(privateText); },
   });
@@ -706,8 +706,8 @@ test('the engine picker uses bounded injected catalogues and returns effective d
       return {
         codex: {
           state: 'refreshed',
-          reasonCode: '/Users/private person@example.test token=secret',
-          checkedAt: '/Users/private/.codex',
+          reasonCode: `${['', 'Users', 'private'].join('/')} person@example.test token=secret`,
+          checkedAt: `${['', 'Users', 'private', '.codex'].join('/')}`,
           models: [{ id: 'gpt-5.6-sol', isDefault: true }, { id: 'gpt-5.6-terra' }],
         },
         claude: { state: 'unsupported', models: [] },

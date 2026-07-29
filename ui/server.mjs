@@ -40,7 +40,7 @@ import {
 } from './lib/onboardingProposal.mjs';
 import { loadDeviceSettings, pendingDeviceSections, saveDeviceSettings, setWindowsStartup, updateDownloadDirectory, windowsStartupStatus } from './lib/deviceSettings.mjs';
 import { disableRemoteAccess, enableRemoteAccess, remoteAccessStatus } from './lib/remoteAccess.mjs';
-import { checkForUpdate, downloadVerifiedUpdate } from './lib/updates.mjs';
+import { checkForUpdate, downloadVerifiedUpdate, publicDownloadedUpdate } from './lib/updates.mjs';
 import {
   adoptExistingWorkspaceFromGithub, confirmRecoveryKey, connectWorkspaceSync, detectGit, disableWorkspaceSync, loadSyncSettings, pendingRecoveryKey,
   prepareGithubDeployKey, queueWorkspaceResolution, queueWorkspaceSync, restoreWorkspaceFromGithub,
@@ -115,7 +115,11 @@ function queueCheckpoint(reason, { includeDevicePreferences = false } = {}) {
     ? { deviceSettings: loadDeviceSettings() }
     : {};
   return queueWorkspaceSync(WORKSPACE_ROOT, reason, options)
-    .catch((error) => ({ state: 'needs-attention', error: error.message }));
+    .catch(() => ({
+      state: 'needs-attention',
+      error: 'Private backup needs attention',
+      reasonCode: 'backup-error',
+    }));
 }
 
 export function today() {
@@ -146,6 +150,10 @@ function sendJson(res, status, obj) {
   const body = JSON.stringify(obj);
   res.writeHead(status, { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) });
   res.end(body);
+}
+
+export function publicApiError(fallback = 'Request could not be completed.', _error = null) {
+  return { error: fallback, reasonCode: 'request-failed' };
 }
 
 function sendText(res, status, type, text) {
@@ -681,11 +689,11 @@ async function handleRead(req, res, url) {
   }
   if (req.method === 'GET' && url.pathname === '/api/setup/proposal') {
     try { return sendJson(res, 200, { proposal: readOnboardingProposal(WORKSPACE_ROOT) }); }
-    catch (e) { return sendJson(res, 400, { error: e.message }); }
+    catch { return sendJson(res, 400, publicApiError('Setup proposal could not be read.')); }
   }
   if (req.method === 'GET' && url.pathname === '/api/search-profile') {
     try { return sendJson(res, 200, readSearchProfileState()); }
-    catch (e) { return sendJson(res, 400, { error: e.message }); }
+    catch { return sendJson(res, 400, publicApiError('Search profile could not be read.')); }
   }
   if (req.method === 'GET' && url.pathname === '/api/app-info') {
     return sendJson(res, 200, {
@@ -781,22 +789,22 @@ async function handleRead(req, res, url) {
       const abs = safeCvPath(WORKSPACE_ROOT, url.searchParams.get('path'));
       if (!fs.existsSync(abs)) return sendJson(res, 404, { error: 'no such file' });
       return sendText(res, 200, 'text/plain; charset=utf-8', fs.readFileSync(abs, 'utf8'));
-    } catch (e) { return sendJson(res, 400, { error: e.message }); }
+    } catch { return sendJson(res, 400, publicApiError('CV file request is invalid.')); }
   }
   if (req.method === 'GET' && url.pathname === '/api/cv/quality') {
     try { return sendJson(res, 200, readCvQuality(WORKSPACE_ROOT, url.searchParams.get('slug') || '')); }
-    catch (e) { return sendJson(res, 400, { error: e.message }); }
+    catch { return sendJson(res, 400, publicApiError('CV quality record could not be read.')); }
   }
   if (req.method === 'GET' && url.pathname === '/api/cv/pdf') {
     const target = url.searchParams.get('target') === 'master' ? 'master' : 'application';
     const slug = url.searchParams.get('slug') || '';
     let pdf;
     try { pdf = cvPdfPath(WORKSPACE_ROOT, { target, slug }); }
-    catch (e) { return sendJson(res, /(stale|record lost)/i.test(e.message) ? 409 : 404, { error: e.message }); }
+    catch (e) { return sendJson(res, /(stale|record lost)/i.test(e.message) ? 409 : 404, publicApiError('CV PDF is stale or unavailable.')); }
     if (target === 'application' && url.searchParams.get('download') === '1') {
       let decision;
       try { decision = cvDownloadDecision(WORKSPACE_ROOT, slug); }
-      catch (e) { return sendJson(res, 400, { error: e.message }); }
+      catch { return sendJson(res, 400, publicApiError('CV download could not be validated.')); }
       if (!decision.allowed) return sendJson(res, 409, decision);
     }
     const buf = fs.readFileSync(pdf);
@@ -876,13 +884,13 @@ export function createServer() {
         const decoded = body.finish();
         if (!decoded.ok) return replyJson(res, 400, { error: 'request body is not valid UTF-8' });
         Promise.resolve(routes[routeKey](req, res, decoded.text, url))
-          .catch((error) => { if (!res.writableEnded) replyJson(res, 500, { error: error.message }); });
+          .catch(() => { if (!res.writableEnded) replyJson(res, 500, publicApiError()); });
       });
       return;
     }
     handleRead(req, res, url)
       .then((handled) => { if (handled === null && !res.writableEnded) sendJson(res, 404, { error: 'not found' }); })
-      .catch((error) => { if (!res.writableEnded) sendJson(res, 500, { error: error.message }); });
+      .catch(() => { if (!res.writableEnded) sendJson(res, 500, publicApiError()); });
   });
   server.once('close', () => { void providerLoginControl.shutdown(); });
   return server;
@@ -1109,7 +1117,7 @@ function currentDraftForRevision(revision) {
 function replySearchProfileConflict(res, error) {
   return replyJson(res, 409, {
     conflict: true, currentRevision: error.currentRevision,
-    error: error.message,
+    ...publicApiError('Search-profile update conflict.'),
   });
 }
 
@@ -1128,7 +1136,7 @@ routes['PUT /api/search-profile/draft'] = (req, res, body) => {
     return replyJson(res, 200, { ok: true, draft: state.draft, draftRevision: state.draftRevision });
   } catch (e) {
     if (Object.hasOwn(e, 'currentRevision')) return replySearchProfileConflict(res, e);
-    return replyJson(res, 400, { error: e.message });
+    return replyJson(res, 400, publicApiError('Search-profile draft could not be saved.'));
   }
 };
 
@@ -1153,7 +1161,7 @@ routes['POST /api/search-profile/publish'] = (req, res, body) => {
     return replyJson(res, 200, { ok: true, published });
   } catch (e) {
     if (Object.hasOwn(e, 'currentRevision')) return replySearchProfileConflict(res, e);
-    return replyJson(res, 400, { error: e.message });
+    return replyJson(res, 400, publicApiError('Search profile could not be published.'));
   }
 };
 
@@ -1163,7 +1171,7 @@ routes['POST /api/workspace/create'] = (req, res, body) => {
   try {
     seedWorkspace(APP_ROOT, WORKSPACE_ROOT);
     return replyJson(res, 200, { ok: true, workspaceRoot: WORKSPACE_ROOT });
-  } catch (e) { return replyJson(res, 400, { error: e.message }); }
+  } catch { return replyJson(res, 400, publicApiError('Workspace creation could not be completed.')); }
 };
 
 routes['POST /api/workspace/restore'] = async (req, res, body) => {
@@ -1178,7 +1186,7 @@ routes['POST /api/workspace/restore'] = async (req, res, body) => {
     });
     const { validation, ...restored } = result;
     return replyJson(res, 200, { ...restored, doctor: validation });
-  } catch (e) { return replyJson(res, 400, { error: e.message }); }
+  } catch { return replyJson(res, 400, publicApiError('Workspace restore could not be completed.')); }
 };
 
 routes['POST /api/workspace/adopt-private'] = async (req, res, body) => {
@@ -1193,7 +1201,7 @@ routes['POST /api/workspace/adopt-private'] = async (req, res, body) => {
     });
     res.setHeader('Cache-Control', 'no-store');
     return replyJson(res, 200, result);
-  } catch (e) { return replyJson(res, 400, { error: e.message }); }
+  } catch { return replyJson(res, 400, publicApiError('Private workspace adoption could not be completed.')); }
 };
 
 routes['POST /api/sync/connect'] = async (req, res, body) => {
@@ -1204,7 +1212,7 @@ routes['POST /api/sync/connect'] = async (req, res, body) => {
       remoteUrl: b.remoteUrl, passphrase: b.passphrase,
     }, { deviceSettings: process.platform === 'win32' ? loadDeviceSettings() : null });
     return replyJson(res, 200, result);
-  } catch (e) { return replyJson(res, 400, { error: e.message }); }
+  } catch { return replyJson(res, 400, publicApiError('Private backup could not be connected.')); }
 };
 
 routes['POST /api/sync/deploy-key'] = (req, res, body) => {
@@ -1214,19 +1222,19 @@ routes['POST /api/sync/deploy-key'] = (req, res, body) => {
     const result = prepareGithubDeployKey(WORKSPACE_ROOT);
     res.setHeader('Cache-Control', 'no-store');
     return replyJson(res, 200, { ok: true, publicKey: result.publicKey });
-  } catch (e) { return replyJson(res, 400, { error: e.message }); }
+  } catch { return replyJson(res, 400, publicApiError('Deploy key preparation failed.')); }
 };
 
 routes['POST /api/sync/backup'] = async (req, res, body) => {
   const b = parseBody(body); if (!b) return replyJson(res, 400, { error: 'bad json' });
   try { return replyJson(res, 200, await queueCheckpoint(b.reason || 'manual backup')); }
-  catch (e) { return replyJson(res, 500, { error: e.message }); }
+  catch { return replyJson(res, 500, publicApiError('Private backup could not be completed.')); }
 };
 
 routes['POST /api/sync/retry'] = async (req, res, body) => {
   const b = parseBody(body); if (!b) return replyJson(res, 400, { error: 'bad json' });
   try { return replyJson(res, 200, await queueCheckpoint('retry backup')); }
-  catch (e) { return replyJson(res, 500, { error: e.message }); }
+  catch { return replyJson(res, 500, publicApiError('Private backup retry could not be completed.')); }
 };
 
 routes['POST /api/sync/resolve'] = async (req, res, body) => {
@@ -1253,9 +1261,11 @@ routes['POST /api/sync/resolve'] = async (req, res, body) => {
     const result = await queueWorkspaceResolution(WORKSPACE_ROOT, analysisToken, lease);
     return replyJson(res, 200, result);
   } catch (e) {
-    return replyJson(res, /confirm|changed|in progress|lease/i.test(e.message) ? 409 : 500, {
-      error: e.message,
-    });
+    return replyJson(
+      res,
+      /confirm|changed|in progress|lease/i.test(e.message) ? 409 : 500,
+      publicApiError('Backup resolution could not be completed.'),
+    );
   } finally {
     heartbeat?.stop();
     if (lease) {
@@ -1288,7 +1298,7 @@ routes['POST /api/sync/passphrase'] = async (req, res, body) => {
   try {
     const result = await rotateWorkspaceRecoveryPassphrase(WORKSPACE_ROOT, b.passphrase);
     return replyJson(res, result.ok ? 200 : 503, result);
-  } catch (e) { return replyJson(res, 400, { error: e.message }); }
+  } catch { return replyJson(res, 400, publicApiError('Recovery passphrase could not be changed.')); }
 };
 
 async function applyTrackerMutation(res, mutate, commitMessage, expectedRevision) {
@@ -1309,8 +1319,8 @@ async function applyTrackerMutation(res, mutate, commitMessage, expectedRevision
         error: 'The tracker changed while this page was open. Scout preserved the newer data; refresh and retry.',
       });
     }
-    if (e instanceof SyntaxError) return replyJson(res, 500, { error: `tracker unreadable: ${e.message}` });
-    return replyJson(res, 400, { error: e.message });
+    if (e instanceof SyntaxError) return replyJson(res, 500, publicApiError('Tracker could not be read.'));
+    return replyJson(res, 400, publicApiError('Tracker update could not be completed.'));
   } finally {
     releaseTrackerMutationLock(WORKSPACE_ROOT, lock.token);
   }
@@ -1384,12 +1394,12 @@ routes['POST /api/stage/complete'] = async (req, res, body) => {
 routes['POST /api/cv/save'] = (req, res, body) => {
   const b = parseBody(body); if (!b) return replyJson(res, 400, { error: 'bad json' });
   let abs;
-  try { abs = safeCvPath(WORKSPACE_ROOT, b.path); } catch (e) { return replyJson(res, 400, { error: e.message }); }
+  try { abs = safeCvPath(WORKSPACE_ROOT, b.path); } catch { return replyJson(res, 400, publicApiError('CV file request is invalid.')); }
   if (typeof b.content !== 'string') return replyJson(res, 400, { error: 'content required' });
   if (path.resolve(abs) === path.resolve(WORKSPACE.cv, 'master-cv.md') && Buffer.byteLength(b.content.trim(), 'utf8') < 500) {
     return replyJson(res, 409, { error: 'The master CV is empty or incomplete. Scout kept the existing file; restore the reviewed proposal or enter at least 500 bytes before saving.' });
   }
-  try { atomicWriteFile(abs, b.content); } catch (e) { return replyJson(res, 500, { error: e.message }); }
+  try { atomicWriteFile(abs, b.content); } catch { return replyJson(res, 500, publicApiError('CV file could not be saved.')); }
   void queueCheckpoint(`edit cv - ${b.path}`);
   replyJson(res, 200, { ok: true, savedLocally: true, syncQueued: true });
 };
@@ -1409,8 +1419,8 @@ routes['POST /api/cv/render'] = (req, res, body) => {
     }, { phase: 'Queued for rendering', total: 3 });
     return replyJson(res, 202, { operation });
   } catch (e) {
-    if (e instanceof OperationConflictError) return replyJson(res, 409, { error: e.message, operation: e.operation });
-    return replyJson(res, 400, { error: e.message });
+    if (e instanceof OperationConflictError) return replyJson(res, 409, { ...publicApiError('Another operation is already running.'), operation: e.operation });
+    return replyJson(res, 400, publicApiError('CV rendering could not be started.'));
   }
 };
 
@@ -1421,7 +1431,7 @@ routes['POST /api/cv/quality'] = (req, res, body) => {
     const result = runCvQuality(WORKSPACE_ROOT, b.slug || '', { locale: config.locale, appRoot: APP_ROOT, compile: false });
     void queueCheckpoint(`review cv quality - ${b.slug || 'application'}`);
     return replyJson(res, 200, result);
-  } catch (e) { return replyJson(res, 400, { error: e.message }); }
+  } catch { return replyJson(res, 400, publicApiError('CV quality check could not be completed.')); }
 };
 
 routes['POST /api/cv/quality/override'] = (req, res, body) => {
@@ -1431,7 +1441,7 @@ routes['POST /api/cv/quality/override'] = (req, res, body) => {
     void queueCheckpoint(`accept cv draft - ${b.slug || 'application'}`);
     return replyJson(res, 200, result);
   }
-  catch (e) { return replyJson(res, 409, { error: e.message }); }
+  catch { return replyJson(res, 409, publicApiError('CV quality decision could not be saved.')); }
 };
 
 import { activeChatTurnCount, registerChatRoutes } from './lib/chatService.mjs';
@@ -1449,8 +1459,8 @@ routes['POST /api/setup/proposal'] = (req, res, body) => {
     return replyJson(res, 202, { operation });
   }
   catch (e) {
-    if (e instanceof OperationConflictError) return replyJson(res, 409, { error: e.message, operation: e.operation });
-    return replyJson(res, 400, { error: e.message });
+    if (e instanceof OperationConflictError) return replyJson(res, 409, { ...publicApiError('Another operation is already running.'), operation: e.operation });
+    return replyJson(res, 400, publicApiError('Setup proposal could not be started.'));
   }
 };
 
@@ -1461,7 +1471,7 @@ routes['POST /api/setup/activate'] = (req, res, body) => {
     void queueCheckpoint('activate setup proposal');
     return replyJson(res, 200, result);
   }
-  catch (e) { return replyJson(res, 409, { error: e.message }); }
+  catch { return replyJson(res, 409, publicApiError('Setup proposal could not be activated.')); }
 };
 
 routes['POST /api/setup/recovery'] = (req, res, body) => {
@@ -1470,7 +1480,7 @@ routes['POST /api/setup/recovery'] = (req, res, body) => {
     const result = recoverActivatedProposal(WORKSPACE_ROOT, b.confirmed);
     void queueCheckpoint('recover activated master cv');
     return replyJson(res, 200, result);
-  } catch (e) { return replyJson(res, 409, { error: e.message }); }
+  } catch { return replyJson(res, 409, publicApiError('Setup recovery could not be completed.')); }
 };
 
 routes['DELETE /api/setup/proposal'] = (req, res) => {
@@ -1504,7 +1514,7 @@ routes['POST /api/setup/config'] = (req, res, body) => {
     writeWorkspaceConfig(WORKSPACE_ROOT, next);
     void queueCheckpoint('update setup');
     return replyJson(res, 200, { ok: true, config: next });
-  } catch (e) { return replyJson(res, 400, { error: e.message }); }
+  } catch { return replyJson(res, 400, publicApiError('Setup settings could not be saved.')); }
 };
 
 routes['POST /api/setup/complete'] = async (req, res, body) => {
@@ -1524,7 +1534,7 @@ routes['POST /api/setup/complete'] = async (req, res, body) => {
     }
     void queueCheckpoint('complete setup', { includeDevicePreferences: true });
     return replyJson(res, 200, { ok: true, completedAt: config.setup.completedAt });
-  } catch (e) { return replyJson(res, 400, { error: e.message }); }
+  } catch { return replyJson(res, 400, publicApiError('Setup could not be completed.')); }
 };
 
 routes['POST /api/device/settings'] = (req, res, body) => {
@@ -1536,7 +1546,7 @@ routes['POST /api/device/settings'] = (req, res, body) => {
       const host = path.resolve(APP_ROOT, '..', 'Scout.exe');
       if (!fs.existsSync(host)) return replyJson(res, 400, { error: 'Windows startup is available in the installed Scout app' });
       const result = setWindowsStartup(enabled, host);
-      if (!result.ok) return replyJson(res, 400, result);
+      if (!result.ok) return replyJson(res, 400, publicApiError('Windows startup could not be changed.'));
       settings.startWithWindows = enabled;
       settings.startup = {
         mechanism: result.mechanism || 'task-scheduler',
@@ -1550,7 +1560,7 @@ routes['POST /api/device/settings'] = (req, res, body) => {
     saveDeviceSettings(settings);
     void queueCheckpoint('update device settings', { includeDevicePreferences: true });
     return replyJson(res, 200, { ok: true, settings, pendingSetupSections: pendingDeviceSections(settings) });
-  } catch (e) { return replyJson(res, 400, { error: e.message }); }
+  } catch { return replyJson(res, 400, publicApiError('Device settings could not be saved.')); }
 };
 
 routes['POST /api/remote-access/enable'] = (req, res, body) => {
@@ -1569,14 +1579,14 @@ routes['POST /api/remote-access/enable'] = (req, res, body) => {
           if (startup.ok) {
             settings.startWithWindows = true;
             settings.startup = { mechanism: startup.mechanism, verifiedAt: startup.verifiedAt };
-          } else startupWarning = startup.error;
+          } else startupWarning = 'Automatic startup could not be enabled.';
         }
       }
       saveDeviceSettings(settings);
       result = { ...result, startupWarning };
     }
     return replyJson(res, result.enabled ? 200 : 202, { ...publicRemoteStatus(result), startupWarning: result.startupWarning || null });
-  } catch (e) { return replyJson(res, 400, { error: e.message }); }
+  } catch { return replyJson(res, 400, publicApiError('Private remote access could not be enabled.')); }
 };
 
 routes['POST /api/remote-access/disable'] = (req, res, body) => {
@@ -1585,7 +1595,7 @@ routes['POST /api/remote-access/disable'] = (req, res, body) => {
     const result = disableRemoteAccess(loadDeviceSettings());
     saveDeviceSettings(result.settings);
     return replyJson(res, 200, publicRemoteStatus(result));
-  } catch (e) { return replyJson(res, 409, { error: e.message }); }
+  } catch { return replyJson(res, 409, publicApiError('Private remote access could not be disabled.')); }
 };
 
 routes['POST /api/setup/section'] = (req, res, body) => {
@@ -1626,9 +1636,9 @@ async function updateStatus(force = false) {
     settings.updates = { ...settings.updates, lastCheckedAt: new Date().toISOString(), lastResult: result, lastNotifiedVersion: notify ? result.latestVersion : settings.updates?.lastNotifiedVersion };
     saveDeviceSettings(settings);
     if (result.available && result.package && settings.updates.policy === 'download' && settings.updates.downloaded?.version !== result.latestVersion) {
-      void downloadCurrentUpdate(result).catch((error) => {
+      void downloadCurrentUpdate(result).catch(() => {
         const latest = loadDeviceSettings();
-        latest.updates = { ...latest.updates, downloadError: error.message };
+        latest.updates = { ...latest.updates, downloadError: 'Update download could not be completed.' };
         saveDeviceSettings(latest);
       });
     }
@@ -1640,7 +1650,7 @@ async function updateStatus(force = false) {
 routes['POST /api/update/check'] = async (req, res, body) => {
   const b = parseBody(body); if (!b) return replyJson(res, 400, { error: 'bad json' });
   try { return replyJson(res, 200, { ...await updateStatus(Boolean(b.force)), canDownload: req.scoutAccess === 'local' }); }
-  catch (e) { return replyJson(res, 503, { error: e.message, available: false, currentVersion: APP_VERSION }); }
+  catch { return replyJson(res, 503, { ...publicApiError('Update check could not be completed.'), available: false, currentVersion: APP_VERSION }); }
 };
 
 routes['POST /api/update/download'] = async (req, res, body) => {
@@ -1649,8 +1659,8 @@ routes['POST /api/update/download'] = async (req, res, body) => {
     const result = await updateStatus(true);
     if (!result.available) return replyJson(res, 409, { error: 'Scout is already up to date' });
     const downloaded = await downloadCurrentUpdate(result);
-    return replyJson(res, 200, { ok: true, downloaded });
-  } catch (e) { return replyJson(res, 503, { error: e.message }); }
+    return replyJson(res, 200, { ok: true, downloaded: publicDownloadedUpdate(downloaded) });
+  } catch { return replyJson(res, 503, publicApiError('Update download could not be completed.')); }
 };
 
 routes['POST /api/setup/credentials'] = (req, res, body) => {
@@ -1662,7 +1672,7 @@ routes['POST /api/setup/credentials'] = (req, res, body) => {
     });
     void queueCheckpoint('update source credentials');
     return replyJson(res, 200, { ok: true, configured: !!(b.appId && b.apiKey) });
-  } catch (e) { return replyJson(res, 400, { error: e.message }); }
+  } catch { return replyJson(res, 400, publicApiError('Source credentials could not be saved.')); }
 };
 
 routes['POST /api/setup/import-cv'] = (req, res, body) => {
@@ -1686,7 +1696,7 @@ routes['POST /api/setup/import-cv'] = (req, res, body) => {
     replyJson(res, 200, { ok: true, source: `imports/${name}`, extracted: `imports/${path.basename(extracted)}`, text });
   }).catch((e) => {
     fs.rmSync(imported, { force: true });
-    replyJson(res, 400, { error: e.message });
+    replyJson(res, 400, publicApiError('CV import could not be completed.'));
   });
 };
 
@@ -1698,7 +1708,7 @@ routes['POST /api/scan'] = (req, res, body) => {
   const config = loadWorkspaceConfig(WORKSPACE_ROOT);
   const provider = b.provider || config.ai?.provider;
   let model;
-  try { model = assertSafeModel(b.model); } catch (e) { return replyJson(res, 400, { error: e.message }); }
+  try { model = assertSafeModel(b.model); } catch { return replyJson(res, 400, { error: 'model is invalid' }); }
   if (!['codex', 'claude'].includes(provider)) return replyJson(res, 400, { error: 'choose an authenticated AI provider first' });
   try {
     const estimate = scanEstimate(readScanRecords(), provider, 'primary');
@@ -1727,8 +1737,8 @@ routes['POST /api/scan'] = (req, res, body) => {
     }, { phase: 'Validating approved evidence', total: 5, estimate });
     return replyJson(res, 202, { operation });
   } catch (e) {
-    if (e instanceof OperationConflictError) return replyJson(res, 409, { error: e.message, operation: e.operation });
-    return replyJson(res, 400, { error: e.message });
+    if (e instanceof OperationConflictError) return replyJson(res, 409, { ...publicApiError('Another operation is already running.'), operation: e.operation });
+    return replyJson(res, 400, publicApiError('Scan could not be started.'));
   }
 };
 
@@ -1760,8 +1770,12 @@ routes['POST /api/schedule'] = (req, res, body) => {
     } else if (b.action === 'run-now') result = runScheduledNow({ id });
     else return replyJson(res, 400, { error: 'action must be install, remove, or run-now' });
     if (result.ok) void queueCheckpoint(`schedule ${b.action}`);
-    return replyJson(res, result.ok ? 200 : 500, { ...result, id, schedule: readScheduleSummary() });
-  } catch (e) { return replyJson(res, 400, { error: e.message }); }
+    return replyJson(res, result.ok ? 200 : 500, {
+      ...(result.ok ? result : { ok: false, error: 'Schedule could not be changed.', reasonCode: 'request-failed' }),
+      id,
+      schedule: readScheduleSummary(),
+    });
+  } catch { return replyJson(res, 400, publicApiError('Schedule could not be changed.')); }
 };
 
 // Restart: reply first, then hand the port to a fresh detached copy of this

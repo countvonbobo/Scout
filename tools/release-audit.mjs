@@ -7,7 +7,7 @@ import { isMainModule } from '../ui/lib/mainModule.mjs';
 
 const DEFAULT_BUILD_DIRS = ['dist', path.join('installer', 'output')];
 const IGNORED_DIRECTORY_NAMES = new Set(['.git', 'node_modules']);
-const PLACEHOLDER = /^(?:change-?me|downgrade|dummy|example|fake|legacy[-_].*|must-not-.*|new-fenced|not-?set|partial[-_].*|placeholder|private[-_].*|redacted|replace-?me|.*secret.*|synthetic[-_].*|test|.*[-_]test|todo|your[-_].*|<.*>|\$\{.*\})$/i;
+const PLACEHOLDER = /^(?:change-?me|dummy|example|fake|not-?set|placeholder|redacted|replace-?me|test|todo|your[-_][a-z0-9_-]+|<[^>\r\n]+>|\$\{[A-Z][A-Z0-9_]*\})$/i;
 
 const SECRET_RULES = Object.freeze([
   { id: 'private-key', regex: /-----BEGIN (?:RSA |EC |OPENSSH |DSA )?PRIVATE KEY-----/g },
@@ -20,7 +20,7 @@ const PRIVATE_RUNTIME_ROOTS = new Set([
   '.scout', 'applications', 'chats', 'cv', 'data', 'profile', 'reports',
 ]);
 const SERIALIZED_EXTENSIONS = /\.(?:json|jsonl|ndjson|log|out|txt)$/i;
-const PRIVATE_PATH = /\/Users\/(?!(?:A|example|owner|private|scoutqa|user)(?:\/|["'\s])|Shared(?:\/|["'\s])|Public(?:\/|["'\s])|YOUR|<)[^/"'\s]+|\/home\/(?!(?:a|example|private|user)(?:\/|["'\s])|YOUR|<)[^/"'\s]+|[A-Za-z]:\\Users\\(?!(?:example|oli|owner|private|scoutqa|user)(?:\\|["'\s])|Public(?:\\|["'\s])|YOUR|<)[^\\/"'\s]+/gi;
+const PRIVATE_PATH = /\/Users\/(?!(?:Shared|Public)(?:\/|["'\s])|YOUR|<)[^/"'\s]+|\/home\/(?!YOUR|<)[^/"'\s]+|[A-Za-z]:[\\/]Users[\\/](?!Public(?:[\\/]|["'\s])|YOUR|<)[^\\/"'\s]+/gi;
 const DOCUMENTED_PUBLIC_PATH_FILES = new Set([
   'docs/INSTALL_VPS.md',
   'docs/diagnostics/beta15-vps-workspace-incident.md',

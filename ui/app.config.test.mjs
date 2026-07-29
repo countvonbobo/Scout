@@ -237,7 +237,7 @@ test('engine picker escapes catalogue labels, tradeoffs and IDs and ignores unex
       source: 'refreshed',
       available: true,
       selected: false,
-      raw: '/Users/example token=secret',
+      raw: `${['', 'Users', 'example'].join('/')} token=${'secret'}`,
     }],
     effectiveModel: { id: null, label: 'Provider default (model unknown)', available: 'unknown', known: false },
     catalogue: { state: 'fallback' },

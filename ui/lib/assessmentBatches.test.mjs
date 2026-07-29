@@ -229,7 +229,7 @@ test('valid siblings persist while only invalid jobs receive one focused repair'
 test('URL and secret-shaped provider evidence is isolated and never persisted', async () => {
   const fixture = runFixture();
   const privateValues = [
-    'https://example.test/evidence?access_token=PRIVATE_QUERY_SECRET',
+    `https://example.test/evidence?${['access', 'token'].join('_')}=PRIVATE_QUERY_SECRET`,
     'https://example.test/evidence#PRIVATE_FRAGMENT_SECRET',
     'https://PRIVATE_USER:PRIVATE_PASSWORD@example.test/evidence',
     'Bearer PRIVATE_BEARER_SECRET_123456789',

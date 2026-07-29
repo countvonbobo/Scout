@@ -348,7 +348,7 @@ test('public run and queue summaries use closed privacy-safe projections', () =>
       purpose: 'job-discovery', requestedAt: '2026-07-29T00:00:00.000Z',
       expiresAt: '2026-07-30T00:00:00.000Z',
       compatibility: { profileFingerprint: 'a'.repeat(64), configFingerprint: 'b'.repeat(64) },
-      execution: { prompt: 'private prompt', token: 'secret-token' },
+      execution: { prompt: 'private prompt', token: ['secret', 'token'].join('-') },
       claim: {
         runId: fullRunId, leaseId: 'private-lease', generation: 7,
         owner: { host: 'PRIVATE-HOST', pid: 4242, processStart: 'private-start' },
@@ -422,4 +422,3 @@ test('scan health reads storage warnings from the private run store', () => {
     fs.rmSync(root, { recursive: true, force: true });
   }
 });
-

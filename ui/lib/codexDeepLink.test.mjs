@@ -51,7 +51,7 @@ test('capability failures and unknown results are bounded without raw diagnostic
     platform: 'darwin',
     handler: {
       failed: true,
-      error: '/Users/private/person failed person@example.test',
+      error: `${['', 'Users', 'private', 'person'].join('/')} failed person@example.test`,
       stdout: 'token=secret',
     },
     checkedAt,

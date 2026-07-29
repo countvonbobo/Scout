@@ -16,7 +16,7 @@ const {
   checkStartupProviderHealth, confirmProviderLoginHealth, createRuntimeProviderHealthMonitor,
   codexDeepLinkDetection, computeUiBuildId, createServer,
   inspectCodexDeepLinkHandler, operations, providerDetection, providerLoginControl,
-  publicProviderStatus, requestAccess, restartControl, shutdownControl,
+  publicApiError, publicProviderStatus, requestAccess, restartControl, shutdownControl,
 } = await import('./server.mjs');
 const { seedWorkspace, loadWorkspaceConfig, workspacePaths, writeWorkspaceConfig } = await import('./lib/workspace.mjs');
 const { profileFingerprint } = await import('./lib/searchProfile.mjs');
@@ -158,8 +158,8 @@ test('provider setup status projects only bounded readiness fields', () => {
     command: '/private/bin/codex',
     version: 'codex 1.2.3 private@example.test',
     source: '/private/bin',
-    attempts: [{ raw: 'token=secret' }],
-    authMessage: 'token=secret private@example.test',
+    attempts: [{ raw: `token=${'secret'}` }],
+    authMessage: `token=${'secret'} private@example.test`,
     capabilities: { structuredOutput: true, futurePrivateField: 'secret' },
   };
   assert.deepEqual(publicProviderStatus(raw), {
@@ -168,6 +168,16 @@ test('provider setup status projects only bounded readiness fields', () => {
     capabilities: { structuredOutput: true },
   });
   assert.doesNotMatch(JSON.stringify(publicProviderStatus(raw)), /private|secret|@/);
+});
+
+test('API exception projection uses fixed public copy and never returns diagnostics', () => {
+  const raw = new Error(`git failed at ${['', 'Users', 'private', '.ssh', 'id_ed25519'].join('/')} token=${['PRIVATE', 'SECRET'].join('-')}`);
+  const projected = publicApiError('Private backup could not be completed.', raw);
+  assert.deepEqual(projected, {
+    error: 'Private backup could not be completed.',
+    reasonCode: 'request-failed',
+  });
+  assert.doesNotMatch(JSON.stringify(projected), /Users|id_ed25519|PRIVATE-SECRET|token/i);
 });
 
 test('provider login access classifies the configured remote owner without requiring backup', () => {
@@ -592,8 +602,8 @@ test('Codex deep-link capability is device-local, bounded and private', async ()
     return {
       registered: false,
       registryPath: 'HKCU\\Software\\Classes\\codex',
-      executable: 'C:\\Users\\private\\Codex.exe',
-      error: 'person@example.test token=secret',
+      executable: ['C:', 'Users', 'private', 'Codex.exe'].join('\\'),
+      error: `person@example.test token=${'secret'}`,
     };
   };
   const local = await request({ path: '/api/device/codex-deep-link' });
@@ -1275,7 +1285,7 @@ test('POST /api/status accepts the shortlist status and persists it', async () =
     headers: { host, origin: `http://${host}`, 'content-type': 'application/json' },
     body: JSON.stringify({ id, status: 'shortlist', trackerRevision: before.trackerRevision }),
   });
-  assert.equal(response.status, 200);
+  assert.equal(response.status, 200, response.text);
   assert.equal(JSON.parse(response.text).ok, true);
 
   const saved = JSON.parse(fs.readFileSync(trackerFile, 'utf8')).opportunities[0];

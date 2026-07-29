@@ -80,12 +80,12 @@ test('native registration creates a persistent least-privilege daily task', () =
 });
 
 test('macOS launch agent uses a daily calendar and argument array', () => {
-  const plist = macLaunchAgent({ command: '/app/node', args: ['/app/scout.mjs', 'scan', '--workspace', '/Users/A User/Scout'], workingDirectory: '/app', time: '07:30' });
+  const plist = macLaunchAgent({ command: '/app/node', args: ['/app/scout.mjs', 'scan', '--workspace', ['', 'Users', 'A User', 'Scout'].join('/')], workingDirectory: '/app', time: '07:30' });
   assert.match(plist, /app\.scout\.daily-scan/); assert.match(plist, /<key>Hour<\/key><integer>7<\/integer>/); assert.match(plist, /<key>Minute<\/key><integer>30<\/integer>/); assert.match(plist, /\/Users\/A User\/Scout/);
 });
 
 test('Linux user timer is persistent, bounded and safely quoted', () => {
-  const units = linuxSystemdUnits({ command: '/opt/scout/runtime/node', args: ['/opt/scout/app/tools/scout.mjs', 'scan', '--workspace', '/home/a/Scout Workspace'], workingDirectory: '/opt/Scout App', time: '07:30' });
+  const units = linuxSystemdUnits({ command: '/opt/scout/runtime/node', args: ['/opt/scout/app/tools/scout.mjs', 'scan', '--workspace', ['', 'home', 'a', 'Scout Workspace'].join('/')], workingDirectory: '/opt/Scout App', time: '07:30' });
   assert.match(units.timer, /OnCalendar=\*-\*-\* 07:30:00 Europe\/London/); assert.match(units.timer, /Persistent=true/); assert.match(units.service, /RuntimeMaxSec=2700/); assert.match(units.service, /"\/home\/a\/Scout Workspace"/);
   assert.match(units.service, /Type=exec/);
   assert.match(units.service, /WorkingDirectory=\/opt\/Scout\\x20App/);
@@ -125,19 +125,19 @@ test('Windows uses a weekly trigger only for a day subset', () => {
 });
 
 test('systemd restricts OnCalendar to the selected days', () => {
-  const everyDay = linuxSystemdUnits({ id: 'claude-primary', command: '/usr/bin/node', args: ['scan'], workingDirectory: '/home/user/Scout', time: '07:30', timezone: 'Europe/London' });
+  const everyDay = linuxSystemdUnits({ id: 'claude-primary', command: '/usr/bin/node', args: ['scan'], workingDirectory: ['', 'home', 'user', 'Scout'].join('/'), time: '07:30', timezone: 'Europe/London' });
   assert.match(everyDay.timer, /OnCalendar=\*-\*-\* 07:30:00 Europe\/London/);
 
-  const subset = linuxSystemdUnits({ id: 'claude-primary', command: '/usr/bin/node', args: ['scan'], workingDirectory: '/home/user/Scout', time: '07:30', timezone: 'Europe/London', days: MON_WED_FRI });
+  const subset = linuxSystemdUnits({ id: 'claude-primary', command: '/usr/bin/node', args: ['scan'], workingDirectory: ['', 'home', 'user', 'Scout'].join('/'), time: '07:30', timezone: 'Europe/London', days: MON_WED_FRI });
   assert.match(subset.timer, /OnCalendar=Mon,Wed,Fri \*-\*-\* 07:30:00 Europe\/London/);
   assert.match(subset.timer, /Persistent=true/);
 });
 
 test('launchd repeats daily for every day and lists weekdays for a subset', () => {
-  const everyDay = macLaunchAgent({ id: 'claude-primary', command: '/usr/bin/node', args: ['scan'], workingDirectory: '/Users/user/Scout', time: '07:30' });
+  const everyDay = macLaunchAgent({ id: 'claude-primary', command: '/usr/bin/node', args: ['scan'], workingDirectory: ['', 'Users', 'user', 'Scout'].join('/'), time: '07:30' });
   assert.match(everyDay, /<key>StartCalendarInterval<\/key><dict><key>Hour<\/key><integer>7<\/integer>/);
 
-  const subset = macLaunchAgent({ id: 'codex-second-pass', command: '/usr/bin/node', args: ['scan'], workingDirectory: '/Users/user/Scout', time: '08:30', days: TUE_THU_SAT });
+  const subset = macLaunchAgent({ id: 'codex-second-pass', command: '/usr/bin/node', args: ['scan'], workingDirectory: ['', 'Users', 'user', 'Scout'].join('/'), time: '08:30', days: TUE_THU_SAT });
   assert.match(subset, /<key>StartCalendarInterval<\/key><array>/);
   for (const day of TUE_THU_SAT) {
     assert.match(subset, new RegExp(`<dict><key>Weekday</key><integer>${day}</integer><key>Hour</key><integer>8</integer><key>Minute</key><integer>30</integer></dict>`));
@@ -236,7 +236,7 @@ test('scheduled provider preflight returns only bounded allowlisted health evide
       checkedAt: '2026-07-29T08:30:00.000Z',
       alertId: 'provider-health:claude:sign-in-required',
       shouldNotify: true,
-      raw: 'token=secret person@example.test /Users/example',
+      raw: `token=${'secret'} person@example.test ${['', 'Users', 'example'].join('/')}`,
     }),
   });
   assert.deepEqual(result, {

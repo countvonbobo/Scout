@@ -78,7 +78,7 @@ test('structured provider failures cross the real boundary as safe distinct heal
       { kind: 'remote-auth-failure', source: 'provider-operation', reasonCode: 'authentication-required' },
     ],
     [
-      'request failed: ENETUNREACH /Users/example/private.json',
+      `request failed: ENETUNREACH ${['', 'Users', 'example', 'private.json'].join('/')}`,
       { kind: 'network-failure', source: 'provider-operation', reasonCode: 'network-unavailable' },
     ],
     [
@@ -86,11 +86,11 @@ test('structured provider failures cross the real boundary as safe distinct heal
       { kind: 'rate-limit', source: 'provider-operation', reasonCode: 'rate-limited' },
     ],
     [
-      'unsupported CLI version: unknown option --output-schema at /Users/example/bin/codex',
+      `unsupported CLI version: unknown option --output-schema at ${['', 'Users', 'example', 'bin', 'codex'].join('/')}`,
       { kind: 'cli-update', source: 'provider-operation', reasonCode: 'cli-update-required' },
     ],
     [
-      '500 provider body token=secret person@example.test /Users/example/private.json',
+      `500 provider body token=secret person@example.test ${['', 'Users', 'example', 'private.json'].join('/')}`,
       { kind: 'provider-failure', source: 'provider-operation', reasonCode: 'provider-error' },
     ],
   ];

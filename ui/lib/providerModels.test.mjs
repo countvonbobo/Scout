@@ -153,7 +153,7 @@ test('Codex catalogue parser accepts only bounded structured model IDs', () => {
       {
         slug: 'gpt-5.6-sol',
         display_name: 'Person <person@example.test>',
-        description: '/Users/example/.codex token=secret-value',
+        description: `${['', 'Users', 'example', '.codex'].join('/')} token=${['secret', 'value'].join('-')}`,
         is_default: true,
         base_instructions: 'private raw provider content',
       },

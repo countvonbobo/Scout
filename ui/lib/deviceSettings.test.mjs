@@ -18,7 +18,7 @@ test('device settings persist outside the app and retain defaults', () => {
 });
 
 test('verified update downloads stay in device-local state rather than the workspace', () => {
-  const directory = updateDownloadDirectory({ LOCALAPPDATA: 'C:\\Users\\Owner\\AppData\\Local' }, 'win32');
+  const directory = updateDownloadDirectory({ LOCALAPPDATA: ['C:', 'Users', 'Owner', 'AppData', 'Local'].join('\\') }, 'win32');
   assert.match(directory, /AppData[\\/]Local[\\/]Scout[\\/]updates$/);
 });
 

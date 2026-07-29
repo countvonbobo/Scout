@@ -26,6 +26,15 @@ const MARKER_FILTER_PATHS = Object.freeze([
 ]);
 const MARKER_CLEANER = fileURLToPath(new URL('../../tools/scout-marker-clean.mjs', import.meta.url))
   .replaceAll('\\', '/');
+const PUBLIC_SYNC_ERRORS = new Set([
+  'Private backup command timed out',
+  'Recovery key cache is missing',
+  'The safe merge did not complete; both recovery references were preserved',
+  'The Scout host and GitHub both contain new changes',
+  'The Scout host and GitHub both contain new changes that can be safely preserved',
+  'This backup divergence needs manual review',
+  'This device has unsynced work and GitHub contains newer changes',
+]);
 
 class RuntimeCommandTimeoutError extends Error {}
 
@@ -301,7 +310,12 @@ export function validateGithubUrl(value) {
 
 export function detectGit(options = {}) {
   const git = runGit(process.cwd(), ['--version'], options);
-  if (!git.ok) return { installed: false, credentialManager: false, error: git.error };
+  if (!git.ok) return {
+    installed: false,
+    credentialManager: false,
+    error: 'Git could not be detected',
+    reasonCode: 'git-unavailable',
+  };
   const manager = runGit(process.cwd(), ['credential-manager', '--version'], options);
   return { installed: true, version: git.stdout, credentialManager: manager.ok, credentialManagerVersion: manager.ok ? manager.stdout : null };
 }
@@ -404,7 +418,15 @@ function remoteUrl(root, options = {}) {
 
 function setState(root, state, details = {}) {
   const checkedAt = new Date().toISOString();
-  const value = { state, checkedAt, ...details, ...(state === 'synced' ? { lastSuccessfulAt: checkedAt } : {}) };
+  const publicDetails = { ...details };
+  if (Object.hasOwn(publicDetails, 'error')) {
+    const proposed = String(publicDetails.error || '');
+    publicDetails.error = PUBLIC_SYNC_ERRORS.has(proposed)
+      ? proposed
+      : state === 'offline' ? 'GitHub backup is temporarily unavailable' : 'Private backup needs attention';
+    publicDetails.reasonCode = state === 'offline' ? 'backup-offline' : 'backup-error';
+  }
+  const value = { state, checkedAt, ...publicDetails, ...(state === 'synced' ? { lastSuccessfulAt: checkedAt } : {}) };
   if (state === 'synced') {
     const settings = loadSyncSettings(root);
     if (settings.enabled) saveSyncSettings(root, { ...settings, lastSuccessfulAt: checkedAt });

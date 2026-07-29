@@ -158,9 +158,22 @@ test('public source staging contains contributor inputs without private workspac
 test('the generated public source tree passes the real privacy audit', () => {
   const stageDir = fs.mkdtempSync(path.join(os.tmpdir(), 'scout-public-audited-stage-'));
   const staged = stagePublicSource({ root: ROOT, stageDir });
-  const audit = auditPublicSourceStage({ root: ROOT, stageDir: staged.stageDir });
+  const audit = auditPublicSourceStage({
+    root: ROOT,
+    stageDir: staged.stageDir,
+    markers: ['Synthetic', 'Personal', 'Marker'].join(' '),
+  });
   assert.equal(audit.status, 0);
   assert.match(audit.output, /Release audit passed/);
+});
+
+test('public source publication refuses to audit without configured personal markers', () => {
+  const stageDir = fs.mkdtempSync(path.join(os.tmpdir(), 'scout-public-marker-stage-'));
+  fs.writeFileSync(path.join(stageDir, 'README.md'), '# public source\n');
+  assert.throws(
+    () => auditPublicSourceStage({ root: ROOT, stageDir, markers: '' }),
+    /requires at least one configured personal marker/,
+  );
 });
 
 test('staging copies only manifest content and bundled runtime', () => {

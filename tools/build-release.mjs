@@ -189,15 +189,18 @@ export function stagePublicSource({
 export function auditPublicSourceStage({
   root = DEFAULT_ROOT,
   stageDir,
+  markers = process.env.SCOUT_RELEASE_MARKERS || '',
 } = {}) {
   const result = spawnSync(process.execPath, [
     path.join(path.resolve(root), 'tools', 'release-audit.mjs'),
     '--root',
     path.resolve(stageDir),
     '--stage',
+    '--require-markers',
   ], {
     cwd: root,
     encoding: 'utf8',
+    env: { ...process.env, SCOUT_RELEASE_MARKERS: markers },
     windowsHide: true,
   });
   if (result.status !== 0) {

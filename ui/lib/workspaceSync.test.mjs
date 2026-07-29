@@ -978,6 +978,9 @@ test('offline sync keeps a local commit pending', async () => {
   const result = await runWorkspaceSync(f.root, 'offline change', { spawn: offlineSpawn });
   assert.equal(result.state, 'offline');
   assert.equal(result.pending, true);
+  assert.equal(result.reasonCode, 'backup-offline');
+  assert.equal(result.error, 'GitHub backup is temporarily unavailable');
+  assert.doesNotMatch(JSON.stringify(result), /synthetic offline|github\.com\/example|Users|home\//i);
   assert.match(git(f.root, 'log', '-1', '--pretty=%s'), /offline change/);
   fs.rmSync(f.base, { recursive: true, force: true });
 });

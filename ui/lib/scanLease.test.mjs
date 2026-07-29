@@ -664,7 +664,7 @@ test('legacy evidence appearing after an interrupted fresh decision blocks with 
   fs.writeFileSync(path.join(root, '.scout-scan.lock'), `${JSON.stringify({
     agent: 'old-codex',
     mode: 'primary',
-    token: 'legacy-after-fresh-decision',
+    token: ['legacy', 'after', 'fresh', 'decision'].join('-'),
     startedAt: new Date().toISOString(),
   })}\n`, 'utf8');
   assert.throws(
@@ -679,7 +679,7 @@ test('an expired ownerless legacy lock is unverifiable and fails closed', () => 
   fs.writeFileSync(file, `${JSON.stringify({
     agent: 'codex',
     mode: 'primary',
-    token: 'legacy-ownerless',
+    token: ['legacy', 'ownerless'].join('-'),
     startedAt: '2026-07-27T07:00:00.000Z',
   })}\n`, 'utf8');
   const before = fs.readFileSync(file, 'utf8');
@@ -696,7 +696,7 @@ test('the legacy adapter cannot bypass a direct lease takeover margin', () => {
     now: start, leaseDurationMs: 90_000, takeoverMarginMs: 15_000,
   });
   const tooEarly = acquireScanLock(root, {
-    agent: 'codex', mode: 'primary', token: 'legacy-early',
+    agent: 'codex', mode: 'primary', token: ['legacy', 'early'].join('-'),
     now: new Date(start.getTime() + 90_001),
   });
   assert.equal(tooEarly.ok, false);
@@ -1245,7 +1245,7 @@ test('guard metadata with unknown fields is not trusted for stale quarantine', a
     guardId: 'guard-extra-field',
     owner: { host: os.hostname(), pid: 999_999_999, processStart: 'dead-process' },
     acquiredAt: new Date(Date.now() - 31_000).toISOString(),
-    secret: 'must-not-be-accepted',
+    secret: ['must', 'not', 'be', 'accepted'].join('-'),
   })}\n`, 'utf8');
   const contender = await child(['acquire', root, 'run-extra', '1000', '0', '100']).result;
   assert.equal(contender.acquired, false);

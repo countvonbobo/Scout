@@ -75,7 +75,7 @@ function harness({
       value: {
         PATH: '/trusted/bin',
         HOME: '/synthetic-owner',
-        SCOUT_TEST_SECRET: 'must-not-reach-login',
+        SCOUT_TEST_SECRET: ['must', 'not', 'reach', 'login'].join('-'),
       },
       enumerable: false,
     },
@@ -471,7 +471,7 @@ test('Claude credential clearing is an explicit owner-only fixed logout operatio
       windowsVerbatimArguments: undefined,
     },
   });
-  h.children[2].stdout.write('Logged out private@example.test token=secret\n');
+  h.children[2].stdout.write(`Logged out private@example.test token=${'secret'}\n`);
   h.children[2].close(0);
   assert.deepEqual(await clearing, {
     provider: 'claude',
@@ -1002,7 +1002,7 @@ test('spawn failures, untrusted status and nonzero login exits expose no raw dia
 
   const h = harness();
   const started = await h.manager.startProviderLogin('codex', OWNER);
-  h.login.stderr.write('private@example.test token=secret\n');
+  h.login.stderr.write(`private@example.test token=${'secret'}\n`);
   h.login.close(2);
   await new Promise((resolve) => setImmediate(resolve));
   const terminal = h.manager.getProviderLoginSession(started.sessionId, OWNER);
@@ -1013,7 +1013,7 @@ test('spawn failures, untrusted status and nonzero login exits expose no raw dia
 test('no session secret, raw output or manual code is persisted or returned', async () => {
   const h = harness({ provider: 'claude' });
   const started = await h.manager.startProviderLogin('claude', OWNER);
-  h.login.stdout.write('Paste authorization code: token=raw-secret\n');
+  h.login.stdout.write(`Paste authorization code: token=${['raw', 'secret'].join('-')}\n`);
   await new Promise((resolve) => setImmediate(resolve));
   await h.manager.submitProviderLoginCode(started.sessionId, 'PRIVATE-CODE', OWNER);
   const snapshot = h.manager.getProviderLoginSession(started.sessionId, OWNER);

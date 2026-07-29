@@ -23,6 +23,7 @@ function scanRoot() {
 }
 
 const authenticated = () => ({ installed: true, authenticated: true, executable: 'codex', capabilities: { structuredOutput: true } });
+const fixtureToken = (value) => value;
 
 function publishedRankingProfile() {
   return publishSearchProfile({
@@ -82,7 +83,7 @@ function scanHarness(sources, seenCandidates) {
       validate(value);
       return { value, usage: {} };
     },
-    acquireLockFn: () => ({ ok: true, lock: { token: 'ranked-discovery-test' } }),
+    acquireLockFn: () => ({ ok: true, lock: { token: fixtureToken('ranked-discovery-test') } }),
     releaseLockFn: () => ({ ok: true }),
     checkLivenessFn: async (candidates) => ({ live: candidates, removed: [], summary: { checked: candidates.length, gone: 0, unverified: 0 } }),
   };
@@ -352,7 +353,7 @@ test('runtime scan filters from the published profile before provider assessment
       hiring_cafe: { configured: true, status: 'healthy', count: 1, jobs: [{ company: 'Acme', title: 'Engineer', url: 'https://example.test/job', description: 'Perform coding.' }] },
     } }),
     runStructuredTurnFn: async () => { providerCalls += 1; throw new Error('excluded vacancy must not be assessed'); },
-    acquireLockFn: () => ({ ok: true, lock: { token: 'filter-test' } }), releaseLockFn: () => ({ ok: true }),
+    acquireLockFn: () => ({ ok: true, lock: { token: fixtureToken('filter-test') } }), releaseLockFn: () => ({ ok: true }),
   });
   assert.equal(result.ok, true, result.error);
   assert.equal(result.scan.candidates_found, 0);
@@ -430,7 +431,7 @@ test('closed selected adverts are replaced by the next ranked eligible vacancy',
       validate(value);
       return { value, usage: {} };
     },
-    acquireLockFn: () => ({ ok: true, lock: { token: 'liveness-backfill-test' } }),
+    acquireLockFn: () => ({ ok: true, lock: { token: fixtureToken('liveness-backfill-test') } }),
     releaseLockFn: () => ({ ok: true }),
     onProgress: () => {},
   });
@@ -468,7 +469,7 @@ test('a failed ranked scan retains its discovery engine and available orchestrat
     } }),
     checkLivenessFn: async (items) => ({ live: items, removed: [], summary: { checked: items.length, gone: 0, unverified: 0 } }),
     runStructuredTurnFn: async () => { throw new Error('ranked provider failure'); },
-    acquireLockFn: () => ({ ok: true, lock: { token: 'failed-ranked-test' } }),
+    acquireLockFn: () => ({ ok: true, lock: { token: fixtureToken('failed-ranked-test') } }),
     releaseLockFn: () => ({ ok: true }),
   });
   assert.equal(result.ok, false);
@@ -509,7 +510,7 @@ test('ranked second-pass candidates are renumbered and match persisted selection
       validate(value);
       return { value, usage: {} };
     },
-    acquireLockFn: () => ({ ok: true, lock: { token: 'second-pass-ranked-test' } }),
+    acquireLockFn: () => ({ ok: true, lock: { token: fixtureToken('second-pass-ranked-test') } }),
     releaseLockFn: () => ({ ok: true }),
   });
   assert.equal(result.ok, true);
@@ -557,7 +558,7 @@ test('real scan execution uses stable assessment batches of at most ten', async 
         validate(value);
         return { value, usage: { input_tokens: batch.length } };
       },
-      acquireLockFn: () => ({ ok: true, lock: { token: 'assessment-batch-test' } }),
+      acquireLockFn: () => ({ ok: true, lock: { token: fixtureToken('assessment-batch-test') } }),
       releaseLockFn: () => ({ ok: true }),
       queueWorkspaceSyncFn: async () => ({ ok: true }),
     });
@@ -605,7 +606,7 @@ test('real scan execution keeps valid siblings and reports exhausted jobs precis
         validate(value);
         return { value, usage: {} };
       },
-      acquireLockFn: () => ({ ok: true, lock: { token: 'assessment-partial-test' } }),
+      acquireLockFn: () => ({ ok: true, lock: { token: fixtureToken('assessment-partial-test') } }),
       releaseLockFn: () => ({ ok: true }),
       queueWorkspaceSyncFn: async () => ({ ok: true }),
     });

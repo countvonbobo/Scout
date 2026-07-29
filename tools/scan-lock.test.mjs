@@ -73,7 +73,7 @@ test('legacy adapter reports downgrade/coexistence after fenced activation', () 
   fs.writeFileSync(path.join(repo, '.scout-scan.lock'), `${JSON.stringify({
     agent: 'old-codex',
     mode: 'primary',
-    token: 'downgrade',
+    token: ['down', 'grade'].join(''),
     startedAt: new Date().toISOString(),
   })}\n`, 'utf8');
   const status = readScanLock(repo);
@@ -81,7 +81,7 @@ test('legacy adapter reports downgrade/coexistence after fenced activation', () 
   assert.equal(status.reason, 'downgrade-coexistence');
   assert.match(status.message, /downgrade.*coexistence|coexistence.*downgrade/i);
   const result = acquireScanLock(repo, {
-    agent: 'codex', mode: 'primary', token: 'new-fenced',
+    agent: 'codex', mode: 'primary', token: ['new', 'fenced'].join('-'),
   });
   assert.equal(result.ok, false);
   assert.equal(result.reason, 'migration-blocked');

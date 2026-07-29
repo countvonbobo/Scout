@@ -148,3 +148,9 @@ export async function downloadVerifiedUpdate(update, directory, {
     fileSystem.rmSync(temporary, { force: true });
   }
 }
+
+export function publicDownloadedUpdate(downloaded) {
+  if (!downloaded || typeof downloaded !== 'object') return null;
+  const { name, sha256, version, verifiedAt } = downloaded;
+  return { name, sha256, version, verifiedAt };
+}

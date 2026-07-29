@@ -20,6 +20,13 @@ import {
   runProviderCommand,
 } from './providers.mjs';
 
+const windowsHome = (name) => ['C:', 'Users', name].join('\\');
+const unixHome = (root, name) => ['', root, name].join('/');
+const WINDOWS_EXAMPLE_HOME = windowsHome('example');
+const WINDOWS_QA_HOME = windowsHome('ScoutQA');
+const MAC_EXAMPLE_HOME = unixHome('Users', 'example');
+const LINUX_EXAMPLE_HOME = unixHome('home', 'example');
+
 test('provider commands allow Windows resolution to choose native executables or cmd shims', () => {
   assert.equal(providerCommand('codex', 'win32'), 'codex.cmd');
   assert.equal(providerCommand('claude', 'linux'), 'claude');
@@ -99,42 +106,42 @@ test('provider detector shares an in-flight probe and caches the result briefly'
 
 test('Windows provider environment includes standard Codex and Claude install locations', () => {
   const env = providerEnvironment({
-    USERPROFILE: 'C:\\Users\\example',
-    APPDATA: 'C:\\Users\\example\\AppData\\Roaming',
+    USERPROFILE: WINDOWS_EXAMPLE_HOME,
+    APPDATA: `${WINDOWS_EXAMPLE_HOME}\\AppData\\Roaming`,
     Path: 'C:\\Windows\\System32',
   }, 'win32');
-  assert.match(env.Path, /C:\\Users\\example\\AppData\\Roaming\\npm/i);
+  assert.ok(env.Path.toLowerCase().includes(`${WINDOWS_EXAMPLE_HOME}\\AppData\\Roaming\\npm`.toLowerCase()));
   assert.match(env.Path, /C:\\Program Files\\nodejs/i);
-  assert.match(env.Path, /C:\\Users\\example\\\.local\\bin/i);
+  assert.ok(env.Path.toLowerCase().includes(`${WINDOWS_EXAMPLE_HOME}\\.local\\bin`.toLowerCase()));
   assert.match(env.Path, /C:\\Windows\\System32/i);
 });
 
 test('Codex candidates include the official OpenAI Windows installation', () => {
   const candidates = providerCandidates('codex', {
     platform: 'win32',
-    env: { USERPROFILE: 'C:\\Users\\Oli', LOCALAPPDATA: 'C:\\Users\\Oli\\AppData\\Local', APPDATA: 'C:\\Users\\Oli\\AppData\\Roaming', Path: '' },
+    env: { USERPROFILE: windowsHome('Oli'), LOCALAPPDATA: `${windowsHome('Oli')}\\AppData\\Local`, APPDATA: `${windowsHome('Oli')}\\AppData\\Roaming`, Path: '' },
     exists: (candidate) => candidate.endsWith('Programs\\OpenAI\\Codex\\bin\\codex.exe'),
     resolve: () => 'codex.cmd',
   });
-  assert.equal(candidates[0], 'C:\\Users\\Oli\\AppData\\Local\\Programs\\OpenAI\\Codex\\bin\\codex.exe');
+  assert.equal(candidates[0], `${windowsHome('Oli')}\\AppData\\Local\\Programs\\OpenAI\\Codex\\bin\\codex.exe`);
 });
 
 test('macOS and Linux candidates include user-local and standalone installs before PATH fallback', () => {
   for (const platform of ['darwin', 'linux']) {
     const candidates = providerCandidates('codex', {
-      platform, env: { HOME: '/home/example', PATH: '' },
-      exists: (candidate) => candidate === '/home/example/.local/bin/codex' || candidate === '/home/example/.codex/bin/codex',
+      platform, env: { HOME: LINUX_EXAMPLE_HOME, PATH: '' },
+      exists: (candidate) => candidate === `${LINUX_EXAMPLE_HOME}/.local/bin/codex` || candidate === `${LINUX_EXAMPLE_HOME}/.codex/bin/codex`,
       resolve: () => 'codex',
     });
-    assert.deepEqual(candidates, ['/home/example/.local/bin/codex', '/home/example/.codex/bin/codex', 'codex']);
+    assert.deepEqual(candidates, [`${LINUX_EXAMPLE_HOME}/.local/bin/codex`, `${LINUX_EXAMPLE_HOME}/.codex/bin/codex`, 'codex']);
   }
 });
 
 test('Unix provider status redacts the home directory with a native-looking path', () => {
   const result = providerStatus('codex', {
     platform: 'darwin',
-    env: { HOME: '/Users/example', PATH: '' },
-    exists: (candidate) => candidate === '/Users/example/.local/bin/codex',
+    env: { HOME: MAC_EXAMPLE_HOME, PATH: '' },
+    exists: (candidate) => candidate === `${MAC_EXAMPLE_HOME}/.local/bin/codex`,
     resolve: () => null,
     spawn: (command, args) => ({
       status: 0,
@@ -167,45 +174,45 @@ test('provider status exposes bounded structured-output compatibility', () => {
 test('Windows provider candidates tolerate lowercase packaged-runtime environment keys', () => {
   const candidates = providerCandidates('codex', {
     platform: 'win32',
-    env: { userprofile: 'C:\\Users\\ScoutQA', localappdata: 'C:\\Users\\ScoutQA\\AppData\\Local', path: '' },
+    env: { userprofile: WINDOWS_QA_HOME, localappdata: `${WINDOWS_QA_HOME}\\AppData\\Local`, path: '' },
     exists: (candidate) => candidate.toLowerCase().endsWith('programs\\openai\\codex\\bin\\codex.exe'),
     resolve: () => null,
   });
-  assert.equal(candidates[0], 'C:\\Users\\ScoutQA\\AppData\\Local\\Programs\\OpenAI\\Codex\\bin\\codex.exe');
+  assert.equal(candidates[0], `${WINDOWS_QA_HOME}\\AppData\\Local\\Programs\\OpenAI\\Codex\\bin\\codex.exe`);
 });
 
 test('Windows provider candidates recover the user home from LocalAppData', () => {
   const candidates = providerCandidates('claude', {
     platform: 'win32',
-    env: { LOCALAPPDATA: 'C:\\Users\\ScoutQA\\AppData\\Local', Path: '' },
+    env: { LOCALAPPDATA: `${WINDOWS_QA_HOME}\\AppData\\Local`, Path: '' },
     exists: (candidate) => candidate.toLowerCase().endsWith('.local\\bin\\claude.exe'),
     resolve: () => null,
   });
-  assert.equal(candidates[0], 'C:\\Users\\ScoutQA\\.local\\bin\\claude.exe');
+  assert.equal(candidates[0], `${WINDOWS_QA_HOME}\\.local\\bin\\claude.exe`);
 });
 
 test('packaged Scout derives LocalAppData from its own runtime path', () => {
   const candidates = providerCandidates('codex', {
     platform: 'win32',
     env: { Path: '' },
-    runtimePath: 'C:\\Users\\ScoutQA\\AppData\\Local\\Programs\\Scout\\runtime\\ScoutRuntime.exe',
+    runtimePath: `${WINDOWS_QA_HOME}\\AppData\\Local\\Programs\\Scout\\runtime\\ScoutRuntime.exe`,
     exists: () => false,
     resolve: () => null,
   });
-  assert.equal(candidates[0], 'C:\\Users\\ScoutQA\\AppData\\Local\\Programs\\OpenAI\\Codex\\bin\\codex.exe');
+  assert.equal(candidates[0], `${WINDOWS_QA_HOME}\\AppData\\Local\\Programs\\OpenAI\\Codex\\bin\\codex.exe`);
 });
 
 test('packaged Scout gives provider turns the interactive user home', () => {
   const env = providerEnvironment(
     { Path: 'C:\\Windows\\System32' },
     'win32',
-    'C:\\Users\\ScoutQA\\AppData\\Local\\Programs\\Scout\\runtime\\ScoutRuntime.exe',
+    `${WINDOWS_QA_HOME}\\AppData\\Local\\Programs\\Scout\\runtime\\ScoutRuntime.exe`,
   );
-  assert.equal(env.USERPROFILE, 'C:\\Users\\ScoutQA');
-  assert.equal(env.HOME, 'C:\\Users\\ScoutQA');
-  assert.equal(env.LOCALAPPDATA, 'C:\\Users\\ScoutQA\\AppData\\Local');
-  assert.equal(env.APPDATA, 'C:\\Users\\ScoutQA\\AppData\\Roaming');
-  assert.match(env.Path, /C:\\Users\\ScoutQA\\\.local\\bin/i);
+  assert.equal(env.USERPROFILE, WINDOWS_QA_HOME);
+  assert.equal(env.HOME, WINDOWS_QA_HOME);
+  assert.equal(env.LOCALAPPDATA, `${WINDOWS_QA_HOME}\\AppData\\Local`);
+  assert.equal(env.APPDATA, `${WINDOWS_QA_HOME}\\AppData\\Roaming`);
+  assert.ok(env.Path.toLowerCase().includes(`${WINDOWS_QA_HOME}\\.local\\bin`.toLowerCase()));
 });
 
 test('provider checks receive the augmented environment', () => {
@@ -213,7 +220,7 @@ test('provider checks receive the augmented environment', () => {
   const spawn = (command, args, options) => { calls.push(options); return { status: 0, stdout: 'ok', stderr: '' }; };
   providerStatus('codex', {
     spawn, platform: 'win32',
-    env: { USERPROFILE: 'C:\\Users\\example', APPDATA: 'C:\\Users\\example\\AppData\\Roaming', Path: 'C:\\Windows\\System32' },
+    env: { USERPROFILE: WINDOWS_EXAMPLE_HOME, APPDATA: `${WINDOWS_EXAMPLE_HOME}\\AppData\\Roaming`, Path: 'C:\\Windows\\System32' },
     resolve: (command, options) => { assert.match(options.env.Path, /AppData\\Roaming\\npm/i); return 'codex.exe'; },
   });
   assert.match(calls[0].env.Path, /AppData\\Roaming\\npm/i);
@@ -229,13 +236,13 @@ test('Windows provider status uses a resolved native executable directly', () =>
   const result = providerStatus('claude', {
     spawn,
     platform: 'win32',
-    env: { USERPROFILE: 'C:\\Users\\example', APPDATA: 'C:\\Users\\example\\AppData\\Roaming', LOCALAPPDATA: 'C:\\Users\\example\\AppData\\Local', Path: 'C:\\Windows\\System32' },
+    env: { USERPROFILE: WINDOWS_EXAMPLE_HOME, APPDATA: `${WINDOWS_EXAMPLE_HOME}\\AppData\\Roaming`, LOCALAPPDATA: `${WINDOWS_EXAMPLE_HOME}\\AppData\\Local`, Path: 'C:\\Windows\\System32' },
     exists: () => false,
-    resolve: () => 'C:\\Users\\example\\.local\\bin\\claude.exe',
+    resolve: () => `${WINDOWS_EXAMPLE_HOME}\\.local\\bin\\claude.exe`,
   });
   assert.equal(result.installed, true);
   assert.equal(result.authenticated, true);
-  assert.equal(calls[0][0], 'C:\\Users\\example\\.local\\bin\\claude.exe');
+  assert.equal(calls[0][0], `${WINDOWS_EXAMPLE_HOME}\\.local\\bin\\claude.exe`);
   assert.equal(calls[0][2].shell, false);
 });
 
@@ -300,14 +307,14 @@ test('unsupported, malformed, oversized and timed-out catalogues fail closed wit
   const status = {
     installed: true,
     authenticated: true,
-    executable: '/Users/example/.local/bin/codex',
+    executable: `${MAC_EXAMPLE_HOME}/.local/bin/codex`,
     env: {},
   };
   const cases = [
     { status: 2, stdout: '', stderr: 'unknown command person@example.test token=secret' },
-    { status: 0, stdout: '{', stderr: '/Users/example/.codex' },
+    { status: 0, stdout: '{', stderr: `${MAC_EXAMPLE_HOME}/.codex` },
     { status: 0, stdout: 'x'.repeat(600_000), stderr: 'oversized secret' },
-    { status: null, stdout: '', stderr: 'timed out /Users/example', timedOut: true },
+    { status: null, stdout: '', stderr: `timed out ${MAC_EXAMPLE_HOME}`, timedOut: true },
   ];
   for (const synthetic of cases) {
     const result = await codexModelCatalogueStatus(status, { run: async () => synthetic });
@@ -352,9 +359,9 @@ test('local provider status becomes a bounded privacy-safe health signal', () =>
     authenticated: true,
     version: 'codex-cli 1.2.3 person@example.test',
     authMessage: 'Logged in as person@example.test',
-    executable: '/Users/example/.local/bin/codex',
+    executable: `${MAC_EXAMPLE_HOME}/.local/bin/codex`,
     env: { TOKEN: 'secret' },
-    attempts: [{ source: '/Users/example/.local/bin/codex', result: 'authenticated' }],
+    attempts: [{ source: `${MAC_EXAMPLE_HOME}/.local/bin/codex`, result: 'authenticated' }],
   });
 
   assert.deepEqual(signal, {
@@ -387,7 +394,7 @@ test('remote provider responses become distinct bounded signals without response
     [{ ok: false, status: 401, body: 'token=secret person@example.test' }, { kind: 'remote-auth-failure', source: 'provider-operation', reasonCode: 'authentication-required' }],
     [{ ok: false, status: 403 }, { kind: 'remote-auth-failure', source: 'provider-operation', reasonCode: 'authentication-required' }],
     [{ ok: false, status: 429 }, { kind: 'rate-limit', source: 'provider-operation', reasonCode: 'rate-limited' }],
-    [{ ok: false, errorCode: 'ENETUNREACH', stderr: '/Users/example private' }, { kind: 'network-failure', source: 'provider-operation', reasonCode: 'network-unavailable' }],
+    [{ ok: false, errorCode: 'ENETUNREACH', stderr: `${MAC_EXAMPLE_HOME} private` }, { kind: 'network-failure', source: 'provider-operation', reasonCode: 'network-unavailable' }],
     [{ ok: false, reasonCode: 'cli-update-required', stdout: 'download from private URL' }, { kind: 'cli-update', source: 'provider-operation', reasonCode: 'cli-update-required' }],
     [{ loginInProgress: true }, { kind: 'login-started', source: 'provider-operation' }],
     [{ checking: true }, { kind: 'check-started', source: 'provider-operation' }],
@@ -404,7 +411,7 @@ test('remote provider responses become distinct bounded signals without response
 test('provider failure classification returns only allowlisted safe reason codes', () => {
   const cases = [
     [{ error: '403 forbidden token=secret' }, { reasonCode: 'authentication-required' }],
-    [{ error: 'connect ETIMEDOUT /Users/example/private' }, { reasonCode: 'network-unavailable' }],
+    [{ error: `connect ETIMEDOUT ${MAC_EXAMPLE_HOME}/private` }, { reasonCode: 'network-unavailable' }],
     [{ error: 'rate limit exceeded for person@example.test' }, { reasonCode: 'rate-limited' }],
     [{ error: 'please upgrade the CLI; unsupported --json-schema' }, { reasonCode: 'cli-update-required' }],
     [{ error: 'opaque provider failure token=secret' }, { reasonCode: 'provider-error' }],

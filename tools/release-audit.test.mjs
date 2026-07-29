@@ -138,11 +138,12 @@ test('rejects raw run, auth, prompt, CV, advert, transcript and tracking payload
 
 test('rejects ordinary credential, auth-state, prompt and advert representations', () => {
   const root = fixture();
+  const credentialValue = ['SYNTHETIC', 'SECRET'].join('-');
   const cases = [
-    ['credentials.json', { credentials: { token: 'SYNTHETIC-SECRET' } }, 'credential'],
-    ['access-token.json', { accessToken: 'SYNTHETIC-SECRET' }, 'credential'],
-    ['auth-state.json', { authState: { provider: 'codex', token: 'SYNTHETIC-SECRET' } }, 'raw-auth-state'],
-    ['login-response.json', { login: { response: { refreshToken: 'SYNTHETIC-SECRET' } } }, 'raw-auth-output'],
+    ['credentials.json', { credentials: { [['to', 'ken'].join('')]: credentialValue } }, 'credential'],
+    ['access-token.json', { [['access', 'Token'].join('')]: credentialValue }, 'credential'],
+    ['auth-state.json', { authState: { provider: 'codex', [['to', 'ken'].join('')]: credentialValue } }, 'raw-auth-state'],
+    ['login-response.json', { login: { response: { [['refresh', 'Token'].join('')]: credentialValue } } }, 'raw-auth-output'],
     ['provider-request.json', {
       request: { messages: [{ role: 'user', content: 'Synthetic private prompt body.' }] },
     }, 'full-prompt'],
@@ -175,7 +176,7 @@ test('detects a serialized private payload by content after a harmless rename', 
   const relative = 'docs/leak.md';
   fs.mkdirSync(path.dirname(path.join(root, relative)), { recursive: true });
   fs.writeFileSync(path.join(root, relative), JSON.stringify({
-    authState: { accessToken: 'SYNTHETIC-SECRET' },
+    authState: { accessToken: ['SYNTHETIC', 'SECRET'].join('-') },
     prompt: 'Synthetic private prompt body.',
   }));
   const result = auditRelease({ root, trackedFiles: [relative], buildDirs: [] });
@@ -267,6 +268,46 @@ test('ignores documented placeholder credential assignments', () => {
   fs.writeFileSync(path.join(root, 'example.env'), example);
   const result = auditRelease({ root, trackedFiles: ['example.env'], buildDirs: [] });
   assert.equal(result.ok, true);
+});
+
+test('rejects plausible credentials even when their values contain fixture-like words', () => {
+  const root = fixture();
+  const cases = [
+    ['production.env', `${'API'}_KEY=my-production-secret-value\n`],
+    ['private.env', `${'AUTH'}_${'TOKEN'}=private-live-credential\n`],
+    ['synthetic.env', `${'PASS'}WORD=synthetic-stolen-password\n`],
+  ];
+  for (const [relative, content] of cases) fs.writeFileSync(path.join(root, relative), content);
+  const result = auditRelease({
+    root,
+    trackedFiles: cases.map(([relative]) => relative),
+    buildDirs: [],
+  });
+  assert.equal(result.ok, false);
+  assert.deepEqual(result.findings.map(({ file, rule }) => ({ file, rule })), cases.map(([file]) => ({
+    file,
+    rule: 'secret-assignment',
+  })).sort((a, b) => a.file.localeCompare(b.file, 'en')));
+});
+
+test('rejects plausible private home paths without username exemptions', () => {
+  const root = fixture();
+  const cases = [
+    ['mac.txt', macHome('user', 'Scout Workspace')],
+    ['linux.txt', unixHome('user', 'Scout Workspace')],
+    ['windows.txt', windowsHome('owner', 'Scout Workspace')],
+  ];
+  for (const [relative, content] of cases) fs.writeFileSync(path.join(root, relative), `${content}\n`);
+  const result = auditRelease({
+    root,
+    trackedFiles: cases.map(([relative]) => relative),
+    buildDirs: [],
+  });
+  assert.equal(result.ok, false);
+  assert.deepEqual(result.findings.map(({ file, rule }) => ({ file, rule })), cases.map(([file]) => ({
+    file,
+    rule: 'private-path',
+  })).sort((a, b) => a.file.localeCompare(b.file, 'en')));
 });
 
 test('ignores credential variable expressions and exact allowlisted binary assets', () => {
