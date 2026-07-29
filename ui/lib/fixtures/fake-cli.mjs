@@ -11,7 +11,7 @@ process.stdin.on('end', () => {
     process.exit(3);
   }
   if (command === 'AUTH_FAIL') {
-    process.stderr.write('401 Unauthorized for person@example.test token=secret\n');
+    process.stderr.write('401 Unauthorized for person@example.test; credentials expired\n');
     process.exit(3);
   }
   if (command === 'HANG') {
