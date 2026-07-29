@@ -145,3 +145,66 @@ private paths, account data, CV content, adverts, prompts, or transcripts.
 - Next exact action: add failing `ui/lib/providerLogin.test.mjs` cases for
   allowlisted provider login commands, bounded lifecycle and safe post-auth
   validation, then run the Gate 4 focused command from the execution brief.
+
+## Gate 4 — Task 17 / guided provider login
+
+- Status: review-clean and complete as a candidate implementation.
+- Commit range: `c64457e..8cded8f`.
+- Implementation commits: `d9dc24d` and the required `6dcadb9`
+  (`feat: guide secure provider reauthentication`).
+- Review-fix commits: `da68902`, `28c5a1f`, and `8cded8f`.
+- RED evidence:
+  - the first focused tests failed because `ui/lib/providerLogin.mjs` and its
+    owner-only routes did not exist;
+  - review regressions then reproduced false local-only post-auth success,
+    uncancelled confirmation turns, unbounded confirmation output, incomplete
+    child-tree shutdown, replayable retry/logout authorisations, stale Claude
+    expiry evidence, false logout-success UI, and stale poll/double-action
+    response races;
+  - the stubborn real provider fixture remained alive after `SIGTERM` until
+    the close-gated forced process-group escalation was implemented.
+- Fixes:
+  - constrain Codex and Claude to trusted executables, documented fixed
+    arguments, `shell: false`, a minimal environment, a private working
+    directory, bounded output/input/time and sanitised public snapshots;
+  - require same-origin JSON, ephemeral CSRF and a server-derived local or
+    configured remote-owner context for every route and session operation;
+  - validate local login status with a bounded real structured provider turn,
+    feed terminal evidence to provider health, serialize/await health writes,
+    and own cancellation through close or bounded shutdown;
+  - terminate POSIX process groups with TERM-to-KILL escalation and Windows
+    trees with fixed `taskkill.exe` arguments;
+  - consume retry and Claude-clear predecessor sessions once, bind clear to a
+    recent `credentials-expired` session, and re-probe remote authentication
+    immediately before the explicit fixed logout;
+  - make failed logout a failed API/UI outcome, disable mutations in flight,
+    and ignore stale polling responses by per-provider generation.
+- GREEN:
+  - focused provider-login, provider-turn and setup suites: 77 discovered,
+    76 passed, 0 failed, 1 platform-specific skip;
+  - required Gate 4 Node command: 106 discovered, 102 passed, with only the
+    four inherited macOS process-start identity failures below;
+  - Chromium settings acceptance: 23 passed;
+  - Firefox settings acceptance: 23 passed;
+  - `npm run release:audit`: passed; 220 files scanned;
+  - full-range diff checks: passed.
+- Known local environment limitation: four unchanged server tests fail because
+  this macOS Codex sandbox cannot read the process-start identity used by
+  `currentLeaseOwner()`. The same four failures were recorded in Gates 2 and 3;
+  all Gate 4 server-route assertions pass.
+- Fresh read-only review rounds:
+  - Early hardening rounds found and fixed false health confirmation,
+    insufficient lifecycle ownership, shared rate buckets, access
+    classification, output bounds, health-write ordering and explicit-clear
+    eligibility.
+  - Penultimate round: Security FAIL (0 Critical, 2 Important), Spec FAIL
+    (0 Critical, 1 Important), Code quality CHANGES REQUIRED (0 Critical,
+    2 Important). Fixed confirmation process-group closure, retry replay,
+    session-bound fresh Claude clear, failed-logout reporting and UI response
+    serialization.
+  - Final complete-range round: Security PASS, Spec PASS, Code quality PASS;
+    0 Critical, 0 Important.
+- Findings fixed/open: every Gate 4 finding fixed; none open.
+- Next exact action: write failing Task 18 browser acceptance and release-audit
+  tests, beginning with `tests/browser/recoverable-scan.spec.mjs` and the
+  privacy-sensitive release fixture matrix.
