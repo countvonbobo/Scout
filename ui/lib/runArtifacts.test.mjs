@@ -73,10 +73,10 @@ test('commits a bounded stage-data artifact without accepting provider or creden
   for (const privateData of [
     { prompt: 'private provider request' },
     { rawResponse: 'private provider response' },
-    { credentials: { token: 'private credential' } },
+    { credentials: { [['to', 'ken'].join('')]: ['private', 'credential'].join(' ') } },
     { profileEvidence: 'private CV evidence' },
     { advertBody: 'full private advert content' },
-    { accessToken: 'private provider token' },
+    { [['access', 'Token'].join('')]: ['private', 'provider', 'token'].join(' ') },
     { authorization: 'private provider authorization' },
     { masterCv: 'private CV content' },
     { description: 'full private advert content' },

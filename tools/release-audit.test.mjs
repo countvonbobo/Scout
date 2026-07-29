@@ -290,6 +290,29 @@ test('rejects plausible credentials even when their values contain fixture-like 
   })).sort((a, b) => a.file.localeCompare(b.file, 'en')));
 });
 
+test('rejects quoted credential assignments containing whitespace without reporting their values', () => {
+  const root = fixture();
+  const cases = [
+    ['password.env', `${'PASS'}${'WORD'}="a long private password"\n`],
+    ['auth-token.yaml', `${'AUTH'}_${'TOKEN'}: "live token value 123456"\n`],
+    ['api-key.env', `${'API'}_${'KEY'}='long private key value'\n`],
+  ];
+  for (const [relative, content] of cases) fs.writeFileSync(path.join(root, relative), content);
+  const result = auditRelease({
+    root,
+    trackedFiles: cases.map(([relative]) => relative),
+    buildDirs: [],
+  });
+  assert.equal(result.ok, false);
+  assert.deepEqual(result.findings.map(({ file, rule }) => ({ file, rule })), cases.map(([file]) => ({
+    file,
+    rule: 'secret-assignment',
+  })).sort((a, b) => a.file.localeCompare(b.file, 'en')));
+  assert.equal(JSON.stringify(result.findings).includes('private password'), false);
+  assert.equal(JSON.stringify(result.findings).includes('token value'), false);
+  assert.equal(JSON.stringify(result.findings).includes('private key'), false);
+});
+
 test('checks every sensitive assignment on a line and rejects bearer and provider tokens', () => {
   const root = fixture();
   const bearer = ['Authorization:', 'Bearer', 'liveBearerCredential123456'].join(' ');

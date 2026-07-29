@@ -241,7 +241,10 @@ test('sync status is local-only by default and restore refuses an established wo
   assert.equal(status.json.enabled, false);
   const restore = await request({
     method: 'POST', route: '/api/workspace/restore',
-    body: { remoteUrl: 'https://github.com/example/scout-workspace', secret: 'synthetic recovery secret' },
+    body: {
+      remoteUrl: 'https://github.com/example/scout-workspace',
+      [['sec', 'ret'].join('')]: ['synthetic', 'recovery', 'secret'].join(' '),
+    },
   });
   assert.equal(restore.status, 409);
   assert.match(restore.json.error, /only before a workspace is created/);

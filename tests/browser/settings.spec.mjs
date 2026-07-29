@@ -104,6 +104,35 @@ test('first service worker installation does not pretend Scout has updated', asy
   await expect(page.locator('#ui-update-banner')).toBeHidden();
 });
 
+test('a verified update download presents only its safe package name', async ({ page }) => {
+  const packageName = 'Scout-0.1.0-beta.23-windows-x64.exe';
+  await page.route('**/api/update/download', async (route) => {
+    await route.fulfill({
+      contentType: 'application/json',
+      body: JSON.stringify({
+        downloaded: {
+          name: packageName,
+          sha256: 'a'.repeat(64),
+          version: '0.1.0-beta.23',
+          verifiedAt: '2026-07-29T10:00:00.000Z',
+        },
+      }),
+    });
+  });
+  await page.evaluate(() => window.Scout.renderUpdateBanner({
+    available: true,
+    latestVersion: '0.1.0-beta.23',
+    canDownload: true,
+    package: { name: 'Scout-0.1.0-beta.23-windows-x64.exe' },
+  }));
+
+  const banner = page.locator('#update-banner');
+  await banner.getByRole('button', { name: 'Download verified update' }).click();
+  await expect(banner).toContainText(packageName);
+  await expect(banner).not.toContainText('undefined');
+  await expect(banner).not.toContainText('/Users/');
+});
+
 test('a stale tracker mutation refreshes its revision and retries exactly once', async ({ page }) => {
   let revision = 'revision-before-scan';
   const revisionsSent = [];
