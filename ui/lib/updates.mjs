@@ -151,6 +151,14 @@ export async function downloadVerifiedUpdate(update, directory, {
 
 export function publicDownloadedUpdate(downloaded) {
   if (!downloaded || typeof downloaded !== 'object') return null;
-  const { name, sha256, version, verifiedAt } = downloaded;
+  const name = String(downloaded.name || '');
+  const sha256 = String(downloaded.sha256 || '');
+  const version = String(downloaded.version || '');
+  const verifiedAt = String(downloaded.verifiedAt || '');
+  if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,179}$/.test(name)
+      || path.basename(name) !== name
+      || !/^[a-f0-9]{64}$/i.test(sha256)
+      || !/^\d+\.\d+\.\d+(?:-[A-Za-z0-9.-]+)?$/.test(version)
+      || Number.isNaN(Date.parse(verifiedAt))) return null;
   return { name, sha256, version, verifiedAt };
 }

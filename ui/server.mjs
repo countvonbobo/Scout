@@ -416,9 +416,34 @@ function publicRemoteStatus(value) {
   };
 }
 
+export function publicDeviceSettings(settings, startupStatus = {}) {
+  const startupVerifiedAt = String(settings?.startup?.verifiedAt || '');
+  return {
+    schemaVersion: Number(settings?.schemaVersion) || 3,
+    startWithWindows: Boolean(settings?.startWithWindows),
+    startup: {
+      mechanism: settings?.startup?.mechanism === 'task-scheduler' ? 'task-scheduler' : null,
+      verifiedAt: Number.isNaN(Date.parse(startupVerifiedAt)) ? null : startupVerifiedAt,
+    },
+    updates: {
+      policy: settings?.updates?.policy === 'download' ? 'download' : 'notify',
+      downloaded: publicDownloadedUpdate(settings?.updates?.downloaded),
+      downloadError: settings?.updates?.downloadError ? 'Update download could not be completed.' : null,
+    },
+    startupStatus: {
+      supported: Boolean(startupStatus?.supported),
+      enabled: Boolean(startupStatus?.enabled),
+      mechanism: startupStatus?.mechanism === 'task-scheduler' ? 'task-scheduler' : null,
+    },
+  };
+}
+
 function currentDeviceSettings() {
   const settings = loadDeviceSettings();
-  return { ...settings, startupStatus: process.platform === 'win32' ? windowsStartupStatus() : { supported: false, enabled: false, mechanism: null } };
+  const startupStatus = process.platform === 'win32'
+    ? windowsStartupStatus()
+    : { supported: false, enabled: false, mechanism: null };
+  return publicDeviceSettings(settings, startupStatus);
 }
 
 export const providerDetection = { detect: detectProvidersAsync };
@@ -1563,7 +1588,16 @@ routes['POST /api/device/settings'] = (req, res, body) => {
     }
     saveDeviceSettings(settings);
     void queueCheckpoint('update device settings', { includeDevicePreferences: true });
-    return replyJson(res, 200, { ok: true, settings, pendingSetupSections: pendingDeviceSections(settings) });
+    return replyJson(res, 200, {
+      ok: true,
+      settings: publicDeviceSettings(
+        settings,
+        process.platform === 'win32'
+          ? windowsStartupStatus()
+          : { supported: false, enabled: false, mechanism: null },
+      ),
+      pendingSetupSections: pendingDeviceSections(settings),
+    });
   } catch { return replyJson(res, 400, publicApiError('Device settings could not be saved.')); }
 };
 
@@ -1628,39 +1662,47 @@ async function downloadCurrentUpdate(result) {
   return updateDownloadRunning;
 }
 
-async function updateStatus(force = false) {
+export function canAutoDownloadUpdate(requestAccess, settings, result) {
+  return requestAccess === 'local'
+    && result?.available === true
+    && Boolean(result.package)
+    && settings?.updates?.policy === 'download'
+    && settings?.updates?.downloaded?.version !== result.latestVersion;
+}
+
+async function updateStatus(force = false, { requestAccess = 'local' } = {}) {
   const settings = loadDeviceSettings();
   const last = new Date(settings.updates?.lastCheckedAt || 0).getTime();
   if (!force && Date.now() - last < 86400000 && settings.updates?.lastResult) {
     const cached = settings.updates.lastResult;
-    return { ...cached, notify: false, policy: settings.updates.policy, downloaded: settings.updates.downloaded ? { ...settings.updates.downloaded, path: undefined } : null };
+    return { ...cached, notify: false, policy: settings.updates.policy, downloaded: publicDownloadedUpdate(settings.updates.downloaded) };
   }
   if (!updateCheckRunning) updateCheckRunning = checkForUpdate(APP_VERSION).then((result) => {
     const notify = Boolean(result.available && (force || settings.updates?.lastNotifiedVersion !== result.latestVersion));
     settings.updates = { ...settings.updates, lastCheckedAt: new Date().toISOString(), lastResult: result, lastNotifiedVersion: notify ? result.latestVersion : settings.updates?.lastNotifiedVersion };
     saveDeviceSettings(settings);
-    if (result.available && result.package && settings.updates.policy === 'download' && settings.updates.downloaded?.version !== result.latestVersion) {
+    if (canAutoDownloadUpdate(requestAccess, settings, result)) {
       void downloadCurrentUpdate(result).catch(() => {
         const latest = loadDeviceSettings();
         latest.updates = { ...latest.updates, downloadError: 'Update download could not be completed.' };
         saveDeviceSettings(latest);
       });
     }
-    return { ...result, notify, policy: settings.updates.policy, downloaded: settings.updates.downloaded ? { ...settings.updates.downloaded, path: undefined } : null };
+    return { ...result, notify, policy: settings.updates.policy, downloaded: publicDownloadedUpdate(settings.updates.downloaded) };
   }).finally(() => { updateCheckRunning = null; });
   return updateCheckRunning;
 }
 
 routes['POST /api/update/check'] = async (req, res, body) => {
   const b = parseBody(body); if (!b) return replyJson(res, 400, { error: 'bad json' });
-  try { return replyJson(res, 200, { ...await updateStatus(Boolean(b.force)), canDownload: req.scoutAccess === 'local' }); }
+  try { return replyJson(res, 200, { ...await updateStatus(Boolean(b.force), { requestAccess: req.scoutAccess }), canDownload: req.scoutAccess === 'local' }); }
   catch { return replyJson(res, 503, { ...publicApiError('Update check could not be completed.'), available: false, currentVersion: APP_VERSION }); }
 };
 
 routes['POST /api/update/download'] = async (req, res, body) => {
   const b = parseBody(body); if (!b) return replyJson(res, 400, { error: 'bad json' });
   try {
-    const result = await updateStatus(true);
+    const result = await updateStatus(true, { requestAccess: req.scoutAccess });
     if (!result.available) return replyJson(res, 409, { error: 'Scout is already up to date' });
     const downloaded = await downloadCurrentUpdate(result);
     return replyJson(res, 200, { ok: true, downloaded: publicDownloadedUpdate(downloaded) });

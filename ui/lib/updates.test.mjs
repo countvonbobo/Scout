@@ -44,6 +44,13 @@ test('download projection never exposes its device-local absolute path', () => {
     verifiedAt: '2026-07-29T10:00:00.000Z',
   });
   assert.equal('path' in projected, false);
+  assert.equal(publicDownloadedUpdate({
+    path: '/private/update',
+    name: '../private-update.exe',
+    sha256: 'a'.repeat(64),
+    version: '0.1.0',
+    verifiedAt: '2026-07-29T10:00:00.000Z',
+  }), null);
 });
 
 test('update check selects a newer verified Scout release and device package', async () => {

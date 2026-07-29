@@ -13,10 +13,10 @@ process.env.SCOUT_WORKSPACE = testWorkspace;
 process.env.SCOUT_DEVICE_SETTINGS = path.join(testWorkspace, 'device-settings.json');
 const {
   APP_ROOT, APP_VERSION, UI_BUILD_FILES, UI_BUILD_ID, WORKSPACE_ROOT,
-  checkStartupProviderHealth, confirmProviderLoginHealth, createRuntimeProviderHealthMonitor,
+  canAutoDownloadUpdate, checkStartupProviderHealth, confirmProviderLoginHealth, createRuntimeProviderHealthMonitor,
   codexDeepLinkDetection, computeUiBuildId, createServer,
   inspectCodexDeepLinkHandler, operations, providerDetection, providerLoginControl,
-  publicApiError, publicProviderStatus, requestAccess, restartControl, shutdownControl,
+  publicApiError, publicDeviceSettings, publicProviderStatus, requestAccess, restartControl, shutdownControl,
 } = await import('./server.mjs');
 const { seedWorkspace, loadWorkspaceConfig, workspacePaths, writeWorkspaceConfig } = await import('./lib/workspace.mjs');
 const { profileFingerprint } = await import('./lib/searchProfile.mjs');
@@ -178,6 +178,43 @@ test('API exception projection uses fixed public copy and never returns diagnost
     reasonCode: 'request-failed',
   });
   assert.doesNotMatch(JSON.stringify(projected), /Users|id_ed25519|PRIVATE-SECRET|token/i);
+});
+
+test('device status omits persisted paths and remote update checks cannot auto-download', () => {
+  const privatePath = ['', 'Users', 'private', 'Scout', 'updates', 'Scout.exe'].join('/');
+  const settings = {
+    schemaVersion: 3,
+    startWithWindows: true,
+    startup: { mechanism: 'task-scheduler', verifiedAt: privatePath },
+    completedSections: { [privatePath]: 1 },
+    deferredSections: { [privatePath]: privatePath },
+    updates: {
+      policy: 'download',
+      lastCheckedAt: privatePath,
+      lastNotifiedVersion: privatePath,
+      downloaded: {
+        path: privatePath,
+        name: 'Scout.exe',
+        sha256: 'a'.repeat(64),
+        version: '0.1.0-beta.22',
+        verifiedAt: '2026-07-29T10:00:00.000Z',
+      },
+      downloadError: privatePath,
+    },
+  };
+  const result = { available: true, package: { name: 'Scout.exe' }, latestVersion: '0.1.0-beta.23' };
+  assert.equal(canAutoDownloadUpdate('remote-owner', settings, result), false);
+  assert.equal(canAutoDownloadUpdate('local', settings, result), true);
+  const projected = publicDeviceSettings(settings, {
+    supported: true,
+    enabled: false,
+    mechanism: 'task-scheduler',
+    error: privatePath,
+  });
+  assert.equal(projected.updates.policy, 'download');
+  assert.equal(projected.updates.downloaded.name, 'Scout.exe');
+  assert.equal(projected.startup.verifiedAt, null);
+  assert.doesNotMatch(JSON.stringify(projected), /Users|completedSections|deferredSections|lastCheckedAt|lastNotifiedVersion/);
 });
 
 test('provider login access classifies the configured remote owner without requiring backup', () => {

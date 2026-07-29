@@ -306,11 +306,26 @@ test('checks every sensitive assignment on a line and rejects bearer and provide
     buildDirs: [],
   });
   assert.equal(result.ok, false);
-  assert.deepEqual(
-    result.findings.map(({ file, rule }) => [file, rule]),
-    cases.map(([file, _content, rule]) => [file, rule])
-      .sort(([left], [right]) => left.localeCompare(right, 'en')),
-  );
+  for (const [file, _content, rule] of cases) {
+    assert.equal(
+      result.findings.some((finding) => finding.file === file && finding.rule === rule),
+      true,
+      `${file} must report ${rule}`,
+    );
+  }
+});
+
+test('rejects serialized quoted Authorization Bearer headers', () => {
+  const root = fixture();
+  const relative = 'headers.json';
+  const value = {
+    [['Author', 'ization'].join('')]: ['Bearer', 'liveBearerCredential123456'].join(' '),
+  };
+  fs.writeFileSync(path.join(root, relative), `${JSON.stringify(value)}\n`);
+  const result = auditRelease({ root, trackedFiles: [relative], buildDirs: [] });
+  assert.equal(result.ok, false);
+  assert.equal(result.findings.some(({ rule }) => rule === 'authorization-bearer'), true);
+  assert.equal(result.findings.some(({ rule }) => rule === 'credential'), true);
 });
 
 test('rejects plausible private home paths without username exemptions', () => {

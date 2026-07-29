@@ -15,7 +15,7 @@ const SECRET_RULES = Object.freeze([
   { id: 'github-token', regex: /\b(?:gh[pousr]_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{20,})\b/g },
   { id: 'slack-token', regex: /\bxox[baprs]-[A-Za-z0-9-]{10,}\b/g },
   { id: 'google-api-key', regex: /\bAIza[A-Za-z0-9_-]{30,}\b/g },
-  { id: 'authorization-bearer', regex: /\bAuthorization[ \t]*:[ \t]*Bearer[ \t]+[A-Za-z0-9._~+/-]{16,}\b/gi },
+  { id: 'authorization-bearer', regex: /\bAuthorization["']?[ \t]*[:=][ \t]*["']?Bearer[ \t]+[A-Za-z0-9._~+/-]{16,}\b/gi },
   { id: 'openai-token', regex: /\bsk-(?:proj-)?[A-Za-z0-9_-]{16,}\b/g },
 ]);
 const PRIVATE_RUNTIME_ROOTS = new Set([
@@ -87,7 +87,8 @@ function privacyRuleForKey(key, value, owner = {}, ancestors = []) {
   const normal = normaliseSerializedKey(key);
   const inAuthContext = ancestors.some((part) =>
     /(?:auth|authentication|authorization|credential|device|login|provider|session)/.test(part));
-  if (normal === 'credentials'
+  if (normal === 'authorization'
+    || normal === 'credentials'
     || ['accesstoken', 'authtoken', 'bearertoken', 'clientsecret', 'idtoken', 'password', 'refreshtoken'].includes(normal)
     || (normal === 'token' && inAuthContext)) {
     return 'credential';
