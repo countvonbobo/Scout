@@ -49,6 +49,17 @@ const DEFAULT_MAX_LINE_BYTES = 2 * 1024;
 const DEFAULT_TERMINATE_GRACE_MS = 1_000;
 const DEFAULT_SHUTDOWN_DEADLINE_MS = 3_000;
 const MANUAL_CODE = /^[A-Za-z0-9][A-Za-z0-9._~+/=-]{5,255}$/;
+const SECRET_LABEL = /\b(?:api[- ]?key|bearer|password|secret|token)\b/i;
+const CLAUDE_OAUTH_KEYS = new Set([
+  'client_id',
+  'code',
+  'code_challenge',
+  'code_challenge_method',
+  'redirect_uri',
+  'response_type',
+  'scope',
+  'state',
+]);
 const ENV_ALLOWLIST = new Set([
   'appdata',
   'comspec',
@@ -119,24 +130,72 @@ function checkedManualCode(value) {
   return value;
 }
 
+function providerHostname(hostname, provider) {
+  const value = hostname.toLowerCase();
+  return provider === 'codex'
+    ? value === 'openai.com' || value.endsWith('.openai.com')
+    : value === 'anthropic.com'
+      || value.endsWith('.anthropic.com')
+      || value === 'claude.ai'
+      || value.endsWith('.claude.ai');
+}
+
+function safeClaudeOauthQuery(url) {
+  const entries = [...url.searchParams];
+  if (entries.length === 0) return true;
+  if (entries.length !== CLAUDE_OAUTH_KEYS.size) return false;
+  const seen = new Set();
+  for (const [key, value] of entries) {
+    if (!CLAUDE_OAUTH_KEYS.has(key)
+      || seen.has(key)
+      || Buffer.byteLength(value, 'utf8') < 1
+      || Buffer.byteLength(value, 'utf8') > 1_024) {
+      return false;
+    }
+    seen.add(key);
+  }
+  if (seen.size !== CLAUDE_OAUTH_KEYS.size) return false;
+  if (!/^(?:true|1)$/.test(url.searchParams.get('code') || '')) return false;
+  if (!/^[A-Za-z0-9._-]{1,256}$/.test(url.searchParams.get('client_id') || '')) return false;
+  if (url.searchParams.get('response_type') !== 'code') return false;
+  if (url.searchParams.get('code_challenge_method') !== 'S256') return false;
+  if (!/^[A-Za-z0-9_-]{43,128}$/.test(url.searchParams.get('code_challenge') || '')) return false;
+  if (!/^[A-Za-z0-9._~=-]{8,512}$/.test(url.searchParams.get('state') || '')) return false;
+  if (!/^[A-Za-z0-9:._ -]{1,512}$/.test(url.searchParams.get('scope') || '')) return false;
+  try {
+    const redirect = new URL(url.searchParams.get('redirect_uri'));
+    if (redirect.protocol !== 'https:'
+      || redirect.username
+      || redirect.password
+      || redirect.search
+      || redirect.hash
+      || redirect.href.length > 1_024
+      || !providerHostname(redirect.hostname, 'claude')) {
+      return false;
+    }
+  } catch {
+    return false;
+  }
+  return true;
+}
+
 function safeUrl(provider, value) {
   try {
     const url = new URL(value);
-    if (url.protocol !== 'https:' || url.username || url.password || url.href.length > 2_048) {
+    if (url.protocol !== 'https:'
+      || url.username
+      || url.password
+      || url.hash
+      || url.href.length > 2_048) {
       return null;
     }
-    const hostname = url.hostname.toLowerCase();
-    const allowed = provider === 'codex'
-      ? hostname === 'openai.com' || hostname.endsWith('.openai.com')
-      : hostname === 'anthropic.com'
-        || hostname.endsWith('.anthropic.com')
-        || hostname === 'claude.ai'
-        || hostname.endsWith('.claude.ai');
-    if (!allowed) return null;
+    if (!providerHostname(url.hostname, provider)) return null;
+    if (provider === 'claude') {
+      return safeClaudeOauthQuery(url) ? url.href : null;
+    }
     // Device verification queries can carry opaque transient state. The CLI
     // keeps that state; Scout exposes only the provider-owned destination.
     url.search = '';
-    url.hash = '';
     return url.href;
   } catch {
     return null;
@@ -150,6 +209,7 @@ function minimalProviderEnvironment(source) {
 }
 
 function parseSafeLoginLine(session, line) {
+  if (SECRET_LABEL.test(line)) return;
   if (session.provider === 'claude'
     && /\b(?:paste|enter|submit)\b.{0,80}\b(?:authorization|authentication|login)?\s*code\b/i.test(line)) {
     session.codeRequired = true;
@@ -169,9 +229,17 @@ function parseSafeLoginLine(session, line) {
     const code = codeMatch?.[1] || '';
     if (code
       && code === code.toUpperCase()
-      && !/\b(?:api[- ]?key|bearer|password|secret|token)\b/i.test(line)) {
+      && !SECRET_LABEL.test(line)) {
       session.userCode = code;
     }
+  }
+}
+
+function parseSafeLoginPromptPrefix(session, prefix) {
+  if (session.provider !== 'claude' || SECRET_LABEL.test(prefix)) return;
+  if (/\b(?:paste|enter|submit)\b.{0,80}\b(?:authorization|authentication|login)?\s*code\s*:?\s*$/i.test(prefix)) {
+    session.codeRequired = true;
+    if (session.state === 'starting') session.state = 'awaiting-code';
   }
 }
 
@@ -531,8 +599,10 @@ export function createProviderLoginManager({
       failOutput(session);
       return;
     }
-    // Interactive CLIs do not always newline-terminate their prompt.
-    parseSafeLoginLine(session, session.buffers[stream]);
+    // Interactive CLIs do not always newline-terminate their prompt. Only the
+    // minimum non-secret Claude prompt sentinel is safe to recognise from an
+    // incomplete record; URL and device-code candidates wait for a full line.
+    parseSafeLoginPromptPrefix(session, session.buffers[stream]);
   }
 
   function spawnFixed(session, argumentsList, stdin) {

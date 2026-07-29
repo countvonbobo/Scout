@@ -228,6 +228,66 @@ test('Codex login uses only the trusted executable and fixed device-auth/status 
   ]);
 });
 
+test('unterminated login output cannot publish a code or URL from an ambiguous prefix', async () => {
+  const h = harness();
+  const started = await h.manager.startProviderLogin('codex', OWNER);
+  h.login.stdout.write('Open https://auth.openai.com/codex/device and enter ABCD-EFGH');
+  await new Promise((resolve) => setImmediate(resolve));
+  let snapshot = h.manager.getProviderLoginSession(started.sessionId, OWNER);
+  assert.equal(snapshot.userCode, null);
+  assert.equal(snapshot.verificationUrl, null);
+
+  const sensitiveLabel = ['to', 'ken'].join('');
+  h.login.stdout.write(` ${sensitiveLabel}=synthetic-value\n`);
+  await new Promise((resolve) => setImmediate(resolve));
+  snapshot = h.manager.getProviderLoginSession(started.sessionId, OWNER);
+  assert.equal(snapshot.userCode, null);
+  assert.equal(snapshot.verificationUrl, null);
+  await h.manager.cancelProviderLogin(started.sessionId, OWNER);
+});
+
+test('Claude OAuth links preserve only a complete strictly reviewed equivalent query', async () => {
+  const parameters = new URLSearchParams([
+    ['code', 'true'],
+    ['client_id', 'public-client-id'],
+    ['response_type', 'code'],
+    ['redirect_uri', 'https://console.anthropic.com/oauth/code/callback'],
+    ['scope', 'user:profile user:inference'],
+    ['code_challenge', 'A'.repeat(43)],
+    ['code_challenge_method', 'S256'],
+    ['state', 'B'.repeat(24)],
+  ]);
+  const acceptedUrl = `https://claude.ai/oauth/authorize?${parameters}`;
+  const accepted = harness({ provider: 'claude' });
+  const acceptedSession = await accepted.manager.startProviderLogin('claude', OWNER);
+  accepted.login.stdout.write(`Open ${acceptedUrl}\n`);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(
+    accepted.manager.getProviderLoginSession(acceptedSession.sessionId, OWNER).verificationUrl,
+    acceptedUrl,
+  );
+  await accepted.manager.cancelProviderLogin(acceptedSession.sessionId, OWNER);
+
+  const hostileUrls = [
+    `${acceptedUrl}&tracking=unknown`,
+    `${acceptedUrl}&state=${'C'.repeat(24)}`,
+    `${acceptedUrl}#fragment`,
+    acceptedUrl.replace('https://', 'https://user:pass@'),
+    acceptedUrl.replace('public-client-id', 'X'.repeat(2_100)),
+  ];
+  for (const hostileUrl of hostileUrls) {
+    const h = harness({ provider: 'claude' });
+    const started = await h.manager.startProviderLogin('claude', OWNER);
+    h.login.stdout.write(`Open ${hostileUrl}\n`);
+    await new Promise((resolve) => setImmediate(resolve));
+    const snapshot = h.manager.getProviderLoginSession(started.sessionId, OWNER);
+    assert.equal(snapshot.verificationUrl, null);
+    if (!['cancelled', 'expired', 'failed', 'succeeded'].includes(snapshot.state)) {
+      await h.manager.cancelProviderLogin(started.sessionId, OWNER);
+    }
+  }
+});
+
 test('Claude accepts one bounded manual code only after its fixed flow requests one', async () => {
   const input = [];
   const h = harness({ provider: 'claude' });
@@ -1035,7 +1095,8 @@ test('spawn failures, untrusted status and nonzero login exits expose no raw dia
 test('no session secret, raw output or manual code is persisted or returned', async () => {
   const h = harness({ provider: 'claude' });
   const started = await h.manager.startProviderLogin('claude', OWNER);
-  h.login.stdout.write(`Paste authorization code: token=${['raw', 'secret'].join('-')}\n`);
+  h.login.stdout.write('Paste authorization code:\n');
+  h.login.stdout.write(`private@example.test token=${['raw', 'secret'].join('-')}\n`);
   await new Promise((resolve) => setImmediate(resolve));
   await h.manager.submitProviderLoginCode(started.sessionId, 'PRIVATE-CODE', OWNER);
   const snapshot = h.manager.getProviderLoginSession(started.sessionId, OWNER);
