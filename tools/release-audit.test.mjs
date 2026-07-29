@@ -357,6 +357,8 @@ test('rejects namespaced credential assignment families without flagging unrelat
     ['provider-token.mjs', `const ${'provider'}${'Token'} = "opaque provider credential";\n`],
     ['github-token.mjs', `const ${'github'}${'Token'} = "opaque github credential";\n`],
     ['openai-token.mjs', `const ${'openai'}${'Token'} = "opaque openai credential";\n`],
+    ['csrf-token.mjs', `const ${'csrf'}${'Token'} = "live csrf token 123456";\n`],
+    ['provider-login-csrf.mjs', `const ${'providerLogin'}${'CsrfToken'} = "live provider csrf 123456";\n`],
     ['api-secret.mjs', `const ${'api'}${'Secret'} = "opaque api secret value";\n`],
     ['consumer-secret.mjs', `const ${'consumer'}${'Secret'} = "opaque consumer secret";\n`],
     ['authorization.mjs', `const ${'author'}${'ization'} = "Basic dXNlcjpwYXNzd29yZA==";\n`],

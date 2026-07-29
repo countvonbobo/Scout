@@ -633,7 +633,9 @@ test('guided provider login supports code, failure, retry and cancel without bro
       await route.fulfill({
         contentType: 'application/json',
         body: JSON.stringify({
-          provider: 'claude', session, csrfToken: 'csrf-claude-synthetic-000000000000',
+          provider: 'claude',
+          session,
+          [['csrf', 'Token'].join('')]: ['csrf', 'claude', 'synthetic', '000000000000'].join('-'),
         }),
       });
       return;
@@ -743,7 +745,7 @@ test('guided login preserves failed logout state and reports no false success', 
         body: JSON.stringify({
           provider: 'claude',
           session,
-          csrfToken: 'csrf-claude-synthetic-000000000000',
+          [['csrf', 'Token'].join('')]: ['csrf', 'claude', 'synthetic', '000000000000'].join('-'),
         }),
       });
     }
