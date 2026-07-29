@@ -406,3 +406,29 @@ private paths, account data, CV content, adverts, prompts, or transcripts.
   - diff checks: passed.
 - Findings fixed/open: all round-3 findings fixed; complete-range Spec,
   code-quality and privacy/security re-review is pending.
+
+### Whole-epic review round 4
+
+- Verdicts:
+  - Spec PASS: 0 Critical, 0 Important.
+  - Code quality PASS: 0 Critical, 0 Important.
+  - Privacy/security FAIL: 0 Critical, 2 Important.
+- Review-fix commit: `219032a` (`fix: enforce local update privacy boundary`).
+- Findings reproduced and fixed:
+  - classify serialized `Authorization` values as credentials and detect
+    quoted JSON/header Bearer syntax;
+  - require local request access before the saved automatic-download policy
+    may start a package download, so remote update checks remain read-only;
+  - project device settings through a closed schema, omitting persisted
+    download paths, startup diagnostics and arbitrary corrupted fields;
+  - validate the bounded downloaded-update projection instead of copying
+    persisted names, hashes, versions or timestamps on trust.
+- GREEN after fixes:
+  - release-audit/build, doctor and update suites: 42 passed, 0 failed,
+    0 skipped;
+  - device/update boundary regression and local update-policy integration:
+    2 passed;
+  - default release audit: passed for 515 files;
+  - diff checks: passed.
+- Findings fixed/open: all round-4 findings fixed; complete-range Spec,
+  code-quality and privacy/security re-review is pending.
