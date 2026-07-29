@@ -48,9 +48,10 @@ not rewritten.
 Do not delete `.scout/scan-lease.json`, `.scout/scan-queue.jsonl`, a run
 journal, or a legacy `.scout-scan.lock` to make work continue. A live,
 unexpired or unverifiable owner must be stopped and allowed to reach its
-takeover margin. Once the fenced lease format has activated, an older Scout
-binary or a new legacy lock is a downgrade/coexistence conflict; stop the old
-binary and retry with the current version.
+takeover margin. Stop every older Scout process before the first fenced
+activation. Once activated, the fenced lease is authoritative; an older Scout
+binary or a new legacy lock is a downgrade/coexistence conflict, and Scout
+refuses to run until only the current version remains.
 
 If a terminal run remains visible because lease cleanup was interrupted, leave
 it in place. A successor validates the terminal journal and removes or

@@ -8,7 +8,7 @@ explicit bundled CLI invocation in [Quick Start](QUICK_START.md).
 
 ## Before upgrading
 
-1. Finish or stop active scans and remove/disable the schedule if the release notes require it.
+1. Finish or stop active scans and remove/disable the schedule if the release notes require it. Stop every older Scout process before a release first activates the fenced scan lease.
 2. Back up the complete private workspace, including hidden `.git` and `.scout` directories.
 3. Record the installed Scout version and run `scout doctor`.
 4. Read release notes for schema, provider and source changes.
@@ -28,6 +28,13 @@ scout doctor --workspace "$HOME/Documents/Scout Workspace"
 ```
 
 Scout validates `workspace.json`. Versioned migrations are designed to be safe to rerun and save the pre-migration configuration under `.scout/backups/`. Scout refuses a workspace schema newer than the application understands; upgrade the application rather than manually lowering `schemaVersion`.
+
+The first fenced scan-lease activation is a one-way execution boundary, not a
+manual workspace-data conversion. Once activated, the fenced lease is
+authoritative and Scout refuses a downgrade or old/new coexistence against the
+same workspace. Stop the older application completely before the first new
+scan; restoring only an older executable is not a safe rollback after fenced
+activation.
 
 VPS source checkouts continue to use the protected release workflow described in
 [VPS installation](INSTALL_VPS.md). It refuses dirty or unexpected checkouts,
@@ -55,6 +62,11 @@ a public repository safe: old mixed Git history must remain private.
 
 ## Rollback and uninstall
 
-If an upgrade fails, stop Scout, preserve the failed workspace and logs, reinstall the previous compatible application version, and restore a copied backup only when necessary. Do not overwrite newer workspace history casually.
+If an upgrade fails, stop Scout, preserve the failed workspace and logs, and
+restore only a version and workspace snapshot that are mutually compatible.
+After fenced-lease activation, do not restart an older Scout binary against
+that workspace: downgrade/coexistence is refused to protect it from two
+writers. Restore a copied pre-activation snapshot only when a reviewed rollback
+requires it. Do not overwrite newer workspace history casually.
 
 Uninstall removes application files but intentionally preserves the workspace. Verify this on important deployments and remove schedules separately.

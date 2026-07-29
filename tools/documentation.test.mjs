@@ -143,3 +143,16 @@ test('maintainer instructions require operations context, documentation upkeep a
   assert.match(policy, /private workspace data/i);
   assert.match(policy, /Do not create root-level TODO/i);
 });
+
+test('beta.23 upgrade guidance explains the one-way fenced lease boundary', () => {
+  const release = fs.readFileSync(path.join(root, 'docs', 'releases', '0.1.0-beta.23.md'), 'utf8');
+  const upgrades = fs.readFileSync(path.join(root, 'docs', 'UPGRADES.md'), 'utf8');
+  const troubleshooting = fs.readFileSync(path.join(root, 'docs', 'TROUBLESHOOTING.md'), 'utf8');
+
+  for (const [name, content] of Object.entries({ release, upgrades, troubleshooting })) {
+    assert.match(content, /old(?:er)? Scout.*(?:stop|stopped)|stop.*old(?:er)? Scout/is, `${name}: stop old Scout`);
+    assert.match(content, /fenced lease.*authoritative|authoritative.*fenced lease/is, `${name}: authoritative lease`);
+    assert.match(content, /downgrade.*coexist|coexist.*downgrade/is, `${name}: downgrade/coexistence refusal`);
+  }
+  assert.match(release, /no manual workspace-data conversion is normally needed/i);
+});
