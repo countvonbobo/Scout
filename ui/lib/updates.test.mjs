@@ -6,7 +6,7 @@ import path from 'node:path';
 import test from 'node:test';
 import {
   checkForUpdate, compareVersions, downloadVerifiedUpdate, packageName, parseChecksums,
-  publicDownloadedUpdate,
+  publicDownloadedUpdate, publicIsoTimestamp,
 } from './updates.mjs';
 
 function streamedResponse(chunks, headers = {}) {
@@ -32,13 +32,13 @@ test('beta versions compare numerically', () => {
 test('download projection never exposes its device-local absolute path', () => {
   const projected = publicDownloadedUpdate({
     path: ['C:', 'Users', 'Owner', 'AppData', 'Local', 'Scout', 'updates', 'Scout.exe'].join('\\'),
-    name: 'Scout.exe',
+    name: 'Scout-0.1.0-beta.23-windows-x64.exe',
     sha256: 'a'.repeat(64),
     version: '0.1.0-beta.23',
     verifiedAt: '2026-07-29T10:00:00.000Z',
   });
   assert.deepEqual(projected, {
-    name: 'Scout.exe',
+    name: 'Scout-0.1.0-beta.23-windows-x64.exe',
     sha256: 'a'.repeat(64),
     version: '0.1.0-beta.23',
     verifiedAt: '2026-07-29T10:00:00.000Z',
@@ -51,6 +51,17 @@ test('download projection never exposes its device-local absolute path', () => {
     version: '0.1.0',
     verifiedAt: '2026-07-29T10:00:00.000Z',
   }), null);
+  assert.equal(publicDownloadedUpdate({
+    name: 'Private-Person.exe',
+    sha256: 'a'.repeat(64),
+    version: '0.1.0-private-person',
+    verifiedAt: '2026-07-29T10:00:00.000Z',
+  }), null);
+  assert.equal(
+    publicIsoTimestamp(`July 29, 2026 (${['', 'Users', 'private', 'Scout'].join('/')})`),
+    null,
+  );
+  assert.equal(publicIsoTimestamp('2026-07-29T10:00:00Z'), '2026-07-29T10:00:00.000Z');
 });
 
 test('update check selects a newer verified Scout release and device package', async () => {

@@ -40,7 +40,9 @@ import {
 } from './lib/onboardingProposal.mjs';
 import { loadDeviceSettings, pendingDeviceSections, saveDeviceSettings, setWindowsStartup, updateDownloadDirectory, windowsStartupStatus } from './lib/deviceSettings.mjs';
 import { disableRemoteAccess, enableRemoteAccess, remoteAccessStatus } from './lib/remoteAccess.mjs';
-import { checkForUpdate, downloadVerifiedUpdate, publicDownloadedUpdate } from './lib/updates.mjs';
+import {
+  checkForUpdate, downloadVerifiedUpdate, publicDownloadedUpdate, publicIsoTimestamp,
+} from './lib/updates.mjs';
 import {
   adoptExistingWorkspaceFromGithub, confirmRecoveryKey, connectWorkspaceSync, detectGit, disableWorkspaceSync, loadSyncSettings, pendingRecoveryKey,
   prepareGithubDeployKey, queueWorkspaceResolution, queueWorkspaceSync, restoreWorkspaceFromGithub,
@@ -417,13 +419,12 @@ function publicRemoteStatus(value) {
 }
 
 export function publicDeviceSettings(settings, startupStatus = {}) {
-  const startupVerifiedAt = String(settings?.startup?.verifiedAt || '');
   return {
     schemaVersion: Number(settings?.schemaVersion) || 3,
     startWithWindows: Boolean(settings?.startWithWindows),
     startup: {
       mechanism: settings?.startup?.mechanism === 'task-scheduler' ? 'task-scheduler' : null,
-      verifiedAt: Number.isNaN(Date.parse(startupVerifiedAt)) ? null : startupVerifiedAt,
+      verifiedAt: publicIsoTimestamp(settings?.startup?.verifiedAt),
     },
     updates: {
       policy: settings?.updates?.policy === 'download' ? 'download' : 'notify',

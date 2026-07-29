@@ -149,16 +149,26 @@ export async function downloadVerifiedUpdate(update, directory, {
   }
 }
 
+export function publicIsoTimestamp(value) {
+  const text = String(value || '');
+  if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{3})?Z$/.test(text)) return null;
+  const milliseconds = Date.parse(text);
+  return Number.isNaN(milliseconds) ? null : new Date(milliseconds).toISOString();
+}
+
 export function publicDownloadedUpdate(downloaded) {
   if (!downloaded || typeof downloaded !== 'object') return null;
   const name = String(downloaded.name || '');
   const sha256 = String(downloaded.sha256 || '');
   const version = String(downloaded.version || '');
-  const verifiedAt = String(downloaded.verifiedAt || '');
-  if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,179}$/.test(name)
+  const verifiedAt = publicIsoTimestamp(downloaded.verifiedAt);
+  const safeVersion = /^\d+\.\d+\.\d+(?:-beta\.\d+)?$/.test(version);
+  const expectedName = safeVersion
+    ? new RegExp(`^Scout-${version.replaceAll('.', '\\.')}-(?:windows-x64\\.exe|macos-(?:arm64|x64)\\.dmg|linux-x64\\.(?:deb|tar\\.gz))$`)
+    : null;
+  if (!expectedName?.test(name)
       || path.basename(name) !== name
       || !/^[a-f0-9]{64}$/i.test(sha256)
-      || !/^\d+\.\d+\.\d+(?:-[A-Za-z0-9.-]+)?$/.test(version)
-      || Number.isNaN(Date.parse(verifiedAt))) return null;
+      || !verifiedAt) return null;
   return { name, sha256, version, verifiedAt };
 }

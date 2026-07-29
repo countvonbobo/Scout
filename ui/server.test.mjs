@@ -185,7 +185,7 @@ test('device status omits persisted paths and remote update checks cannot auto-d
   const settings = {
     schemaVersion: 3,
     startWithWindows: true,
-    startup: { mechanism: 'task-scheduler', verifiedAt: privatePath },
+    startup: { mechanism: 'task-scheduler', verifiedAt: `July 29, 2026 (${privatePath})` },
     completedSections: { [privatePath]: 1 },
     deferredSections: { [privatePath]: privatePath },
     updates: {
@@ -194,7 +194,7 @@ test('device status omits persisted paths and remote update checks cannot auto-d
       lastNotifiedVersion: privatePath,
       downloaded: {
         path: privatePath,
-        name: 'Scout.exe',
+        name: 'Scout-0.1.0-beta.22-windows-x64.exe',
         sha256: 'a'.repeat(64),
         version: '0.1.0-beta.22',
         verifiedAt: '2026-07-29T10:00:00.000Z',
@@ -212,7 +212,7 @@ test('device status omits persisted paths and remote update checks cannot auto-d
     error: privatePath,
   });
   assert.equal(projected.updates.policy, 'download');
-  assert.equal(projected.updates.downloaded.name, 'Scout.exe');
+  assert.equal(projected.updates.downloaded.name, 'Scout-0.1.0-beta.22-windows-x64.exe');
   assert.equal(projected.startup.verifiedAt, null);
   assert.doesNotMatch(JSON.stringify(projected), /Users|completedSections|deferredSections|lastCheckedAt|lastNotifiedVersion/);
 });
