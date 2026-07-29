@@ -800,3 +800,72 @@ private paths, account data, CV content, adverts, prompts, or transcripts.
   review and verification, update the draft PR and require all seven GitHub
   Actions checks to pass. Otherwise leave the draft PR unpushed and report the
   privacy gate as unresolved.
+
+## 2026-07-29 metadata rewrite and independent review bridge
+
+The publication blocker recorded immediately above is historical. The operator
+authorised a metadata-only rewrite of the already published feature branch.
+Publication used a force-with-lease bound to old fork head
+`dcf2c5ef02d726eeb35d997a53f156f90b440a76`; its rewritten equivalent is
+`7953b48`. The final pre-rewrite implementation checkpoint `f152950` maps to
+`ab402c2ffa33d25d1cb6f26cfef5ea765b8b9067`. Both 64-commit ranges have final
+tree `472c7856ad85f5a9f0b9514aafccd3331abdee19` and ordered tree/message digest
+`5ccfc4d039ffdf329ec4174b2be2c2d9d52981b08d2ff97fb425f3a27cb42214`.
+The complete per-commit old → rewritten map is retained in draft PR #82's
+body. No later history rewrite is authorised.
+
+Two normal fast-forward Windows portability commits followed the rewrite. All
+seven CI jobs passed at exact head
+`d5ebca214863389aa7febd1bfc88ef5e3d35f67d`. Independent review of that exact
+head against `f8732fd005a8b77fa79c7d63abe52c5a08b205bd` then recorded Changes
+requested in review `4812913188`: 0 Critical, 12 Important and 4 Minor findings.
+The earlier zero-finding verdicts in this ledger are historical checkpoints,
+not acceptance of `d5ebca2`.
+
+## 2026-07-29 PR #82 repair checkpoint 1
+
+- Reviewed starting head: `d5ebca214863389aa7febd1bfc88ef5e3d35f67d`.
+- Repair implementation head before this ledger-only commit: `25235b7`.
+- Publication/CI state: additive commits are local and cleanly committed; they
+  have not yet received new exact-head CI or independent review.
+- Fixed Important 1 in `173e792`: the persistent production character now
+  breaks the reused CSS animation lifecycle on a state change. RED reused the
+  old `thinking` animation at 10 seconds; GREEN starts `success` and `warning`
+  at cell zero, visits all 16 cells and finishes on the terminal cell. The
+  complete character browser file passed 24/24 across Chromium and Firefox;
+  70 affected unit/configuration tests passed.
+- Fixed Minor 2 in `8fcedce`: the Codex deep-link server regression failed
+  alone with `403 !== 200`; it now creates/restores its own device settings and
+  restores the inspector in `try/finally`, and passes independently.
+- Fixed Minor 4 in `f0f9289`: a failing documentation contract now requires
+  the Beta 23 note, upgrade/rollback guide and troubleshooting guide to state
+  that no manual data conversion is normally needed, older Scout must stop
+  before first fenced activation, the fenced lease becomes authoritative and
+  downgrade/coexistence is refused. All documentation checks pass.
+- Fixed Minor 1 in `5618adb`: activation retains the current and immediately
+  previous exact shell caches, navigation falls back only to the active cache,
+  and versioned assets resolve from their matching build. The real Chromium
+  A-client → activate B → stay on A → disable HTTP cache → offline unused-A
+  sprite regression passes, as does the independent B offline graph.
+- Fixed Important 3 and Important 4 in `4ffa882`: URL/code candidates are
+  committed only from complete bounded records; incomplete output recognises
+  only the minimal non-secret Claude prompt. The split secret-labelled prefix
+  regression leaves code and URL null. Claude OAuth accepts only the complete
+  eight-key reviewed query with strict count/value/length/host rules and
+  preserves the accepted query exactly; unknown parameters, duplicates,
+  userinfo, fragments and unbounded values fail closed. The 64 affected
+  provider-login/setup tests and release audit pass.
+- Fixed Important 2 in `25235b7`: provider-scoped cross-process
+  authentication-mutation capabilities block only same-provider preflight,
+  prevent local credential observations overwriting `login-in-progress`,
+  expire/recover within a bound and are held through child/confirmation
+  closure plus terminal health persistence. Explicit Claude logout acquires
+  the same authority before its fresh expiry check and mutation. Sixty focused
+  authority/health/login tests, all 50 server tests and release audit pass.
+- Still open from the exact-head review: Important 5–12 and Minor 3. Important
+  12 is partially repaired by this truthful bridge/checkpoint but requires one
+  final update at the eventual exact pushed head.
+- Exact next action: push this additive checkpoint normally, update draft PR
+  #82 with these exact commits and evidence, then implement Important 5 by
+  routing chat, bounded fit assessment and onboarding provider results through
+  the durable health hook without resending provider work.
