@@ -8,9 +8,40 @@ const MODULE_URL = '**/lib/scoutCharacter.mjs*';
 // One navigation per test. Probes are mounted and replaced in place, so adding
 // a state costs an evaluate rather than a full dashboard load.
 async function openDashboard(page) {
-  await page.goto('/');
-  await expect.poll(() => page.evaluate(() => Boolean(window.ScoutCharacter))).toBe(true);
+  await page.goto('/', { waitUntil: 'commit' });
+  await expect.poll(
+    () => page.evaluate(() => Boolean(window.ScoutCharacter)),
+    { timeout: 20_000 },
+  ).toBe(true);
 }
+
+test('dashboard readiness does not wait for a nonessential sprite load', async ({ page }) => {
+  test.setTimeout(10_000);
+  let release;
+  let requested = false;
+  const held = new Promise((resolve) => { release = resolve; });
+  await page.route('**/readiness-probe.png', async (route) => {
+    requested = true;
+    await held;
+    await route.continue().catch(() => {});
+  });
+  await page.addInitScript(() => {
+    document.addEventListener('DOMContentLoaded', () => {
+      const image = document.createElement('img');
+      image.src = '/readiness-probe.png';
+      image.alt = '';
+      document.body.append(image);
+    }, { once: true });
+  });
+  try {
+    await openDashboard(page);
+    expect(requested).toBe(true);
+    expect(await page.evaluate(() => Boolean(window.ScoutCharacter))).toBe(true);
+  } finally {
+    release();
+    await page.unroute('**/readiness-probe.png').catch(() => {});
+  }
+});
 
 // Everything below runs in the page. Kept as one injected source string so the
 // measurement helpers exist for every evaluate without re-navigating.
