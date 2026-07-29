@@ -112,6 +112,21 @@ test('guided login confirms health with a bounded real provider turn', async () 
 let server;
 let port;
 
+async function removeTestWorkspace() {
+  let lastError;
+  for (let attempt = 0; attempt < 20; attempt += 1) {
+    try {
+      await fs.promises.rm(testWorkspace, { recursive: true, force: true });
+      return;
+    } catch (error) {
+      if (!['EBUSY', 'ENOTEMPTY', 'EPERM'].includes(error?.code)) throw error;
+      lastError = error;
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+  }
+  throw lastError;
+}
+
 before(async () => {
   server = createServer();
   await new Promise((resolve, reject) => {
@@ -123,16 +138,12 @@ before(async () => {
 
 after(async () => {
   if (server) await new Promise((resolve) => server.close(resolve));
+  await providerLoginControl.shutdown();
   if (previousWorkspace === undefined) delete process.env.SCOUT_WORKSPACE;
   else process.env.SCOUT_WORKSPACE = previousWorkspace;
   if (previousDeviceSettings === undefined) delete process.env.SCOUT_DEVICE_SETTINGS;
   else process.env.SCOUT_DEVICE_SETTINGS = previousDeviceSettings;
-  fs.rmSync(testWorkspace, {
-    recursive: true,
-    force: true,
-    maxRetries: 5,
-    retryDelay: 100,
-  });
+  await removeTestWorkspace();
 });
 
 function request({ method = 'GET', path = '/', headers = {}, body = '' }) {
