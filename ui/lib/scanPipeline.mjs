@@ -467,6 +467,9 @@ export async function runScanPipeline({
   claimedLease = null,
   storagePolicy = {},
   healthPreflight = null,
+  waitForTransientLease = (milliseconds) => new Promise((resolve) => {
+    setTimeout(resolve, milliseconds);
+  }),
 } = {}) {
   if (!root) throw new TypeError('scan pipeline workspace root is required');
   assertRunStorageWritable(root, storagePolicy);
@@ -482,6 +485,9 @@ export async function runScanPipeline({
   if (healthPreflight !== null && typeof healthPreflight !== 'function') {
     throw new TypeError('scan pipeline health preflight must be a function');
   }
+  if (typeof waitForTransientLease !== 'function') {
+    throw new TypeError('scan pipeline transient lease waiter must be a function');
+  }
   const functions = stageFunctions(stages);
   const ownsLease = claimedLease === null;
   const provisionalRunId = claimedLease?.runId || requestedRunId || randomUUID();
@@ -494,10 +500,23 @@ export async function runScanPipeline({
       currentLeaseOwner(),
       pipelineOperation(provisionalRunId, compatibility, 'recovery-selection'),
       leaseOptions,
-    );
+  );
   let durableQueueSubmission = false;
-  for (let attempt = 0; !lease && queue?.request && attempt < 8; attempt += 1) {
+  for (let attempt = 0; !lease && attempt < 64; attempt += 1) {
     const observed = readScanLease(root);
+    if (observed?.operation?.kind === 'provider-health') {
+      const waitUntil = Date.parse(observed.expiresAt) + Number(observed.takeoverMarginMs || 0);
+      const waitMs = Math.max(1, Math.min(250, waitUntil - Date.now()));
+      await waitForTransientLease(waitMs);
+      lease = acquireScanLease(
+        root,
+        currentLeaseOwner(),
+        pipelineOperation(provisionalRunId, compatibility, 'recovery-selection'),
+        leaseOptions,
+      );
+      continue;
+    }
+    if (!queue?.request) break;
     if (observed) {
       const queued = enqueueOverlappingScanRequest(root, {
         ...queue.request,

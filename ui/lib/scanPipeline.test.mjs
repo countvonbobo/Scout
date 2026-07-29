@@ -1012,6 +1012,64 @@ test('a blocked queued provider is skipped while the next healthy provider still
   }
 });
 
+test('a transient provider-health lease is retried without queueing or stranding the scan', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'scout-provider-health-lease-race-'));
+  const queueCompatibility = {
+    profileFingerprint: 'b'.repeat(64),
+    configFingerprint: 'c'.repeat(64),
+    schemaVersion: 1,
+  };
+  const healthLease = acquireScanLease(
+    root,
+    currentLeaseOwner(),
+    {
+      kind: 'provider-health',
+      runId: 'provider-health-codex',
+      provider: 'codex',
+      phase: 'periodic',
+    },
+  );
+  let waits = 0;
+  let queueRuns = 0;
+  try {
+    const result = await runScanPipeline({
+      root,
+      compatibility: RECOVERY_COMPATIBILITY,
+      stages: durableStageHarness(new Map()),
+      async waitForTransientLease() {
+        waits += 1;
+        releaseScanLease(healthLease);
+      },
+      queue: {
+        compatibility: queueCompatibility,
+        request: {
+          id: 'manual-health-race',
+          key: 'manual-health-race',
+          requestedAt: '2026-07-29T08:00:00.000Z',
+          expiresAt: '2026-07-29T20:00:00.000Z',
+          requester: 'manual',
+          windowAt: null,
+          purpose: 'manual-discovery',
+          compatibility: queueCompatibility,
+        },
+        async run() {
+          queueRuns += 1;
+          throw new Error('provider-health race must not create queue work');
+        },
+      },
+    });
+
+    assert.equal(result.outcome, 'complete');
+    assert.equal(waits, 1);
+    assert.equal(queueRuns, 0);
+    assert.deepEqual(projectScanQueue(root).requests, []);
+    assert.equal(readScanLease(root), null);
+  } finally {
+    try { releaseScanLease(healthLease); } catch {}
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test('idle startup drains older compatible FIFO work before beginning an unqueued run', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'scout-pipeline-startup-fifo-'));
   const queueCompatibility = {
