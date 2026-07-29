@@ -36,6 +36,19 @@ The maintained beta deployment uses one private, single-owner Ubuntu VPS:
   a compatible durable queue request; idle startup drains older compatible work
   before beginning new unqueued work, and interrupted claims resume under their
   original run identity.
+- Recovery selects the newest run compatible with the requested mode, purpose,
+  published profile, source/config fingerprint and versioned stage inputs. It
+  records why newer incomplete candidates were skipped. Deterministic stages
+  are reused only when their inputs match; assessment reuse additionally binds
+  provider, model, prompt and schema provenance. Incompatible candidates become
+  immutable partial or abandoned evidence. A provider change is explicit and
+  creates new assessment provenance.
+- The durable queue is an append-only journal. Manual requests expire after 24
+  hours; scheduled requests expire at the next logical window or 12 hours,
+  whichever comes first. Equivalent work deduplicates, scheduled equivalents
+  coalesce, and stale/expired/superseded work never executes. On handoff, the
+  oldest compatible manual request precedes the newest compatible scheduled
+  request. Every transition remains auditable.
 - Only successfully terminalised mutations and scans queue encrypted
   private-repository backup checkpoints. The scan keeps its fenced lease and
   heartbeat through the receipt-gated checkpoint. Runtime Git commands are
@@ -67,6 +80,21 @@ The maintained beta deployment uses one private, single-owner Ubuntu VPS:
   completed jobs or batches. Durable request records contain only stable job
   references, input digests, bounded parameters and versioned provenance, not
   CVs, adverts, prompts, transcripts or raw provider responses.
+- Device-local provider health uses `checking`, `ready`,
+  `credentials-present-unverified`, `sign-in-required`, `login-in-progress`,
+  `network-unavailable`, `rate-limited`, `cli-update-required` and
+  `provider-error`. Checks run at startup, before manual/scheduled work,
+  periodically while schedules are enabled and after login outcomes. A remote
+  auth failure remains authoritative until a real remote success. A blocked
+  provider creates deduplicated durable alert/run evidence and blocks only its
+  own work; there is no silent substitution or automatic missed-window resend.
+- Guided provider login is an owner-only, same-origin, CSRF-protected in-memory
+  state machine. It uses only `codex login --device-auth` plus
+  `codex login status`, or `claude auth login` with bounded code input when
+  requested. Commands use trusted executables, fixed arguments, `shell: false`,
+  a minimal environment, private working directory and bounded process/output
+  lifetime. Claude logout is never automatic: a recent one-use failed session
+  and fresh remote-auth recheck precede explicit `claude auth logout`.
 - Tracker, daily-report and scan-run finalisation is one journal-authorised
   mutation plan. Scout persists the bounded intended content and target
   revisions before taking the shared workspace mutation coordinator, then
@@ -84,6 +112,20 @@ The maintained beta deployment uses one private, single-owner Ubuntu VPS:
   force-pushes. Merge failure preserves both refs; push failure preserves the
   local merge as pending. Public status exposes only counts and sanitised
   affected areas.
+- Full journals and referenced artifacts are retained for the newest 20 runs,
+  all runs from the previous 30 days and every active, queued, partial, failed,
+  unrepaired or recovery-referenced run. Compact terminal summaries are kept
+  for one year. Storage pressure measures runs, artifacts and queue separately
+  and refuses new durable work before journalling becomes unsafe.
+  Reviewed cleanup validates and atomically writes an encrypted archive before
+  deleting only explicitly selected eligible data under the active fence;
+  interrupted cleanup resumes from the archive/receipt. Queue compaction keeps
+  live work and required terminal evidence.
+- Public APIs, UI, logs, backups and release artifacts exclude credentials,
+  auth codes, full prompts, CV/ad bodies, provider transcripts, raw
+  stdout/stderr, raw run/auth state, private paths and tracking values.
+  Provider/account state remains device-local. Run views use shortened IDs,
+  sanitised ownership, allowlisted reason codes and bounded counts.
 
 Do not assume a developer computer's local application checkout or workspace is live. Diagnose the VPS for production-like bugs unless the user explicitly reports a local-only installation.
 

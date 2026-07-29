@@ -16,6 +16,19 @@ const SECRET_RULES = Object.freeze([
   { id: 'slack-token', regex: /\bxox[baprs]-[A-Za-z0-9-]{10,}\b/g },
   { id: 'google-api-key', regex: /\bAIza[A-Za-z0-9_-]{30,}\b/g },
 ]);
+const PRIVATE_RUNTIME_ROOTS = new Set([
+  '.scout', 'applications', 'chats', 'cv', 'data', 'profile', 'reports',
+]);
+const SERIALIZED_PRIVACY_RULES = Object.freeze([
+  ['raw-run-state', /"rawRunState"\s*:/g],
+  ['raw-auth-output', /"rawAuthOutput"\s*:/g],
+  ['auth-code', /"(?:authorization|authentication|device|login)Code"\s*:/gi],
+  ['full-prompt', /"prompt"\s*:/g],
+  ['cv-body', /"(?:cvText|cvBody)"\s*:/g],
+  ['advert-body', /"(?:advertBody|fullAdvert|jobAdvertBody)"\s*:/g],
+  ['provider-transcript', /"providerTranscript"\s*:/g],
+  ['tracking-value', /"(?:trackingValue|trackingParameters)"\s*:/g],
+]);
 
 function normaliseRelative(root, file) {
   const relative = path.relative(root, file);
@@ -57,7 +70,7 @@ function secretAssignmentFindings(text) {
   return findings;
 }
 
-function scanText(text, markers) {
+function scanText(text, markers, relative = '') {
   const findings = [];
   const lower = text.toLocaleLowerCase('en-US');
   for (let markerIndex = 0; markerIndex < markers.length; markerIndex += 1) {
@@ -77,6 +90,21 @@ function scanText(text, markers) {
     }
   }
   findings.push(...secretAssignmentFindings(text));
+  if (/\.(?:json|jsonl|ndjson)$/i.test(relative)) {
+    for (const [rule, regex] of SERIALIZED_PRIVACY_RULES) {
+      regex.lastIndex = 0;
+      let match;
+      while ((match = regex.exec(text)) !== null) {
+        findings.push({ line: lineAt(text, match.index), rule });
+        if (match[0].length === 0) regex.lastIndex += 1;
+      }
+    }
+  }
+  const privatePath = /\/Users\/(?!Shared(?:\/|["'\s])|YOUR|<)[^/"'\s]+|[A-Za-z]:\\Users\\(?!Public(?:\\|["'\s])|YOUR|<)[^\\/"'\s]+/g;
+  let pathMatch;
+  while ((pathMatch = privatePath.exec(text)) !== null) {
+    findings.push({ line: lineAt(text, pathMatch.index), rule: 'private-path' });
+  }
   return findings;
 }
 
@@ -138,8 +166,12 @@ export function auditRelease({
     if (content.subarray(0, 8192).includes(0)) continue;
     filesScanned += 1;
     const text = content.toString('utf8');
-    for (const finding of scanText(text, markers)) {
-      findings.push({ file: normaliseRelative(absoluteRoot, file), ...finding });
+    const relative = normaliseRelative(absoluteRoot, file);
+    if (PRIVATE_RUNTIME_ROOTS.has(relative.split('/')[0])) {
+      findings.push({ file: relative, line: 1, rule: 'private-runtime-artifact' });
+    }
+    for (const finding of scanText(text, markers, relative)) {
+      findings.push({ file: relative, ...finding });
     }
   }
   findings.sort((a, b) => a.file.localeCompare(b.file, 'en') || a.line - b.line || a.rule.localeCompare(b.rule, 'en'));

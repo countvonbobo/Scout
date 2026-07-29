@@ -87,6 +87,8 @@ function normalise(relative) {
 export function includeReleasePath(relative) {
   const value = normalise(relative);
   const base = path.posix.basename(value);
+  const root = value.split('/')[0];
+  if (['.scout', 'applications', 'chats', 'cv', 'data', 'profile', 'reports'].includes(root)) return false;
   if (value.split('/').some((part) => ['.bin', 'fixtures', 'test', 'tests', 'test-data', '__tests__'].includes(part))) return false;
   if (base === '.DS_Store' || base === 'Thumbs.db') return false;
   if (/\.test\.mjs$/i.test(base)) return false;

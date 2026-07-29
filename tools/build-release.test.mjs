@@ -44,6 +44,18 @@ test('release tree filter omits tests and snapshots', () => {
   assert.equal(includeReleasePath('ui/__snapshots__/screen.txt'), false);
   assert.equal(includeReleasePath('node_modules/.bin/mammoth'), false);
   assert.equal(includeReleasePath('node_modules/mammoth/test/test-data/sample.docx'), false);
+  for (const privateRuntimePath of [
+    'data/scan-runs.jsonl',
+    '.scout/runs/run-synthetic/journal.jsonl',
+    '.scout/provider-health/codex.json',
+    'profile/context.md',
+    'cv/master-cv.md',
+    'applications/synthetic-role/cv.typ',
+    'reports/2026-07-29.md',
+    'chats/synthetic.json',
+  ]) {
+    assert.equal(includeReleasePath(privateRuntimePath), false);
+  }
 });
 
 test('production dependency filter excludes development-only browser tooling', () => {

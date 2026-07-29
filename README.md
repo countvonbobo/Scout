@@ -58,6 +58,22 @@ Application upgrades replace application files and managed instructions. They do
 
 Private GitHub backup is optional. Scout verifies that a repository is not public before connecting it, keeps normal career files readable in that private repository, and additionally encrypts credentials, generated PDF/DOCX files and recovery state. Keep the passphrase or one-time emergency recovery key safe. Codex and Claude sign-in state remains provider-owned and is not copied.
 
+Scans are recoverable rather than blindly restarted. An append-only journal,
+fenced lease and durable overlap queue let Scout resume compatible completed
+stages and assessment batches after a process or machine restart, while stale
+workers are prevented from committing. The Jobs view shows bounded recovery,
+batch and queue state without exposing host identity, private paths, prompts,
+provider output or advert content. Storage-pressure warnings stop new durable
+work before recovery evidence becomes unsafe; reviewed cleanup never deletes
+active or recovery-critical runs.
+
+Provider health is tracked separately for Codex and Claude. An unhealthy
+provider blocks only its own work and is never silently replaced. Use the
+owner-only guided sign-in in **Settings -> AI providers**, or the documented
+terminal command shown there. Scout never clears Claude credentials
+automatically; expired credentials can be cleared only after a fresh failed
+authentication check and explicit confirmation.
+
 You can select a non-default workspace with either:
 
 ```powershell

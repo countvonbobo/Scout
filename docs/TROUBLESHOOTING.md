@@ -26,6 +26,61 @@ Confirm both variables exist in the selected workspace `.env`, without quotes ac
 
 Check `scout schedule status`, confirm the native scheduler entry points to the current application/workspace and run `scout schedule run-now`. Inspect workspace logs and Task Scheduler, launchd, or systemd-user history. Remove/reinstall the schedule after moving a workspace.
 
+If Scout reports a provider-health block, open **Settings -> AI providers**.
+`sign-in required`, `network unavailable`, `rate limited`, `CLI update
+required`, and `provider error` are distinct conditions. Fix only the named
+provider and retry explicitly; Scout does not substitute the other provider or
+automatically replay a missed scheduled window. Guided sign-in uses the fixed
+Codex device flow or fixed Claude login flow. If it is unavailable, use the
+manual command shown in Settings. Claude credential clearing is offered only
+after a fresh expired-credential failure and always requires confirmation.
+
+## Interrupted scan, recovery, or lost lease
+
+After a process exit or machine restart, start Scout normally. It validates the
+append-only run journal, the rebuildable manifest, the persisted lease expiry
+and the previous process-start identity. It then resumes the newest
+stage-compatible run; it may reuse deterministic stages while restarting
+assessment when provider/model/prompt/schema provenance changed. Newer
+incompatible candidates are left as bounded `partial` or `abandoned` evidence,
+not rewritten.
+
+Do not delete `.scout/scan-lease.json`, `.scout/scan-queue.jsonl`, a run
+journal, or a legacy `.scout-scan.lock` to make work continue. A live,
+unexpired or unverifiable owner must be stopped and allowed to reach its
+takeover margin. Once the fenced lease format has activated, an older Scout
+binary or a new legacy lock is a downgrade/coexistence conflict; stop the old
+binary and retry with the current version.
+
+If a terminal run remains visible because lease cleanup was interrupted, leave
+it in place. A successor validates the terminal journal and removes or
+supersedes the stale lease safely after expiry. If Scout reports a corrupt
+journal, preserve the workspace and the exact bounded error. It can quarantine
+only a torn final append; hash, identity, schema or mid-history corruption fails
+closed and requires restoring that run state from an encrypted backup or
+operator review. Never hand-edit journal hashes or copy events between runs.
+
+Queued manual overlaps expire after 24 hours. Scheduled overlaps expire at the
+next window or 12 hours, whichever is earlier. Expired, stale, superseded and
+deduplicated requests remain auditable but do not run. After release, the oldest
+compatible manual request is handed off before the newest compatible scheduled
+request.
+
+## Storage pressure or interrupted cleanup
+
+Scout measures run journals, derived artifacts and the queue separately. It
+retains the newest 20 runs, 30 days of full history, one year of compact
+terminal summaries, and every active, queued, partial, failed, unrepaired or
+recovery-referenced run. If a warning becomes a refusal, review the proposed
+encrypted archive and cleanup selection; Scout will not silently delete
+recovery-critical state.
+
+An interrupted cleanup is resumable from its verified encrypted archive and
+receipt. Do not remove the archive, receipt, run directories or queue journal
+manually. Retry the reviewed cleanup. If the archive fails authentication or
+the fence changed, preserve all source data and investigate before selecting
+anything again.
+
 ## Port or UI problem
 
 Scout serves the UI on loopback at `http://127.0.0.1:8459`. Close stale Scout processes before retrying. Do not expose the port to the network. From source, run `npm test` before `npm start` and inspect terminal output.
@@ -49,6 +104,13 @@ Backup is optional. Confirm Git and Git Credential Manager are installed, restar
 ## Backup is offline, pending, or needs attention
 
 **Offline — saved locally** means Scout made a local commit and will retry later. **Needs attention** can mean both the Scout host and GitHub have new history. Open **Backup details**, then **Advanced backup settings**. Scout offers **Preserve both and sync** only after it has fetched both tips, verified that the worktree is clean, and confirmed that the two histories changed separate ordinary files. The action creates recovery references and uses a normal merge; it never resets, rebases or force-pushes. Overlapping changes, renames, deletions, dirty files, stale confirmations and unusual Git state remain manual-review cases. Never delete `.git`, `.scout/sync.json` or `.scout-backup/` as a conflict workaround.
+
+If the normal merge committed locally but its push was interrupted, leave the
+merge and both recovery references intact. Backup remains push-pending and a
+normal Retry resumes from that local merge after refetch/revalidation. Do not
+start another resolution, reset the branch, rebase or force-push. If ordinary
+tracker/report work is still active, wait: divergence resolution and workspace
+mutation share one coordinator and must not overlap.
 
 ## A scan reviewed candidates but kept zero
 
