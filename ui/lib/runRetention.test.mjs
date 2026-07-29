@@ -114,6 +114,27 @@ function legacyQueueCompaction(root, operationId, recordedAt, {
   }));
 }
 
+function versionTwoQueueCompaction(root, operationId, completedAt, {
+  recordedAt = completedAt,
+} = {}) {
+  const audits = legacyQueueCompaction(root, operationId, recordedAt);
+  const manifestFile = path.join(root, '.scout', 'queue-compactions', operationId, 'manifest.json');
+  const manifest = JSON.parse(fs.readFileSync(manifestFile, 'utf8'));
+  fs.writeFileSync(manifestFile, `${stableJson({
+    ...manifest,
+    schemaVersion: 2,
+    completedAt,
+  })}\n`);
+  return audits;
+}
+
+function queueCompactionFiles(root, operationId) {
+  const directory = path.join(root, '.scout', 'queue-compactions', operationId);
+  return Object.fromEntries(fs.readdirSync(directory).sort().map((name) => (
+    [name, fs.readFileSync(path.join(directory, name), 'utf8')]
+  )));
+}
+
 function archiveAuthority(root, passphrase = 'correct horse battery staple') {
   return { passphrase, ...initializeRecoveryBackup(root, passphrase) };
 }
@@ -622,6 +643,102 @@ test('legacy queue receipt folding fails closed when its durable audit is missin
       JSON.parse(fs.readFileSync(path.join(directory, 'manifest.json'), 'utf8')).schemaVersion,
       1,
     );
+  }
+});
+
+test('legacy queue receipt folding rejects noncanonical audit timestamps and invalid event or lease identities without mutation', () => {
+  const malformedCases = [
+    ['numeric timestamp', { recordedAt: '0' }],
+    ['locale timestamp', { recordedAt: 'January 1, 2025 12:00:00 UTC' }],
+    ['normalised timestamp', { recordedAt: '2025-01-01T12:00:00Z' }],
+    ['event identity', { eventId: 'event.invalid' }],
+    ['lease identity', { leaseId: '-lease-invalid' }],
+  ];
+  for (const [label, malformed] of malformedCases) {
+    const root = temp();
+    const lease = acquireScanLease(root, currentLeaseOwner(), {
+      kind: 'scan', runId: 'retention-cleanup', provider: 'codex', mode: 'primary', phase: 'queue',
+    });
+    const operationId = crypto.createHash('sha256').update(`legacy-malformed-${label}`).digest('hex');
+    const sentinelId = crypto.createHash('sha256').update(`legacy-sentinel-${label}`).digest('hex');
+    const audits = [
+      ...legacyQueueCompaction(root, operationId, '2025-01-01T12:00:00.000Z'),
+      ...versionTwoQueueCompaction(root, sentinelId, '2025-01-02T12:00:00.000Z'),
+    ];
+    Object.assign(audits[0], malformed);
+    const auditFile = path.join(root, '.scout', 'run-retention.jsonl');
+    fs.writeFileSync(auditFile, `${audits.map(stableJson).join('\n')}\n`);
+    const before = {
+      audit: fs.readFileSync(auditFile, 'utf8'),
+      malformed: queueCompactionFiles(root, operationId),
+      sentinel: queueCompactionFiles(root, sentinelId),
+    };
+
+    assert.throws(
+      () => compactScanQueue(root, lease, { now: new Date('2026-07-29T12:00:00.000Z') }),
+      /queue compaction audit/i,
+      label,
+    );
+    assert.deepEqual(queueCompactionFiles(root, operationId), before.malformed, label);
+    assert.deepEqual(queueCompactionFiles(root, sentinelId), before.sentinel, label);
+    assert.equal(fs.readFileSync(auditFile, 'utf8'), before.audit, label);
+  }
+});
+
+test('version-two queue receipt pruning rejects malformed manifest and audit evidence without mutation', () => {
+  const malformedCases = [
+    ['numeric manifest timestamp', { manifest: { completedAt: '0' } }],
+    ['locale manifest timestamp', { manifest: { completedAt: 'January 1, 2025 12:00:00 UTC' } }],
+    ['normalised manifest timestamp', { manifest: { completedAt: '2025-01-01T12:00:00Z' } }],
+    ['numeric audit timestamp', { audit: { recordedAt: '0' } }],
+    ['locale audit timestamp', { audit: { recordedAt: 'January 1, 2025 12:00:00 UTC' } }],
+    ['normalised audit timestamp', { audit: { recordedAt: '2025-01-01T12:00:00Z' } }],
+    ['event identity', { audit: { eventId: 'event.invalid' } }],
+    ['lease identity', { audit: { leaseId: '-lease-invalid' } }],
+    ['operation identity', { extraAudit: { operationId: 'operation.invalid' } }],
+  ];
+  for (const [label, malformed] of malformedCases) {
+    const root = temp();
+    const lease = acquireScanLease(root, currentLeaseOwner(), {
+      kind: 'scan', runId: 'retention-cleanup', provider: 'codex', mode: 'primary', phase: 'queue',
+    });
+    const operationId = crypto.createHash('sha256').update(`v2-malformed-${label}`).digest('hex');
+    const sentinelId = crypto.createHash('sha256').update(`v2-sentinel-${label}`).digest('hex');
+    const audits = [
+      ...versionTwoQueueCompaction(root, operationId, '2025-01-01T12:00:00.000Z'),
+      ...versionTwoQueueCompaction(root, sentinelId, '2025-01-02T12:00:00.000Z'),
+    ];
+    if (malformed.manifest) {
+      const manifestFile = path.join(
+        root, '.scout', 'queue-compactions', operationId, 'manifest.json',
+      );
+      const manifest = JSON.parse(fs.readFileSync(manifestFile, 'utf8'));
+      fs.writeFileSync(manifestFile, `${stableJson({ ...manifest, ...malformed.manifest })}\n`);
+    }
+    if (malformed.audit) Object.assign(audits[0], malformed.audit);
+    if (malformed.extraAudit) {
+      audits.push({
+        ...audits[0],
+        eventId: crypto.randomUUID(),
+        ...malformed.extraAudit,
+      });
+    }
+    const auditFile = path.join(root, '.scout', 'run-retention.jsonl');
+    fs.writeFileSync(auditFile, `${audits.map(stableJson).join('\n')}\n`);
+    const before = {
+      audit: fs.readFileSync(auditFile, 'utf8'),
+      malformed: queueCompactionFiles(root, operationId),
+      sentinel: queueCompactionFiles(root, sentinelId),
+    };
+
+    assert.throws(
+      () => compactScanQueue(root, lease, { now: new Date('2026-07-29T12:00:00.000Z') }),
+      /queue compaction (?:manifest|audit)/i,
+      label,
+    );
+    assert.deepEqual(queueCompactionFiles(root, operationId), before.malformed, label);
+    assert.deepEqual(queueCompactionFiles(root, sentinelId), before.sentinel, label);
+    assert.equal(fs.readFileSync(auditFile, 'utf8'), before.audit, label);
   }
 });
 

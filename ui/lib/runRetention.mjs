@@ -32,6 +32,9 @@ const DEFAULT_RESERVE_BYTES = 64 * 1024;
 const RETENTION_INDEX_SCHEMA_VERSION = 1;
 const ARCHIVE_SCHEMA_VERSION = 1;
 const MAX_COMPLETED_QUEUE_COMPACTION_RECEIPTS = 20;
+const SAFE_TOKEN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
+const SHA256 = /^[a-f0-9]{64}$/;
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 function sha256(value) {
   return crypto.createHash('sha256').update(value).digest('hex');
@@ -49,6 +52,12 @@ function checkedDate(value, label) {
   const date = value instanceof Date ? value : new Date(value);
   if (Number.isNaN(date.getTime())) throw new TypeError(`${label} must be a valid date`);
   return date;
+}
+
+function isCanonicalIsoTimestamp(value) {
+  if (typeof value !== 'string') return false;
+  const date = new Date(value);
+  return !Number.isNaN(date.getTime()) && date.toISOString() === value;
 }
 
 function safeRunDirectory(root, runId) {
@@ -757,15 +766,14 @@ function checkedQueueOperationManifest(root, operationId, manifestFile) {
   if (!manifest || keys !== expectedKeys.sort().join(',')
     || ![1, 2].includes(manifest.schemaVersion)
     || manifest.operationId !== operationId
-    || !/^[a-f0-9]{64}$/.test(manifest.operationId || '')
-    || !/^[a-f0-9]{64}$/.test(manifest.beforeDigest || '')
-    || !/^[a-f0-9]{64}$/.test(manifest.afterDigest || '')
+    || !SHA256.test(manifest.operationId || '')
+    || !SHA256.test(manifest.beforeDigest || '')
+    || !SHA256.test(manifest.afterDigest || '')
     || !['prepared', 'completed'].includes(manifest.status)
     || !Number.isSafeInteger(manifest.removedEvents) || manifest.removedEvents < 0
     || (manifest.schemaVersion === 2
       && manifest.completedAt !== null
-      && (typeof manifest.completedAt !== 'string'
-        || Number.isNaN(Date.parse(manifest.completedAt))))
+      && !isCanonicalIsoTimestamp(manifest.completedAt))
     || (manifest.schemaVersion === 2 && manifest.status === 'prepared' && manifest.completedAt !== null)
     || (manifest.schemaVersion === 2 && manifest.status === 'completed' && manifest.completedAt === null)) {
     throw new Error('queue compaction manifest is invalid');
@@ -790,40 +798,65 @@ function queueOperations(root) {
   });
 }
 
-function legacyQueueCompletionTime(manifest, events) {
-  const matches = events.filter((event) => (
-    event?.type === 'queue-compacted' && event.operationId === manifest.operationId
-  ));
-  if (matches.length !== 1) {
-    throw new Error('legacy queue compaction audit must be unique');
-  }
-  const event = matches[0];
+function checkedQueueCompactionAudit(event) {
   const keys = [
     'afterDigest', 'beforeDigest', 'eventId', 'fencingGeneration', 'leaseId',
     'operationId', 'recordedAt', 'removedEvents', 'schemaVersion', 'type',
   ];
-  if (Object.keys(event).sort().join(',') !== keys.sort().join(',')
+  if (!event || typeof event !== 'object' || Array.isArray(event)
+    || Object.keys(event).sort().join(',') !== keys.sort().join(',')
     || event.schemaVersion !== 1
-    || typeof event.eventId !== 'string' || !event.eventId
-    || typeof event.leaseId !== 'string' || !event.leaseId
+    || event.type !== 'queue-compacted'
+    || !UUID.test(event.eventId || '')
+    || !SAFE_TOKEN.test(event.leaseId || '')
+    || !SHA256.test(event.operationId || '')
     || !Number.isSafeInteger(event.fencingGeneration) || event.fencingGeneration < 1
-    || typeof event.recordedAt !== 'string' || Number.isNaN(Date.parse(event.recordedAt))
-    || event.beforeDigest !== manifest.beforeDigest
+    || !isCanonicalIsoTimestamp(event.recordedAt)
+    || !SHA256.test(event.beforeDigest || '')
+    || !SHA256.test(event.afterDigest || '')
+    || !Number.isSafeInteger(event.removedEvents) || event.removedEvents < 0) {
+    throw new Error('queue compaction audit is invalid');
+  }
+  return event;
+}
+
+function queueCompletionAudit(manifest, events, label = 'queue compaction') {
+  const matches = events.filter((event) => (
+    event.operationId === manifest.operationId
+  ));
+  if (matches.length !== 1) {
+    throw new Error(`${label} audit must be unique`);
+  }
+  const event = checkedQueueCompactionAudit(matches[0]);
+  if (event.beforeDigest !== manifest.beforeDigest
     || event.afterDigest !== manifest.afterDigest
     || event.removedEvents !== manifest.removedEvents) {
-    throw new Error('legacy queue compaction audit does not match its receipt');
+    throw new Error(`${label} audit does not match its receipt`);
   }
+  return event;
+}
+
+function legacyQueueCompletionTime(manifest, events) {
+  const event = queueCompletionAudit(manifest, events, 'legacy queue compaction');
   return event.recordedAt;
 }
 
 function reduceCompletedQueueOperations(root) {
   const operations = queueOperations(root);
   const audit = auditEvents(root);
+  const queueAudit = audit
+    .filter((event) => event?.type === 'queue-compacted')
+    .map(checkedQueueCompactionAudit);
+  for (const { manifest } of operations) {
+    if (manifest.schemaVersion === 2 && manifest.status === 'completed') {
+      queueCompletionAudit(manifest, queueAudit);
+    }
+  }
   const migrations = operations
     .filter(({ manifest }) => manifest.schemaVersion === 1 && manifest.status === 'completed')
     .map((operation) => ({
       operation,
-      completedAt: legacyQueueCompletionTime(operation.manifest, audit),
+      completedAt: legacyQueueCompletionTime(operation.manifest, queueAudit),
     }));
   for (const { operation, completedAt } of migrations) {
     const migrated = {
@@ -836,8 +869,8 @@ function reduceCompletedQueueOperations(root) {
   }
   const completed = operations.filter(({ manifest }) => manifest.status === 'completed');
   completed.sort((left, right) => {
-    const timeDifference = Date.parse(right.manifest.completedAt || 0)
-      - Date.parse(left.manifest.completedAt || 0);
+    const timeDifference = Date.parse(right.manifest.completedAt)
+      - Date.parse(left.manifest.completedAt);
     return timeDifference || right.manifest.operationId.localeCompare(left.manifest.operationId);
   });
   const retained = new Set(completed.slice(0, MAX_COMPLETED_QUEUE_COMPACTION_RECEIPTS)
