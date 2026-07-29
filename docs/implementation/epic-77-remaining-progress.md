@@ -376,3 +376,33 @@ private paths, account data, CV content, adverts, prompts, or transcripts.
   - diff checks: passed.
 - Findings fixed/open: all round-2 findings fixed; complete-range Spec,
   code-quality and privacy/security re-review is pending.
+
+### Whole-epic review round 3
+
+- Verdicts:
+  - Spec PASS: 0 Critical, 0 Important.
+  - Code quality FAIL: 0 Critical, 1 Important.
+  - Privacy/security FAIL: 0 Critical, 2 Important.
+- Review-fix commit: `4ec238a` (`fix: close diagnostics privacy gaps`).
+- Findings reproduced and fixed:
+  - update the inherited sync test to require fixed public copy,
+    `backup-error`, and absence of the raw commit diagnostic;
+  - add a closed public doctor projection for setup status so configuration,
+    tracker/CLI/runtime paths, versions, provider records and raw errors never
+    cross the API boundary;
+  - replace source tracker/fetch exception details with fixed reason-coded
+    responses;
+  - inspect every sensitive assignment on a line instead of stopping at the
+    first placeholder, and reject high-signal Authorization Bearer and
+    OpenAI-style provider tokens.
+- GREEN after fixes:
+  - release-audit/build, doctor and update suites: 41 passed, 0 failed,
+    0 skipped;
+  - bounded offline and failed-checkpoint sync regressions: 2 passed;
+  - setup/API public-projection server regressions: 2 passed;
+  - affected chat/settings/recoverable browser matrix: 92 discovered,
+    90 passed, 0 failed, 2 intentional platform/host skips;
+  - default release audit: passed for 515 files;
+  - diff checks: passed.
+- Findings fixed/open: all round-3 findings fixed; complete-range Spec,
+  code-quality and privacy/security re-review is pending.
