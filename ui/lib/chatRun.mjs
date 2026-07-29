@@ -42,6 +42,34 @@ function relativeToRepo(cwd, file) {
   return rel.replace(/\\/g, '/');
 }
 
+const SAFE_TOOL_ACTIVITIES = new Set(['searching', 'thinking', 'writing']);
+
+function publicTurnEvent(event) {
+  if (event?.kind === 'tool') {
+    const activity = SAFE_TOOL_ACTIVITIES.has(event.activity) ? event.activity : 'thinking';
+    return {
+      kind: 'tool',
+      label: activity === 'writing'
+        ? 'Editing a file'
+        : activity === 'searching' ? 'Searching provider sources' : 'Using provider tools',
+      activity,
+    };
+  }
+  if (event?.kind === 'done' && event.ok === false) {
+    return { kind: 'done', text: '', ok: false, usage: {} };
+  }
+  return event;
+}
+
+function providerFailure(detail) {
+  const text = String(detail || '').slice(0, 4_096);
+  const modelRejected = /\b(?:invalid|unknown|unsupported)\s+model\b/i.test(text)
+    || /\bmodel\b.{0,120}\b(?:does not exist|not found|not available|unavailable|unsupported|access denied)\b/i.test(text);
+  return modelRejected
+    ? { error: 'The provider rejected that model.', reasonCode: 'model-rejected' }
+    : { error: 'Provider turn failed.', reasonCode: 'provider-error' };
+}
+
 export function runTurn({
   command, args, prompt, cwd, parseLine,
   env = process.env,
@@ -96,9 +124,8 @@ export function runTurn({
       clearTimeout(terminationTimer);
       resolve({
         ok: false,
-        error: err.code === 'ENOENT'
-          ? `${command} not found on PATH - install it, then restart the Scout server`
-          : `spawn failed: ${err.message}`,
+        error: err.code === 'ENOENT' ? 'Provider CLI is unavailable.' : 'Provider turn could not start.',
+        reasonCode: err.code === 'ENOENT' ? 'provider-unavailable' : 'process-start-failed',
       });
     });
     const observeOutput = (stream, chunk) => {
@@ -139,7 +166,7 @@ export function runTurn({
           if (rel) state.files.add(rel);
         }
         if (ev.kind === 'done') state.done = ev;
-        onEvent(ev);
+        onEvent(publicTurnEvent(ev));
       }
     });
     child.on('close', (code) => {
@@ -149,19 +176,33 @@ export function runTurn({
       if (outputExceeded) {
         resolve({
           ok: false,
-          error: 'provider output exceeded the safe output limit',
+          error: 'Provider output exceeded the safe limit.',
+          reasonCode: 'output-limit',
           outputExceeded: true,
           sessionId: state.sessionId,
           filesTouched,
         });
       } else if (timedOut) {
         const duration = timeoutMs % 60000 === 0 ? `${timeoutMs / 60000} minutes` : `${timeoutMs} ms`;
-        resolve({ ok: false, error: `timed out after ${duration}`, sessionId: state.sessionId, filesTouched });
+        resolve({
+          ok: false,
+          error: `Provider turn timed out after ${duration}.`,
+          reasonCode: 'timeout',
+          sessionId: state.sessionId,
+          filesTouched,
+        });
       } else if (stopped) {
-        resolve({ ok: false, error: 'stopped', stopped: true, sessionId: state.sessionId, filesTouched });
+        resolve({
+          ok: false,
+          error: 'Provider turn stopped.',
+          reasonCode: 'stopped',
+          stopped: true,
+          sessionId: state.sessionId,
+          filesTouched,
+        });
       } else if (code !== 0) {
         const detail = (state.done && state.done.text) || state.stderr.trim() || `exit code ${code}`;
-        resolve({ ok: false, error: detail, sessionId: state.sessionId, filesTouched });
+        resolve({ ok: false, ...providerFailure(detail), sessionId: state.sessionId, filesTouched });
       } else if (state.done && state.done.ok !== false) {
         resolve({
           ok: true,
@@ -173,7 +214,7 @@ export function runTurn({
         });
       } else {
         const detail = (state.done && state.done.text) || state.stderr.trim() || `exit code ${code}`;
-        resolve({ ok: false, error: detail, sessionId: state.sessionId, filesTouched });
+        resolve({ ok: false, ...providerFailure(detail), sessionId: state.sessionId, filesTouched });
       }
     });
     child.stdin.on('error', () => { /* child may exit before reading stdin */ });

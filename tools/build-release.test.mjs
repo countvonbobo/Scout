@@ -3,11 +3,15 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
+import { fileURLToPath } from 'node:url';
 import {
+  auditPublicSourceStage,
   includePublicSourcePath, includeReleasePath, productionDependencyFilter, productionLockfile,
   productionPackageManifest, PUBLIC_SOURCE_FILES, RELEASE_FILES,
   sha256, stagePublicSource, stageRelease, writeChecksums,
 } from './build-release.mjs';
+
+const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
 test('release manifest is allowlisted and excludes private workspace roots', () => {
   const sources = RELEASE_FILES.map((entry) => entry.source);
@@ -149,6 +153,14 @@ test('public source staging contains contributor inputs without private workspac
   assert.equal(fs.existsSync(path.join(staged.stageDir, '.github', 'source.txt')), true);
   assert.equal(fs.existsSync(path.join(staged.stageDir, 'installer', 'output')), false);
   assert.equal(fs.existsSync(path.join(staged.stageDir, 'profile')), false);
+});
+
+test('the generated public source tree passes the real privacy audit', () => {
+  const stageDir = fs.mkdtempSync(path.join(os.tmpdir(), 'scout-public-audited-stage-'));
+  const staged = stagePublicSource({ root: ROOT, stageDir });
+  const audit = auditPublicSourceStage({ root: ROOT, stageDir: staged.stageDir });
+  assert.equal(audit.status, 0);
+  assert.match(audit.output, /Release audit passed/);
 });
 
 test('staging copies only manifest content and bundled runtime', () => {

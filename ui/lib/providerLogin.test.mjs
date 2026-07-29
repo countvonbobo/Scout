@@ -360,6 +360,33 @@ test('retry consumes one terminal predecessor and rejects replay', async () => {
   );
 });
 
+test('a pre-session retry failure releases the predecessor for one later retry', async () => {
+  const child = fakeChild();
+  const status = { installed: true, authenticated: false, command: 'codex' };
+  Object.defineProperties(status, {
+    executable: { value: '/trusted/bin/codex' },
+    env: { value: { PATH: '/trusted/bin', HOME: '/synthetic-owner' } },
+  });
+  let statusCalls = 0;
+  const manager = createProviderLoginManager({
+    providerStatus: async () => {
+      statusCalls += 1;
+      if (statusCalls === 2) throw new Error('transient status failure');
+      return status;
+    },
+    spawn: () => child,
+    cwd: '/fixed/scout',
+  });
+  const first = await manager.startProviderLogin('codex', OWNER);
+  await manager.cancelProviderLogin(first.sessionId, OWNER);
+  await assert.rejects(
+    manager.retryProviderLogin('codex', first.sessionId, OWNER),
+    /transient status failure/,
+  );
+  const retried = await manager.retryProviderLogin('codex', first.sessionId, OWNER);
+  assert.equal(retried.state, 'starting');
+});
+
 test('simultaneous starts reserve the provider before asynchronous status lookup', async () => {
   const statusReady = deferred();
   const status = { installed: true };

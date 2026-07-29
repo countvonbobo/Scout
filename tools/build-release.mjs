@@ -186,6 +186,26 @@ export function stagePublicSource({
   return { root: resolvedRoot, stageDir: resolvedStage };
 }
 
+export function auditPublicSourceStage({
+  root = DEFAULT_ROOT,
+  stageDir,
+} = {}) {
+  const result = spawnSync(process.execPath, [
+    path.join(path.resolve(root), 'tools', 'release-audit.mjs'),
+    '--root',
+    path.resolve(stageDir),
+    '--stage',
+  ], {
+    cwd: root,
+    encoding: 'utf8',
+    windowsHide: true,
+  });
+  if (result.status !== 0) {
+    throw new Error(`public source privacy audit failed:\n${String(result.stdout || '')}\n${String(result.stderr || '')}`.trim());
+  }
+  return { status: result.status, output: String(result.stdout || '') };
+}
+
 function required(root, relative) {
   const value = path.join(root, relative);
   if (!fs.existsSync(value)) throw new Error(`required release input is missing: ${relative}`);
@@ -312,6 +332,7 @@ async function main(argv = process.argv.slice(2)) {
     : installer
     ? buildInstaller({ root, stageDir, version: valueAfter('--version', argv) || undefined })
     : stageRelease({ root, stageDir });
+  if (publicSource) auditPublicSourceStage({ root, stageDir: result.stageDir });
   process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
 }
 

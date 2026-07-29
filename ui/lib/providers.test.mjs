@@ -1,4 +1,6 @@
 import assert from 'node:assert/strict';
+import { EventEmitter } from 'node:events';
+import { PassThrough } from 'node:stream';
 import { test } from 'node:test';
 import {
   assertSafeModel,
@@ -15,6 +17,7 @@ import {
   providerRemoteHealthSignal,
   providerStatus,
   providerStatusAsync,
+  runProviderCommand,
 } from './providers.mjs';
 
 test('provider commands allow Windows resolution to choose native executables or cmd shims', () => {
@@ -46,6 +49,30 @@ test('async provider status does not block the event loop', async () => {
   const result = await pending;
   assert.equal(result.authenticated, true);
   assert.equal(result.capabilities.structuredOutput, true);
+});
+
+test('provider command timeout escalates and settles even when close never arrives', async () => {
+  const child = new EventEmitter();
+  child.pid = 4242;
+  child.stdout = new PassThrough();
+  child.stderr = new PassThrough();
+  child.killSignals = [];
+  child.kill = (signal = 'SIGTERM') => {
+    child.killSignals.push(signal);
+    return true;
+  };
+  const started = Date.now();
+  const result = await runProviderCommand('synthetic-provider', ['--version'], {
+    timeoutMs: 10,
+    terminateGraceMs: 10,
+    closeDeadlineMs: 40,
+    spawn: () => child,
+    platform: 'linux',
+  });
+  assert.equal(result.timedOut, true);
+  assert.equal(result.status, null);
+  assert.deepEqual(child.killSignals, ['SIGTERM', 'SIGKILL']);
+  assert.ok(Date.now() - started < 500);
 });
 
 test('provider detector shares an in-flight probe and caches the result briefly', async () => {

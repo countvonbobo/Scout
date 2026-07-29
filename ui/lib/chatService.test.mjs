@@ -367,7 +367,7 @@ test('handoff route persists the switch and summary when the replacement turn fa
     const res = await callRoute(routeFixture(root)['POST /api/chat/handoff'], JSON.stringify({ id: ID }));
     const events = sseEvents(res.text());
     assert.equal(events.at(-1).event, 'error');
-    assert.equal(events.at(-1).data.message, 'replacement failed');
+    assert.equal(events.at(-1).data.message, 'Provider turn failed.');
     assert.equal(events.at(-1).data.engine, 'codex');
     assert.equal(events.at(-1).data.sessionId, 'replacement-session');
     const saved = loadChat(root, ID);
@@ -376,7 +376,7 @@ test('handoff route persists the switch and summary when the replacement turn fa
     assert.ok(saved.filesTouched.includes('applications/acme/failed.typ'));
     assert.equal(saved.handoffs.length, 1);
     assert.ok(saved.messages.some((m) => m.role === 'system' && m.text.startsWith('handoff summary:')));
-    assert.equal(saved.messages.at(-1).text, 'replacement failed');
+    assert.equal(saved.messages.at(-1).text, 'Provider turn failed.');
   } finally {
     ENGINES.claude = oldClaude;
     ENGINES.codex = oldCodex;
@@ -464,6 +464,62 @@ test('a failed send preserves emitted session and file metadata for retry', { co
   } finally {
     ENGINES.claude = oldClaude;
   }
+});
+
+test('raw provider failures and tool diagnostics never reach SSE or durable chat', async () => {
+  const root = tmpRoot();
+  const privateText = 'token=PRIVATE-SECRET /Users/private/account@example.test';
+  const routes = routeFixture(root, {
+    runTurnFn: (options) => {
+      options.onEvent({
+        kind: 'tool',
+        label: `run: ${privateText}`,
+        file: `/Users/private/${ID}/cv.typ`,
+        activity: 'writing',
+      });
+      return {
+        stop() {},
+        finished: Promise.resolve({
+          ok: false,
+          error: privateText,
+          reasonCode: 'unexpected-private-reason',
+          filesTouched: [`applications/${ID}/cv.typ`],
+        }),
+      };
+    },
+  });
+  const response = await callRoute(
+    routes['POST /api/chat/send'],
+    JSON.stringify({ id: ID, engine: 'claude', text: 'Hello' }),
+  );
+  assert.doesNotMatch(response.text(), /PRIVATE-SECRET|Users|account@|run:/);
+  const events = sseEvents(response.text());
+  assert.deepEqual(events.find((event) => event.event === 'tool'), {
+    event: 'tool',
+    data: { label: 'Editing a file', activity: 'writing' },
+  });
+  assert.equal(events.at(-1).data.message, 'Provider turn failed.');
+  const saved = loadChat(root, ID);
+  assert.doesNotMatch(JSON.stringify(saved), /PRIVATE-SECRET|Users|account@|run:/);
+  assert.equal(saved.messages.at(-1).text, 'Provider turn failed.');
+  assert.deepEqual(saved.filesTouched, [`applications/${ID}/cv.typ`]);
+});
+
+test('tracker read failures do not expose private diagnostic details at the API boundary', async () => {
+  const root = tmpRoot();
+  const privateText = 'token=PRIVATE-SECRET /Users/private/data/opportunities.json';
+  const routes = routeFixture(root, {
+    readTracker: () => { throw new Error(privateText); },
+  });
+  const response = new MockResponse();
+  routes['GET /api/chat'](
+    new EventEmitter(), response, '',
+    new URL(`http://127.0.0.1/api/chat?id=${ID}`),
+  );
+  await response.finished;
+  assert.equal(response.statusCode, 500);
+  assert.deepEqual(JSON.parse(response.text()), { error: 'Tracker could not be read.' });
+  assert.doesNotMatch(response.text(), /PRIVATE-SECRET|Users\/private|opportunities\.json/);
 });
 
 test('a CV writing turn triggers installed-app quality validation when evidence exists', { concurrency: false }, async () => {
@@ -556,7 +612,7 @@ test('handoff build errors end SSE and release the running slot', { concurrency:
     const routes = routeFixture(root);
     const response = await callRoute(routes['POST /api/chat/handoff'], JSON.stringify({ id: ID }));
     assert.deepEqual(sseEvents(response.text()).at(-1), {
-      event: 'error', data: { message: 'summary failed: bad saved session' },
+      event: 'error', data: { message: 'Handoff summary could not start.' },
     });
     const get = new MockResponse();
     routes['GET /api/chat'](new EventEmitter(), get, '', new URL(`http://127.0.0.1/api/chat?id=${ID}`));
@@ -581,7 +637,7 @@ test('handoff save errors end SSE and release the running slot', { concurrency: 
     });
     const response = await callRoute(routes['POST /api/chat/handoff'], JSON.stringify({ id: ID }));
     assert.deepEqual(sseEvents(response.text()).at(-1), {
-      event: 'error', data: { message: 'handoff transcript save failed: disk full' },
+      event: 'error', data: { message: 'Handoff chat history could not be saved.' },
     });
     const get = new MockResponse();
     routes['GET /api/chat'](new EventEmitter(), get, '', new URL(`http://127.0.0.1/api/chat?id=${ID}`));
@@ -711,7 +767,8 @@ test('a provider-rejected model is marked unavailable on the next picker refresh
       stop() {},
       finished: Promise.resolve({
         ok: false,
-        error: 'The provider reports: model gpt-former is not available for this account.',
+        error: 'The provider rejected that model.',
+        reasonCode: 'model-rejected',
         filesTouched: [],
       }),
     }),

@@ -735,6 +735,7 @@ export function createProviderLoginManager({
         codeSubmitted: false,
         codeAttempts: 0,
         retryConsumed: false,
+        retryInFlight: false,
         clearConsumed: false,
         timeout: null,
       };
@@ -777,14 +778,20 @@ export function createProviderLoginManager({
         'LOGIN_RETRY_NOT_ALLOWED',
       );
     }
-    if (previous.retryConsumed) {
+    if (previous.retryConsumed || previous.retryInFlight) {
       throw createError(
         'provider login retry has already been used',
         'LOGIN_RETRY_REPLAYED',
       );
     }
-    previous.retryConsumed = true;
-    return start(provider, ownerContext, 'retry');
+    previous.retryInFlight = true;
+    try {
+      const successor = await start(provider, ownerContext, 'retry');
+      previous.retryConsumed = true;
+      return successor;
+    } finally {
+      previous.retryInFlight = false;
+    }
   }
 
   async function submitProviderLoginCode(sessionIdValue, code, ownerContext) {

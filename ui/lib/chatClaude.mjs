@@ -48,9 +48,13 @@ export function parseClaudeLine(line) {
         out.push({ kind: 'delta', text: block.text });
       } else if (block.type === 'tool_use') {
         const file = fileOfToolInput(block.input);
+        const activity = claudeToolActivity(block.name, file);
         out.push({
-          kind: 'tool', label: file ? `${block.name}: ${file}` : String(block.name || 'tool'),
-          file, mutatesFile: mutatesFile(block.name), activity: claudeToolActivity(block.name, file),
+          kind: 'tool',
+          label: mutatesFile(block.name) ? 'Editing a file' : 'Using provider tools',
+          file,
+          mutatesFile: mutatesFile(block.name),
+          activity,
         });
       }
     }
@@ -62,7 +66,7 @@ export function parseClaudeLine(line) {
       : null;
     out.push({
       kind: 'done',
-      text: structured || (typeof ev.result === 'string' ? ev.result : ''),
+      text: ev.is_error === true ? '' : (structured || (typeof ev.result === 'string' ? ev.result : '')),
       ok: ev.is_error !== true,
       usage: { costUsd: ev.total_cost_usd ?? null, ...(ev.usage || {}) },
     });

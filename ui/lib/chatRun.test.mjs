@@ -33,16 +33,20 @@ test('happy path: streams events, captures session, text, files, usage', async (
   assert.ok(events.some((e) => e.kind === 'tool'));
 });
 
-test('non-zero exit without a done event fails with stderr detail', async () => {
+test('non-zero exit without a done event returns only a bounded failure code', async () => {
   const r = await fakeTurn('FAIL').finished;
   assert.equal(r.ok, false);
-  assert.match(r.error, /fake failure detail|exit code 3/);
+  assert.equal(r.error, 'Provider turn failed.');
+  assert.equal(r.reasonCode, 'provider-error');
+  assert.doesNotMatch(JSON.stringify(r), /fake failure detail/);
 });
 
 test('non-zero exit remains a failure even after a successful done event', async () => {
   const r = await fakeTurn('DONE_THEN_FAIL').finished;
   assert.equal(r.ok, false);
-  assert.match(r.error, /not actually successful|exit code 3/);
+  assert.equal(r.error, 'Provider turn failed.');
+  assert.equal(r.reasonCode, 'provider-error');
+  assert.doesNotMatch(JSON.stringify(r), /not actually successful/);
 });
 
 test('stop() kills the child and reports stopped', async () => {
@@ -68,7 +72,8 @@ test('output byte and individual-line limits stop the provider turn', async () =
   }).finished;
   assert.equal(result.ok, false);
   assert.equal(result.outputExceeded, true);
-  assert.match(result.error, /safe output limit/);
+  assert.equal(result.error, 'Provider output exceeded the safe limit.');
+  assert.equal(result.reasonCode, 'output-limit');
 });
 
 test('stop escalates a stubborn provider process group to forced closure', async () => {
@@ -83,6 +88,14 @@ test('stop escalates a stubborn provider process group to forced closure', async
   assert.equal(result.stopped, true);
 });
 
+test('tool events expose only bounded activity while touched files stay relative', async () => {
+  const events = [];
+  const result = await fakeTurn('hello', { onEvent: (event) => events.push(event) }).finished;
+  const tool = events.find((event) => event.kind === 'tool');
+  assert.deepEqual(tool, { kind: 'tool', label: 'Editing a file', activity: 'writing' });
+  assert.deepEqual(result.filesTouched, ['applications/acme-role-2026-07/cv.typ']);
+});
+
 test('missing binary resolves with a not-found error', async () => {
   const r = await runTurn({
     command: 'definitely-not-a-real-cli-xyz',
@@ -92,7 +105,8 @@ test('missing binary resolves with a not-found error', async () => {
     parseLine: parseClaudeLine,
   }).finished;
   assert.equal(r.ok, false);
-  assert.match(r.error, /not found on PATH/);
+  assert.equal(r.error, 'Provider CLI is unavailable.');
+  assert.equal(r.reasonCode, 'provider-unavailable');
 });
 
 test('tool paths on another Windows drive are excluded', { skip: process.platform !== 'win32' }, async () => {

@@ -7,7 +7,7 @@ import { isMainModule } from '../ui/lib/mainModule.mjs';
 
 const DEFAULT_BUILD_DIRS = ['dist', path.join('installer', 'output')];
 const IGNORED_DIRECTORY_NAMES = new Set(['.git', 'node_modules']);
-const PLACEHOLDER = /^(?:change-?me|dummy|example|fake|not-?set|placeholder|redacted|replace-?me|test|todo|your[-_].*|<.*>|\$\{.*\})$/i;
+const PLACEHOLDER = /^(?:change-?me|downgrade|dummy|example|fake|legacy[-_].*|must-not-.*|new-fenced|not-?set|partial[-_].*|placeholder|private[-_].*|redacted|replace-?me|.*secret.*|synthetic[-_].*|test|.*[-_]test|todo|your[-_].*|<.*>|\$\{.*\})$/i;
 
 const SECRET_RULES = Object.freeze([
   { id: 'private-key', regex: /-----BEGIN (?:RSA |EC |OPENSSH |DSA )?PRIVATE KEY-----/g },
@@ -20,7 +20,7 @@ const PRIVATE_RUNTIME_ROOTS = new Set([
   '.scout', 'applications', 'chats', 'cv', 'data', 'profile', 'reports',
 ]);
 const SERIALIZED_EXTENSIONS = /\.(?:json|jsonl|ndjson|log|out|txt)$/i;
-const PRIVATE_PATH = /\/Users\/(?!Shared(?:\/|["'\s])|Public(?:\/|["'\s])|YOUR|<)[^/"'\s]+|\/home\/(?!YOUR|<)[^/"'\s]+|[A-Za-z]:\\Users\\(?!Public(?:\\|["'\s])|YOUR|<)[^\\/"'\s]+/g;
+const PRIVATE_PATH = /\/Users\/(?!(?:A|example|owner|private|scoutqa|user)(?:\/|["'\s])|Shared(?:\/|["'\s])|Public(?:\/|["'\s])|YOUR|<)[^/"'\s]+|\/home\/(?!(?:a|example|private|user)(?:\/|["'\s])|YOUR|<)[^/"'\s]+|[A-Za-z]:\\Users\\(?!(?:example|oli|owner|private|scoutqa|user)(?:\\|["'\s])|Public(?:\\|["'\s])|YOUR|<)[^\\/"'\s]+/gi;
 const DOCUMENTED_PUBLIC_PATH_FILES = new Set([
   'docs/INSTALL_VPS.md',
   'docs/diagnostics/beta15-vps-workspace-incident.md',
@@ -49,13 +49,6 @@ function normaliseRelative(root, file) {
   return relative.split(path.sep).join('/');
 }
 
-function testOnlySource(relative) {
-  const value = String(relative).split(path.sep).join('/');
-  const base = path.posix.basename(value);
-  return /\.test\.mjs$/i.test(base)
-    || value.split('/').some((part) => ['fixtures', 'test', 'tests', 'test-data', '__tests__', '__snapshots__'].includes(part));
-}
-
 function lineAt(text, index) {
   let line = 1;
   for (let i = 0; i < index; i += 1) if (text.charCodeAt(i) === 10) line += 1;
@@ -78,7 +71,7 @@ function secretAssignmentFindings(text) {
     // Unquoted expressions and property references are code, not embedded
     // credentials. Quoted literals are always checked; unquoted values must
     // resemble a literal rather than `env.KEY`, `portal.token`, or a call.
-    if (!quoted && /[().,]/.test(value)) continue;
+    if (!quoted && /[().,`$]/.test(value)) continue;
     if (!isPlaceholder(value)) findings.push({ line: i + 1, rule: 'secret-assignment' });
   }
   return findings;
@@ -90,6 +83,18 @@ function normaliseSerializedKey(key) {
 
 function privacyRuleForKey(key, value, owner = {}, ancestors = []) {
   const normal = normaliseSerializedKey(key);
+  const inAuthContext = ancestors.some((part) =>
+    /(?:auth|authentication|authorization|credential|device|login|provider|session)/.test(part));
+  if (normal === 'credentials'
+    || ['accesstoken', 'authtoken', 'bearertoken', 'clientsecret', 'idtoken', 'password', 'refreshtoken'].includes(normal)
+    || (normal === 'token' && inAuthContext)) {
+    return 'credential';
+  }
+  if (['authstate', 'authenticationstate', 'loginstate'].includes(normal)) return 'raw-auth-state';
+  if (['response', 'result'].includes(normal)
+    && ancestors.some((part) => /(?:auth|authentication|authorization|device|login)/.test(part))) {
+    return 'raw-auth-output';
+  }
   if (normal === 'events'
     || (normal === 'state' && ancestors.some((part) => /(?:run|scan|journal)/.test(part)))
     || (normal.includes('raw') && /(?:run|scan|execution|journal|state|event)/.test(normal))) {
@@ -104,9 +109,14 @@ function privacyRuleForKey(key, value, owner = {}, ancestors = []) {
     || (normal === 'code' && /^(?:claude|codex)$/i.test(String(owner.provider || '')))
     || (normal === 'code' && ancestors.some((part) => /(?:auth|device|login|provider|session)/.test(part)))) return 'auth-code';
   if (normal.includes('prompt')) return 'full-prompt';
+  if (normal === 'content'
+    && /^(?:system|user)$/i.test(String(owner.role || ''))
+    && ancestors.some((part) => /messages?/.test(part))) return 'full-prompt';
   if (normal === 'resume' || normal === 'mastercv'
     || (/(?:cv|resume)/.test(normal) && /(?:body|content|document|text)/.test(normal))) return 'cv-body';
   if (normal.includes('advert') || /job(?:body|description|text|content)/.test(normal)) return 'advert-body';
+  if (['body', 'content', 'text'].includes(normal)
+    && ancestors.some((part) => /(?:advert|job|vacancy)/.test(part))) return 'advert-body';
   if (normal === 'description' && typeof value === 'string'
     && (value.length >= 120
       || ['company', 'role', 'title'].some((field) => Object.hasOwn(owner, field))
@@ -165,6 +175,25 @@ function serializedPrivacyFindings(text) {
   return findings;
 }
 
+function serializedByContent(text, relative) {
+  if (SERIALIZED_EXTENSIONS.test(relative)) return true;
+  const lines = String(text).split(/\r?\n/).filter((line) => line.trim());
+  if (!lines.length) return false;
+  try {
+    JSON.parse(lines.join('\n'));
+    return true;
+  } catch {
+    try {
+      return lines.every((line) => {
+        JSON.parse(line);
+        return true;
+      });
+    } catch {
+      return false;
+    }
+  }
+}
+
 function scanText(text, markers, relative = '') {
   const findings = [];
   const lower = text.toLocaleLowerCase('en-US');
@@ -185,7 +214,7 @@ function scanText(text, markers, relative = '') {
     }
   }
   findings.push(...secretAssignmentFindings(text));
-  if (SERIALIZED_EXTENSIONS.test(relative)) findings.push(...serializedPrivacyFindings(text));
+  if (serializedByContent(text, relative)) findings.push(...serializedPrivacyFindings(text));
   let pathText = text.replaceAll('\\\\', '\\');
   const documentedPublicPath = [...DOCUMENTED_PUBLIC_PATH_FILES].some((documented) =>
     relative === documented || relative === `app/${documented}` || relative.endsWith(`/app/${documented}`));
@@ -201,9 +230,14 @@ function scanText(text, markers, relative = '') {
 }
 
 function privateRuntimeArtifact(relative) {
-  const parts = String(relative).split(/[\\/]+/).filter(Boolean);
-  if (parts[0]?.toLocaleLowerCase('en-US') === 'app') parts.shift();
-  return PRIVATE_RUNTIME_ROOTS.has(parts[0]?.toLocaleLowerCase('en-US'));
+  const parts = String(relative).split(/[\\/]+/).filter(Boolean)
+    .map((part) => part.toLocaleLowerCase('en-US'));
+  if (PRIVATE_RUNTIME_ROOTS.has(parts[0])) return true;
+  // Release build output wraps the source tree under paths such as
+  // dist/release/stage/app/. The app boundary, wherever its staging parents
+  // live, must apply the same private-root exclusion as a direct stage audit.
+  return parts.some((part, index) =>
+    part === 'app' && PRIVATE_RUNTIME_ROOTS.has(parts[index + 1]));
 }
 
 function allowedReleaseBinary(relative) {
@@ -275,7 +309,6 @@ export function auditRelease({
   const excluded = markerFile ? path.resolve(markerFile) : null;
   const listedTrackedFiles = trackedFiles ?? collectTrackedFiles(absoluteRoot);
   const tracked = listedTrackedFiles
-    .filter((file) => trackedFiles !== undefined || !testOnlySource(file))
     .map((file) => path.resolve(absoluteRoot, file))
     .filter((file) => fs.existsSync(file) && fs.statSync(file).isFile());
   const built = buildDirs.flatMap((dir) => filesUnder(path.resolve(absoluteRoot, dir)));

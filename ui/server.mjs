@@ -24,7 +24,9 @@ import { createProviderHealthMonitor, scheduleStatus, scheduleSummary } from './
 import { loadPortals, portalSummary } from './lib/ats.mjs';
 import { JOB_CATEGORIES } from './lib/filters.mjs';
 import { buildSourcePayload, sourceUrlOf, SourceCache } from './lib/source.mjs';
-import { assertSafeModel, detectProvidersAsync, providerLocalHealthSignal } from './lib/providers.mjs';
+import {
+  assertSafeModel, detectProvidersAsync, providerLocalHealthSignal, runProviderCommand,
+} from './lib/providers.mjs';
 import { providerPreflight, readProviderHealth } from './lib/providerHealth.mjs';
 import { createProviderLoginManager } from './lib/providerLogin.mjs';
 import { runStructuredTurn } from './lib/structuredTurn.mjs';
@@ -520,51 +522,23 @@ export const providerLoginControl = {
   },
 };
 
-function runFixedCapabilityCommand(command, args, {
+async function runFixedCapabilityCommand(command, args, {
   timeoutMs = 2_500,
   maxOutputBytes = 16 * 1024,
 } = {}) {
-  return new Promise((resolve) => {
-    let child;
-    try {
-      child = spawn(command, args, { shell: false, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] });
-    } catch {
-      resolve({ status: null, failed: true });
-      return;
-    }
-    let bytes = 0;
-    let exceeded = false;
-    let failed = false;
-    let timedOut = false;
-    const stdout = [];
-    const collect = (chunk, output) => {
-      bytes += chunk.length;
-      if (bytes > maxOutputBytes && !exceeded) {
-        exceeded = true;
-        child.kill();
-        return;
-      }
-      if (!exceeded) output.push(chunk);
-    };
-    child.stdout?.on('data', (chunk) => collect(chunk, stdout));
-    child.stderr?.on('data', (chunk) => collect(chunk, []));
-    child.on('error', () => { failed = true; });
-    const timeout = setTimeout(() => {
-      timedOut = true;
-      child.kill();
-    }, timeoutMs);
-    timeout.unref?.();
-    child.on('close', (status) => {
-      clearTimeout(timeout);
-      resolve({
-        status,
-        failed,
-        timedOut,
-        exceeded,
-        stdout: Buffer.concat(stdout).toString('utf8'),
-      });
-    });
+  const result = await runProviderCommand(command, args, {
+    shell: false,
+    windowsHide: true,
+    timeoutMs,
+    maxOutputBytes,
   });
+  return {
+    status: result.status,
+    failed: Boolean(result.error),
+    timedOut: result.timedOut,
+    exceeded: result.outputExceeded,
+    stdout: result.stdout,
+  };
 }
 
 export async function inspectCodexDeepLinkHandler({

@@ -15,7 +15,6 @@ const REAL_ACCEPTANCE_SUITES = Object.freeze([
   'ui/lib/assessmentBatches.test.mjs',
   'ui/lib/scanQueue.test.mjs',
   'ui/lib/mutationCoordinator.test.mjs',
-  'ui/lib/scanMutationProjection.test.mjs',
   'ui/lib/recoveryBackup.test.mjs',
   'ui/lib/workspaceSync.test.mjs',
   'ui/lib/runRetention.test.mjs',
@@ -28,12 +27,18 @@ const REAL_ACCEPTANCE_SUITES = Object.freeze([
 
 const PRIVATE_SENTINELS = [
   'PRIVATE-HOST',
-  '/Users/synthetic-private',
+  ['', 'Users', 'synthetic-private'].join('/'),
   'SYNTHETIC-AUTH-CODE',
   'SYNTHETIC-PRIVATE-PROMPT',
   'SYNTHETIC-PROVIDER-TRANSCRIPT',
   'utm_source=synthetic-private',
 ];
+
+test('the real acceptance suite manifest contains only existing test files', () => {
+  expect(
+    REAL_ACCEPTANCE_SUITES.filter((relative) => !fs.existsSync(path.join(ROOT, relative))),
+  ).toEqual([]);
+});
 
 function setupStatus() {
   return {

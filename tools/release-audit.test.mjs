@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -21,6 +22,9 @@ const FIXTURE_TITLES = [
   'Software Developer', 'Hospital Administrator', 'Hospitality Worker',
   'Commercial Solicitor', 'Mechanical Engineering Graduate', 'Retail Manager',
 ];
+const unixHome = (user, suffix = '') => ['', 'home', user, suffix].filter((part, index) => index === 0 || part).join('/');
+const macHome = (user, suffix = '') => ['', 'Users', user, suffix].filter((part, index) => index === 0 || part).join('/');
+const windowsHome = (user, suffix = '') => ['C:', 'Users', user, suffix].filter(Boolean).join('\\');
 
 test('passes clean tracked files and build output', () => {
   const root = fixture();
@@ -109,11 +113,11 @@ test('rejects raw run, auth, prompt, CV, advert, transcript and tracking payload
     ['opaque-payload.json', { payload: 'Synthetic provider output whose provenance cannot be audited.' }, 'raw-auth-output'],
     ['tracking.json', { trackingValue: 'utm_source=synthetic-private' }, 'tracking-value'],
     ['tracking-key.json', { utm_source: 'synthetic-private' }, 'tracking-value'],
-    ['private-path.json', { path: '/Users/synthetic-private/Scout Workspace' }, 'private-path'],
-    ['linux-private-path.json', { path: '/home/synthetic-private/Scout Workspace' }, 'private-path'],
-    ['linux-default-private-path.json', { path: '/home/ubuntu/Documents/Scout Workspace' }, 'private-path'],
-    ['linux-service-private-path.json', { path: '/home/scout/private-state' }, 'private-path'],
-    ['windows-private-path.json', { path: 'C:\\Users\\synthetic-private\\Scout Workspace' }, 'private-path'],
+    ['private-path.json', { path: macHome('synthetic-private', 'Scout Workspace') }, 'private-path'],
+    ['linux-private-path.json', { path: unixHome('synthetic-private', 'Scout Workspace') }, 'private-path'],
+    ['linux-default-private-path.json', { path: unixHome('ubuntu', 'Documents/Scout Workspace') }, 'private-path'],
+    ['linux-service-private-path.json', { path: unixHome('scout', 'private-state') }, 'private-path'],
+    ['windows-private-path.json', { path: windowsHome('synthetic-private', 'Scout Workspace') }, 'private-path'],
   ];
   for (const [relative, value] of cases) {
     fs.writeFileSync(path.join(root, relative), `${typeof value === 'string' ? value : JSON.stringify(value)}\n`);
@@ -130,6 +134,70 @@ test('rejects raw run, auth, prompt, CV, advert, transcript and tracking payload
       .sort(([left], [right]) => left.localeCompare(right, 'en')),
   );
   assert.equal(JSON.stringify(result).includes('synthetic-private'), false);
+});
+
+test('rejects ordinary credential, auth-state, prompt and advert representations', () => {
+  const root = fixture();
+  const cases = [
+    ['credentials.json', { credentials: { token: 'SYNTHETIC-SECRET' } }, 'credential'],
+    ['access-token.json', { accessToken: 'SYNTHETIC-SECRET' }, 'credential'],
+    ['auth-state.json', { authState: { provider: 'codex', token: 'SYNTHETIC-SECRET' } }, 'raw-auth-state'],
+    ['login-response.json', { login: { response: { refreshToken: 'SYNTHETIC-SECRET' } } }, 'raw-auth-output'],
+    ['provider-request.json', {
+      request: { messages: [{ role: 'user', content: 'Synthetic private prompt body.' }] },
+    }, 'full-prompt'],
+    ['vacancy-body.json', {
+      vacancy: { company: 'Synthetic employer', body: 'Synthetic private advert body.' },
+    }, 'advert-body'],
+  ];
+  for (const [relative, value] of cases) {
+    fs.writeFileSync(path.join(root, relative), `${JSON.stringify(value)}\n`);
+  }
+  const result = auditRelease({
+    root,
+    trackedFiles: cases.map(([relative]) => relative),
+    buildDirs: [],
+  });
+  assert.equal(result.ok, false);
+  for (const [file, _value, rule] of cases) {
+    assert.equal(
+      result.findings.some((finding) => finding.file === file && finding.rule === rule),
+      true,
+      `${file} must report ${rule}`,
+    );
+  }
+  assert.equal(JSON.stringify(result).includes('SYNTHETIC-SECRET'), false);
+  assert.equal(JSON.stringify(result).includes('Synthetic private'), false);
+});
+
+test('detects a serialized private payload by content after a harmless rename', () => {
+  const root = fixture();
+  const relative = 'docs/leak.md';
+  fs.mkdirSync(path.dirname(path.join(root, relative)), { recursive: true });
+  fs.writeFileSync(path.join(root, relative), JSON.stringify({
+    authState: { accessToken: 'SYNTHETIC-SECRET' },
+    prompt: 'Synthetic private prompt body.',
+  }));
+  const result = auditRelease({ root, trackedFiles: [relative], buildDirs: [] });
+  assert.equal(result.ok, false);
+  assert.equal(result.findings.some(({ rule }) => rule === 'raw-auth-state'), true);
+  assert.equal(result.findings.some(({ rule }) => rule === 'credential'), true);
+  assert.equal(result.findings.some(({ rule }) => rule === 'full-prompt'), true);
+});
+
+test('default tracked-file audit does not exempt tests or fixtures', () => {
+  const root = fixture();
+  const marker = 'Casey Privateperson';
+  const relative = 'tests/private.fixture.mjs';
+  fs.mkdirSync(path.dirname(path.join(root, relative)), { recursive: true });
+  fs.writeFileSync(path.join(root, relative), `export const owner = '${marker}';\n`);
+  assert.equal(spawnSync('git', ['init', '-q'], { cwd: root }).status, 0);
+  assert.equal(spawnSync('git', ['add', relative], { cwd: root }).status, 0);
+  const result = auditRelease({ root, buildDirs: [], markers: [marker] });
+  assert.equal(result.ok, false);
+  assert.deepEqual(result.findings, [{
+    file: relative, line: 1, rule: 'personal-marker-1',
+  }]);
 });
 
 test('rejects private runtime roots inside the staged app layout regardless of case or binary content', () => {
@@ -156,6 +224,19 @@ test('rejects private runtime roots inside the staged app layout regardless of c
   assert.equal(result.findings.every((finding) => finding.file === '[redacted-path]'), true);
 });
 
+test('rejects private runtime roots inside the default nested release stage', () => {
+  const root = fixture();
+  const relative = 'dist/release/stage/app/Data/private.json';
+  const file = path.join(root, relative);
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file, '{}\n');
+  const result = auditRelease({ root, trackedFiles: [], buildDirs: ['dist'] });
+  assert.equal(result.ok, false);
+  assert.deepEqual(result.findings, [{
+    file: '[redacted-path]', line: 1, rule: 'private-runtime-artifact',
+  }]);
+});
+
 test('allows only the exact documented VPS paths after release app wrapping', () => {
   const root = fixture();
   const documented = [
@@ -167,11 +248,11 @@ test('allows only the exact documented VPS paths after release app wrapping', ()
   for (const relative of documented) {
     const file = path.join(root, relative);
     fs.mkdirSync(path.dirname(file), { recursive: true });
-    fs.writeFileSync(file, '/home/ubuntu/Documents/Scout Workspace\n/home/scout-deploy/.ssh/authorized_keys\n');
+    fs.writeFileSync(file, `${unixHome('ubuntu', 'Documents/Scout Workspace')}\n${unixHome('scout-deploy', '.ssh/authorized_keys')}\n`);
   }
   const leaked = 'app/config/runtime.json';
   fs.mkdirSync(path.dirname(path.join(root, leaked)), { recursive: true });
-  fs.writeFileSync(path.join(root, leaked), '{"workspace":"/home/ubuntu/Documents/Scout Workspace"}\n');
+  fs.writeFileSync(path.join(root, leaked), `${JSON.stringify({ workspace: unixHome('ubuntu', 'Documents/Scout Workspace') })}\n`);
 
   const documentedResult = auditRelease({ root, trackedFiles: documented, buildDirs: [] });
   assert.equal(documentedResult.ok, true);

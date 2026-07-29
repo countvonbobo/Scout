@@ -201,17 +201,50 @@ export function providerStatus(provider, {
   return result;
 }
 
-function runProviderCommand(command, args, options = {}) {
+function terminateProviderCommand(child, {
+  force = false,
+  platform = process.platform,
+} = {}) {
+  if (platform === 'win32') {
+    if (Number.isSafeInteger(child?.pid) && child.pid > 0) {
+      try {
+        spawnSync('taskkill.exe', ['/pid', String(child.pid), '/T', '/F'], {
+          windowsHide: true,
+          stdio: 'ignore',
+          timeout: 1_000,
+          shell: false,
+        });
+      } catch { /* fall through to the direct child */ }
+    }
+    try { child?.kill('SIGKILL'); } catch { /* it may already have exited */ }
+    return;
+  }
+  const signal = force ? 'SIGKILL' : 'SIGTERM';
+  try {
+    if (Number.isSafeInteger(child?.pid) && child.pid > 0) process.kill(-child.pid, signal);
+    else child?.kill(signal);
+  } catch {
+    try { child?.kill(signal); } catch { /* it may already have exited */ }
+  }
+}
+
+export function runProviderCommand(command, args, options = {}) {
   return new Promise((resolve) => {
     const {
       timeoutMs = 10_000,
       maxOutputBytes: configuredMaxOutputBytes = 64 * 1024,
+      terminateGraceMs = 750,
+      closeDeadlineMs = 2_000,
+      spawn = spawnProcess,
+      platform = process.platform,
       ...spawnOptions
     } = options;
     let child;
     try {
-      child = spawnProcess(command, args, {
-        ...spawnOptions, stdio: ['ignore', 'pipe', 'pipe'],
+      child = spawn(command, args, {
+        ...spawnOptions,
+        stdio: ['ignore', 'pipe', 'pipe'],
+        detached: platform !== 'win32',
       });
     } catch (error) {
       resolve({ status: null, stdout: '', stderr: '', error });
@@ -225,28 +258,16 @@ function runProviderCommand(command, args, options = {}) {
     let outputExceeded = false;
     let timedOut = false;
     let error = null;
-    const timeout = setTimeout(() => {
-      timedOut = true;
-      child.kill();
-    }, timeoutMs);
-    timeout.unref?.();
-    const collect = (chunks, chunk, stream) => {
-      if (outputExceeded) return;
-      const nextBytes = stream === 'stdout' ? stdoutBytes + chunk.length : stderrBytes + chunk.length;
-      if (nextBytes > maxOutputBytes) {
-        outputExceeded = true;
-        child.kill();
-        return;
-      }
-      chunks.push(chunk);
-      if (stream === 'stdout') stdoutBytes = nextBytes;
-      else stderrBytes = nextBytes;
-    };
-    child.stdout?.on('data', (chunk) => collect(stdout, chunk, 'stdout'));
-    child.stderr?.on('data', (chunk) => collect(stderr, chunk, 'stderr'));
-    child.on('error', (value) => { error = value; });
-    child.on('close', (status) => {
+    let closed = false;
+    let forcedTimer = null;
+    let deadlineTimer = null;
+    let timeout = null;
+    const finish = (status = null) => {
+      if (closed) return;
+      closed = true;
       clearTimeout(timeout);
+      clearTimeout(forcedTimer);
+      clearTimeout(deadlineTimer);
       resolve({
         status,
         stdout: Buffer.concat(stdout).toString('utf8'),
@@ -255,7 +276,42 @@ function runProviderCommand(command, args, options = {}) {
         outputExceeded,
         timedOut,
       });
-    });
+    };
+    const stop = () => {
+      terminateProviderCommand(child, { platform });
+      if (!forcedTimer) {
+        forcedTimer = setTimeout(
+          () => terminateProviderCommand(child, { force: true, platform }),
+          terminateGraceMs,
+        );
+        forcedTimer.unref?.();
+      }
+      if (!deadlineTimer) {
+        deadlineTimer = setTimeout(() => finish(null), closeDeadlineMs);
+        deadlineTimer.unref?.();
+      }
+    };
+    timeout = setTimeout(() => {
+      timedOut = true;
+      stop();
+    }, timeoutMs);
+    timeout.unref?.();
+    const collect = (chunks, chunk, stream) => {
+      if (outputExceeded) return;
+      const nextBytes = stream === 'stdout' ? stdoutBytes + chunk.length : stderrBytes + chunk.length;
+      if (nextBytes > maxOutputBytes) {
+        outputExceeded = true;
+        stop();
+        return;
+      }
+      chunks.push(chunk);
+      if (stream === 'stdout') stdoutBytes = nextBytes;
+      else stderrBytes = nextBytes;
+    };
+    child.stdout?.on('data', (chunk) => collect(stdout, chunk, 'stdout'));
+    child.stderr?.on('data', (chunk) => collect(stderr, chunk, 'stderr'));
+    child.on('error', (value) => { error = value; finish(null); });
+    child.on('close', (status) => finish(status));
   });
 }
 

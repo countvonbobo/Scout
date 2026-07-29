@@ -52,10 +52,10 @@ export function parseCodexLine(line) {
       return (it.changes || [])
         .map((c) => c && c.path)
         .filter(Boolean)
-        .map((f) => ({ kind: 'tool', label: `edit: ${f}`, file: f, mutatesFile: true, activity: codexToolActivity('file_change', f) }));
+        .map((f) => ({ kind: 'tool', label: 'Editing a file', file: f, mutatesFile: true, activity: codexToolActivity('file_change', f) }));
     }
     if (it.type === 'command_execution') {
-      return [{ kind: 'tool', label: `run: ${it.command || ''}`.trim(), file: null, activity: codexToolActivity('command', it.command) }];
+      return [{ kind: 'tool', label: 'Running a provider command', file: null, activity: codexToolActivity('command', it.command) }];
     }
     return [];
   }
@@ -63,7 +63,7 @@ export function parseCodexLine(line) {
     return [{ kind: 'done', text: '', ok: true, usage: ev.usage || {} }];
   }
   if (ev.type === 'turn.failed') {
-    return [{ kind: 'done', text: (ev.error && ev.error.message) || 'turn failed', ok: false, usage: {} }];
+    return [{ kind: 'done', text: '', ok: false, usage: {} }];
   }
 
   // legacy shape
@@ -72,7 +72,7 @@ export function parseCodexLine(line) {
     if (m.type === 'session_configured' && m.session_id) return [{ kind: 'session', sessionId: m.session_id }];
     if (m.type === 'agent_message' && m.message) return [{ kind: 'delta', text: m.message }];
     if (m.type === 'task_complete') return [{ kind: 'done', text: m.last_agent_message || '', ok: true, usage: {} }];
-    if (m.type === 'error') return [{ kind: 'done', text: m.message || 'error', ok: false, usage: {} }];
+    if (m.type === 'error') return [{ kind: 'done', text: '', ok: false, usage: {} }];
   }
   return [];
 }
