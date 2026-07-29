@@ -88,3 +88,60 @@ private paths, account data, CV content, adverts, prompts, or transcripts.
 - Next exact action: add failing `ui/lib/providerHealth.test.mjs` state,
   persistence, precedence, scheduling, fencing, and retry cases, then run
   `node --test ui/lib/providerHealth.test.mjs ui/lib/providers.test.mjs ui/lib/scheduler.test.mjs ui/lib/scanPipeline.test.mjs`.
+
+## Gate 3 — Task 16 / issue #76
+
+- Status: review-clean and complete as a candidate implementation.
+- Commit range: `595d314..5e98f40`.
+- Implementation commits: `c675a2d`, `9767719`, and `e128676`.
+- Review-fix commits: `63d2d5d`, `502ac83`, `9e6c501`, and `5e98f40`.
+- RED evidence:
+  - the provider-health core initially failed module loading because
+    `ui/lib/providerHealth.mjs` did not exist;
+  - provider/scheduler adapter tests initially failed because the bounded
+    health signal and monitor exports did not exist;
+  - scan preflight initially had no refusal hook or durable blocked-run path;
+  - review regressions reproduced preflight authority retention, unsafe error
+    collapsing, mislabeled scheduled checks, unfenced read/modify/write, and a
+    transient health lease incorrectly entering the overlap queue.
+- Fixes:
+  - persist one strict schema-v1 health record per provider using bounded
+    evidence, 32-entry history, alert deduplication and acknowledgement;
+  - preserve remote authentication failure authority until a genuine remote
+    success, while retaining distinct network, rate-limit, CLI-update and
+    provider-error states;
+  - serialize unleased health mutations through short existing fenced lease
+    authority, and retry that transient authority without enqueueing a scan;
+  - run fenced preflight after startup queue drain and before recovery or
+    stages, recording `run.started`, `provider-health-blocked`, and terminal
+    `abandoned` evidence without assessment or tracker/report mutation;
+  - wire manual, scheduled, startup, periodic and provider-operation health
+    checks with exact bounded purposes and no provider substitution or
+    automatic missed-window resend.
+- GREEN:
+  - provider-health, provider-adapter, structured-turn and scheduler suites:
+    70 passed, 0 failed, 0 skipped;
+  - focused server startup/periodic runtime-wiring test: 1 passed;
+  - storage-pressure ordering regression: 1 passed;
+  - `npm run release:audit`: passed; 219 files scanned;
+  - full-range diff check: passed.
+- Required focused command:
+  - 128 tests discovered; 92 passed and 36 stopped at the inherited macOS
+    process-start identity boundary before executing their lease assertions.
+  - Every failure reports `cannot determine the current process-start identity`
+    from unchanged `ui/lib/scanLease.mjs`; this sandbox cannot read
+    `kern.proc.pid.<pid>` even with escalation. The new real-fence pipeline
+    tests remain authoritative in the GitHub Linux matrix.
+- Fresh read-only review rounds:
+  - Round 1: FAIL / CHANGES_REQUESTED; 0 Critical, 4 Important, 0 Minor.
+    Fixed preflight exception authority, cross-process health serialization,
+    production error classification, and runtime purpose/wiring coverage.
+  - Round 2: FAIL / CHANGES_REQUESTED; 0 Critical, 1 Important, 0 Minor.
+    Prevented short provider-health authority from queueing and stranding a
+    racing scan.
+  - Round 3: Spec compliance PASS; Code quality APPROVED; 0 Critical,
+    0 Important, 0 Minor.
+- Findings fixed/open: every Gate 3 finding fixed; none open.
+- Next exact action: add failing `ui/lib/providerLogin.test.mjs` cases for
+  allowlisted provider login commands, bounded lifecycle and safe post-auth
+  validation, then run the Gate 4 focused command from the execution brief.
