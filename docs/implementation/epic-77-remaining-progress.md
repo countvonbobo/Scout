@@ -649,3 +649,28 @@ private paths, account data, CV content, adverts, prompts, or transcripts.
 - Next exact action: run the complete final verification matrix from this
   review-clean committed tree, push the branch, open the required stacked
   draft PR and obtain every required GitHub Actions result.
+
+## Final local verification
+
+- Verified commit: `a64168cacb8d3a8e21ca37d3415ef673dad77439`.
+- `node --test tools/release-audit.test.mjs tools/build-release.test.mjs`:
+  35 passed, 0 failed, 0 skipped.
+- `npx playwright test tests/browser/recoverable-scan.spec.mjs
+  --project=chromium`: 5 passed, 0 failed, 1 documented macOS
+  process-identity skip.
+- `npm test`: 1,102 discovered, 841 passed, 256 failed and 5 skipped. The
+  failures trace to this host's inability to read `kern.proc.pid.<pid>`
+  process-start identity or dependent server/setup assertions receiving fixed
+  failure responses; every affected focused suite that does not require that
+  host primitive is green.
+- `npm run test:browser`: 148 discovered, 145 passed, 0 failed and 3
+  intentional platform/host skips.
+- `npm run release:audit`: passed for 515 source/build files.
+- complete-range diff checks: passed.
+- worktree before this evidence-only ledger commit: clean.
+- Known packaging limitation remains unchanged: local stage construction
+  refreshes the real release tree but cannot finish without the optional
+  app-local `.scout-runtime/typst`; cross-platform packaging tests and CI are
+  authoritative.
+- Next exact action: push this evidence commit, create the required stacked
+  draft PR and wait for all seven required GitHub Actions checks.
