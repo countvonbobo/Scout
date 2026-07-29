@@ -612,6 +612,86 @@ test('legacy queue receipts retain the newest twenty by their unique durable aud
   );
 });
 
+test('version-two queue receipts retain the newest twenty by their reconciled completion time', () => {
+  const root = temp();
+  const lease = acquireScanLease(root, currentLeaseOwner(), {
+    kind: 'scan', runId: 'retention-cleanup', provider: 'codex', mode: 'primary', phase: 'queue',
+  });
+  const operationIds = Array.from({ length: 21 }, (_, index) => (
+    crypto.createHash('sha256').update(`v2-receipt:${index}`).digest('hex')
+  )).sort();
+  const audits = operationIds.flatMap((operationId, index) => versionTwoQueueCompaction(
+    root,
+    operationId,
+    `2025-02-${String(21 - index).padStart(2, '0')}T12:00:00.000Z`,
+  ));
+  const auditFile = path.join(root, '.scout', 'run-retention.jsonl');
+  fs.writeFileSync(auditFile, `${audits.map(stableJson).join('\n')}\n`);
+
+  compactScanQueue(root, lease, { now: new Date('2026-07-29T12:00:00.000Z') });
+
+  const operationRoot = path.join(root, '.scout', 'queue-compactions');
+  assert.deepEqual(fs.readdirSync(operationRoot).sort(), operationIds.slice(0, 20).sort());
+  for (let index = 0; index < 20; index += 1) {
+    const manifest = JSON.parse(fs.readFileSync(
+      path.join(operationRoot, operationIds[index], 'manifest.json'),
+      'utf8',
+    ));
+    assert.equal(manifest.completedAt, audits[index].recordedAt);
+  }
+  const retainedAudits = fs.readFileSync(auditFile, 'utf8')
+    .trim().split('\n').map(JSON.parse);
+  assert.deepEqual(
+    retainedAudits.map((event) => event.operationId).sort(),
+    operationIds.slice(0, 20).sort(),
+  );
+});
+
+test('version-two queue receipt pruning rejects canonical conflicting completion times without mutation', () => {
+  const conflictingCases = [
+    ['future manifest', '2099-01-01T00:00:00.000Z', '2025-03-01T00:00:00.000Z'],
+    ['past manifest', '2020-01-01T00:00:00.000Z', '2099-01-01T00:00:00.000Z'],
+  ];
+  for (const [label, completedAt, recordedAt] of conflictingCases) {
+    const root = temp();
+    const lease = acquireScanLease(root, currentLeaseOwner(), {
+      kind: 'scan', runId: 'retention-cleanup', provider: 'codex', mode: 'primary', phase: 'queue',
+    });
+    const operationIds = Array.from({ length: 21 }, (_, index) => (
+      crypto.createHash('sha256').update(`v2-conflict-${label}:${index}`).digest('hex')
+    ));
+    const audits = operationIds.flatMap((operationId, index) => (
+      index === 0
+        ? versionTwoQueueCompaction(root, operationId, completedAt, { recordedAt })
+        : versionTwoQueueCompaction(
+          root,
+          operationId,
+          `2025-03-${String(index + 1).padStart(2, '0')}T12:00:00.000Z`,
+        )
+    ));
+    const auditFile = path.join(root, '.scout', 'run-retention.jsonl');
+    fs.writeFileSync(auditFile, `${audits.map(stableJson).join('\n')}\n`);
+    const operationRoot = path.join(root, '.scout', 'queue-compactions');
+    const before = {
+      audit: fs.readFileSync(auditFile, 'utf8'),
+      operations: Object.fromEntries(operationIds.map((operationId) => (
+        [operationId, queueCompactionFiles(root, operationId)]
+      ))),
+    };
+
+    assert.throws(
+      () => compactScanQueue(root, lease, { now: new Date('2026-07-29T12:00:00.000Z') }),
+      /queue compaction audit does not match its receipt/i,
+      label,
+    );
+    assert.deepEqual(fs.readdirSync(operationRoot).sort(), operationIds.sort(), label);
+    for (const operationId of operationIds) {
+      assert.deepEqual(queueCompactionFiles(root, operationId), before.operations[operationId], label);
+    }
+    assert.equal(fs.readFileSync(auditFile, 'utf8'), before.audit, label);
+  }
+});
+
 test('legacy queue receipt folding fails closed when its durable audit is missing, ambiguous or conflicting', () => {
   for (const auditCase of ['missing', 'ambiguous', 'conflicting']) {
     const root = temp();

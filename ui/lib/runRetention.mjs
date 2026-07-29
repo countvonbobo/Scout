@@ -830,7 +830,10 @@ function queueCompletionAudit(manifest, events, label = 'queue compaction') {
   const event = checkedQueueCompactionAudit(matches[0]);
   if (event.beforeDigest !== manifest.beforeDigest
     || event.afterDigest !== manifest.afterDigest
-    || event.removedEvents !== manifest.removedEvents) {
+    || event.removedEvents !== manifest.removedEvents
+    || (manifest.schemaVersion === 2
+      && manifest.status === 'completed'
+      && event.recordedAt !== manifest.completedAt)) {
     throw new Error(`${label} audit does not match its receipt`);
   }
   return event;
@@ -847,16 +850,19 @@ function reduceCompletedQueueOperations(root) {
   const queueAudit = audit
     .filter((event) => event?.type === 'queue-compacted')
     .map(checkedQueueCompactionAudit);
+  const completionTimes = new Map();
   for (const { manifest } of operations) {
-    if (manifest.schemaVersion === 2 && manifest.status === 'completed') {
-      queueCompletionAudit(manifest, queueAudit);
-    }
+    if (manifest.status !== 'completed') continue;
+    const completedAt = manifest.schemaVersion === 1
+      ? legacyQueueCompletionTime(manifest, queueAudit)
+      : queueCompletionAudit(manifest, queueAudit).recordedAt;
+    completionTimes.set(manifest.operationId, completedAt);
   }
   const migrations = operations
     .filter(({ manifest }) => manifest.schemaVersion === 1 && manifest.status === 'completed')
     .map((operation) => ({
       operation,
-      completedAt: legacyQueueCompletionTime(operation.manifest, queueAudit),
+      completedAt: completionTimes.get(operation.manifest.operationId),
     }));
   for (const { operation, completedAt } of migrations) {
     const migrated = {
@@ -869,8 +875,8 @@ function reduceCompletedQueueOperations(root) {
   }
   const completed = operations.filter(({ manifest }) => manifest.status === 'completed');
   completed.sort((left, right) => {
-    const timeDifference = Date.parse(right.manifest.completedAt)
-      - Date.parse(left.manifest.completedAt);
+    const timeDifference = Date.parse(completionTimes.get(right.manifest.operationId))
+      - Date.parse(completionTimes.get(left.manifest.operationId));
     return timeDifference || right.manifest.operationId.localeCompare(left.manifest.operationId);
   });
   const retained = new Set(completed.slice(0, MAX_COMPLETED_QUEUE_COMPACTION_RECEIPTS)
@@ -921,24 +927,26 @@ function writeQueueOperation(root, operation) {
 }
 
 function completeQueueOperation(root, lease, operation, manifestFile) {
-  currentFence(lease, () => appendAuditOnce(root, {
+  const proposedCompletedAt = new Date().toISOString();
+  const completionAudit = currentFence(lease, () => appendAuditOnce(root, {
     schemaVersion: 1,
     eventId: crypto.randomUUID(),
     operationId: operation.operationId,
     type: 'queue-compacted',
-    recordedAt: new Date().toISOString(),
+    recordedAt: proposedCompletedAt,
     leaseId: lease.leaseId,
     fencingGeneration: lease.generation,
     beforeDigest: operation.beforeDigest,
     afterDigest: operation.afterDigest,
     removedEvents: operation.removedEvents,
   }));
+  const completedAt = queueCompletionAudit(operation, [completionAudit]).recordedAt;
   currentFence(lease, () => {
     const completed = {
       schemaVersion: 2,
       operationId: operation.operationId,
       status: 'completed',
-      completedAt: new Date().toISOString(),
+      completedAt,
       beforeDigest: operation.beforeDigest,
       afterDigest: operation.afterDigest,
       removedEvents: operation.removedEvents,
