@@ -4,14 +4,38 @@ import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import {
-  initializeRecoveryBackup, loadRecoveryHeader, recoveryFileList, restoreRecoveryBackup,
+  createRecoveryKeys, initializeRecoveryBackup, loadRecoveryHeader, recoveryFileList, restoreRecoveryBackup,
   restoreRecoveryBackupWithKey, rotateRecoveryPassphrase, unlockRecoveryKey, writeRecoveryBackup,
+  verifyReviewedRunArchive, writeReviewedRunArchive,
 } from './recoveryBackup.mjs';
 import * as recoveryBackup from './recoveryBackup.mjs';
 import crypto from 'node:crypto';
 
 const EXAMPLE_ENV = ['SECRET', 'example'].join('=') + '\n';
 const CHANGED_ENV = ['SECRET', 'dummy'].join('=') + '\n';
+
+test('reviewed run archives use the authenticated recovery-key boundary and detect tampering', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'scout-reviewed-archive-'));
+  const created = createRecoveryKeys('correct horse battery staple');
+  try {
+    const written = writeReviewedRunArchive(root, created.dataKey, {
+      schemaVersion: 1,
+      archiveId: 'a'.repeat(64),
+      reviewedSelectionDigest: 'b'.repeat(64),
+      runs: [{ runId: 'synthetic-run', files: [{ path: 'journal.jsonl', data: 'PRIVATE-JOURNAL' }] }],
+    });
+    assert.doesNotMatch(fs.readFileSync(written.file, 'utf8'), /synthetic-run|PRIVATE-JOURNAL/);
+    assert.equal(verifyReviewedRunArchive(written.file, created.dataKey).runs[0].runId, 'synthetic-run');
+    const record = JSON.parse(fs.readFileSync(written.file, 'utf8'));
+    const changed = Buffer.from(record.data, 'base64url');
+    changed[0] ^= 1;
+    record.data = changed.toString('base64url');
+    fs.writeFileSync(written.file, JSON.stringify(record));
+    assert.throws(() => verifyReviewedRunArchive(written.file, created.dataKey), /modified|invalid/i);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
 
 function fixture() {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'scout-recovery-'));

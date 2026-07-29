@@ -3,6 +3,7 @@ import path from 'node:path';
 import { assessmentRecoveryBoundary } from './assessmentBatches.mjs';
 import { projectRunManifest } from './runArtifacts.mjs';
 import { validateRunJournal } from './runJournal.mjs';
+import { measureRunStorage } from './runRetention.mjs';
 import { projectScanQueue } from './scanQueue.mjs';
 import { workspacePaths } from './workspace.mjs';
 
@@ -291,4 +292,48 @@ export function readPublicRunSummaries(root, { lease = null, now = new Date() } 
 
 export function readPublicScanQueue(root, now = new Date()) {
   return publicQueueSummary(projectScanQueue(root, now));
+}
+
+export function publicStoragePressure(measurement = {}, policy = {}) {
+  const maximumBytes = policy.maximumBytes || {};
+  const warningBytes = policy.warningBytes || {};
+  const warnings = [];
+  for (const area of ['runs', 'artifacts', 'queue']) {
+    const bytes = Number(measurement?.[area]?.bytes || 0);
+    if (Number.isFinite(Number(maximumBytes[area])) && bytes >= Number(maximumBytes[area])) {
+      warnings.push({ area, level: 'blocked' });
+    } else if (Number.isFinite(Number(warningBytes[area])) && bytes >= Number(warningBytes[area])) {
+      warnings.push({ area, level: 'warning' });
+    }
+  }
+  const totals = {
+    runs: {
+      bytes: Number(measurement?.runs?.bytes || 0),
+      count: Number(measurement?.runs?.count || 0),
+    },
+    artifacts: {
+      bytes: Number(measurement?.artifacts?.bytes || 0),
+      count: Number(measurement?.artifacts?.count || 0),
+    },
+    queue: {
+      bytes: Number(measurement?.queue?.bytes || 0),
+      events: Number(measurement?.queue?.events || 0),
+    },
+    totalBytes: Number(measurement?.totalBytes || 0),
+  };
+  return {
+    state: warnings.some((warning) => warning.level === 'blocked')
+      ? 'blocked'
+      : warnings.length ? 'warning' : 'healthy',
+    totals,
+    warnings,
+    recoveryCritical: {
+      count: Number(measurement?.recoveryCritical?.count || 0),
+      bytes: Number(measurement?.recoveryCritical?.bytes || 0),
+    },
+  };
+}
+
+export function readPublicStoragePressure(root, policy = {}) {
+  return publicStoragePressure(measureRunStorage(root), policy);
 }

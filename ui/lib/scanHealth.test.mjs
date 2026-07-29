@@ -5,7 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import {
   normaliseSourceHealth, parseScanRuns, publicQueueSummary, publicRunSummary,
-  readPublicRunSummaries, scanHealthFromText,
+  publicStoragePressure, readPublicRunSummaries, readPublicStoragePressure, scanHealthFromText,
 } from './scanHealth.mjs';
 
 test('parseScanRuns parses jsonl and reports bad lines', () => {
@@ -372,6 +372,50 @@ test('a corrupt run directory never publishes its unvalidated name', () => {
     const result = readPublicRunSummaries(root);
     assert.equal(result.runs[0].id, 'invalid-run');
     assert.doesNotMatch(JSON.stringify(result), /private-looking-prefix-secret|private-looking/i);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('storage pressure health reports separate bounded totals without private run identities', () => {
+  const pressure = publicStoragePressure({
+    runs: { bytes: 80, count: 3 },
+    artifacts: { bytes: 105, count: 4 },
+    queue: { bytes: 12, events: 2 },
+    totalBytes: 197,
+    recoveryCritical: { count: 2, bytes: 64, runIds: ['private-run-id'] },
+  }, {
+    warningBytes: { runs: 100, artifacts: 100, queue: 100 },
+    maximumBytes: { runs: 200, artifacts: 100, queue: 200 },
+  });
+
+  assert.deepEqual(pressure, {
+    state: 'blocked',
+    totals: {
+      runs: { bytes: 80, count: 3 },
+      artifacts: { bytes: 105, count: 4 },
+      queue: { bytes: 12, events: 2 },
+      totalBytes: 197,
+    },
+    warnings: [{ area: 'artifacts', level: 'blocked' }],
+    recoveryCritical: { count: 2, bytes: 64 },
+  });
+  assert.doesNotMatch(JSON.stringify(pressure), /private-run-id/);
+});
+
+test('scan health reads storage warnings from the private run store', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'scout-storage-health-'));
+  try {
+    const artifacts = path.join(root, '.scout', 'runs', 'private-run-id', 'artifacts');
+    fs.mkdirSync(artifacts, { recursive: true });
+    fs.writeFileSync(path.join(artifacts, 'large.json'), 'x'.repeat(16));
+    const health = readPublicStoragePressure(root, {
+      warningBytes: { runs: 100, artifacts: 10, queue: 100 },
+      maximumBytes: { runs: 200, artifacts: 20, queue: 200 },
+    });
+    assert.equal(health.state, 'warning');
+    assert.deepEqual(health.warnings, [{ area: 'artifacts', level: 'warning' }]);
+    assert.doesNotMatch(JSON.stringify(health), /private-run-id/);
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }

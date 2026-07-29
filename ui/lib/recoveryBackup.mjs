@@ -8,6 +8,7 @@ export const RECOVERY_DIR = '.scout-backup/v1';
 const HEADER = 'header.json';
 const BLOB_DIR = 'files';
 const INDEX_AAD = Buffer.from('scout-recovery-index-v1');
+const REVIEWED_RUN_ARCHIVE_AAD = Buffer.from('scout-reviewed-run-archive-v1');
 const PASSPHRASE_PREFIX = 'passphrase';
 const RECOVERY_PREFIX = 'SCOUT-1-';
 const MAX_HEADER_BYTES = 2 * 1024 * 1024;
@@ -198,6 +199,67 @@ function walk(root, relative, out) {
   if (stat.isDirectory()) {
     for (const name of fs.readdirSync(absolute)) walk(root, `${relative}/${name}`, out);
   } else if (stat.isFile()) out.push(relative);
+}
+
+function checkedReviewedRunArchive(payload) {
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload)
+    || payload.schemaVersion !== 1
+    || !/^[a-f0-9]{64}$/.test(payload.archiveId || '')
+    || !/^[a-f0-9]{64}$/.test(payload.reviewedSelectionDigest || '')
+    || !Array.isArray(payload.runs)) {
+    throw new Error('Reviewed run archive payload is invalid');
+  }
+  return payload;
+}
+
+/**
+ * Persist a reviewed run archive inside Scout's existing protected recovery
+ * boundary. The caller must supply the already-unlocked recovery data key;
+ * this module deliberately does not create a second credential store.
+ */
+export function writeReviewedRunArchive(workspaceRoot, dataKey, payload, { assertFence } = {}) {
+  if (!Buffer.isBuffer(dataKey) || dataKey.length !== 32) {
+    throw new Error('A protected archive sink with an unlocked recovery data key is required');
+  }
+  checkedReviewedRunArchive(payload);
+  checkFence(assertFence);
+  const directory = path.join(path.resolve(workspaceRoot), RECOVERY_DIR, 'run-archives');
+  fs.mkdirSync(directory, { recursive: true });
+  checkFence(assertFence);
+  const opaqueArchiveId = crypto.createHmac('sha256', dataKey)
+    .update(`run-archive:${payload.archiveId}`)
+    .digest('hex');
+  const file = path.join(directory, `${opaqueArchiveId}.json`);
+  const plaintext = Buffer.from(stableArchiveJson(payload), 'utf8');
+  const encrypted = aesEncrypt(dataKey, plaintext, REVIEWED_RUN_ARCHIVE_AAD);
+  atomicWrite(file, `${JSON.stringify(encrypted)}\n`);
+  checkFence(assertFence);
+  const verified = verifyReviewedRunArchive(file, dataKey);
+  if (stableArchiveJson(verified) !== plaintext.toString('utf8')) {
+    throw new Error('Reviewed run archive verification failed');
+  }
+  return { file, archiveId: payload.archiveId, bytes: fs.statSync(file).size };
+}
+
+function stableArchiveJson(value) {
+  if (Array.isArray(value)) return `[${value.map(stableArchiveJson).join(',')}]`;
+  if (value && typeof value === 'object') {
+    return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${stableArchiveJson(value[key])}`).join(',')}}`;
+  }
+  return JSON.stringify(value);
+}
+
+export function verifyReviewedRunArchive(file, dataKey) {
+  if (!Buffer.isBuffer(dataKey) || dataKey.length !== 32) {
+    throw new Error('A protected archive sink with an unlocked recovery data key is required');
+  }
+  try {
+    const record = JSON.parse(fs.readFileSync(file, 'utf8'));
+    const plaintext = aesDecrypt(dataKey, record, REVIEWED_RUN_ARCHIVE_AAD);
+    return checkedReviewedRunArchive(JSON.parse(plaintext.toString('utf8')));
+  } catch (error) {
+    throw new Error('Reviewed run archive is invalid or modified', { cause: error });
+  }
 }
 
 async function walkAsync(root, relative, out) {
