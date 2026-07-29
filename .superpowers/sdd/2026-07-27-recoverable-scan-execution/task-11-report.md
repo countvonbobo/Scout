@@ -163,3 +163,40 @@ Observed:
 ### Fix-round concerns
 
 - None open.
+
+## Fix round 2
+
+Scoped re-review found that the raw-diff object grammar accepted malformed
+lengths from 41 through 63 characters because it used `{40,64}`.
+
+### RED
+
+Command:
+
+`node --test --test-name-pattern="malformed or unmerged" ui/lib/workspaceSync.test.mjs`
+
+Result:
+
+- FAIL: 0/1.
+- The otherwise valid 41-digit raw addition was classified `overlapping`
+  instead of failing closed, proving that the parser accepted it.
+
+The fixture also explicitly checks valid 40- and 64-digit object IDs and an
+invalid 63-digit object ID.
+
+### Fix and GREEN
+
+- Replaced each object-ID range with an exact 40-or-64 lowercase hexadecimal
+  alternative.
+- `node --test --test-name-pattern="malformed or unmerged" ui/lib/workspaceSync.test.mjs`
+  - PASS: 1/1. Valid 40/64 records parse; malformed 41/63 records fail closed.
+- `node --test --test-name-pattern="disjoint additions and modifications" ui/lib/workspaceSync.test.mjs`
+  - PASS: 1/1, preserving real Git SHA-1 behaviour.
+- `node --check ui/lib/workspaceSync.mjs`
+  - PASS.
+- `git diff --check`
+  - PASS; only repository line-ending conversion notices were printed.
+
+### Fix-round concerns
+
+- None open.

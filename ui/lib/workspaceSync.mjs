@@ -442,7 +442,7 @@ function changedPaths(root, range, options = {}) {
   for (let index = 0; index < records.length;) {
     const header = records[index++];
     const match = header.match(
-      /^:([0-7]{6}) ([0-7]{6}) ([0-9a-f]{40,64}) ([0-9a-f]{40,64}) ([A-Z])(\d{0,3})$/,
+      /^:([0-7]{6}) ([0-7]{6}) ((?:[0-9a-f]{40}|[0-9a-f]{64})) ((?:[0-9a-f]{40}|[0-9a-f]{64})) ([A-Z])(\d{0,3})$/,
     );
     if (!match) return { ok: false, paths: [], complex: true };
     const [, oldMode, newMode, , , status, score] = match;

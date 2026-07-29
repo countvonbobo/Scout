@@ -859,6 +859,26 @@ test('malformed or unmerged raw diff metadata fails closed', async () => {
     assert.equal(unmerged.classification, 'manual-required');
     assert.match(unmerged.reason, /non-standard/i);
     assert.doesNotMatch(JSON.stringify(unmerged), /conflict\.json/i);
+
+    for (const length of [40, 64, 41, 63]) {
+      const objectId = 'a'.repeat(length);
+      const zeroId = '0'.repeat(length);
+      const header = `:000000 100644 ${zeroId} ${objectId} A`;
+      const analysis = analyseBackupDivergence(f.deviceTwo, {
+        spawn: (command, args, options) => (
+          args[0] === 'diff' && args.includes('--raw')
+            ? { status: 0, stdout: `${header}\0data/object-id.json\0`, stderr: '' }
+            : f.spawn(command, args, options)
+        ),
+      });
+      if (length === 40 || length === 64) {
+        assert.equal(analysis.classification, 'overlapping', `valid ${length}-digit object ID`);
+      } else {
+        assert.equal(analysis.classification, 'manual-required', `invalid ${length}-digit object ID`);
+        assert.match(analysis.reason, /could not be compared/i);
+      }
+      assert.doesNotMatch(JSON.stringify(analysis), /object-id\.json/i);
+    }
   } finally {
     fs.rmSync(f.base, { recursive: true, force: true });
   }
