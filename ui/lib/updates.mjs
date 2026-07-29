@@ -156,7 +156,25 @@ export function publicIsoTimestamp(value) {
   return Number.isNaN(milliseconds) ? null : new Date(milliseconds).toISOString();
 }
 
-export function publicDownloadedUpdate(downloaded) {
+export function publicUpdateLocationHint(name, {
+  env = process.env, platform = process.platform,
+} = {}) {
+  const packageName = String(name || '');
+  if (!/^Scout-\d+\.\d+\.\d+(?:-beta\.\d+)?-(?:windows-x64\.exe|macos-(?:arm64|x64)\.dmg|linux-x64\.(?:deb|tar\.gz))$/.test(packageName)) return null;
+  if (env.SCOUT_DEVICE_SETTINGS) {
+    return platform === 'win32'
+      ? 'the updates folder beside %SCOUT_DEVICE_SETTINGS%'
+      : 'the updates folder beside $SCOUT_DEVICE_SETTINGS';
+  }
+  if (platform === 'win32') {
+    const base = env.LOCALAPPDATA ? '%LOCALAPPDATA%' : '%USERPROFILE%\\AppData\\Local';
+    return `${base}\\Scout\\updates\\${packageName}`;
+  }
+  if (env.XDG_CONFIG_HOME) return `$XDG_CONFIG_HOME/Scout/updates/${packageName}`;
+  return `~/.config/Scout/updates/${packageName}`;
+}
+
+export function publicDownloadedUpdate(downloaded, options = {}) {
   if (!downloaded || typeof downloaded !== 'object') return null;
   const name = String(downloaded.name || '');
   const sha256 = String(downloaded.sha256 || '');
@@ -170,5 +188,8 @@ export function publicDownloadedUpdate(downloaded) {
       || path.basename(name) !== name
       || !/^[a-f0-9]{64}$/i.test(sha256)
       || !verifiedAt) return null;
-  return { name, sha256, version, verifiedAt };
+  return {
+    name, sha256, version, verifiedAt,
+    locationHint: publicUpdateLocationHint(name, options),
+  };
 }

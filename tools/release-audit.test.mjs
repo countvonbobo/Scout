@@ -264,7 +264,12 @@ test('allows only the exact documented VPS paths after release app wrapping', ()
 
 test('ignores documented placeholder credential assignments', () => {
   const root = fixture();
-  const example = [`${'API'}_KEY=replace-me`, `${'PASS'}WORD=<your-password>`].join('\n') + '\n';
+  const example = [
+    `${'API'}_KEY=replace-me`,
+    `${'ADZUNA'}_${'API'}_${'KEY'}=<your-api-key>`,
+    `${'PASS'}WORD=<your-password>`,
+    `${'GH'}_${'TOKEN'}: "\${{ github.token }}"`,
+  ].join('\n') + '\n';
   fs.writeFileSync(path.join(root, 'example.env'), example);
   const result = auditRelease({ root, trackedFiles: ['example.env'], buildDirs: [] });
   assert.equal(result.ok, true);
@@ -296,6 +301,9 @@ test('rejects quoted credential assignments containing whitespace without report
     ['password.env', `${'PASS'}${'WORD'}="a long private password"\n`],
     ['auth-token.yaml', `${'AUTH'}_${'TOKEN'}: "live token value 123456"\n`],
     ['api-key.env', `${'API'}_${'KEY'}='long private key value'\n`],
+    ['escaped-password.env', `${'PASS'}${'WORD'}="test\\"long private password"\n`],
+    ['doubled-api-key.yaml', `${'API'}_${'KEY'}: 'test''long private key value'\n`],
+    ['static-token.mjs', `const ${'auth'}${'Token'} = \`long private token value\`;\n`],
   ];
   for (const [relative, content] of cases) fs.writeFileSync(path.join(root, relative), content);
   const result = auditRelease({
@@ -311,6 +319,32 @@ test('rejects quoted credential assignments containing whitespace without report
   assert.equal(JSON.stringify(result.findings).includes('private password'), false);
   assert.equal(JSON.stringify(result.findings).includes('token value'), false);
   assert.equal(JSON.stringify(result.findings).includes('private key'), false);
+});
+
+test('rejects namespaced credential assignment families without flagging unrelated code tokens', () => {
+  const root = fixture();
+  const cases = [
+    ['adzuna.env', `${'ADZUNA'}_${'API'}_${'KEY'}="opaque live value 123456"\n`],
+    ['openai.env', `${'OPENAI'}_${'API'}_${'KEY'}=opaque-live-value-123456\n`],
+    ['database.env', `${'DB'}_${'PASS'}${'WORD'}='opaque database password'\n`],
+    ['refresh.env', `${'REFRESH'}_${'TOKEN'}="opaque refresh value"\n`],
+    ['bearer.env', `${'SERVICE'}_${'BEARER'}_${'TOKEN'}="opaque bearer value"\n`],
+    ['identity.env', `${'ID'}_${'TOKEN'}="opaque identity value"\n`],
+    ['session.env', `${'SESSION'}_${'TOKEN'}="opaque session value"\n`],
+    ['quoted-key.yaml', `"${'SERVICE'}_${'TOKEN'}": "opaque quoted key value"\n`],
+  ];
+  for (const [relative, content] of cases) fs.writeFileSync(path.join(root, relative), content);
+  fs.writeFileSync(path.join(root, 'source.mjs'), "const cancellationToken = operation.signal;\nconst csrfToken = `csrf-${provider}`;\n");
+  const result = auditRelease({
+    root,
+    trackedFiles: [...cases.map(([relative]) => relative), 'source.mjs'],
+    buildDirs: [],
+  });
+  assert.equal(result.ok, false);
+  assert.deepEqual(result.findings.map(({ file, rule }) => ({ file, rule })), cases.map(([file]) => ({
+    file,
+    rule: 'secret-assignment',
+  })).sort((a, b) => a.file.localeCompare(b.file, 'en')));
 });
 
 test('checks every sensitive assignment on a line and rejects bearer and provider tokens', () => {

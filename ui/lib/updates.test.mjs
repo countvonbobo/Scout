@@ -6,7 +6,7 @@ import path from 'node:path';
 import test from 'node:test';
 import {
   checkForUpdate, compareVersions, downloadVerifiedUpdate, packageName, parseChecksums,
-  publicDownloadedUpdate, publicIsoTimestamp,
+  publicDownloadedUpdate, publicIsoTimestamp, publicUpdateLocationHint,
 } from './updates.mjs';
 
 function streamedResponse(chunks, headers = {}) {
@@ -36,12 +36,13 @@ test('download projection never exposes its device-local absolute path', () => {
     sha256: 'a'.repeat(64),
     version: '0.1.0-beta.23',
     verifiedAt: '2026-07-29T10:00:00.000Z',
-  });
+  }, { env: { LOCALAPPDATA: 'SYNTHETIC_LOCAL_APP_DATA' }, platform: 'win32' });
   assert.deepEqual(projected, {
     name: 'Scout-0.1.0-beta.23-windows-x64.exe',
     sha256: 'a'.repeat(64),
     version: '0.1.0-beta.23',
     verifiedAt: '2026-07-29T10:00:00.000Z',
+    locationHint: '%LOCALAPPDATA%\\Scout\\updates\\Scout-0.1.0-beta.23-windows-x64.exe',
   });
   assert.equal('path' in projected, false);
   assert.equal(publicDownloadedUpdate({
@@ -62,6 +63,19 @@ test('download projection never exposes its device-local absolute path', () => {
     null,
   );
   assert.equal(publicIsoTimestamp('2026-07-29T10:00:00Z'), '2026-07-29T10:00:00.000Z');
+  assert.equal(
+    publicUpdateLocationHint('Scout-0.1.0-beta.23-linux-x64.deb', {
+      env: { XDG_CONFIG_HOME: 'SYNTHETIC_XDG_CONFIG' }, platform: 'linux',
+    }),
+    '$XDG_CONFIG_HOME/Scout/updates/Scout-0.1.0-beta.23-linux-x64.deb',
+  );
+  assert.equal(
+    publicUpdateLocationHint('Scout-0.1.0-beta.23-macos-arm64.dmg', {
+      env: { SCOUT_DEVICE_SETTINGS: 'SYNTHETIC_SETTINGS' }, platform: 'darwin',
+    }),
+    'the updates folder beside $SCOUT_DEVICE_SETTINGS',
+  );
+  assert.equal(publicUpdateLocationHint('Private-Person.exe'), null);
 });
 
 test('update check selects a newer verified Scout release and device package', async () => {

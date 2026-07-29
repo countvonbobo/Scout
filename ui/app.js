@@ -2949,8 +2949,8 @@ const Scout = {
         try {
           const response = await fetch('/api/update/download', { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' });
           const result = await response.json(); if (!response.ok) throw new Error(result.error || 'Download failed');
-          if (!result.downloaded?.name || !result.downloaded?.version) throw new Error('Downloaded package response was incomplete');
-          copy.textContent = `Scout ${result.downloaded.version} is verified. Close Scout, then run ${result.downloaded.name} from your configured update download folder.`;
+          if (!result.downloaded?.name || !result.downloaded?.version || !result.downloaded?.locationHint) throw new Error('Downloaded package response was incomplete');
+          copy.textContent = `Scout ${result.downloaded.version} is verified. Close Scout, then run ${result.downloaded.name}. Find it at ${result.downloaded.locationHint}.`;
           download.remove();
         } catch (error) { copy.textContent = `Update download failed: ${error.message}`; download.disabled = false; download.textContent = 'Try again'; }
       });

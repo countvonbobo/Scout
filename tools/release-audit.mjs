@@ -7,7 +7,7 @@ import { isMainModule } from '../ui/lib/mainModule.mjs';
 
 const DEFAULT_BUILD_DIRS = ['dist', path.join('installer', 'output')];
 const IGNORED_DIRECTORY_NAMES = new Set(['.git', 'node_modules']);
-const PLACEHOLDER = /^(?:change-?me|dummy|example|fake|not-?set|placeholder|redacted|replace-?me|test|todo|your[-_][a-z0-9_-]+|<[^>\r\n]+>|\$\{[A-Z][A-Z0-9_]*\})$/i;
+const PLACEHOLDER = /^(?:change-?me|dummy|example|fake|not-?set|placeholder|redacted|replace-?me|test|todo|your[-_][a-z0-9_-]+|<[^>\r\n]+>|\$\{[A-Z][A-Z0-9_]*\}|\$\{\{\s*[A-Z][A-Z0-9_.-]*\s*\}\})$/i;
 
 const SECRET_RULES = Object.freeze([
   { id: 'private-key', regex: /-----BEGIN (?:RSA |EC |OPENSSH |DSA )?PRIVATE KEY-----/g },
@@ -61,23 +61,61 @@ function isPlaceholder(value) {
   return PLACEHOLDER.test(String(value).trim().replace(/^['"]|['"]$/g, ''));
 }
 
+function sensitiveAssignmentKey(key) {
+  const text = String(key);
+  const normal = text.replace(/[^a-z0-9]/gi, '').toLocaleLowerCase('en-US');
+  const specificSuffixes = [
+    'apikey', 'accesstoken', 'authtoken', 'bearertoken', 'clientsecret',
+    'idtoken', 'password', 'refreshtoken', 'sessiontoken',
+  ];
+  if (specificSuffixes.some((suffix) => normal.endsWith(suffix))) return true;
+  if (normal === 'secret' || normal === 'token') return true;
+  return /^[A-Z][A-Z0-9_-]+$/.test(text)
+    && (normal.endsWith('secret') || normal.endsWith('token'));
+}
+
+function boundedQuotedLiteral(remainder, quote) {
+  let value = '';
+  for (let i = 1; i < remainder.length && i <= 4097; i += 1) {
+    const character = remainder[i];
+    if (character === '\\') {
+      if (i + 1 >= remainder.length) return { invalid: true };
+      value += character + remainder[i + 1];
+      i += 1;
+      continue;
+    }
+    if (character === quote) {
+      if (i > 1 && remainder[i + 1] === quote) {
+        value += quote + quote;
+        i += 1;
+        continue;
+      }
+      return { value };
+    }
+    value += character;
+  }
+  return { invalid: true };
+}
+
 function secretAssignmentFindings(text) {
   const findings = [];
   const lines = text.split(/\r?\n/);
-  const assignment = /\b(?:api[_-]?key|access[_-]?token|auth[_-]?token|client[_-]?secret|password|secret|token)\b\s*[:=]\s*/gi;
+  const assignment = /(?<![A-Za-z0-9_])(["']?)([A-Za-z][A-Za-z0-9_-]{1,80})\1\s*[:=]\s*/g;
   for (let i = 0; i < lines.length; i += 1) {
     for (const match of lines[i].matchAll(assignment)) {
+      if (!sensitiveAssignmentKey(match[2])) continue;
       const remainder = lines[i].slice((match.index || 0) + match[0].length);
-      const quote = remainder[0] === '"' || remainder[0] === "'" ? remainder[0] : null;
-      const closingQuote = quote ? remainder.indexOf(quote, 1) : -1;
-      if (quote && (closingQuote === -1 || closingQuote > 4097)) {
+      const quote = ['"', "'", '`'].includes(remainder[0]) ? remainder[0] : null;
+      const literal = quote ? boundedQuotedLiteral(remainder, quote) : null;
+      if (literal?.invalid) {
         findings.push({ line: i + 1, rule: 'secret-assignment' });
         continue;
       }
       const value = quote
-        ? remainder.slice(1, closingQuote)
+        ? literal.value
         : remainder.match(/^[^\s'";#]{8,}/)?.[0];
       if (!value || value.length < 8) continue;
+      if (quote === '`' && value.includes('${')) continue;
       // Unquoted expressions and property references are code, not embedded
       // credentials. Quoted literals are always checked; unquoted values must
       // resemble a literal rather than `env.KEY`, `portal.token`, or a call.

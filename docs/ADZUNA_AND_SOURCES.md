@@ -8,7 +8,7 @@ Create an application through Adzuna's official developer portal and obtain an a
 
 ```dotenv
 ADZUNA_APP_ID=replace_with_your_app_id
-ADZUNA_API_KEY=replace_with_your_api_key
+ADZUNA_API_KEY=<your-api-key>
 ```
 
 Do not commit `.env`, paste keys into chat, or add them to `workspace.json`. Test availability with:
