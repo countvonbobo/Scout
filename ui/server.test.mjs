@@ -721,30 +721,49 @@ test('remote pages and APIs require the configured Tailscale owner', async () =>
 });
 
 test('Codex deep-link capability is device-local, bounded and private', async () => {
+  const settingsFile = process.env.SCOUT_DEVICE_SETTINGS;
+  const previousSettings = fs.existsSync(settingsFile) ? fs.readFileSync(settingsFile) : null;
+  const previousInspector = codexDeepLinkDetection.inspect;
   let inspections = 0;
-  codexDeepLinkDetection.inspect = async () => {
-    inspections += 1;
-    return {
-      registered: false,
-      registryPath: 'HKCU\\Software\\Classes\\codex',
-      executable: ['C:', 'Users', 'private', 'Codex.exe'].join('\\'),
-      error: `person@example.test token=${'secret'}`,
+  try {
+    fs.writeFileSync(settingsFile, JSON.stringify({
+      schemaVersion: 3,
+      remoteAccess: {
+        enabled: true,
+        ownerLogin: 'owner@example.com',
+        origin: 'https://scout-host.example.ts.net',
+        httpsPort: 443,
+        managedMapping: { protocol: 'https', port: 443, target: 'http://127.0.0.1:8459' },
+      },
+    }));
+    codexDeepLinkDetection.inspect = async () => {
+      inspections += 1;
+      return {
+        registered: false,
+        registryPath: 'HKCU\\Software\\Classes\\codex',
+        executable: ['C:', 'Users', 'private', 'Codex.exe'].join('\\'),
+        error: `person@example.test token=${'secret'}`,
+      };
     };
-  };
-  const local = await request({ path: '/api/device/codex-deep-link' });
-  assert.equal(local.status, 200);
-  const localBody = JSON.parse(local.text);
-  assert.equal(localBody.state, 'unavailable');
-  assert.equal(localBody.canAttempt, false);
-  assert.doesNotMatch(local.text, /registry|Users|person@|token|executable|error/i);
+    const local = await request({ path: '/api/device/codex-deep-link' });
+    assert.equal(local.status, 200);
+    const localBody = JSON.parse(local.text);
+    assert.equal(localBody.state, 'unavailable');
+    assert.equal(localBody.canAttempt, false);
+    assert.doesNotMatch(local.text, /registry|Users|person@|token|executable|error/i);
 
-  const remote = await request({
-    path: '/api/device/codex-deep-link',
-    headers: { host: 'scout-host.example.ts.net', 'tailscale-user-login': 'owner@example.com' },
-  });
-  assert.equal(remote.status, 200);
-  assert.equal(JSON.parse(remote.text).state, 'remote');
-  assert.equal(inspections, 1);
+    const remote = await request({
+      path: '/api/device/codex-deep-link',
+      headers: { host: 'scout-host.example.ts.net', 'tailscale-user-login': 'owner@example.com' },
+    });
+    assert.equal(remote.status, 200);
+    assert.equal(JSON.parse(remote.text).state, 'remote');
+    assert.equal(inspections, 1);
+  } finally {
+    codexDeepLinkDetection.inspect = previousInspector;
+    if (previousSettings) fs.writeFileSync(settingsFile, previousSettings);
+    else fs.rmSync(settingsFile, { force: true });
+  }
 });
 
 test('Codex handler inspection uses only fixed read-only platform commands', async () => {
