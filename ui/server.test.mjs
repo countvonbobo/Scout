@@ -16,7 +16,8 @@ const {
   canAutoDownloadUpdate, checkStartupProviderHealth, confirmProviderLoginHealth, createRuntimeProviderHealthMonitor,
   codexDeepLinkDetection, computeUiBuildId, createServer,
   inspectCodexDeepLinkHandler, operations, providerDetection, providerLoginControl,
-  publicApiError, publicDeviceSettings, publicProviderStatus, requestAccess, restartControl, shutdownControl,
+  publicApiError, publicCvImportError, publicDeviceSettings, publicProviderStatus,
+  publicSetupConfigError, requestAccess, restartControl, shutdownControl,
 } = await import('./server.mjs');
 const { seedWorkspace, loadWorkspaceConfig, workspacePaths, writeWorkspaceConfig } = await import('./lib/workspace.mjs');
 const { profileFingerprint } = await import('./lib/searchProfile.mjs');
@@ -178,6 +179,38 @@ test('API exception projection uses fixed public copy and never returns diagnost
     reasonCode: 'request-failed',
   });
   assert.doesNotMatch(JSON.stringify(projected), /Users|id_ed25519|PRIVATE-SECRET|token/i);
+});
+
+test('setup and CV exception projections expose only fixed actionable classifications', () => {
+  assert.deepEqual(
+    publicSetupConfigError(new Error('workspace triage.checkScore cannot exceed actionScore')),
+    {
+      error: 'Check score cannot exceed action score.',
+      reasonCode: 'invalid-triage-thresholds',
+    },
+  );
+  assert.deepEqual(
+    publicCvImportError(new Error('PDF contains little or no selectable text; scanned PDFs need OCR before import')),
+    {
+      error: 'This PDF contains little or no selectable text. Scanned PDFs need OCR before import.',
+      reasonCode: 'pdf-needs-ocr',
+    },
+  );
+  const privateDiagnostic = `PDF could not be read: failed at ${['', 'Users', 'private', 'cv.pdf'].join('/')} token=${['PRIVATE', 'SECRET'].join('-')}`;
+  const unreadable = publicCvImportError(new Error(privateDiagnostic));
+  assert.deepEqual(unreadable, {
+    error: 'PDF could not be read. Export it again or choose another PDF.',
+    reasonCode: 'pdf-unreadable',
+  });
+  assert.doesNotMatch(JSON.stringify(unreadable), /Users|PRIVATE-SECRET|token/i);
+  assert.deepEqual(publicSetupConfigError(new Error(privateDiagnostic)), {
+    error: 'Setup settings could not be saved.',
+    reasonCode: 'request-failed',
+  });
+  assert.deepEqual(publicCvImportError(new Error(privateDiagnostic.replace('PDF could not be read:', 'unknown:'))), {
+    error: 'CV import could not be completed.',
+    reasonCode: 'request-failed',
+  });
 });
 
 test('device status omits persisted paths and remote update checks cannot auto-download', () => {

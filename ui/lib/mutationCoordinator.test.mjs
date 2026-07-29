@@ -520,6 +520,14 @@ test('run-log recipes project funnel counters without copying nested source pros
   const privateBody = 'Unlabelled provider response containing a complete candidate history.';
   const recipe = runLogAppendRecipe({
     timestamp: '2026-07-28T09:00:00.000Z',
+    discarded: {
+      hard_exclusion: 1,
+      mandatory_unmet: 2,
+      below_threshold: 3,
+      provider_discarded: 4,
+      advert_closed: 5,
+      private_counter: 999,
+    },
     funnel: {
       sourceRecords: 1,
       selected: 1,
@@ -558,4 +566,22 @@ test('run-log recipes project funnel counters without copying nested source pros
     assessed: 1,
     assessmentFailed: 0,
   });
+  assert.deepEqual(recipe.record.discarded, {
+    hard_exclusion: 1,
+    mandatory_unmet: 2,
+    below_threshold: 3,
+    provider_discarded: 4,
+    advert_closed: 5,
+  });
+  assert.deepEqual(scanReportRecipe({
+    date: '2026-07-28',
+    discarded: {
+      hard_exclusion: 1,
+      mandatory_unmet: 2,
+      below_threshold: 3,
+      provider_discarded: 4,
+      advert_closed: 5,
+      private_counter: 999,
+    },
+  }).model.discarded, recipe.record.discarded);
 });

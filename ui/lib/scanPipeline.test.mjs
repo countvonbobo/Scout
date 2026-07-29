@@ -951,9 +951,9 @@ test('a blocked queued provider is skipped while the next healthy provider still
               id,
               key: id,
               requestedAt,
-              expiresAt: '2026-07-28T10:00:00.000Z',
+              expiresAt: new Date(new Date(requestedAt).getTime() + 12 * 60 * 60 * 1000).toISOString(),
               requester: 'scheduled',
-              windowAt: '2026-07-27T10:00:00.000Z',
+              windowAt: '2026-07-28T10:00:00.000Z',
               purpose: 'manual-discovery',
               compatibility: queueCompatibility,
               lease,
@@ -2257,6 +2257,11 @@ test('provider health preflight durably abandons a blocked run before any scan w
       async finalize() { calls.push('finalize'); },
       async postTerminalSuccess() { calls.push('post-success'); },
       queue: {
+        compatibility: {
+          profileFingerprint: 'b'.repeat(64),
+          configFingerprint: 'c'.repeat(64),
+          schemaVersion: 1,
+        },
         async run() { throw new Error('queue drain should have no work'); },
         async cover() { calls.push('queue-cover'); },
       },

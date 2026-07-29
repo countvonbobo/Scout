@@ -158,6 +158,33 @@ export function publicApiError(fallback = 'Request could not be completed.', _er
   return { error: fallback, reasonCode: 'request-failed' };
 }
 
+export function publicSetupConfigError(error) {
+  if (String(error?.message || '') === 'workspace triage.checkScore cannot exceed actionScore') {
+    return {
+      error: 'Check score cannot exceed action score.',
+      reasonCode: 'invalid-triage-thresholds',
+    };
+  }
+  return publicApiError('Setup settings could not be saved.');
+}
+
+export function publicCvImportError(error) {
+  const message = String(error?.message || '');
+  if (message === 'PDF contains little or no selectable text; scanned PDFs need OCR before import') {
+    return {
+      error: 'This PDF contains little or no selectable text. Scanned PDFs need OCR before import.',
+      reasonCode: 'pdf-needs-ocr',
+    };
+  }
+  if (message.startsWith('PDF could not be read:')) {
+    return {
+      error: 'PDF could not be read. Export it again or choose another PDF.',
+      reasonCode: 'pdf-unreadable',
+    };
+  }
+  return publicApiError('CV import could not be completed.');
+}
+
 function sendText(res, status, type, text) {
   res.writeHead(status, { 'Content-Type': type, 'Content-Length': Buffer.byteLength(text) });
   res.end(text);
@@ -1544,7 +1571,7 @@ routes['POST /api/setup/config'] = (req, res, body) => {
     writeWorkspaceConfig(WORKSPACE_ROOT, next);
     void queueCheckpoint('update setup');
     return replyJson(res, 200, { ok: true, config: next });
-  } catch { return replyJson(res, 400, publicApiError('Setup settings could not be saved.')); }
+  } catch (error) { return replyJson(res, 400, publicSetupConfigError(error)); }
 };
 
 routes['POST /api/setup/complete'] = async (req, res, body) => {
@@ -1741,9 +1768,9 @@ routes['POST /api/setup/import-cv'] = (req, res, body) => {
     atomicWriteFile(extracted, `${text}\n`, { mode: 0o600 });
     void queueCheckpoint(`import cv - ${name}`);
     replyJson(res, 200, { ok: true, source: `imports/${name}`, extracted: `imports/${path.basename(extracted)}`, text });
-  }).catch((e) => {
+  }).catch((error) => {
     fs.rmSync(imported, { force: true });
-    replyJson(res, 400, publicApiError('CV import could not be completed.'));
+    replyJson(res, 400, publicCvImportError(error));
   });
 };
 

@@ -297,7 +297,10 @@ test('setup rejects inverted triage thresholds', async () => {
     body: { triage: { actionScore: 50, checkScore: 60 } },
   });
   assert.equal(response.status, 400);
-  assert.match(response.json.error, /checkScore cannot exceed actionScore/);
+  assert.deepEqual(response.json, {
+    error: 'Check score cannot exceed action score.',
+    reasonCode: 'invalid-triage-thresholds',
+  });
 });
 
 test('CV import rejects malformed base64', async () => {
@@ -351,7 +354,10 @@ test('CV import identifies image-only or text-empty PDFs as needing OCR', async 
     body: { name: 'scanned.pdf', base64: blankPdf().toString('base64') },
   });
   assert.equal(response.status, 400);
-  assert.match(response.json.error, /scanned PDFs need OCR/);
+  assert.deepEqual(response.json, {
+    error: 'This PDF contains little or no selectable text. Scanned PDFs need OCR before import.',
+    reasonCode: 'pdf-needs-ocr',
+  });
   assert.equal(fs.existsSync(path.join(workspace, 'imports', 'scanned.pdf')), false);
 });
 
@@ -361,7 +367,10 @@ test('CV import reports an unreadable PDF clearly', async () => {
     body: { name: 'malformed.pdf', base64: Buffer.from('%PDF-1.7\nnot a readable document').toString('base64') },
   });
   assert.equal(response.status, 400);
-  assert.match(response.json.error, /^PDF could not be read:/);
+  assert.deepEqual(response.json, {
+    error: 'PDF could not be read. Export it again or choose another PDF.',
+    reasonCode: 'pdf-unreadable',
+  });
   assert.equal(fs.existsSync(path.join(workspace, 'imports', 'malformed.pdf')), false);
 });
 

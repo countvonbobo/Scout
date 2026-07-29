@@ -12,6 +12,10 @@ const SAFE_OUTCOME = new Set([
   'kept', 'hard_exclusion', 'mandatory_unmet', 'below_threshold',
   'provider_discarded', 'advert_closed',
 ]);
+const DISCARDED_COUNTERS = [
+  'hard_exclusion', 'mandatory_unmet', 'below_threshold',
+  'provider_discarded', 'advert_closed',
+];
 const SCAN_TAGS = new Set([
   'Advert unavailable',
   'Check mandatory requirement',
@@ -72,6 +76,10 @@ function safeSelectionSummary(value) {
   return Object.fromEntries(SELECTION_COUNTERS
     .filter((key) => value?.[key] !== undefined)
     .map((key) => [key, number(value[key])]));
+}
+
+function safeDiscarded(value) {
+  return Object.fromEntries(DISCARDED_COUNTERS.map((key) => [key, number(value?.[key])]));
 }
 
 function canonicalUrl(value) {
@@ -213,9 +221,7 @@ function safeRunRecord(record) {
     keepers_added: number(record?.keepers_added),
     duplicates_collapsed: number(record?.duplicates_collapsed),
     keepers_updated: number(record?.keepers_updated),
-    discarded: Object.fromEntries(Object.entries(record?.discarded || {}).map(([key, value]) => [
-      code(key, 'other'), number(value),
-    ])),
+    discarded: safeDiscarded(record?.discarded),
     candidates_dropped: number(record?.candidates_dropped),
     candidates_dropped_by_source: Object.fromEntries(Object.entries(record?.candidates_dropped_by_source || {})
       .map(([key, value]) => [code(key, 'source'), number(value)])),
@@ -300,9 +306,7 @@ export function scanReportRecipe(model) {
         reasonCodes: (item?.reasonCodes || []).map((value) => code(value, 'check-required')).slice(0, 8),
       })),
       keeperCount: number(model.keeperCount),
-      discarded: Object.fromEntries(Object.entries(model.discarded || {}).map(([key, value]) => [
-        code(key, 'other'), number(value),
-      ])),
+      discarded: safeDiscarded(model.discarded),
       nearMisses: (model.nearMisses || []).map((item) => ({
         company: boundedLabel(item?.company, 120),
         role: boundedLabel(item?.role, 160),

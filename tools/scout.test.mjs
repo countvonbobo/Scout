@@ -187,6 +187,7 @@ test('runtime scan skips AI for a healthy empty source result and needs no Git r
 });
 
 test('runtime preflight labels manual and scheduled scans and never requeues a blocked window', async () => {
+  const nextScheduledWindow = new Date(Date.now() + 60 * 60 * 1000).toISOString();
   for (const scenario of [
     { requester: 'manual', purpose: 'manual-run' },
     {
@@ -194,7 +195,7 @@ test('runtime preflight labels manual and scheduled scans and never requeues a b
       purpose: 'scheduled-job',
       scheduleId: 'codex-primary',
       logicalWindowId: '2026-07-29T07:30:00.000Z',
-      windowAt: '2026-07-29T07:30:00.000Z',
+      windowAt: nextScheduledWindow,
     },
   ]) {
     const root = scanRoot();
@@ -475,7 +476,10 @@ test('a failed ranked scan retains its discovery engine and available orchestrat
   assert.equal(result.ok, false);
   assert.equal(result.scan.discovery_engine, 'ranked-discovery');
   assert.equal(result.scan.funnel.selected, 1);
-  assert.deepEqual(result.scan.selection.map((item) => item.url), ['https://example.test/failed-ranked']);
+  assert.deepEqual(
+    result.scan.explanations.filter((item) => item.selection_reason).map((item) => item.sourceUrl),
+    ['https://example.test/failed-ranked'],
+  );
   assert.equal(result.scan.profile_id, published.id);
   assert.equal(result.scan.discarded.hard_exclusion, 1);
   assert.deepEqual(
@@ -516,7 +520,10 @@ test('ranked second-pass candidates are renumbered and match persisted selection
   assert.equal(result.ok, true);
   assert.deepEqual(prompted.map((item) => item.candidateId), ['candidate-001']);
   assert.deepEqual(prompted.map((item) => item.url), ['https://example.test/baker']);
-  assert.deepEqual(result.scan.selection.map((item) => item.url), prompted.map((item) => item.url));
+  assert.deepEqual(
+    result.scan.explanations.filter((item) => item.selection_reason).map((item) => item.sourceUrl),
+    prompted.map((item) => item.url),
+  );
   assert.equal(result.scan.funnel.selected, prompted.length);
   assert.equal(result.scan.funnel.assessed, prompted.length);
 });
@@ -687,13 +694,15 @@ test('runtime scan records provider failure truthfully and always releases its l
   assert.equal(result.ok, false);
   assert.equal(result.status, 'failed');
   assert.equal(result.scan.degraded, true);
-  assert.deepEqual(result.scan.errors, ['all candidate assessments exhausted their bounded provider retries']);
+  assert.deepEqual(result.scan.errors, ['assessment-retries-exhausted']);
   assert.equal(released, true);
   const events = replayRunJournal(path.join(root, '.scout', 'runs', result.runId, 'journal.jsonl'));
   assert.equal(events.at(-1).type, 'run.completed');
   assert.equal(events.at(-1).payload.outcome, 'failed');
   assert.equal(fs.existsSync(path.join(root, '.scout', 'scan-lease.json')), false);
-  assert.match(fs.readFileSync(path.join(root, 'data', 'scan-runs.jsonl'), 'utf8'), /all candidate assessments exhausted/);
+  const persisted = fs.readFileSync(path.join(root, 'data', 'scan-runs.jsonl'), 'utf8');
+  assert.match(persisted, /assessment-retries-exhausted/);
+  assert.doesNotMatch(persisted, /all candidate assessments exhausted/);
 });
 
 test('runtime records a canonical failure when collection fails before finalization', async () => {
@@ -708,7 +717,8 @@ test('runtime records a canonical failure when collection fails before finalizat
 
     assert.equal(result.ok, false);
     assert.equal(result.status, 'failed');
-    assert.equal(result.scan.errors[0], 'synthetic collection failure');
+    assert.equal(result.error, 'synthetic collection failure');
+    assert.equal(result.scan.errors[0], 'redacted-diagnostic');
     const events = replayRunJournal(path.join(root, '.scout', 'runs', result.runId, 'journal.jsonl'));
     assert.equal(events.at(-1).type, 'run.completed');
     assert.equal(events.at(-1).payload.outcome, 'failed');
