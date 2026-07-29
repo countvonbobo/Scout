@@ -7,9 +7,9 @@ import { fileURLToPath } from 'node:url';
 import { afterEach, test } from 'node:test';
 import * as scanLeaseModule from './scanLease.mjs';
 import {
-  LeaseLostError, acquireScanLease, assertCurrentFence, currentLeaseOwner, readScanLease,
-  handoffScanLease, releaseScanLease, releaseScanLeaseByToken, renewScanLease, startLeaseHeartbeat,
-  synchronousFenceCallback,
+  LeaseLostError, acquireScanLease, assertCurrentFence, currentLeaseOwner,
+  darwinProcessStartIdentity, readScanLease, handoffScanLease, releaseScanLease,
+  releaseScanLeaseByToken, renewScanLease, startLeaseHeartbeat, synchronousFenceCallback,
 } from './scanLease.mjs';
 import { appendRunEvent, openRunJournal } from './runJournal.mjs';
 import {
@@ -528,6 +528,36 @@ test('a fenced run handle cannot redirect its journal file outside the canonical
   releaseScanLease(lease);
 });
 
+test('a not-yet-created journal remains contained through a symlinked workspace root', () => {
+  const physicalRoot = temp();
+  const linkedRoot = `${physicalRoot}-linked`;
+  fs.symlinkSync(physicalRoot, linkedRoot, process.platform === 'win32' ? 'junction' : 'dir');
+  roots.push(linkedRoot);
+  const lease = acquireScanLease(
+    linkedRoot,
+    currentLeaseOwner(),
+    operation('run-linked-workspace'),
+  );
+  const run = openRunJournal(linkedRoot, 'run-linked-workspace');
+
+  const event = appendRunEvent(run, {
+    type: 'stage.completed',
+    stageId: 'collect',
+    idempotencyKey: 'collect-linked-v1',
+    payload: { schemaVersion: 1, count: 0 },
+  }, lease);
+
+  assert.equal(event.runId, 'run-linked-workspace');
+  assert.equal(fs.realpathSync(run.file), path.join(
+    fs.realpathSync(physicalRoot),
+    '.scout',
+    'runs',
+    'run-linked-workspace',
+    'journal.jsonl',
+  ));
+  releaseScanLease(lease);
+});
+
 test('legacy acquisition and token-authorised release work in distinct processes', async () => {
   const root = temp();
   const acquired = await child(['legacy-acquire', root, 'legacy-cross-process']).result;
@@ -946,6 +976,42 @@ test('process-start identities include the platform boot or session boundary', (
   else if (process.platform === 'darwin') assert.match(identity, /^darwin-[A-Za-z0-9_-]+$/);
   else if (process.platform === 'win32') assert.match(identity, /^windows-\d+$/);
   else assert.match(identity, /^posix-[A-Za-z0-9_-]+$/);
+});
+
+test('Darwin process identity remains boot-bound when private kernel process data is unavailable', () => {
+  const spawn = (command, args) => {
+    assert.equal(command, 'sysctl');
+    if (args.join(' ') === '-n kern.boottime') {
+      return { status: 0, stdout: '{ sec = 1785142800, usec = 123456 } Tue Jul 28 09:00:00 2026\n' };
+    }
+    assert.equal(args[0], '-b');
+    assert.match(args[1], /^kern\.proc\.pid\.\d+$/);
+    return { status: 1, stdout: Buffer.alloc(0) };
+  };
+  const start = 'Tue Jul 28 10:11:12 2026';
+  const identity = darwinProcessStartIdentity(1234, start, {
+    spawn,
+    instanceStart: 1785143472123.456,
+  });
+
+  assert.match(identity, /^darwin-fallback-[a-f0-9]{32}-[a-f0-9]{32}$/);
+  assert.equal(identity, darwinProcessStartIdentity(1234, start, {
+    spawn,
+    instanceStart: 1785143472123.456,
+  }));
+  assert.notEqual(identity, darwinProcessStartIdentity(1234, start, {
+    spawn,
+    instanceStart: 1785143472123.789,
+  }), 'same-second PID reuse must receive a distinct owner identity');
+  assert.notEqual(identity, darwinProcessStartIdentity(1235, start, {
+    spawn,
+    instanceStart: 1785143472123.456,
+  }));
+  assert.notEqual(identity, darwinProcessStartIdentity(1234, 'Tue Jul 28 10:11:13 2026', {
+    spawn,
+    instanceStart: 1785143472123.456,
+  }));
+  assert.doesNotMatch(identity, /1785142800|1234|Jul|2026/);
 });
 
 test('remote-host stale ownership is preserved when liveness cannot be verified', async () => {

@@ -93,10 +93,28 @@ function legacyLockFile(root) {
 
 function canonicalPath(value, fileSystem = fs) {
   const resolved = path.resolve(value);
-  try {
-    return fileSystem.realpathSync.native?.(resolved) ?? fileSystem.realpathSync(resolved);
-  } catch {
-    return resolved;
+  const missing = [];
+  let candidate = resolved;
+  while (true) {
+    try {
+      const physical = fileSystem.realpathSync.native?.(candidate)
+        ?? fileSystem.realpathSync(candidate);
+      return path.join(physical, ...missing);
+    } catch (error) {
+      if (error?.code !== 'ENOENT') return resolved;
+      try {
+        // ENOENT from realpath can also mean a broken symlink. Never walk
+        // through an existing unresolved component when checking containment.
+        fileSystem.lstatSync(candidate);
+        return resolved;
+      } catch (statError) {
+        if (statError?.code !== 'ENOENT') return resolved;
+      }
+      const parent = path.dirname(candidate);
+      if (parent === candidate) return resolved;
+      missing.unshift(path.basename(candidate));
+      candidate = parent;
+    }
   }
 }
 
@@ -153,30 +171,55 @@ function sameOwner(left, right) {
     && left?.processStart === right?.processStart;
 }
 
-function darwinProcessStartIdentity(pid, formattedStart) {
-  const boot = spawnSync('sysctl', ['-n', 'kern.boottime'], {
-    encoding: 'utf8', timeout: 2_000,
-  });
-  const processInfo = spawnSync('sysctl', ['-b', `kern.proc.pid.${pid}`], {
-    encoding: null, timeout: 2_000, maxBuffer: 1024 * 1024,
-  });
-  if (boot.status !== 0 || !boot.stdout.trim()
-    || processInfo.status !== 0 || !Buffer.isBuffer(processInfo.stdout)) return null;
+export function darwinProcessStartIdentity(pid, formattedStart, {
+  spawn = spawnSync,
+  instanceStart = null,
+} = {}) {
+  if (!Number.isSafeInteger(pid) || pid < 1) return null;
   const seconds = Math.floor(Date.parse(formattedStart) / 1000);
   if (!Number.isSafeInteger(seconds)) return null;
+  const boot = spawn('sysctl', ['-n', 'kern.boottime'], {
+    encoding: 'utf8', timeout: 2_000, maxBuffer: 16 * 1024,
+  });
+  if (boot.status !== 0 || typeof boot.stdout !== 'string' || !boot.stdout.trim()) return null;
+  const processInfo = spawn('sysctl', ['-b', `kern.proc.pid.${pid}`], {
+    encoding: null, timeout: 2_000, maxBuffer: 1024 * 1024,
+  });
   const matches = [];
-  for (let offset = 0; offset <= processInfo.stdout.length - 16; offset += 1) {
-    if (Number(processInfo.stdout.readBigInt64LE(offset)) !== seconds) continue;
-    const microseconds = Number(processInfo.stdout.readBigInt64LE(offset + 8));
-    if (Number.isSafeInteger(microseconds) && microseconds >= 0 && microseconds < 1_000_000) {
-      matches.push(microseconds);
+  if (processInfo.status === 0 && Buffer.isBuffer(processInfo.stdout)) {
+    for (let offset = 0; offset <= processInfo.stdout.length - 16; offset += 1) {
+      if (Number(processInfo.stdout.readBigInt64LE(offset)) !== seconds) continue;
+      const microseconds = Number(processInfo.stdout.readBigInt64LE(offset + 8));
+      if (Number.isSafeInteger(microseconds) && microseconds >= 0 && microseconds < 1_000_000) {
+        matches.push(microseconds);
+      }
     }
   }
-  if (matches.length !== 1) return null;
-  const session = createHash('sha256')
-    .update(`${boot.stdout.trim()}\0${seconds}.${String(matches[0]).padStart(6, '0')}`)
-    .digest('hex');
-  return requireToken(`darwin-${session}`, 'process-start identity');
+  if (matches.length === 1) {
+    const session = createHash('sha256')
+      .update(`${boot.stdout.trim()}\0${seconds}.${String(matches[0]).padStart(6, '0')}`)
+      .digest('hex');
+    return requireToken(`darwin-${session}`, 'process-start identity');
+  }
+  const coarse = createHash('sha256')
+    .update(`${boot.stdout.trim()}\0${pid}\0${seconds}`)
+    .digest('hex')
+    .slice(0, 32);
+  if (!Number.isFinite(instanceStart)) {
+    return requireToken(`darwin-fallback-${coarse}`, 'process-start identity');
+  }
+  const instance = createHash('sha256')
+    .update(`${coarse}\0${instanceStart}`)
+    .digest('hex')
+    .slice(0, 32);
+  return requireToken(`darwin-fallback-${coarse}-${instance}`, 'process-start identity');
+}
+
+function darwinIdentity(identity) {
+  const fallback = /^darwin-fallback-([a-f0-9]{32})(?:-[a-f0-9]{32})?$/.exec(identity || '');
+  if (fallback) return { precision: 'fallback', coarse: fallback[1] };
+  if (/^darwin-[a-f0-9]{64}$/.test(identity || '')) return { precision: 'kernel' };
+  return null;
 }
 
 function processStartIdentity(pid) {
@@ -203,7 +246,9 @@ function processStartIdentity(pid) {
     const started = result.status === 0 ? result.stdout.trim() : '';
     if (!started) return null;
     if (process.platform === 'darwin') {
-      return darwinProcessStartIdentity(pid, started);
+      return darwinProcessStartIdentity(pid, started, {
+        instanceStart: pid === process.pid ? performance.timeOrigin : null,
+      });
     }
     return requireToken(`posix-${Buffer.from(started).toString('base64url')}`, 'process-start identity');
   } catch {
@@ -230,7 +275,21 @@ function ownerIsLive(owner) {
     return error?.code === 'EPERM';
   }
   const currentStart = processStartIdentity(owner.pid);
-  if (currentStart) return currentStart === owner.processStart;
+  if (currentStart) {
+    const recordedDarwin = darwinIdentity(owner.processStart);
+    const currentDarwin = darwinIdentity(currentStart);
+    // Kernel process metadata can become temporarily unavailable. A precision
+    // change is uncertainty, not proof that the live PID was reused.
+    if (recordedDarwin && currentDarwin
+      && recordedDarwin.precision !== currentDarwin.precision) return true;
+    // Other processes cannot observe Node's high-resolution time origin. The
+    // coarse component is used only to preserve a possibly-live stale guard;
+    // the full persisted identity still fences same-second PID reuse.
+    if (recordedDarwin?.precision === 'fallback' && currentDarwin?.precision === 'fallback') {
+      return recordedDarwin.coarse === currentDarwin.coarse;
+    }
+    return currentStart === owner.processStart;
+  }
   // If the platform cannot inspect another live process safely, preserve the
   // guard. A false live result delays recovery; a false dead result permits
   // simultaneous writers.

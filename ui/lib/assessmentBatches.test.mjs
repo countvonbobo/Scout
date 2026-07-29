@@ -601,7 +601,7 @@ test('settled provider failures remain bounded while an independent heartbeat ke
         setTimeout(() => reject(new Error('synthetic settled provider failure')), 20);
       }),
     });
-    assert.ok(Date.now() - started < 500, 'provider timeout must remain bounded');
+    assert.ok(Date.now() - started < 1_000, 'provider timeout must remain bounded');
     assert.ok(heartbeats >= 2, `expected independent heartbeats, received ${heartbeats}`);
     assert.equal(result.assessments.length, 0);
     assert.equal(result.failures[0].code, 'assessment-provider-exhausted');

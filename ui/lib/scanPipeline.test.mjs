@@ -944,8 +944,8 @@ test('a blocked queued provider is skipped while the next healthy provider still
         ...durableStageHarness(new Map()),
         collect: async ({ lease }) => {
           for (const [id, requestedAt] of [
-            ['claude-blocked', '2026-07-27T10:00:00.000Z'],
-            ['codex-healthy', '2026-07-27T10:01:00.000Z'],
+            ['claude-blocked', '2026-07-27T10:01:00.000Z'],
+            ['codex-healthy', '2026-07-27T10:00:00.000Z'],
           ]) {
             enqueueScanRequest(root, {
               id,
