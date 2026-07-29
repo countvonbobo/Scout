@@ -334,6 +334,23 @@ test('local provider status becomes a bounded privacy-safe health signal', () =>
     source: 'provider-operation',
   });
   assert.doesNotMatch(JSON.stringify(signal), /person@|Users|TOKEN|secret|version|attempts|executable|authMessage/);
+  assert.deepEqual(providerLocalHealthSignal({
+    installed: false,
+    authenticated: false,
+  }, { source: 'startup' }), {
+    kind: 'provider-failure',
+    source: 'startup',
+    reasonCode: 'provider-error',
+  });
+  assert.deepEqual(providerLocalHealthSignal({
+    installed: true,
+    authenticated: true,
+    capabilities: { structuredOutput: false },
+  }, { source: 'manual-preflight' }), {
+    kind: 'cli-update',
+    source: 'manual-preflight',
+    reasonCode: 'cli-update-required',
+  });
 });
 
 test('remote provider responses become distinct bounded signals without response bodies', () => {

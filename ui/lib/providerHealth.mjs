@@ -384,11 +384,11 @@ export function recordProviderHealth(root, provider, signal, {
     ...checkedSignal(signal, source ?? inferredSource(checkedPurpose), now),
     purpose: checkedPurpose,
   };
-  if (evidence.source !== 'provider-operation') {
+  if (lease === undefined && evidence.source !== 'provider-operation') {
     return persistRecord(root, provider, evidence);
   }
   if (!isScanLease(lease)) {
-    throw new LeaseLostError('a genuine current scan lease is required for provider-operation health evidence');
+    throw new LeaseLostError('a genuine current scan lease is required for fenced provider health evidence');
   }
   assertScanLeaseScope(lease, root, lease.runId);
   return assertCurrentFence(lease, synchronousFenceCallback(

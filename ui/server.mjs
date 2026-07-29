@@ -19,11 +19,12 @@ import {
   acquireScanLease, currentLeaseOwner, readScanLease, releaseScanLease, startLeaseHeartbeat,
 } from './lib/scanLease.mjs';
 import { scanEstimate } from './lib/scanEstimate.mjs';
-import { scheduleStatus, scheduleSummary } from './lib/scheduler.mjs';
+import { createProviderHealthMonitor, scheduleStatus, scheduleSummary } from './lib/scheduler.mjs';
 import { loadPortals, portalSummary } from './lib/ats.mjs';
 import { JOB_CATEGORIES } from './lib/filters.mjs';
 import { buildSourcePayload, sourceUrlOf, SourceCache } from './lib/source.mjs';
-import { assertSafeModel, detectProvidersAsync } from './lib/providers.mjs';
+import { assertSafeModel, detectProvidersAsync, providerLocalHealthSignal } from './lib/providers.mjs';
+import { providerPreflight } from './lib/providerHealth.mjs';
 import { doctor } from './lib/doctor.mjs';
 import { extractCvText } from './lib/cvImport.mjs';
 import { setupReadiness } from './lib/setupReadiness.mjs';
@@ -1539,6 +1540,20 @@ registerChatRoutes({ routes, repoRoot: WORKSPACE_ROOT, readTracker, onCheckpoint
 
 const isMain = isMainModule(import.meta.url);
 if (isMain) {
+  const runtimeProviderPreflight = async (root, provider, purpose, options = {}) => {
+    const status = (await detectProvidersAsync())[provider];
+    return providerPreflight(root, provider, purpose, {
+      ...options,
+      probe: async () => providerLocalHealthSignal(status, {
+        source: options.source,
+      }),
+    });
+  };
+  const providerHealthMonitor = createProviderHealthMonitor({
+    root: WORKSPACE_ROOT,
+    getScheduleJobs: () => loadWorkspaceConfig(WORKSPACE_ROOT).schedule?.jobs || [],
+    preflight: runtimeProviderPreflight,
+  });
   if (process.platform === 'win32') {
     try {
       const settings = loadDeviceSettings();
@@ -1564,7 +1579,22 @@ if (isMain) {
   });
   server.on('listening', () => {
     console.log(`Scout UI on http://127.0.0.1:${PORT}`);
-    if (workspaceInitialised()) void queueCheckpoint('startup sync');
+    if (workspaceInitialised()) {
+      void queueCheckpoint('startup sync');
+      const config = loadWorkspaceConfig(WORKSPACE_ROOT);
+      const configuredProviders = new Set([
+        config.ai?.provider,
+        ...(config.schedule?.jobs || [])
+          .filter((job) => job?.enabled === true)
+          .map((job) => job.provider),
+      ].filter((provider) => ['codex', 'claude'].includes(provider)));
+      for (const provider of configuredProviders) {
+        void runtimeProviderPreflight(WORKSPACE_ROOT, provider, 'startup', {
+          source: 'startup',
+        }).catch(() => {});
+      }
+      void providerHealthMonitor.runNow().catch(() => {});
+    }
   });
   server.listen(PORT, '127.0.0.1');
   const syncTimer = setInterval(() => { if (workspaceInitialised()) void queueCheckpoint('periodic sync'); }, 5 * 60 * 1000);

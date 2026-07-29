@@ -376,6 +376,12 @@ export function detectProviders(options) {
 // small allowlisted signal vocabulary, so conversion deliberately never copies
 // arbitrary input fields.
 export function providerLocalHealthSignal(status, { source = 'provider-operation' } = {}) {
+  if (status?.installed !== true) {
+    return healthSignal('provider-failure', source, 'provider-error');
+  }
+  if (status?.capabilities?.structuredOutput === false) {
+    return healthSignal('cli-update', source, 'cli-update-required');
+  }
   if (status?.authenticated === true) {
     return healthSignal('local-credentials-present', source);
   }

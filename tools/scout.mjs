@@ -10,7 +10,10 @@ import { fetchAdzuna, resolveAdzunaCredentials } from '../ui/lib/adzuna.mjs';
 import { fetchConfiguredPortals } from '../ui/lib/ats.mjs';
 import { fetchHiringCafe } from '../ui/lib/hiringCafe.mjs';
 import { loadEnv } from '../ui/lib/env.mjs';
-import { assertSafeModel, providerStatus } from '../ui/lib/providers.mjs';
+import {
+  assertSafeModel, providerLocalHealthSignal, providerRemoteHealthSignal, providerStatus,
+} from '../ui/lib/providers.mjs';
+import { providerPreflight, recordProviderHealth } from '../ui/lib/providerHealth.mjs';
 import { setupReadiness } from '../ui/lib/setupReadiness.mjs';
 import { runStructuredTurn } from '../ui/lib/structuredTurn.mjs';
 import {
@@ -330,7 +333,10 @@ export function migrateLegacyWorkspace(sourceRoot, targetRoot) {
   return { sourceRoot, targetRoot, verifiedFiles, committed: commit.status === 0, commitMessage: String(commit.stderr || commit.stdout || '').trim() };
 }
 
-export function assertScanReady(root, provider, { providerStatusFn = providerStatus } = {}) {
+export function assertScanReady(root, provider, {
+  providerStatusFn = providerStatus,
+  deferProviderHealth = false,
+} = {}) {
   const config = loadWorkspaceConfig(root);
   const tracker = readScanTracker(root);
   const selected = config.ai?.provider;
@@ -341,8 +347,9 @@ export function assertScanReady(root, provider, { providerStatusFn = providerSta
   }
   const requestedProviderReady = Boolean(providers[provider]?.installed && providers[provider]?.authenticated
     && providers[provider]?.capabilities?.structuredOutput !== false);
-  readiness.checks.requestedProvider = requestedProviderReady;
-  readiness.ready = readiness.ready && requestedProviderReady;
+  readiness.checks.provider = deferProviderHealth ? true : readiness.checks.provider;
+  readiness.checks.requestedProvider = deferProviderHealth ? true : requestedProviderReady;
+  readiness.ready = Object.values(readiness.checks).every(Boolean);
   const publishedProfile = loadPublishedSearchProfile(root);
   const profileReady = Boolean(publishedProfile || readiness.established);
   readiness.checks.searchProfile = profileReady;
@@ -365,7 +372,7 @@ export async function runScan(root, provider, mode, {
   queueWorkspaceSyncFn = queueWorkspaceSync,
 } = {}) {
   onProgress({ phase: 'Validating approved evidence', current: 1, total: 5 });
-  assertScanReadyFn(root, provider);
+  assertScanReadyFn(root, provider, { deferProviderHealth: true });
   const initial = await runScanWithFn(root, provider, mode, {
     onProgress, model, requester, windowAt, scheduleId, logicalWindowId, queueWorkspaceSyncFn,
   });
@@ -528,11 +535,12 @@ export async function runScanWith(root, provider, mode, {
   queueWorkspaceSyncFn = queueWorkspaceSync,
   heartbeatOptions = {},
   mutationHooks = {},
+  providerPreflightFn = providerPreflight,
+  recordProviderHealthFn = recordProviderHealth,
 } = {}) {
   if (!['codex', 'claude'].includes(provider)) throw new Error('provider must be codex or claude');
   if (!['primary', 'second-pass', 'broadened'].includes(mode)) throw new Error('mode must be primary, broadened or second-pass');
   const status = providerStatusFn(provider);
-  if (!status.installed || !status.authenticated) throw new Error(`${provider} is not installed and authenticated; run scout doctor`);
   const config = loadWorkspaceConfig(root);
   model = model === undefined
     ? (config.ai?.provider === provider ? assertSafeModel(config.ai?.model) : null)
@@ -603,6 +611,14 @@ export async function runScanWith(root, provider, mode, {
       stages,
       claimedLease,
       heartbeatOptions,
+      healthPreflight({ root: workspaceRoot, provider: selectedProvider, purpose, lease }) {
+        const source = requester === 'scheduled' ? 'scheduled-preflight' : 'manual-preflight';
+        return providerPreflightFn(workspaceRoot, selectedProvider, purpose, {
+          lease,
+          source,
+          probe: async () => providerLocalHealthSignal(status, { source }),
+        });
+      },
       prepare({ lease }) {
         assertCurrentFence(lease, synchronousFenceCallback(() => {
           syncManagedInstructions(APP_ROOT, root);
@@ -646,6 +662,8 @@ export async function runScanWith(root, provider, mode, {
             queueWorkspaceSyncFn,
             heartbeatOptions,
             mutationHooks,
+            providerPreflightFn,
+            recordProviderHealthFn,
           });
           if (queued.status === 'in-progress'
             && queued.reason === 'operator-intervention-required'
@@ -808,10 +826,25 @@ export async function runScanWith(root, provider, mode, {
                   repairInstruction,
                   JSON.stringify(context),
                 ].join('\n\n');
-                return runStructuredTurnFn({
+                const invocation = runStructuredTurnFn({
                   provider, status, schema: SCAN_ASSESSMENT_SCHEMA, prompt,
                   model, validate: (value) => value, timeoutMs, maxInputTokens,
                 });
+                void Promise.resolve(invocation).then(
+                  (remoteResult) => recordProviderHealthFn(
+                    root,
+                    provider,
+                    providerRemoteHealthSignal(remoteResult, { source: 'provider-operation' }),
+                    { lease, purpose: 'manual-run' },
+                  ),
+                  (error) => recordProviderHealthFn(
+                    root,
+                    provider,
+                    providerRemoteHealthSignal(error, { source: 'provider-operation' }),
+                    { lease, purpose: 'manual-run' },
+                  ),
+                ).catch(() => {});
+                return invocation;
               },
             });
             assessmentFailures = assessed.failures;
@@ -854,10 +887,18 @@ export async function runScanWith(root, provider, mode, {
     });
     if (!result) {
       const failure = durable.failures[0];
+      const providerBlocked = durable.outcome === 'abandoned'
+        && failure?.code === 'provider-health-blocked';
       result = {
         ok: false,
-        status: durable.outcome === 'queued' ? 'queued' : 'failed',
-        error: failure?.message || (failure?.code === 'lease-busy' ? 'another scan is already running' : 'durable scan pipeline failed'),
+        status: durable.outcome === 'queued' ? 'queued' : providerBlocked ? 'skipped' : 'failed',
+        ...(providerBlocked ? { reason: failure.reason } : {}),
+        error: failure?.message
+          || (failure?.code === 'lease-busy'
+            ? 'another scan is already running'
+            : providerBlocked
+              ? `${provider} provider health blocks this scan`
+              : 'durable scan pipeline failed'),
       };
     }
     const intervention = durable.outcome === 'in-progress'

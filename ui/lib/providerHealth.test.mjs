@@ -173,6 +173,15 @@ test('rejects scan-derived writes without a genuine current fence', (t) => {
     ),
     /genuine current scan lease/i,
   );
+  assert.throws(
+    () => recordProviderHealth(
+      root,
+      'codex',
+      signal('local-credentials-present', 0, 'manual-preflight'),
+      { purpose: 'manual-run', lease: {} },
+    ),
+    /genuine current scan lease/i,
+  );
   assert.equal(fs.existsSync(healthFile(root)), false);
 });
 

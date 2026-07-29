@@ -927,6 +927,91 @@ test('terminal release drains the next queued request under a newer genuine fenc
   }
 });
 
+test('a blocked queued provider is skipped while the next healthy provider still runs', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'scout-provider-health-queue-isolation-'));
+  const queueCompatibility = {
+    profileFingerprint: 'b'.repeat(64),
+    configFingerprint: 'c'.repeat(64),
+    schemaVersion: 1,
+  };
+  const healthChecks = [];
+  const stageCalls = [];
+  try {
+    const result = await runScanPipeline({
+      root,
+      compatibility: RECOVERY_COMPATIBILITY,
+      stages: {
+        ...durableStageHarness(new Map()),
+        collect: async ({ lease }) => {
+          for (const [id, requestedAt] of [
+            ['claude-blocked', '2026-07-27T10:00:00.000Z'],
+            ['codex-healthy', '2026-07-27T10:01:00.000Z'],
+          ]) {
+            enqueueScanRequest(root, {
+              id,
+              key: id,
+              requestedAt,
+              expiresAt: '2026-07-28T10:00:00.000Z',
+              requester: 'scheduled',
+              windowAt: '2026-07-27T10:00:00.000Z',
+              purpose: 'manual-discovery',
+              compatibility: queueCompatibility,
+              lease,
+            });
+          }
+          return { stageId: 'collect', stableIds: ['direct'] };
+        },
+      },
+      queue: {
+        compatibility: queueCompatibility,
+        now: new Date('2026-07-27T10:05:00.000Z'),
+        async run(request, context) {
+          const provider = request.id.startsWith('claude') ? 'claude' : 'codex';
+          const queued = await runScanPipeline({
+            root,
+            compatibility: { ...RECOVERY_COMPATIBILITY, provider },
+            claimedLease: context.lease,
+            healthPreflight({ provider: checkedProvider }) {
+              healthChecks.push(checkedProvider);
+              return checkedProvider === 'claude'
+                ? { ok: false, state: 'sign-in-required' }
+                : { ok: true, state: 'ready' };
+            },
+            stages: Object.fromEntries(DURABLE_STAGES.map((stageId) => [stageId, async () => {
+              stageCalls.push(`${provider}:${stageId}`);
+              return { stageId, stableIds: [`${provider}:${stageId}`] };
+            }])),
+          });
+          return queued.outcome === 'abandoned' ? 'skipped' : queued.outcome;
+        },
+      },
+    });
+
+    assert.equal(result.outcome, 'complete');
+    assert.deepEqual(healthChecks, ['claude', 'codex']);
+    assert.equal(stageCalls.some((call) => call.startsWith('claude:')), false);
+    assert.equal(stageCalls.filter((call) => call.startsWith('codex:')).length, DURABLE_STAGES.length);
+    assert.deepEqual(
+      projectScanQueue(root).requests.map((request) => [request.id, request.status]),
+      [['claude-blocked', 'skipped'], ['codex-healthy', 'succeeded']],
+    );
+    const journals = fs.readdirSync(path.join(root, '.scout', 'runs'))
+      .map((runId) => replayRunJournal(path.join(root, '.scout', 'runs', runId, 'journal.jsonl')));
+    const blocked = journals.find((events) => events.some((event) => (
+      event.type === 'run.failure-recorded'
+      && event.payload.code === 'provider-health-blocked'
+    )));
+    assert.deepEqual(blocked.map((event) => event.type), [
+      'run.started',
+      'run.failure-recorded',
+      'run.completed',
+    ]);
+    assert.equal(blocked.at(-1).payload.outcome, 'abandoned');
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test('idle startup drains older compatible FIFO work before beginning an unqueued run', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'scout-pipeline-startup-fifo-'));
   const queueCompatibility = {
@@ -1545,6 +1630,7 @@ test('semantic artifacts provide bounded readable assessment facts without compl
 test('fresh scan refuses storage pressure before its first lease, queue or journal append', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'scout-storage-refusal-'));
   let executions = 0;
+  let healthChecks = 0;
   try {
     await assert.rejects(
       runScanPipeline({
@@ -1555,11 +1641,16 @@ test('fresh scan refuses storage pressure before its first lease, queue or journ
           reserveBytes: 1,
         },
         stages: durableStageHarness(new Map()),
+        healthPreflight() {
+          healthChecks += 1;
+          return { ok: true, state: 'ready' };
+        },
         onStageCommitted() { executions += 1; },
       }),
       (error) => error?.code === 'SCOUT_STORAGE_PRESSURE',
     );
     assert.equal(executions, 0);
+    assert.equal(healthChecks, 0);
     assert.equal(fs.existsSync(path.join(root, '.scout', 'scan-lease.json')), false);
     assert.equal(fs.existsSync(path.join(root, '.scout', 'scan-queue.jsonl')), false);
     assert.equal(fs.existsSync(path.join(root, '.scout', 'runs')), false);
@@ -2076,6 +2167,66 @@ test('an explicit partial post-success result preserves scan success', async () 
       stage: 'post-success',
       reason: 'backup-needs-attention',
     }]);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('provider health preflight durably abandons a blocked run before any scan work', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'scout-provider-health-blocked-'));
+  const calls = [];
+  try {
+    const result = await runScanPipeline({
+      root,
+      compatibility: RECOVERY_COMPATIBILITY,
+      stages: Object.fromEntries(DURABLE_STAGES.map((stageId) => [stageId, async () => {
+        calls.push(stageId);
+        return { stageId, stableIds: [] };
+      }])),
+      async healthPreflight(context) {
+        calls.push('health');
+        assert.equal(context.root, root);
+        assert.equal(context.provider, 'codex');
+        assert.equal(context.purpose, 'manual-discovery');
+        assert.equal(context.lease.runId, context.runId);
+        return {
+          ok: false,
+          state: 'sign-in-required',
+          reason: 'remote-auth-failure',
+        };
+      },
+      async prepare() { calls.push('prepare'); },
+      async finalize() { calls.push('finalize'); },
+      async postTerminalSuccess() { calls.push('post-success'); },
+      queue: {
+        async run() { throw new Error('queue drain should have no work'); },
+        async cover() { calls.push('queue-cover'); },
+      },
+    });
+
+    assert.equal(result.outcome, 'abandoned');
+    assert.deepEqual(result.failures, [{
+      code: 'provider-health-blocked',
+      stage: 'initialise',
+      reason: 'sign-in-required',
+    }]);
+    assert.deepEqual(calls, ['health']);
+    const events = replayRunJournal(openRunJournal(root, result.runId).file);
+    assert.deepEqual(events.map((event) => event.type), [
+      'run.started',
+      'run.failure-recorded',
+      'run.completed',
+    ]);
+    assert.deepEqual(events[1].payload, {
+      schemaVersion: 1,
+      code: 'provider-health-blocked',
+      reason: 'sign-in-required',
+    });
+    assert.deepEqual(events[2].payload, {
+      schemaVersion: 1,
+      outcome: 'abandoned',
+    });
+    assert.equal(readScanLease(root), null);
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }

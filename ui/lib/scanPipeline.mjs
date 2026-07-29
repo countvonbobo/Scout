@@ -55,6 +55,17 @@ const SUCCESSFUL_QUEUE_OUTCOMES = new Set([
   'succeeded', 'succeeded-pending', 'succeeded-partial',
 ]);
 const OPERATOR_INTERVENTION_REASON = 'operator-intervention-required';
+const PROVIDER_HEALTH_STATES = new Set([
+  'checking',
+  'ready',
+  'credentials-present-unverified',
+  'sign-in-required',
+  'login-in-progress',
+  'network-unavailable',
+  'rate-limited',
+  'cli-update-required',
+  'provider-error',
+]);
 
 export class PipelineInterruptedError extends Error {
   constructor(message = 'scan pipeline was interrupted after a durable stage') {
@@ -455,6 +466,7 @@ export async function runScanPipeline({
   queue = null,
   claimedLease = null,
   storagePolicy = {},
+  healthPreflight = null,
 } = {}) {
   if (!root) throw new TypeError('scan pipeline workspace root is required');
   assertRunStorageWritable(root, storagePolicy);
@@ -466,6 +478,9 @@ export async function runScanPipeline({
   }
   if (postTerminalSuccess !== null && typeof postTerminalSuccess !== 'function') {
     throw new TypeError('scan pipeline post-success callback must be a function');
+  }
+  if (healthPreflight !== null && typeof healthPreflight !== 'function') {
+    throw new TypeError('scan pipeline health preflight must be a function');
   }
   const functions = stageFunctions(stages);
   const ownsLease = claimedLease === null;
@@ -577,163 +592,214 @@ export async function runScanPipeline({
   let mutationReceipt = null;
   let receiptIssue = 'mutation-receipt-missing';
   try {
-    const mayRecoverClaimedRun = !ownsLease && openRunJournal(root, provisionalRunId).events.length > 0;
-    const candidates = ownsLease || mayRecoverClaimedRun
-      ? pipelineRunCandidates(root, mayRecoverClaimedRun ? provisionalRunId : requestedRunId)
-      : [];
-    const selection = ownsLease || mayRecoverClaimedRun
-      ? selectRecoverableRun(candidates, compatibility, { root, lease })
-      : { candidate: null };
-    if (selection.candidate) {
-      if (ownsLease) {
-        lease = handoffScanLease(
-          lease,
-          pipelineOperation(selection.candidate.runId, compatibility, 'recover'),
-        );
-      }
-      recovery = recoverRun(root, selection.candidate.runId, lease, selection.decision);
-      run = openRunJournal(root, recovery.runId);
-      manifest = recovery.manifest;
-    } else {
-      run = openRunJournal(root, provisionalRunId);
-      appendRunEvent(run, {
-        type: 'run.started',
-        stageId: 'initialise',
-        idempotencyKey: 'run-started-v1',
-        payload: { schemaVersion: 1, compatibility },
-      }, lease);
-      manifest = validateManifestAgreement(run, lease).manifest;
-    }
-    heartbeat = startLeaseHeartbeat(lease, heartbeatOptions);
-    if (prepare !== null) await prepare({ run, lease });
-
-    const reusable = new Map((recovery?.reusableStages || []).map((stage) => [stage.stageId, stage]));
-    let priorArtifact = null;
-    for (const stageId of DURABLE_DISCOVERY_STAGES) {
-      const stage = functions.get(stageId);
-      if (reusable.has(stageId)) {
-        priorArtifact = recoveredStageData(reusable.get(stageId), stage);
-        outputs.set(stageId, priorArtifact);
-        continue;
-      }
-      const executed = plainStageData(await stage.execute({ run, lease, priorArtifact }), stageId);
-      const persisted = plainStageData(stage.encode(executed), stageId);
-      const durableValue = plainStageData(stage.decode(persisted), stageId);
-      const value = plainStageData(stage.transient(executed, durableValue), stageId);
-      const artifact = commitRunArtifact(run, {
-        id: `${stageId}-g${lease.generation}`,
-        schemaVersion: PIPELINE_STAGE_ARTIFACT_SCHEMA_VERSION,
-      }, {
-        schemaVersion: PIPELINE_STAGE_ARTIFACT_SCHEMA_VERSION,
-        stageId,
-        stableIds: stableIdsFor(stageId, durableValue),
-        data: persisted,
-      }, lease);
-      appendRunEvent(run, {
-        type: 'stage.completed',
-        stageId,
-        idempotencyKey: `${stageId}-completed-g${lease.generation}`,
-        payload: {
-          schemaVersion: 1,
-          reference: { kind: 'stage', id: stageId },
-          count: stableIdsFor(stageId, durableValue).length,
-          artifact,
-        },
-      }, lease);
-      manifest = validateManifestAgreement(run, lease).manifest;
-      priorArtifact = value;
-      outputs.set(stageId, value);
-      await onStageCommitted({ stageId, run, lease, artifact, manifest });
-    }
-    if (finalize !== null) {
-      if (typeof finalize !== 'function') throw new TypeError('scan pipeline finalizer must be a function');
-      const finalized = finalizationOutcome(await finalize({
-        run,
+    if (healthPreflight !== null) {
+      heartbeat = startLeaseHeartbeat(lease, heartbeatOptions);
+      const health = await healthPreflight({
+        root,
+        provider: compatibility.provider,
+        purpose: compatibility.purpose,
+        runId: provisionalRunId,
         lease,
-        stageOutputs: Object.freeze(Object.fromEntries(outputs)),
-      }));
-      outputs.set('finalize', finalized.result);
-      mutationReceipt = finalized.mutationReceipt;
-      receiptIssue = finalized.receiptIssue;
-      if (mutationReceipt) {
-        const existingReceipts = run.events.filter((event) => (
-          event.type === 'mutation.receipted'
-          && event.payload?.reference?.id === mutationReceipt.id
-        ));
-        if (existingReceipts.some((event) => event.payload?.reference?.kind !== 'mutation')
-          || existingReceipts.length > 1) {
-          throw new Error('scan mutation receipt authority is ambiguous');
+      });
+      if (health?.ok !== true) {
+        const state = PROVIDER_HEALTH_STATES.has(health?.state)
+          ? health.state
+          : 'provider-error';
+        const failure = Object.freeze({
+          code: 'provider-health-blocked',
+          stage: 'initialise',
+          reason: state,
+        });
+        failures.push(failure);
+        run = openRunJournal(root, provisionalRunId);
+        appendRunEvent(run, {
+          type: 'run.started',
+          stageId: 'initialise',
+          idempotencyKey: 'run-started-v1',
+          payload: { schemaVersion: 1, compatibility },
+        }, lease);
+        appendRunEvent(run, {
+          type: 'run.failure-recorded',
+          stageId: 'initialise',
+          idempotencyKey: `provider-health-blocked-g${lease.generation}`,
+          payload: {
+            schemaVersion: 1,
+            code: failure.code,
+            reason: failure.reason,
+          },
+        }, lease);
+        appendRunEvent(run, {
+          type: 'run.completed',
+          stageId: 'finalise',
+          idempotencyKey: `run-provider-health-blocked-g${lease.generation}`,
+          payload: { schemaVersion: 1, outcome: 'abandoned' },
+        }, lease);
+        manifest = validateManifestAgreement(run, lease).manifest;
+        terminal = true;
+      } else {
+        heartbeat.stop();
+        heartbeat = null;
+      }
+    }
+    if (!terminal) {
+      const mayRecoverClaimedRun = !ownsLease && openRunJournal(root, provisionalRunId).events.length > 0;
+      const candidates = ownsLease || mayRecoverClaimedRun
+        ? pipelineRunCandidates(root, mayRecoverClaimedRun ? provisionalRunId : requestedRunId)
+        : [];
+      const selection = ownsLease || mayRecoverClaimedRun
+        ? selectRecoverableRun(candidates, compatibility, { root, lease })
+        : { candidate: null };
+      if (selection.candidate) {
+        if (ownsLease) {
+          lease = handoffScanLease(
+            lease,
+            pipelineOperation(selection.candidate.runId, compatibility, 'recover'),
+          );
         }
-        const existingReceipt = existingReceipts[0];
-        if (existingReceipt && existingReceipt.payload.digest !== mutationReceipt.digest) {
-          throw new Error('scan mutation receipt conflicts with durable journal evidence');
-        }
-        if (!existingReceipt) {
-          appendRunEvent(run, {
-            type: 'mutation.receipted',
-            stageId: 'finalise',
-            idempotencyKey: `scan-mutation-receipt-g${lease.generation}`,
-            payload: {
-              schemaVersion: 1,
-              reference: { kind: 'mutation', id: mutationReceipt.id },
-              digest: mutationReceipt.digest,
-            },
-          }, lease);
-        }
+        recovery = recoverRun(root, selection.candidate.runId, lease, selection.decision);
+        run = openRunJournal(root, recovery.runId);
+        manifest = recovery.manifest;
+      } else {
+        run = openRunJournal(root, provisionalRunId);
+        appendRunEvent(run, {
+          type: 'run.started',
+          stageId: 'initialise',
+          idempotencyKey: 'run-started-v1',
+          payload: { schemaVersion: 1, compatibility },
+        }, lease);
         manifest = validateManifestAgreement(run, lease).manifest;
       }
-    }
+      heartbeat = startLeaseHeartbeat(lease, heartbeatOptions);
+      if (prepare !== null) await prepare({ run, lease });
 
-    appendRunEvent(run, {
-      type: 'run.completed',
-      stageId: 'finalise',
-      idempotencyKey: `run-completed-g${lease.generation}`,
-      payload: { schemaVersion: 1, outcome: 'complete' },
-    }, lease);
-    manifest = validateManifestAgreement(run, lease).manifest;
-    terminal = true;
-    if (typeof queue?.cover === 'function') {
-      try {
-        await queue.cover({ run, lease, manifest, mutationReceipt });
-      } catch {
-        failures.push(Object.freeze({
-          code: 'queue-coverage-pending',
-          stage: 'post-success',
-          reason: 'window-coverage-failed',
-        }));
+      const reusable = new Map((recovery?.reusableStages || []).map((stage) => [stage.stageId, stage]));
+      let priorArtifact = null;
+      for (const stageId of DURABLE_DISCOVERY_STAGES) {
+        const stage = functions.get(stageId);
+        if (reusable.has(stageId)) {
+          priorArtifact = recoveredStageData(reusable.get(stageId), stage);
+          outputs.set(stageId, priorArtifact);
+          continue;
+        }
+        const executed = plainStageData(await stage.execute({ run, lease, priorArtifact }), stageId);
+        const persisted = plainStageData(stage.encode(executed), stageId);
+        const durableValue = plainStageData(stage.decode(persisted), stageId);
+        const value = plainStageData(stage.transient(executed, durableValue), stageId);
+        const artifact = commitRunArtifact(run, {
+          id: `${stageId}-g${lease.generation}`,
+          schemaVersion: PIPELINE_STAGE_ARTIFACT_SCHEMA_VERSION,
+        }, {
+          schemaVersion: PIPELINE_STAGE_ARTIFACT_SCHEMA_VERSION,
+          stageId,
+          stableIds: stableIdsFor(stageId, durableValue),
+          data: persisted,
+        }, lease);
+        appendRunEvent(run, {
+          type: 'stage.completed',
+          stageId,
+          idempotencyKey: `${stageId}-completed-g${lease.generation}`,
+          payload: {
+            schemaVersion: 1,
+            reference: { kind: 'stage', id: stageId },
+            count: stableIdsFor(stageId, durableValue).length,
+            artifact,
+          },
+        }, lease);
+        manifest = validateManifestAgreement(run, lease).manifest;
+        priorArtifact = value;
+        outputs.set(stageId, value);
+        await onStageCommitted({ stageId, run, lease, artifact, manifest });
       }
-    }
-    if (postTerminalSuccess !== null) {
-      let postSuccessFailure = null;
-      if (!mutationReceipt) {
-        postSuccessFailure = Object.freeze({
-          code: 'backup-pending',
-          stage: 'post-success',
-          reason: receiptIssue,
-        });
-      } else {
-        try {
-          const postSuccess = postSuccessOutcome(
-            await postTerminalSuccess({ run, lease, manifest, mutationReceipt }),
-          );
-          if (postSuccess.status !== 'complete') {
-            postSuccessFailure = Object.freeze({
-              code: postSuccess.status === 'partial' ? 'backup-partial' : 'backup-pending',
-              stage: 'post-success',
-              reason: postSuccess.reason,
-            });
+      if (finalize !== null) {
+        if (typeof finalize !== 'function') throw new TypeError('scan pipeline finalizer must be a function');
+        const finalized = finalizationOutcome(await finalize({
+          run,
+          lease,
+          stageOutputs: Object.freeze(Object.fromEntries(outputs)),
+        }));
+        outputs.set('finalize', finalized.result);
+        mutationReceipt = finalized.mutationReceipt;
+        receiptIssue = finalized.receiptIssue;
+        if (mutationReceipt) {
+          const existingReceipts = run.events.filter((event) => (
+            event.type === 'mutation.receipted'
+            && event.payload?.reference?.id === mutationReceipt.id
+          ));
+          if (existingReceipts.some((event) => event.payload?.reference?.kind !== 'mutation')
+            || existingReceipts.length > 1) {
+            throw new Error('scan mutation receipt authority is ambiguous');
           }
+          const existingReceipt = existingReceipts[0];
+          if (existingReceipt && existingReceipt.payload.digest !== mutationReceipt.digest) {
+            throw new Error('scan mutation receipt conflicts with durable journal evidence');
+          }
+          if (!existingReceipt) {
+            appendRunEvent(run, {
+              type: 'mutation.receipted',
+              stageId: 'finalise',
+              idempotencyKey: `scan-mutation-receipt-g${lease.generation}`,
+              payload: {
+                schemaVersion: 1,
+                reference: { kind: 'mutation', id: mutationReceipt.id },
+                digest: mutationReceipt.digest,
+              },
+            }, lease);
+          }
+          manifest = validateManifestAgreement(run, lease).manifest;
+        }
+      }
+
+      appendRunEvent(run, {
+        type: 'run.completed',
+        stageId: 'finalise',
+        idempotencyKey: `run-completed-g${lease.generation}`,
+        payload: { schemaVersion: 1, outcome: 'complete' },
+      }, lease);
+      manifest = validateManifestAgreement(run, lease).manifest;
+      terminal = true;
+      if (typeof queue?.cover === 'function') {
+        try {
+          await queue.cover({ run, lease, manifest, mutationReceipt });
         } catch {
+          failures.push(Object.freeze({
+            code: 'queue-coverage-pending',
+            stage: 'post-success',
+            reason: 'window-coverage-failed',
+          }));
+        }
+      }
+      if (postTerminalSuccess !== null) {
+        let postSuccessFailure = null;
+        if (!mutationReceipt) {
           postSuccessFailure = Object.freeze({
             code: 'backup-pending',
             stage: 'post-success',
-            reason: 'backup-failed',
+            reason: receiptIssue,
           });
+        } else {
+          try {
+            const postSuccess = postSuccessOutcome(
+              await postTerminalSuccess({ run, lease, manifest, mutationReceipt }),
+            );
+            if (postSuccess.status !== 'complete') {
+              postSuccessFailure = Object.freeze({
+                code: postSuccess.status === 'partial' ? 'backup-partial' : 'backup-pending',
+                stage: 'post-success',
+                reason: postSuccess.reason,
+              });
+            }
+          } catch {
+            postSuccessFailure = Object.freeze({
+              code: 'backup-pending',
+              stage: 'post-success',
+              reason: 'backup-failed',
+            });
+          }
         }
-      }
-      if (postSuccessFailure) {
-        failures.push(postSuccessFailure);
-        manifest = recordPostSuccessFailure(run, lease, postSuccessFailure);
+        if (postSuccessFailure) {
+          failures.push(postSuccessFailure);
+          manifest = recordPostSuccessFailure(run, lease, postSuccessFailure);
+        }
       }
     }
   } catch (error) {
