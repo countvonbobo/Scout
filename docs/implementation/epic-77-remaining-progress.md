@@ -343,3 +343,36 @@ private paths, account data, CV content, adverts, prompts, or transcripts.
 - Findings fixed/open: all initial findings fixed; the fresh complete-range
   Spec, code-quality and privacy/security re-review verdicts remain required
   before final verification and publication.
+
+### Whole-epic review round 2
+
+- Verdicts:
+  - Spec FAIL: 0 Critical, 2 Important.
+  - Code quality FAIL: 0 Critical, 1 Important.
+  - Privacy/security FAIL: 0 Critical, 2 Important.
+- Review-fix commit: `7c9fcca` (`fix: harden publication privacy boundaries`).
+- Findings reproduced and fixed:
+  - remove broad credential-placeholder and plausible-username exemptions;
+    exact placeholders remain accepted while realistic `secret`, `private`
+    and `synthetic` credential values are rejected;
+  - recognise Windows private home paths with either separator and construct
+    all synthetic path/credential fixtures so tests never weaken production
+    matching;
+  - require configured personal markers when auditing generated
+    public-source publication output;
+  - reduce Git/sync failures to fixed status copy and allowlisted
+    `backup-offline`, `backup-error` and `git-unavailable` reason codes;
+  - project arbitrary API exceptions to fixed route copy, remove raw
+    exception details from update/setup/sync/CV/schedule surfaces, retain the
+    existing local-only update mutation guard, and omit device-local download
+    paths from update responses.
+- GREEN after fixes:
+  - release-audit/build and update suites: 38 passed, 0 failed, 0 skipped;
+  - generated public-source audit: passed with a configured synthetic marker;
+    the marker-free publication regression fails closed;
+  - default release audit: passed for 515 files;
+  - server suite: 48 discovered, 44 passed, with only the four documented
+    macOS process-start identity failures;
+  - diff checks: passed.
+- Findings fixed/open: all round-2 findings fixed; complete-range Spec,
+  code-quality and privacy/security re-review is pending.
