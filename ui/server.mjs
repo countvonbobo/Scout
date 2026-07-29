@@ -27,6 +27,7 @@ import { buildSourcePayload, sourceUrlOf, SourceCache } from './lib/source.mjs';
 import { assertSafeModel, detectProvidersAsync, providerLocalHealthSignal } from './lib/providers.mjs';
 import { providerPreflight } from './lib/providerHealth.mjs';
 import { createProviderLoginManager } from './lib/providerLogin.mjs';
+import { runStructuredTurn } from './lib/structuredTurn.mjs';
 import { doctor } from './lib/doctor.mjs';
 import { extractCvText } from './lib/cvImport.mjs';
 import { setupReadiness } from './lib/setupReadiness.mjs';
@@ -437,9 +438,45 @@ const providerLoginWorkingDirectory = fs.mkdtempSync(
 );
 fs.chmodSync(providerLoginWorkingDirectory, 0o700);
 
+export async function confirmProviderLoginHealth(provider, status, {
+  runStructuredTurnFn = runStructuredTurn,
+} = {}) {
+  try {
+    await runStructuredTurnFn({
+      provider,
+      status,
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        required: ['ready'],
+        properties: { ready: { const: true } },
+      },
+      prompt: 'Perform the fixed provider health check. Respond only with {"ready":true}.',
+      timeoutMs: 60_000,
+      maxInputTokens: 256,
+      validate(value) {
+        if (!value || value.ready !== true || Object.keys(value).join(',') !== 'ready') {
+          throw new Error('provider health confirmation is invalid');
+        }
+        return value;
+      },
+    });
+    return { kind: 'remote-success', source: 'post-auth' };
+  } catch (error) {
+    const kind = {
+      'authentication-required': 'remote-auth-failure',
+      'network-unavailable': 'network-failure',
+      'rate-limited': 'rate-limit',
+      'cli-update-required': 'cli-update',
+    }[error?.reasonCode] || 'provider-failure';
+    return { kind, source: 'post-auth' };
+  }
+}
+
 const runtimeProviderLoginManager = createProviderLoginManager({
   cwd: providerLoginWorkingDirectory,
   providerStatus: async (provider) => (await providerDetection.detect())[provider],
+  confirmProviderHealth: confirmProviderLoginHealth,
   onHealthSignal: async (provider, signal) => providerPreflight(
     WORKSPACE_ROOT,
     provider,
@@ -1015,7 +1052,7 @@ routes['POST /api/provider-login/retry'] = async (req, res, body) => {
     if (previous.provider !== value.provider || !PROVIDER_LOGIN_TERMINAL_STATES.has(previous.state)) {
       return replyJson(res, 409, { error: 'only a terminal provider login can be retried' });
     }
-    const session = await providerLoginControl.manager.startProviderLogin(value.provider, owner);
+    const session = await providerLoginControl.manager.retryProviderLogin(value.provider, owner);
     return replyJson(res, 202, { session });
   } catch (error) {
     return replyProviderLoginError(res, error);

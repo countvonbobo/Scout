@@ -97,9 +97,20 @@ test('provider login panel exposes only accessible state-specific guided actions
     reasonCode: 'validation-failed',
   });
   assert.match(failed, /Retry Claude sign-in/);
-  assert.match(failed, /Clear expired Claude sign-in/);
+  assert.doesNotMatch(failed, /Clear expired Claude sign-in/);
   assert.match(failed, /claude auth login/);
   assert.doesNotMatch(failed, /validation-failed/);
+
+  const expired = providerLoginPanelHtml('claude', {
+    installed: true, authenticated: false,
+  }, {
+    provider: 'claude',
+    sessionId: 'synthetic-session',
+    state: 'expired',
+    codeRequired: false,
+    reasonCode: 'expired',
+  });
+  assert.match(expired, /Clear expired Claude sign-in/);
 });
 
 test('provider login UI keeps its CSRF token and manual code out of browser storage', () => {

@@ -7,6 +7,7 @@ import {
 } from './providerLogin.mjs';
 
 const OWNER = Object.freeze({
+  access: 'local',
   ownerId: 'local-owner',
   originVerified: true,
   csrfVerified: true,
@@ -18,7 +19,7 @@ function deferred() {
   return { promise, resolve };
 }
 
-function fakeChild({ captureInput = null } = {}) {
+function fakeChild({ captureInput = null, closeOnKill = true } = {}) {
   const child = new EventEmitter();
   child.stdout = new PassThrough();
   child.stderr = new PassThrough();
@@ -33,6 +34,7 @@ function fakeChild({ captureInput = null } = {}) {
   child.kill = (signal = 'SIGTERM') => {
     child.killed = true;
     child.killSignals.push(signal);
+    if (closeOnKill) queueMicrotask(() => child.close(null));
     return true;
   };
   child.close = (status = 0) => child.emit('close', status, null);
@@ -46,9 +48,17 @@ function harness({
   maxOutputBytes,
   maxOutputLines,
   maxLineBytes,
+  maxCancels,
+  maxRetries,
+  terminateGraceMs,
+  shutdownDeadlineMs,
+  closeOnKill = true,
+  childCount = 2,
+  confirmProviderHealth = async () => ({ kind: 'remote-success', source: 'post-auth' }),
+  onHealthSignal = async () => {},
 } = {}) {
-  const login = fakeChild();
-  const validation = fakeChild();
+  const login = fakeChild({ closeOnKill });
+  const validation = fakeChild({ closeOnKill });
   const calls = [];
   const health = [];
   const status = {
@@ -68,6 +78,7 @@ function harness({
     },
   });
   const children = [login, validation];
+  while (children.length < childCount) children.push(fakeChild({ closeOnKill }));
   const manager = createProviderLoginManager({
     providerStatus: async (name) => {
       assert.equal(name, provider);
@@ -79,10 +90,18 @@ function harness({
       if (!child) throw new Error('unexpected spawn');
       return child;
     },
-    onHealthSignal: async (name, signal) => health.push([name, signal]),
+    confirmProviderHealth,
+    onHealthSignal: async (name, signal) => {
+      health.push([name, signal]);
+      await onHealthSignal(name, signal);
+    },
     cwd: '/fixed/scout',
     timeoutMs,
     maxStarts,
+    ...(maxCancels === undefined ? {} : { maxCancels }),
+    ...(maxRetries === undefined ? {} : { maxRetries }),
+    ...(terminateGraceMs === undefined ? {} : { terminateGraceMs }),
+    ...(shutdownDeadlineMs === undefined ? {} : { shutdownDeadlineMs }),
     ...(maxOutputBytes === undefined ? {} : { maxOutputBytes }),
     ...(maxOutputLines === undefined ? {} : { maxOutputLines }),
     ...(maxLineBytes === undefined ? {} : { maxLineBytes }),
@@ -113,7 +132,7 @@ test('Codex login uses only the trusted executable and fixed device-auth/status 
       cwd: '/fixed/scout',
       env: { PATH: '/trusted/bin', HOME: '/synthetic-owner' },
       shell: false,
-      stdio: ['pipe', 'pipe', 'pipe'],
+      stdio: ['ignore', 'pipe', 'pipe'],
       windowsHide: true,
       windowsVerbatimArguments: undefined,
     },
@@ -165,6 +184,7 @@ test('Claude accepts one bounded manual code only after its fixed flow requests 
   );
   assert.equal(submitted.state, 'authenticating');
   assert.deepEqual(input, ['CODE-1234\n']);
+  assert.equal(h.login.stdin.writableEnded, true);
   await assert.rejects(
     h.manager.submitProviderLoginCode(started.sessionId, 'CODE-1234', OWNER),
     /not awaiting a manual code/,
@@ -191,7 +211,18 @@ test('owner, origin and CSRF checks protect every session operation', async () =
     h.manager.startProviderLogin('codex', { ...OWNER, originVerified: false }),
     /verified owner context/,
   );
+  await assert.rejects(
+    h.manager.startProviderLogin('codex', { ...OWNER, access: 'public' }),
+    /verified owner context/,
+  );
   const started = await h.manager.startProviderLogin('codex', OWNER);
+  assert.equal(
+    h.manager.getProviderLoginSession(started.sessionId, {
+      ...OWNER,
+      access: 'remote-owner',
+    }).sessionId,
+    started.sessionId,
+  );
   const otherOwner = { ...OWNER, ownerId: 'other-owner' };
   assert.throws(
     () => h.manager.getProviderLoginSession(started.sessionId, otherOwner),
@@ -241,6 +272,28 @@ test('sessions enforce one active login and bounded start rate per owner/provide
     h.manager.startProviderLogin('codex', OWNER),
     /login start rate limit/,
   );
+});
+
+test('cancel and retry have distinct bounded owner/provider rate limits', async () => {
+  const h = harness({
+    childCount: 4,
+    maxCancels: 1,
+    maxRetries: 1,
+    maxStarts: 3,
+  });
+  const first = await h.manager.startProviderLogin('codex', OWNER);
+  await h.manager.cancelProviderLogin(first.sessionId, OWNER);
+
+  const retry = await h.manager.retryProviderLogin('codex', OWNER);
+  await assert.rejects(
+    h.manager.cancelProviderLogin(retry.sessionId, OWNER),
+    /cancel rate limit/,
+  );
+  retry && h.validation.close(1);
+  await new Promise((resolve) => setImmediate(resolve));
+
+  const secondRetry = h.manager.retryProviderLogin('codex', OWNER);
+  await assert.rejects(secondRetry, /retry rate limit/);
 });
 
 test('simultaneous starts reserve the provider before asynchronous status lookup', async () => {
@@ -396,6 +449,44 @@ test('output, line, timeout, cancellation, disconnect and shutdown paths termina
     assert.equal(h.login.killed, true);
   });
 
+  await t.test('cancel waits for close and escalates TERM to KILL within a bound', async () => {
+    const h = harness({
+      closeOnKill: false,
+      terminateGraceMs: 5,
+      shutdownDeadlineMs: 20,
+    });
+    const started = await h.manager.startProviderLogin('codex', OWNER);
+    let settled = false;
+    const cancelled = h.manager.cancelProviderLogin(started.sessionId, OWNER)
+      .then((value) => {
+        settled = true;
+        return value;
+      });
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(settled, false);
+    assert.deepEqual(h.login.killSignals, ['SIGTERM']);
+    const result = await cancelled;
+    assert.equal(result.state, 'cancelled');
+    assert.deepEqual(h.login.killSignals, ['SIGTERM', 'SIGKILL']);
+  });
+
+  await t.test('shutdown gives a previously stubborn child a fresh bounded close wait', async () => {
+    const h = harness({
+      closeOnKill: false,
+      terminateGraceMs: 5,
+      shutdownDeadlineMs: 20,
+    });
+    const started = await h.manager.startProviderLogin('codex', OWNER);
+    await h.manager.cancelProviderLogin(started.sessionId, OWNER);
+    let stopped = false;
+    const shutdown = h.manager.shutdown().then(() => { stopped = true; });
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(stopped, false);
+    h.login.close(null);
+    await shutdown;
+    assert.equal(stopped, true);
+  });
+
   await t.test('child error', async () => {
     const h = harness();
     const started = await h.manager.startProviderLogin('codex', OWNER);
@@ -418,6 +509,17 @@ test('output, line, timeout, cancellation, disconnect and shutdown paths termina
     assert.equal(h.login.killed, true);
   });
 
+  await t.test('actual child disconnect is terminal and cleaned up', async () => {
+    const h = harness();
+    const started = await h.manager.startProviderLogin('codex', OWNER);
+    h.login.emit('disconnect');
+    await new Promise((resolve) => setImmediate(resolve));
+    const result = h.manager.getProviderLoginSession(started.sessionId, OWNER);
+    assert.equal(result.state, 'failed');
+    assert.equal(result.reasonCode, 'process-disconnected');
+    assert.equal(h.login.killed, true);
+  });
+
   await t.test('shutdown', async () => {
     const h = harness();
     const started = await h.manager.startProviderLogin('codex', OWNER);
@@ -432,6 +534,90 @@ test('output, line, timeout, cancellation, disconnect and shutdown paths termina
       /shutting down/,
     );
   });
+});
+
+test('shutdown tracks login and explicit Claude-clear children until both close', async () => {
+  const login = fakeChild({ closeOnKill: false });
+  const clear = fakeChild({ closeOnKill: false });
+  const children = [login, clear];
+  const manager = createProviderLoginManager({
+    providerStatus: async (provider) => {
+      const status = { installed: true, authenticated: false };
+      Object.defineProperties(status, {
+        executable: { value: `/trusted/bin/${provider}` },
+        env: { value: { PATH: '/trusted/bin', HOME: '/synthetic-owner' } },
+      });
+      return status;
+    },
+    spawn: () => children.shift(),
+    terminateGraceMs: 50,
+    shutdownDeadlineMs: 200,
+    timeoutMs: 60_000,
+  });
+  await manager.startProviderLogin('codex', OWNER);
+  const clearing = manager.clearClaudeCredentials(OWNER);
+  await new Promise((resolve) => setImmediate(resolve));
+
+  let stopped = false;
+  const shutdown = manager.shutdown().then(() => { stopped = true; });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(stopped, false);
+  login.close(null);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(stopped, false);
+  clear.close(null);
+  await shutdown;
+  assert.equal(stopped, true);
+  await clearing;
+});
+
+test('shutdown forcibly settles a stubborn Claude-clear operation at its final deadline', async () => {
+  const clear = fakeChild({ closeOnKill: false });
+  const manager = createProviderLoginManager({
+    providerStatus: async () => {
+      const status = { installed: true, authenticated: false };
+      Object.defineProperties(status, {
+        executable: { value: '/trusted/bin/claude' },
+        env: { value: { PATH: '/trusted/bin', HOME: '/synthetic-owner' } },
+      });
+      return status;
+    },
+    spawn: () => clear,
+    terminateGraceMs: 5,
+    shutdownDeadlineMs: 20,
+    timeoutMs: 60_000,
+  });
+  const clearing = manager.clearClaudeCredentials(OWNER);
+  await new Promise((resolve) => setImmediate(resolve));
+  await manager.shutdown();
+  const raced = await Promise.race([
+    clearing,
+    new Promise((resolve) => setTimeout(() => resolve('still-pending'), 30)),
+  ]);
+  clear.close(null);
+  await clearing;
+  assert.deepEqual(raced, {
+    provider: 'claude',
+    reasonCode: 'logout-failed',
+    state: 'failed',
+  });
+});
+
+test('Codex device-code parsing rejects token-shaped output', async () => {
+  const h = harness();
+  const started = await h.manager.startProviderLogin('codex', OWNER);
+  h.login.stdout.write('Use code TOKN-SECR from token output\n');
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(
+    h.manager.getProviderLoginSession(started.sessionId, OWNER).userCode,
+    null,
+  );
+  h.login.stdout.write('Enter code ABCD-EFGH\n');
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(
+    h.manager.getProviderLoginSession(started.sessionId, OWNER).userCode,
+    'ABCD-EFGH',
+  );
 });
 
 test('failed validation is terminal, redacted and signals signed-out health', async () => {
@@ -450,6 +636,58 @@ test('failed validation is terminal, redacted and signals signed-out health', as
   assert.deepEqual(h.health.at(-1), [
     'codex',
     { kind: 'local-signed-out', source: 'post-auth' },
+  ]);
+});
+
+test('success waits for a real health confirmation and its durable write', async () => {
+  const confirmed = deferred();
+  const persisted = deferred();
+  const h = harness({
+    confirmProviderHealth: async () => confirmed.promise,
+    onHealthSignal: async (_provider, signal) => {
+      if (signal.kind === 'remote-success') await persisted.promise;
+    },
+  });
+  const started = await h.manager.startProviderLogin('codex', OWNER);
+  h.login.close(0);
+  await new Promise((resolve) => setImmediate(resolve));
+  h.validation.close(0);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(
+    h.manager.getProviderLoginSession(started.sessionId, OWNER).state,
+    'validating',
+  );
+
+  confirmed.resolve({ kind: 'remote-success', source: 'post-auth' });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(
+    h.manager.getProviderLoginSession(started.sessionId, OWNER).state,
+    'validating',
+  );
+
+  persisted.resolve();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(
+    h.manager.getProviderLoginSession(started.sessionId, OWNER).state,
+    'succeeded',
+  );
+});
+
+test('failed real health confirmation remains terminal without false ready evidence', async () => {
+  const h = harness({
+    confirmProviderHealth: async () => ({ kind: 'network-failure', source: 'post-auth' }),
+  });
+  const started = await h.manager.startProviderLogin('codex', OWNER);
+  h.login.close(0);
+  await new Promise((resolve) => setImmediate(resolve));
+  h.validation.close(0);
+  await new Promise((resolve) => setImmediate(resolve));
+  const result = h.manager.getProviderLoginSession(started.sessionId, OWNER);
+  assert.equal(result.state, 'failed');
+  assert.equal(result.reasonCode, 'health-confirmation-failed');
+  assert.deepEqual(h.health.at(-1), [
+    'codex',
+    { kind: 'network-failure', source: 'post-auth' },
   ]);
 });
 

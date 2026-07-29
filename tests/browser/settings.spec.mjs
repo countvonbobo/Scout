@@ -554,7 +554,9 @@ test('guided provider login supports code, failure, retry and cancel without bro
   });
   await page.unroute('**/api/provider-login/status?*');
   let session = null;
+  let startCount = 0;
   let retryCount = 0;
+  let statusRequests = 0;
   const requests = [];
   const snapshot = (state, fields = {}) => ({
     codeRequired: state === 'awaiting-code',
@@ -573,6 +575,7 @@ test('guided provider login supports code, failure, retry and cancel without bro
     const url = new URL(request.url());
     const action = url.pathname.split('/').at(-1);
     if (action === 'status') {
+      statusRequests += 1;
       await route.fulfill({
         contentType: 'application/json',
         body: JSON.stringify({
@@ -586,10 +589,18 @@ test('guided provider login supports code, failure, retry and cancel without bro
       csrf: request.headers()['x-scout-provider-login-csrf'],
       body: request.postDataJSON(),
     });
-    if (action === 'start') session = snapshot('awaiting-code');
+    if (action === 'start') session = snapshot(++startCount === 1 ? 'awaiting-code' : 'succeeded');
     if (action === 'code') session = snapshot('failed');
     if (action === 'retry') session = snapshot(++retryCount === 1 ? 'starting' : 'succeeded');
-    if (action === 'cancel') session = snapshot('cancelled');
+    if (action === 'cancel') session = snapshot('expired');
+    if (action === 'clear-claude-credentials') {
+      session = null;
+      await route.fulfill({
+        contentType: 'application/json',
+        body: JSON.stringify({ result: { provider: 'claude', reasonCode: null, state: 'cleared' } }),
+      });
+      return;
+    }
     await route.fulfill({
       status: action === 'start' || action === 'retry' ? 202 : 200,
       contentType: 'application/json',
@@ -604,9 +615,12 @@ test('guided provider login supports code, failure, retry and cancel without bro
   const codeInput = dialog.getByLabel('One-time provider code');
   await expect(codeInput).toBeVisible();
   await codeInput.fill('PRIVATE-CODE');
+  const statusBeforeTyping = statusRequests;
+  await expect.poll(() => statusRequests).toBeGreaterThan(statusBeforeTyping);
+  await expect(codeInput).toHaveValue('PRIVATE-CODE');
   await dialog.getByRole('button', { name: 'Submit code' }).click();
   await expect(dialog.getByRole('button', { name: 'Retry Claude sign-in' })).toBeVisible();
-  await expect(dialog.getByRole('button', { name: 'Clear expired Claude sign-in' })).toBeVisible();
+  await expect(dialog.getByRole('button', { name: 'Clear expired Claude sign-in' })).toHaveCount(0);
   await expect(dialog).toContainText('claude auth login');
   await expect(dialog).not.toContainText('validation-failed');
 
@@ -614,11 +628,14 @@ test('guided provider login supports code, failure, retry and cancel without bro
   await expect(dialog.getByRole('button', { name: 'Cancel Claude sign-in' })).toBeVisible();
   await dialog.getByRole('button', { name: 'Cancel Claude sign-in' }).click();
   await expect(dialog.getByRole('button', { name: 'Retry Claude sign-in' })).toBeVisible();
-  await dialog.getByRole('button', { name: 'Retry Claude sign-in' }).click();
+  await expect(dialog.getByRole('button', { name: 'Clear expired Claude sign-in' })).toBeVisible();
+  page.once('dialog', (confirmation) => confirmation.accept());
+  await dialog.getByRole('button', { name: 'Clear expired Claude sign-in' }).click();
+  await dialog.getByRole('button', { name: 'Sign in to Claude with Scout' }).click();
   await expect(dialog).toContainText('Sign-in succeeded');
 
   expect(requests.map(({ action }) => action)).toEqual([
-    'start', 'code', 'retry', 'cancel', 'retry',
+    'start', 'code', 'retry', 'cancel', 'clear-claude-credentials', 'start',
   ]);
   for (const request of requests) {
     expect(request.csrf).toBe('csrf-claude-synthetic-000000000000');

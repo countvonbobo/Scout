@@ -111,7 +111,7 @@ export function providerLoginPanelHtml(provider, providerStatus = {}, session = 
   const retry = retryable
     ? `<button class="act primary" type="button" data-provider-login-action="retry" data-provider="${provider}" data-session-id="${sessionId}">Retry ${name} sign-in</button>`
     : '';
-  const clear = provider === 'claude' && ['failed', 'expired'].includes(state)
+  const clear = provider === 'claude' && state === 'expired'
     ? '<button class="act" type="button" data-provider-login-action="clear" data-provider="claude">Clear expired Claude sign-in</button>'
     : '';
   return `<section class="provider-login-panel" data-provider-login="${provider}" aria-label="${name} sign-in">
@@ -857,7 +857,9 @@ const Setup = {
     try {
       const result = await requestJson(`/api/provider-login/status?${query}`);
       this.providerLoginState[provider] = { ...result, loading: false };
-      if (this.providerLoginVisible()) {
+      const sessionChanged = JSON.stringify(current?.session || null)
+        !== JSON.stringify(result.session || null);
+      if (sessionChanged && this.providerLoginVisible()) {
         if (this.view === 'section') this.renderProviderSettings();
         else this.renderProviders();
       }

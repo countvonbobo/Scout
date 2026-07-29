@@ -13,7 +13,7 @@ process.env.SCOUT_WORKSPACE = testWorkspace;
 process.env.SCOUT_DEVICE_SETTINGS = path.join(testWorkspace, 'device-settings.json');
 const {
   APP_ROOT, APP_VERSION, UI_BUILD_FILES, UI_BUILD_ID, WORKSPACE_ROOT,
-  checkStartupProviderHealth, createRuntimeProviderHealthMonitor,
+  checkStartupProviderHealth, confirmProviderLoginHealth, createRuntimeProviderHealthMonitor,
   codexDeepLinkDetection, computeUiBuildId, createServer,
   inspectCodexDeepLinkHandler, operations, providerDetection, providerLoginControl,
   publicProviderStatus, requestAccess, restartControl, shutdownControl,
@@ -69,6 +69,40 @@ test('server startup and periodic provider health use the configured runtime ent
   ]);
   monitor.stop();
   assert.equal(cleared, true);
+});
+
+test('guided login confirms health with a bounded real provider turn', async () => {
+  const status = {
+    installed: true,
+    authenticated: true,
+    capabilities: { structuredOutput: true },
+  };
+  Object.defineProperties(status, {
+    executable: { value: '/trusted/bin/codex' },
+    env: { value: { PATH: '/trusted/bin' } },
+  });
+  let received;
+  const success = await confirmProviderLoginHealth('codex', status, {
+    runStructuredTurnFn: async (options) => {
+      received = options;
+      return { ok: true, value: options.validate({ ready: true }) };
+    },
+  });
+  assert.deepEqual(success, { kind: 'remote-success', source: 'post-auth' });
+  assert.equal(received.provider, 'codex');
+  assert.equal(received.status, status);
+  assert.deepEqual(received.schema.required, ['ready']);
+  assert.equal(received.schema.additionalProperties, false);
+  assert.match(received.prompt, /fixed provider health check/i);
+  assert.doesNotMatch(received.prompt, /workspace|profile|job|account|token/i);
+  assert.equal(received.timeoutMs, 60_000);
+  assert.equal(received.maxInputTokens, 256);
+
+  const network = new Error('raw private provider failure');
+  Object.defineProperty(network, 'reasonCode', { value: 'network-unavailable' });
+  assert.deepEqual(await confirmProviderLoginHealth('claude', status, {
+    runStructuredTurnFn: async () => { throw network; },
+  }), { kind: 'network-failure', source: 'post-auth' });
 });
 
 let server;
@@ -187,9 +221,16 @@ test('provider login routes require same-origin JSON, ephemeral CSRF and server-
     verificationUrl: null,
   };
   const original = providerLoginControl.manager;
+  const originalDeviceSettings = fs.existsSync(process.env.SCOUT_DEVICE_SETTINGS)
+    ? fs.readFileSync(process.env.SCOUT_DEVICE_SETTINGS)
+    : null;
   providerLoginControl.manager = {
     async startProviderLogin(provider, owner) {
       calls.push(['start', provider, owner]);
+      return session;
+    },
+    async retryProviderLogin(provider, owner) {
+      calls.push(['retry', provider, owner]);
       return session;
     },
     getActiveProviderLogin(provider, owner) {
@@ -304,6 +345,10 @@ test('provider login routes require same-origin JSON, ephemeral CSRF and server-
     assert.equal(cancelled.status, 200);
     assert.equal(JSON.parse(cancelled.text).session.state, 'cancelled');
 
+    const operationsBeforeRetry = JSON.stringify(operations.list());
+    const durableFilesBeforeRetry = fs.existsSync(testWorkspace)
+      ? fs.readdirSync(testWorkspace, { recursive: true }).map(String).sort()
+      : [];
     const retried = await request({
       method: 'POST',
       path: '/api/provider-login/retry',
@@ -311,6 +356,12 @@ test('provider login routes require same-origin JSON, ephemeral CSRF and server-
       body: JSON.stringify({ provider: 'codex', sessionId: session.sessionId }),
     });
     assert.equal(retried.status, 202);
+    assert.equal(calls.some(([name]) => name === 'retry'), true);
+    assert.equal(JSON.stringify(operations.list()), operationsBeforeRetry);
+    assert.deepEqual(
+      fs.readdirSync(testWorkspace, { recursive: true }).map(String).sort(),
+      durableFilesBeforeRetry,
+    );
 
     const unconfirmedClear = await request({
       method: 'POST',
@@ -331,8 +382,48 @@ test('provider login routes require same-origin JSON, ephemeral CSRF and server-
     assert.deepEqual(JSON.parse(cleared.text), {
       result: { provider: 'claude', reasonCode: null, state: 'cleared' },
     });
+
+    fs.writeFileSync(process.env.SCOUT_DEVICE_SETTINGS, JSON.stringify({
+      schemaVersion: 2,
+      remoteAccess: {
+        enabled: true,
+        ownerLogin: 'owner@example.test',
+        origin: 'https://scout.example.ts.net',
+      },
+    }));
+    const remoteHeaders = {
+      host: 'scout.example.ts.net',
+      origin: 'https://scout.example.ts.net',
+      'tailscale-user-login': 'owner@example.test',
+      'content-type': 'application/json',
+    };
+    const remoteStatusResponse = await request({
+      path: '/api/provider-login/status?provider=codex',
+      headers: remoteHeaders,
+    });
+    assert.equal(remoteStatusResponse.status, 200);
+    const remoteStatus = JSON.parse(remoteStatusResponse.text);
+    const remoteStarted = await request({
+      method: 'POST',
+      path: '/api/provider-login/start',
+      headers: {
+        ...remoteHeaders,
+        'x-scout-provider-login-csrf': remoteStatus.csrfToken,
+      },
+      body: '{"provider":"codex"}',
+    });
+    assert.equal(remoteStarted.status, 202);
+    const remoteOwner = calls.filter(([name]) => name === 'start').at(-1)[2];
+    assert.equal(remoteOwner.access, 'remote-owner');
+    assert.equal(remoteOwner.ownerId, owner.ownerId);
+    assert.notEqual(remoteStatus.csrfToken, status.csrfToken);
   } finally {
     providerLoginControl.manager = original;
+    if (originalDeviceSettings) fs.writeFileSync(
+      process.env.SCOUT_DEVICE_SETTINGS,
+      originalDeviceSettings,
+    );
+    else fs.rmSync(process.env.SCOUT_DEVICE_SETTINGS, { force: true });
   }
 });
 

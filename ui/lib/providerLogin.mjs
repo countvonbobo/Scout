@@ -12,6 +12,15 @@ const TERMINAL_STATES = new Set([
   'failed',
   'succeeded',
 ]);
+const POST_AUTH_SIGNALS = new Set([
+  'remote-success',
+  'local-credentials-present',
+  'remote-auth-failure',
+  'network-failure',
+  'rate-limit',
+  'cli-update',
+  'provider-failure',
+]);
 const LOGIN_ARGUMENTS = Object.freeze({
   codex: Object.freeze(['login', '--device-auth']),
   claude: Object.freeze(['auth', 'login']),
@@ -37,6 +46,8 @@ const DEFAULT_RETENTION_MS = 15 * 60 * 1000;
 const DEFAULT_MAX_OUTPUT_BYTES = 64 * 1024;
 const DEFAULT_MAX_OUTPUT_LINES = 256;
 const DEFAULT_MAX_LINE_BYTES = 2 * 1024;
+const DEFAULT_TERMINATE_GRACE_MS = 1_000;
+const DEFAULT_SHUTDOWN_DEADLINE_MS = 3_000;
 const MANUAL_CODE = /^[A-Za-z0-9][A-Za-z0-9._~+/=-]{5,255}$/;
 const ENV_ALLOWLIST = new Set([
   'appdata',
@@ -75,6 +86,7 @@ function checkedOwner(ownerContext) {
     || Array.isArray(ownerContext)
     || ownerContext.originVerified !== true
     || ownerContext.csrfVerified !== true
+    || !['local', 'remote-owner'].includes(ownerContext.access)
     || !/^[A-Za-z0-9._:-]{1,128}$/.test(String(ownerContext.ownerId || ''))) {
     throw new TypeError('provider login requires a verified owner context');
   }
@@ -151,8 +163,15 @@ function parseSafeLoginLine(session, line) {
   }
 
   if (session.provider === 'codex') {
-    const codeMatch = line.match(/\b(?:enter|use)\s+(?:code\s+)?([A-Z0-9][A-Z0-9-]{5,63})\b/i);
-    if (codeMatch) session.userCode = codeMatch[1];
+    const codeMatch = line.match(
+      /\b(?:enter|use)\s+(?:(?:the\s+)?(?:device\s+)?code(?:\s*[:=]\s*|\s+))?([A-Z0-9]{4}(?:-[A-Z0-9]{4}){1,3})(?!-[A-Z0-9])\b/i,
+    );
+    const code = codeMatch?.[1] || '';
+    if (code
+      && code === code.toUpperCase()
+      && !/\b(?:api[- ]?key|bearer|password|secret|token)\b/i.test(line)) {
+      session.userCode = code;
+    }
   }
 }
 
@@ -173,6 +192,10 @@ function createError(message, code) {
 export function createProviderLoginManager({
   providerStatus = providerStatusAsync,
   spawn = spawnProcess,
+  confirmProviderHealth = async () => ({
+    kind: 'local-credentials-present',
+    source: 'post-auth',
+  }),
   onHealthSignal = async () => {},
   cwd = process.cwd(),
   env = process.env,
@@ -183,9 +206,13 @@ export function createProviderLoginManager({
   rateWindowMs: configuredRateWindowMs,
   retentionMs: configuredRetentionMs,
   maxStarts: configuredMaxStarts,
+  maxCancels: configuredMaxCancels,
+  maxRetries: configuredMaxRetries,
   maxOutputBytes: configuredMaxOutputBytes,
   maxOutputLines: configuredMaxOutputLines,
   maxLineBytes: configuredMaxLineBytes,
+  terminateGraceMs: configuredTerminateGraceMs,
+  shutdownDeadlineMs: configuredShutdownDeadlineMs,
 } = {}) {
   const timeoutMs = checkedPositiveInteger(
     configuredTimeoutMs,
@@ -207,6 +234,16 @@ export function createProviderLoginManager({
     3,
     'provider login start limit',
   );
+  const maxCancels = checkedPositiveInteger(
+    configuredMaxCancels,
+    10,
+    'provider login cancel limit',
+  );
+  const maxRetries = checkedPositiveInteger(
+    configuredMaxRetries,
+    3,
+    'provider login retry limit',
+  );
   const maxOutputBytes = checkedPositiveInteger(
     configuredMaxOutputBytes,
     DEFAULT_MAX_OUTPUT_BYTES,
@@ -222,73 +259,136 @@ export function createProviderLoginManager({
     DEFAULT_MAX_LINE_BYTES,
     'provider login individual line limit',
   );
+  const terminateGraceMs = checkedPositiveInteger(
+    configuredTerminateGraceMs,
+    DEFAULT_TERMINATE_GRACE_MS,
+    'provider login termination grace',
+  );
+  const shutdownDeadlineMs = checkedPositiveInteger(
+    configuredShutdownDeadlineMs,
+    DEFAULT_SHUTDOWN_DEADLINE_MS,
+    'provider login shutdown deadline',
+  );
 
   const sessions = new Map();
   const active = new Map();
   const pendingStarts = new Set();
   const starts = new Map();
+  const cancels = new Map();
+  const retries = new Map();
   const clearingOwners = new Set();
+  const trackedChildren = new Set();
+  const pendingClearSettlers = new Map();
   let shuttingDown = false;
+
+  function persistHealth(session, signal) {
+    return Promise.resolve(onHealthSignal(session.provider, signal, {
+      ownerId: session.ownerId,
+    }));
+  }
 
   function emitHealth(session, signal) {
     try {
-      Promise.resolve(onHealthSignal(session.provider, signal, {
-        ownerId: session.ownerId,
-      })).catch(() => {});
+      persistHealth(session, signal).catch(() => {});
     } catch {
       // Health persistence is deliberately unable to leak provider output or
       // keep a completed authentication subprocess alive.
     }
   }
 
-  function stopProcess(session) {
-    const child = session.process;
-    session.process = null;
-    if (!child) return;
-    let closed = false;
-    child.once?.('close', () => { closed = true; });
-    try {
-      child.kill('SIGTERM');
-    } catch {
-      return;
-    }
-    const hardStop = setTimeout(() => {
-      try {
-        if (!closed) child.kill('SIGKILL');
-      } catch {
-        // The child already exited or the platform refused a redundant kill.
-      }
-    }, 1_000);
-    hardStop.unref?.();
+  function trackChild(child) {
+    let resolveClosed;
+    const record = {
+      child,
+      closed: false,
+      closedPromise: new Promise((resolve) => { resolveClosed = resolve; }),
+      stopPromise: null,
+    };
+    trackedChildren.add(record);
+    child.once('close', () => {
+      if (record.closed) return;
+      record.closed = true;
+      trackedChildren.delete(record);
+      resolveClosed();
+    });
+    return record;
+  }
+
+  function waitForChildClose(record, timeout) {
+    if (record.closed) return Promise.resolve(true);
+    if (timeout <= 0) return Promise.resolve(false);
+    return new Promise((resolve) => {
+      const timer = setTimeout(() => resolve(false), timeout);
+      record.closedPromise.then(() => {
+        clearTimeout(timer);
+        resolve(true);
+      });
+    });
+  }
+
+  function stopTrackedChild(record, deadlineAt = Date.now() + shutdownDeadlineMs) {
+    if (!record || record.closed) return Promise.resolve();
+    if (record.stopPromise) return record.stopPromise;
+    const attempt = (async () => {
+      try { record.child.kill('SIGTERM'); } catch {}
+      const grace = Math.min(
+        terminateGraceMs,
+        Math.max(0, deadlineAt - Date.now()),
+      );
+      if (await waitForChildClose(record, grace)) return;
+      try { record.child.kill('SIGKILL'); } catch {}
+      await waitForChildClose(record, Math.max(0, deadlineAt - Date.now()));
+    })();
+    record.stopPromise = attempt.finally(() => {
+      if (!record.closed) record.stopPromise = null;
+    });
+    return record.stopPromise;
+  }
+
+  function stopProcess(session, deadlineAt) {
+    return stopTrackedChild(session.processRecord, deadlineAt);
   }
 
   function terminalHealth(reasonCode, state) {
     if (state === 'succeeded') {
-      // A successful fixed provider status check is the post-auth remote
-      // evidence that may clear provider health's sticky auth barrier.
-      return { kind: 'remote-success', source: 'post-auth' };
+      return { kind: 'local-credentials-present', source: 'post-auth' };
     }
-    if (reasonCode === 'validation-failed'
-      || reasonCode === 'cancelled'
-      || reasonCode === 'expired') {
+    if (reasonCode === 'validation-failed') {
       return { kind: 'local-signed-out', source: 'post-auth' };
     }
     return { kind: 'provider-failure', source: 'post-auth' };
   }
 
-  function terminal(session, state, reasonCode, { kill = false } = {}) {
-    if (TERMINAL_STATES.has(session.state)) return;
-    if (kill) stopProcess(session);
+  function terminal(session, state, reasonCode, {
+    kill = false,
+    deadlineAt,
+    reportHealth = true,
+  } = {}) {
+    if (TERMINAL_STATES.has(session.state)) return Promise.resolve();
+    const cleanup = kill ? stopProcess(session, deadlineAt) : Promise.resolve();
     clearTimeout(session.timeout);
     session.timeout = null;
     session.state = state;
     session.reasonCode = reasonCode;
-    active.delete(ownerProviderKey(session.ownerId, session.provider));
-    emitHealth(session, terminalHealth(reasonCode, state));
+    const activeKey = ownerProviderKey(session.ownerId, session.provider);
+    const record = session.processRecord;
+    if (record && !record.closed) {
+      record.closedPromise.then(() => {
+        if (active.get(activeKey) === session) active.delete(activeKey);
+      });
+    } else {
+      active.delete(activeKey);
+    }
+    if (reportHealth) emitHealth(session, terminalHealth(reasonCode, state));
+    session.buffers = { stdout: '', stderr: '' };
+    session.executable = null;
+    session.env = null;
+    session.healthStatus = null;
     const retention = setTimeout(() => {
       if (sessions.get(session.sessionId) === session) sessions.delete(session.sessionId);
     }, retentionMs);
     retention.unref?.();
+    return cleanup;
   }
 
   function failOutput(session) {
@@ -348,16 +448,33 @@ export function createProviderLoginManager({
 
   function monitorChild(session, child, phase) {
     session.process = child;
+    session.processRecord = trackChild(child);
+    let finished = false;
     child.stdout?.on('data', (chunk) => collectOutput(session, 'stdout', chunk));
     child.stderr?.on('data', (chunk) => collectOutput(session, 'stderr', chunk));
+    child.stdin?.once('error', () => {
+      if (finished || TERMINAL_STATES.has(session.state)) return;
+      finished = true;
+      void terminal(session, 'failed', 'code-write-failed', { kill: true });
+    });
     child.once('error', () => {
-      terminal(session, 'failed', phase === 'login'
+      if (finished) return;
+      finished = true;
+      void terminal(session, 'failed', phase === 'login'
         ? 'process-start-failed'
         : 'validation-failed', { kill: true });
     });
+    child.once('disconnect', () => {
+      if (finished) return;
+      finished = true;
+      void terminal(session, 'failed', 'process-disconnected', { kill: true });
+    });
     child.once('close', (status) => {
+      if (finished) return;
+      finished = true;
       if (TERMINAL_STATES.has(session.state)) return;
       session.process = null;
+      session.processRecord = null;
       if (phase === 'login') {
         if (status !== 0) {
           terminal(session, 'failed', 'login-failed');
@@ -366,11 +483,8 @@ export function createProviderLoginManager({
         beginValidation(session);
         return;
       }
-      terminal(
-        session,
-        status === 0 ? 'succeeded' : 'failed',
-        status === 0 ? null : 'validation-failed',
-      );
+      if (status === 0) void completeValidation(session);
+      else terminal(session, 'failed', 'validation-failed');
     });
   }
 
@@ -389,6 +503,41 @@ export function createProviderLoginManager({
     monitorChild(session, child, 'validation');
   }
 
+  function checkedPostAuthSignal(signal) {
+    if (!signal
+      || typeof signal !== 'object'
+      || Array.isArray(signal)
+      || signal.source !== 'post-auth'
+      || !POST_AUTH_SIGNALS.has(signal.kind)
+      || Object.keys(signal).sort().join(',') !== 'kind,source') {
+      throw new Error('provider health confirmation returned an unsupported signal');
+    }
+    return { kind: signal.kind, source: signal.source };
+  }
+
+  async function completeValidation(session) {
+    if (TERMINAL_STATES.has(session.state)) return;
+    let signal;
+    try {
+      signal = checkedPostAuthSignal(await confirmProviderHealth(
+        session.provider,
+        session.healthStatus,
+      ));
+      await persistHealth(session, signal);
+    } catch {
+      await terminal(session, 'failed', 'health-confirmation-failed');
+      return;
+    }
+    const confirmed = signal.kind === 'remote-success'
+      || signal.kind === 'local-credentials-present';
+    await terminal(
+      session,
+      confirmed ? 'succeeded' : 'failed',
+      confirmed ? null : 'health-confirmation-failed',
+      { reportHealth: false },
+    );
+  }
+
   function sessionForOwner(sessionIdValue, ownerContext) {
     const ownerId = checkedOwner(ownerContext);
     const session = sessions.get(String(sessionIdValue || ''));
@@ -398,32 +547,68 @@ export function createProviderLoginManager({
     return session;
   }
 
-  function enforceRate(ownerId, provider) {
+  function enforceRate(bucket, ownerId, provider, limit, message, code) {
     const key = ownerProviderKey(ownerId, provider);
     const current = Number(now());
-    const recent = (starts.get(key) || []).filter((at) => current - at < rateWindowMs);
-    if (recent.length >= maxStarts) {
-      throw createError('provider login start rate limit reached', 'LOGIN_RATE_LIMIT');
+    const recent = (bucket.get(key) || []).filter((at) => current - at < rateWindowMs);
+    if (recent.length >= limit) {
+      throw createError(message, code);
     }
     recent.push(current);
-    starts.set(key, recent);
+    bucket.set(key, recent);
   }
 
-  async function startProviderLogin(providerValue, ownerContext) {
+  async function start(providerValue, ownerContext, operation) {
     if (shuttingDown) throw createError('provider login manager is shutting down', 'LOGIN_SHUTDOWN');
     const provider = checkedProvider(providerValue);
     const ownerId = checkedOwner(ownerContext);
     const key = ownerProviderKey(ownerId, provider);
     const existing = active.get(key);
-    if (pendingStarts.has(key) || (existing && !TERMINAL_STATES.has(existing.state))) {
+    if (pendingStarts.has(key)
+      || (existing && (
+        !TERMINAL_STATES.has(existing.state)
+        || (existing.processRecord && !existing.processRecord.closed)
+      ))) {
       throw createError('provider login is already active', 'LOGIN_ALREADY_ACTIVE');
     }
-    enforceRate(ownerId, provider);
+    if (operation === 'retry') {
+      enforceRate(
+        retries,
+        ownerId,
+        provider,
+        maxRetries,
+        'provider login retry rate limit reached',
+        'LOGIN_RETRY_RATE_LIMIT',
+      );
+    } else {
+      enforceRate(
+        starts,
+        ownerId,
+        provider,
+        maxStarts,
+        'provider login start rate limit reached',
+        'LOGIN_RATE_LIMIT',
+      );
+    }
     pendingStarts.add(key);
     try {
       const status = await providerStatus(provider);
       if (shuttingDown) throw createError('provider login manager is shutting down', 'LOGIN_SHUTDOWN');
       const executable = checkedExecutable(status);
+      const providerEnv = minimalProviderEnvironment(
+        status.env && typeof status.env === 'object' ? status.env : env,
+      );
+      const healthStatus = {
+        installed: true,
+        authenticated: true,
+        capabilities: {
+          structuredOutput: status.capabilities?.structuredOutput !== false,
+        },
+      };
+      Object.defineProperties(healthStatus, {
+        executable: { value: executable },
+        env: { value: providerEnv },
+      });
       const createdAtMs = Number(now());
       const id = String(sessionId());
       if (!/^[A-Za-z0-9_-]{16,128}$/.test(id) || sessions.has(id)) {
@@ -441,10 +626,10 @@ export function createProviderLoginManager({
         createdAt: new Date(createdAtMs).toISOString(),
         expiresAt: new Date(createdAtMs + timeoutMs).toISOString(),
         executable,
-        env: minimalProviderEnvironment(
-          status.env && typeof status.env === 'object' ? status.env : env,
-        ),
+        env: providerEnv,
+        healthStatus,
         process: null,
+        processRecord: null,
         outputBytes: 0,
         outputLines: 0,
         buffers: { stdout: '', stderr: '' },
@@ -455,13 +640,17 @@ export function createProviderLoginManager({
       sessions.set(id, session);
       active.set(key, session);
       session.timeout = setTimeout(() => {
-        terminal(session, 'expired', 'expired', { kill: true });
+        void terminal(session, 'expired', 'expired', { kill: true });
       }, timeoutMs);
       session.timeout.unref?.();
 
       let child;
       try {
-        child = spawnFixed(session, LOGIN_ARGUMENTS[provider], 'pipe');
+        child = spawnFixed(
+          session,
+          LOGIN_ARGUMENTS[provider],
+          provider === 'codex' ? 'ignore' : 'pipe',
+        );
       } catch {
         terminal(session, 'failed', 'process-start-failed');
         return publicSnapshot(session);
@@ -472,6 +661,14 @@ export function createProviderLoginManager({
     } finally {
       pendingStarts.delete(key);
     }
+  }
+
+  async function startProviderLogin(providerValue, ownerContext) {
+    return start(providerValue, ownerContext, 'start');
+  }
+
+  async function retryProviderLogin(providerValue, ownerContext) {
+    return start(providerValue, ownerContext, 'retry');
   }
 
   async function submitProviderLoginCode(sessionIdValue, code, ownerContext) {
@@ -496,9 +693,17 @@ export function createProviderLoginManager({
     session.codeRequired = false;
     session.state = 'authenticating';
     await new Promise((resolve, reject) => {
-      session.process.stdin.write(`${boundedCode}\n`, (error) => {
+      const input = session.process.stdin;
+      input.write(`${boundedCode}\n`, (error) => {
         if (error) {
-          terminal(session, 'failed', 'code-write-failed', { kill: true });
+          void terminal(session, 'failed', 'code-write-failed', { kill: true });
+          reject(createError('manual code was not accepted', 'LOGIN_CODE_WRITE_FAILED'));
+          return;
+        }
+        try {
+          input.end();
+        } catch {
+          void terminal(session, 'failed', 'code-write-failed', { kill: true });
           reject(createError('manual code was not accepted', 'LOGIN_CODE_WRITE_FAILED'));
           return;
         }
@@ -513,7 +718,15 @@ export function createProviderLoginManager({
     if (TERMINAL_STATES.has(session.state)) {
       throw createError('provider login session is already terminal', 'LOGIN_SESSION_TERMINAL');
     }
-    terminal(session, 'cancelled', 'cancelled', { kill: true });
+    enforceRate(
+      cancels,
+      session.ownerId,
+      session.provider,
+      maxCancels,
+      'provider login cancel rate limit reached',
+      'LOGIN_CANCEL_RATE_LIMIT',
+    );
+    await terminal(session, 'cancelled', 'cancelled', { kill: true });
     return publicSnapshot(session);
   }
 
@@ -524,9 +737,17 @@ export function createProviderLoginManager({
     if (active.has(activeKey) || pendingStarts.has(activeKey) || clearingOwners.has(ownerId)) {
       throw createError('provider login is already active', 'LOGIN_ALREADY_ACTIVE');
     }
-    enforceRate(ownerId, 'claude-clear');
+    enforceRate(
+      starts,
+      ownerId,
+      'claude-clear',
+      maxStarts,
+      'provider login start rate limit reached',
+      'LOGIN_RATE_LIMIT',
+    );
     clearingOwners.add(ownerId);
     const signalSession = { provider: 'claude', ownerId };
+    let clearRecord = null;
     try {
       const status = await providerStatus('claude');
       if (shuttingDown) throw createError('provider login manager is shutting down', 'LOGIN_SHUTDOWN');
@@ -542,16 +763,17 @@ export function createProviderLoginManager({
       const state = await new Promise((resolve) => {
         let child;
         let settled = false;
+        let record = null;
+        let timer = null;
         let bytes = 0;
         let lines = 0;
         let partial = { stdout: 0, stderr: 0 };
-        const settle = (result, { kill = false } = {}) => {
+        const settle = async (result, { kill = false } = {}) => {
           if (settled) return;
           settled = true;
           clearTimeout(timer);
-          if (kill) {
-            try { child?.kill('SIGTERM'); } catch {}
-          }
+          if (record) pendingClearSettlers.delete(record);
+          if (kill) await stopTrackedChild(record);
           resolve(result);
         };
         try {
@@ -567,7 +789,10 @@ export function createProviderLoginManager({
           resolve('failed');
           return;
         }
-        const timer = setTimeout(() => settle('failed', { kill: true }), timeoutMs);
+        record = trackChild(child);
+        clearRecord = record;
+        pendingClearSettlers.set(record, () => settle('failed'));
+        timer = setTimeout(() => { void settle('failed', { kill: true }); }, timeoutMs);
         timer.unref?.();
         const collect = (stream, chunk) => {
           if (settled) return;
@@ -580,13 +805,14 @@ export function createProviderLoginManager({
             ? Buffer.byteLength(text.slice(finalNewline + 1), 'utf8')
             : partial[stream] + data.length;
           if (bytes > maxOutputBytes || lines > maxOutputLines || partial[stream] > maxLineBytes) {
-            settle('failed', { kill: true });
+            void settle('failed', { kill: true });
           }
         };
         child.stdout?.on('data', (chunk) => collect('stdout', chunk));
         child.stderr?.on('data', (chunk) => collect('stderr', chunk));
-        child.once('error', () => settle('failed', { kill: true }));
-        child.once('close', (statusCode) => settle(statusCode === 0 ? 'cleared' : 'failed'));
+        child.once('error', () => { void settle('failed', { kill: true }); });
+        child.once('disconnect', () => { void settle('failed', { kill: true }); });
+        child.once('close', (statusCode) => { void settle(statusCode === 0 ? 'cleared' : 'failed'); });
       });
       const reasonCode = state === 'cleared' ? null : 'logout-failed';
       emitHealth(signalSession, state === 'cleared'
@@ -594,7 +820,11 @@ export function createProviderLoginManager({
         : { kind: 'provider-failure', source: 'post-auth' });
       return { provider: 'claude', reasonCode, state };
     } finally {
-      clearingOwners.delete(ownerId);
+      if (!clearRecord || clearRecord.closed) {
+        clearingOwners.delete(ownerId);
+      } else {
+        clearRecord.closedPromise.then(() => clearingOwners.delete(ownerId));
+      }
     }
   }
 
@@ -613,20 +843,34 @@ export function createProviderLoginManager({
 
   async function disconnectOwner(ownerContext) {
     const ownerId = checkedOwner(ownerContext);
+    const cleanup = [];
     for (const session of sessions.values()) {
       if (session.ownerId === ownerId && !TERMINAL_STATES.has(session.state)) {
-        terminal(session, 'cancelled', 'cancelled', { kill: true });
+        cleanup.push(terminal(session, 'cancelled', 'cancelled', { kill: true }));
       }
     }
+    await Promise.all(cleanup);
   }
 
   async function shutdown() {
     shuttingDown = true;
+    const deadlineAt = Date.now() + shutdownDeadlineMs;
+    const cleanup = [];
     for (const session of sessions.values()) {
       if (!TERMINAL_STATES.has(session.state)) {
-        terminal(session, 'cancelled', 'cancelled', { kill: true });
+        cleanup.push(terminal(session, 'cancelled', 'cancelled', {
+          kill: true,
+          deadlineAt,
+        }));
       }
     }
+    for (const record of [...trackedChildren]) {
+      cleanup.push(stopTrackedChild(record, deadlineAt));
+    }
+    await Promise.all(cleanup);
+    await Promise.all(
+      [...pendingClearSettlers.values()].map((settle) => settle()),
+    );
   }
 
   return Object.freeze({
@@ -635,6 +879,7 @@ export function createProviderLoginManager({
     disconnectOwner,
     getActiveProviderLogin,
     getProviderLoginSession,
+    retryProviderLogin,
     shutdown,
     startProviderLogin,
     submitProviderLoginCode,
@@ -644,6 +889,7 @@ export function createProviderLoginManager({
 const defaultManager = createProviderLoginManager();
 
 export const startProviderLogin = defaultManager.startProviderLogin;
+export const retryProviderLogin = defaultManager.retryProviderLogin;
 export const submitProviderLoginCode = defaultManager.submitProviderLoginCode;
 export const cancelProviderLogin = defaultManager.cancelProviderLogin;
 export const clearClaudeCredentials = defaultManager.clearClaudeCredentials;
