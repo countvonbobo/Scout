@@ -233,7 +233,7 @@ test('URL and secret-shaped provider evidence is isolated and never persisted', 
     'https://example.test/evidence#PRIVATE_FRAGMENT_SECRET',
     'https://PRIVATE_USER:PRIVATE_PASSWORD@example.test/evidence',
     'Bearer PRIVATE_BEARER_SECRET_123456789',
-    'sk-PRIVATE_OPENAI_SECRET_1234567890',
+    ['sk', 'PRIVATE_OPENAI_SECRET_1234567890'].join('-'),
   ];
   try {
     const [batch] = planAssessmentBatches({

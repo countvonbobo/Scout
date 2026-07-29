@@ -998,7 +998,9 @@ test('backup setup still returns the recovery key when the first checkpoint need
   assert.match(connected.recoveryKey, /^SCOUT-1-/);
   assert.equal(connected.status.state, 'needs-attention');
   assert.equal(connected.status.pending, true);
-  assert.match(connected.status.error, /synthetic commit failure/);
+  assert.equal(connected.status.error, 'Private backup needs attention');
+  assert.equal(connected.status.reasonCode, 'backup-error');
+  assert.doesNotMatch(JSON.stringify(connected.status), /synthetic commit failure/);
   assert.equal(loadSyncSettings(f.root).enabled, true);
   fs.rmSync(f.base, { recursive: true, force: true });
 });

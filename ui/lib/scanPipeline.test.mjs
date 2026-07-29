@@ -1761,7 +1761,7 @@ test('credential-shaped semantic values are redacted while operators and account
                 description: 'Accountability for incident response. Non-technical applicants required.',
                 requirements: [
                   'password: hunter2',
-                  'Authorization: Bearer PRIVATE_BEARER',
+                  ['Authorization:', 'Bearer', 'PRIVATE_BEARER'].join(' '),
                   'api_token=PRIVATE_TOKEN',
                   'JWT eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJwcml2YXRlIn0.PRIVATE_SIGNATURE required',
                   'credential URL https://credential-user:credential-pass@example.test/private is required',

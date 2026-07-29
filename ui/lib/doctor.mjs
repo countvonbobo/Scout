@@ -42,3 +42,36 @@ export function doctor(workspaceRoot, {
   const required = checks.config.ok && checks.tracker.ok && checks.typst.ok && (!requireProvider || providerReady);
   return { ok: required, workspaceRoot, checks, providerSetupRequired: !providerReady };
 }
+
+function publicCheck(check) {
+  return {
+    ok: Boolean(check?.ok),
+    ...(Object.hasOwn(check || {}, 'optional') ? { optional: Boolean(check.optional) } : {}),
+  };
+}
+
+export function publicDoctor(result) {
+  const checks = result?.checks || {};
+  const providers = {};
+  for (const provider of ['codex', 'claude']) {
+    const value = checks.providers?.[provider];
+    if (!value) continue;
+    providers[provider] = {
+      installed: Boolean(value.installed),
+      authenticated: Boolean(value.authenticated),
+      capabilities: { structuredOutput: Boolean(value.capabilities?.structuredOutput) },
+    };
+  }
+  return {
+    ok: Boolean(result?.ok),
+    providerSetupRequired: Boolean(result?.providerSetupRequired),
+    checks: {
+      config: publicCheck(checks.config),
+      tracker: publicCheck(checks.tracker),
+      git: publicCheck(checks.git),
+      typst: publicCheck(checks.typst),
+      providers,
+      adzuna: publicCheck(checks.adzuna),
+    },
+  };
+}

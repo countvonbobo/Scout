@@ -30,7 +30,7 @@ import {
 import { providerPreflight, readProviderHealth } from './lib/providerHealth.mjs';
 import { createProviderLoginManager } from './lib/providerLogin.mjs';
 import { runStructuredTurn } from './lib/structuredTurn.mjs';
-import { doctor } from './lib/doctor.mjs';
+import { doctor, publicDoctor } from './lib/doctor.mjs';
 import { extractCvText } from './lib/cvImport.mjs';
 import { setupReadiness } from './lib/setupReadiness.mjs';
 import { OperationConflictError, OperationManager } from './lib/operations.mjs';
@@ -647,7 +647,7 @@ async function handleRead(req, res, url) {
         readiness: {},
         scanHealth: { healthy: false, lastRunAt: null },
         schedule: { enabled: false, configured: false, lastResult: 'never' },
-        doctor: { ok: false, workspaceRoot: WORKSPACE_ROOT, checks: {} },
+        doctor: publicDoctor({ ok: false, providerSetupRequired: true, checks: {} }),
         device: currentDeviceSettings(),
         remoteAccess: publicRemoteStatus(remoteAccessStatus(loadDeviceSettings())),
         requestAccess: req.scoutAccess,
@@ -677,7 +677,7 @@ async function handleRead(req, res, url) {
       readiness: readiness.checks,
       scanHealth: readScanHealth(),
       schedule: readScheduleSummary(config),
-      doctor: doctor(WORKSPACE_ROOT, { appRoot: APP_ROOT, providers }),
+      doctor: publicDoctor(doctor(WORKSPACE_ROOT, { appRoot: APP_ROOT, providers })),
       git: detectGit(),
       sync: syncStatus(WORKSPACE_ROOT),
       device: currentDeviceSettings(),
@@ -828,8 +828,8 @@ async function handleSource(res, id) {
   let entry;
   try {
     entry = (readTracker().opportunities || []).find((o) => o.id === id);
-  } catch (e) {
-    return sendJson(res, 500, { error: `tracker unreadable: ${e.message}` });
+  } catch {
+    return sendJson(res, 500, publicApiError('Tracker could not be read.'));
   }
   if (!entry) return sendJson(res, 404, { error: 'no such opportunity' });
   const target = sourceUrlOf(entry);
@@ -849,8 +849,12 @@ async function handleSource(res, id) {
     if (!r.ok) return sendJson(res, 502, { ok: false, error: `source returned ${r.status}` });
     html = await r.text();
   } catch (e) {
-    const msg = e.name === 'TimeoutError' ? 'source timed out' : `fetch failed: ${e.message}`;
-    return sendJson(res, 502, { ok: false, error: msg });
+    return sendJson(res, 502, {
+      ok: false,
+      ...(e.name === 'TimeoutError'
+        ? { error: 'Source request timed out.', reasonCode: 'source-timeout' }
+        : { error: 'Source could not be fetched.', reasonCode: 'source-fetch-failed' }),
+    });
   }
   const payload = buildSourcePayload(html, target, new Date().toISOString());
   sourceCache.set(id, payload);

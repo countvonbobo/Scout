@@ -149,7 +149,7 @@ test('assessment result artifacts reject URL-bearing and secret-shaped evidence 
     'https://example.test/evidence#PRIVATE_FRAGMENT_SECRET',
     'https://PRIVATE_USER:PRIVATE_PASSWORD@example.test/evidence',
     'Bearer PRIVATE_BEARER_SECRET_123456789',
-    'sk-PRIVATE_OPENAI_SECRET_1234567890',
+    ['sk', 'PRIVATE_OPENAI_SECRET_1234567890'].join('-'),
   ];
   const baseAssessment = {
     candidateId: 'candidate-001',

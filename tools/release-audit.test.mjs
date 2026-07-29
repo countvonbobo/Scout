@@ -290,6 +290,29 @@ test('rejects plausible credentials even when their values contain fixture-like 
   })).sort((a, b) => a.file.localeCompare(b.file, 'en')));
 });
 
+test('checks every sensitive assignment on a line and rejects bearer and provider tokens', () => {
+  const root = fixture();
+  const bearer = ['Authorization:', 'Bearer', 'liveBearerCredential123456'].join(' ');
+  const providerToken = ['sk', 'liveProviderCredential123456'].join('-');
+  const cases = [
+    ['minified.env', `${'TOKEN'}=replace-me ${'PASSWORD'}=live-password-value\n`, 'secret-assignment'],
+    ['authorization.txt', `${bearer}\n`, 'authorization-bearer'],
+    ['provider.txt', `${providerToken}\n`, 'openai-token'],
+  ];
+  for (const [relative, content] of cases) fs.writeFileSync(path.join(root, relative), content);
+  const result = auditRelease({
+    root,
+    trackedFiles: cases.map(([relative]) => relative),
+    buildDirs: [],
+  });
+  assert.equal(result.ok, false);
+  assert.deepEqual(
+    result.findings.map(({ file, rule }) => [file, rule]),
+    cases.map(([file, _content, rule]) => [file, rule])
+      .sort(([left], [right]) => left.localeCompare(right, 'en')),
+  );
+});
+
 test('rejects plausible private home paths without username exemptions', () => {
   const root = fixture();
   const cases = [

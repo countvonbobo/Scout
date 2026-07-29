@@ -15,6 +15,8 @@ const SECRET_RULES = Object.freeze([
   { id: 'github-token', regex: /\b(?:gh[pousr]_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{20,})\b/g },
   { id: 'slack-token', regex: /\bxox[baprs]-[A-Za-z0-9-]{10,}\b/g },
   { id: 'google-api-key', regex: /\bAIza[A-Za-z0-9_-]{30,}\b/g },
+  { id: 'authorization-bearer', regex: /\bAuthorization[ \t]*:[ \t]*Bearer[ \t]+[A-Za-z0-9._~+/-]{16,}\b/gi },
+  { id: 'openai-token', regex: /\bsk-(?:proj-)?[A-Za-z0-9_-]{16,}\b/g },
 ]);
 const PRIVATE_RUNTIME_ROOTS = new Set([
   '.scout', 'applications', 'chats', 'cv', 'data', 'profile', 'reports',
@@ -62,17 +64,17 @@ function isPlaceholder(value) {
 function secretAssignmentFindings(text) {
   const findings = [];
   const lines = text.split(/\r?\n/);
-  const assignment = /\b(?:api[_-]?key|access[_-]?token|auth[_-]?token|client[_-]?secret|password|secret|token)\b\s*[:=]\s*(['"]?)([^\s'";#]{8,})\1/i;
+  const assignment = /\b(?:api[_-]?key|access[_-]?token|auth[_-]?token|client[_-]?secret|password|secret|token)\b\s*[:=]\s*(['"]?)([^\s'";#]{8,})\1/gi;
   for (let i = 0; i < lines.length; i += 1) {
-    const match = lines[i].match(assignment);
-    if (!match) continue;
-    const quoted = Boolean(match[1]);
-    const value = match[2];
-    // Unquoted expressions and property references are code, not embedded
-    // credentials. Quoted literals are always checked; unquoted values must
-    // resemble a literal rather than `env.KEY`, `portal.token`, or a call.
-    if (!quoted && /[().,`$]/.test(value)) continue;
-    if (!isPlaceholder(value)) findings.push({ line: i + 1, rule: 'secret-assignment' });
+    for (const match of lines[i].matchAll(assignment)) {
+      const quoted = Boolean(match[1]);
+      const value = match[2];
+      // Unquoted expressions and property references are code, not embedded
+      // credentials. Quoted literals are always checked; unquoted values must
+      // resemble a literal rather than `env.KEY`, `portal.token`, or a call.
+      if (!quoted && /[().,`$]/.test(value)) continue;
+      if (!isPlaceholder(value)) findings.push({ line: i + 1, rule: 'secret-assignment' });
+    }
   }
   return findings;
 }
