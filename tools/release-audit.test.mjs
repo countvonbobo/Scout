@@ -73,21 +73,50 @@ test('rejects private runtime artifact paths from a release tree', () => {
   assert.equal(result.findings.length, files.length);
 });
 
-test('rejects raw run, auth, prompt, CV, advert, transcript and tracking payloads', () => {
+test('rejects raw run, auth, prompt, CV, advert, transcript and tracking payloads across ordinary serializations', () => {
   const root = fixture();
   const cases = [
     ['raw-run.json', { rawRunState: { phase: 'synthetic-private-phase' } }, 'raw-run-state'],
+    ['raw-run-snake.json', { raw_run_state: { phase: 'synthetic-private-phase' } }, 'raw-run-state'],
+    ['raw-events.jsonl', { events: [{ phase: 'synthetic-private-phase' }] }, 'raw-run-state'],
+    ['nested-run.json', { run: { state: 'assessing', owner: { host: 'synthetic-private-host', pid: 1234 } } }, 'raw-run-state'],
     ['raw-auth.json', { rawAuthOutput: 'synthetic-auth-output' }, 'raw-auth-output'],
+    ['raw-stdout.json', { stdout: 'synthetic-auth-output' }, 'raw-auth-output'],
+    ['generic-output.json', { output: 'synthetic-auth-output' }, 'raw-auth-output'],
     ['auth-code.json', { authorizationCode: 'SYNTHETIC-CODE-1234' }, 'auth-code'],
+    ['auth-code-snake.json', { auth_code: 'SYNTHETIC-CODE-1234' }, 'auth-code'],
+    ['provider-code.json', { provider: 'claude', code: 'SYNTHETIC-CODE-1234' }, 'auth-code'],
+    ['session-user-code.json', { session: { state: 'awaiting-code', userCode: 'SYNTHETIC-CODE-1234' } }, 'auth-code'],
+    ['device-code.json', { device: { code: 'SYNTHETIC-CODE-1234' } }, 'auth-code'],
+    ['auth-code.txt', '"authCode":"SYNTHETIC-CODE-1234"', 'auth-code'],
     ['prompt.json', { prompt: 'A synthetic private prompt body that must not ship.' }, 'full-prompt'],
+    ['full-prompt.json', { fullPrompt: 'A synthetic private prompt body that must not ship.' }, 'full-prompt'],
+    ['prompt.txt', 'prompt: synthetic-private-prompt-body', 'full-prompt'],
+    ['escaped-prompt.json', '{"pro\\u006dpt":"A synthetic private prompt body that must not ship."}', 'full-prompt'],
     ['cv.json', { cvText: 'Synthetic private CV body that must not ship.' }, 'cv-body'],
+    ['master-cv.json', { masterCv: 'Synthetic private CV body that must not ship.' }, 'cv-body'],
+    ['resume.json', { resume: 'Synthetic private CV body that must not ship.' }, 'cv-body'],
     ['advert.json', { advertBody: 'Synthetic full advert body that must not ship.' }, 'advert-body'],
+    ['job-description.json', {
+      company: 'Synthetic employer',
+      title: 'Synthetic role',
+      description: 'Synthetic private advert body '.repeat(12),
+    }, 'advert-body'],
+    ['wrapped-description.json', { job: { description: 'Synthetic short private advert.' } }, 'advert-body'],
     ['transcript.json', { providerTranscript: 'Synthetic provider transcript.' }, 'provider-transcript'],
+    ['plain-transcript.json', { transcript: 'Synthetic provider transcript.' }, 'provider-transcript'],
+    ['transcript.log', 'provider_transcript: synthetic-private-provider-output', 'provider-transcript'],
+    ['opaque-payload.json', { payload: 'Synthetic provider output whose provenance cannot be audited.' }, 'raw-auth-output'],
     ['tracking.json', { trackingValue: 'utm_source=synthetic-private' }, 'tracking-value'],
+    ['tracking-key.json', { utm_source: 'synthetic-private' }, 'tracking-value'],
     ['private-path.json', { path: '/Users/synthetic-private/Scout Workspace' }, 'private-path'],
+    ['linux-private-path.json', { path: '/home/synthetic-private/Scout Workspace' }, 'private-path'],
+    ['linux-default-private-path.json', { path: '/home/ubuntu/Documents/Scout Workspace' }, 'private-path'],
+    ['linux-service-private-path.json', { path: '/home/scout/private-state' }, 'private-path'],
+    ['windows-private-path.json', { path: 'C:\\Users\\synthetic-private\\Scout Workspace' }, 'private-path'],
   ];
   for (const [relative, value] of cases) {
-    fs.writeFileSync(path.join(root, relative), `${JSON.stringify(value)}\n`);
+    fs.writeFileSync(path.join(root, relative), `${typeof value === 'string' ? value : JSON.stringify(value)}\n`);
   }
   const result = auditRelease({
     root,
@@ -103,6 +132,54 @@ test('rejects raw run, auth, prompt, CV, advert, transcript and tracking payload
   assert.equal(JSON.stringify(result).includes('synthetic-private'), false);
 });
 
+test('rejects private runtime roots inside the staged app layout regardless of case or binary content', () => {
+  const root = fixture();
+  const cases = [
+    ['app/Data/private.json', Buffer.from('{}\n')],
+    ['app/.SCOUT/run.bin', Buffer.from([0, 47, 104, 111, 109, 101, 47, 112, 114, 105, 118, 97, 116, 101])],
+  ];
+  for (const [relative, content] of cases) {
+    const file = path.join(root, relative);
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, content);
+  }
+  const result = auditRelease({
+    root,
+    trackedFiles: cases.map(([relative]) => relative),
+    buildDirs: [],
+  });
+  assert.equal(result.ok, false);
+  assert.equal(
+    result.findings.filter((finding) => finding.rule === 'private-runtime-artifact').length,
+    cases.length,
+  );
+  assert.equal(result.findings.every((finding) => finding.file === '[redacted-path]'), true);
+});
+
+test('allows only the exact documented VPS paths after release app wrapping', () => {
+  const root = fixture();
+  const documented = [
+    'app/docs/INSTALL_VPS.md',
+    'app/docs/diagnostics/beta15-vps-workspace-incident.md',
+    'app/tools/deploy-vps.sh',
+    'dist/release/stage/app/docs/INSTALL_VPS.md',
+  ];
+  for (const relative of documented) {
+    const file = path.join(root, relative);
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, '/home/ubuntu/Documents/Scout Workspace\n/home/scout-deploy/.ssh/authorized_keys\n');
+  }
+  const leaked = 'app/config/runtime.json';
+  fs.mkdirSync(path.dirname(path.join(root, leaked)), { recursive: true });
+  fs.writeFileSync(path.join(root, leaked), '{"workspace":"/home/ubuntu/Documents/Scout Workspace"}\n');
+
+  const documentedResult = auditRelease({ root, trackedFiles: documented, buildDirs: [] });
+  assert.equal(documentedResult.ok, true);
+  const leakedResult = auditRelease({ root, trackedFiles: [leaked], buildDirs: [] });
+  assert.equal(leakedResult.ok, false);
+  assert.deepEqual(leakedResult.findings.map(({ rule }) => rule), ['private-path']);
+});
+
 test('ignores documented placeholder credential assignments', () => {
   const root = fixture();
   const example = [`${'API'}_KEY=replace-me`, `${'PASS'}WORD=<your-password>`].join('\n') + '\n';
@@ -111,13 +188,56 @@ test('ignores documented placeholder credential assignments', () => {
   assert.equal(result.ok, true);
 });
 
-test('ignores credential variable expressions and binary files', () => {
+test('ignores credential variable expressions and exact allowlisted binary assets', () => {
   const root = fixture();
   fs.writeFileSync(path.join(root, 'source.mjs'), "const apiKey = String(env.ADZUNA_API_KEY || '').trim();\nconst token = crypto.randomUUID();\n");
-  fs.writeFileSync(path.join(root, 'runtime.exe'), Buffer.from([77, 90, 0, 1, 2, 3]));
-  const result = auditRelease({ root, trackedFiles: ['source.mjs', 'runtime.exe'], buildDirs: [] });
+  const binaries = [
+    'ui/assets/scout-icon.png',
+    'runtime/ScoutRuntime.exe',
+    'Scout.exe',
+    'dmg-root/Scout.app/Contents/MacOS/Scout',
+  ];
+  for (const relative of binaries) {
+    const binary = path.join(root, relative);
+    fs.mkdirSync(path.dirname(binary), { recursive: true });
+    fs.writeFileSync(binary, Buffer.from([137, 80, 78, 71, 0, 1, 2, 3]));
+  }
+  const result = auditRelease({ root, trackedFiles: ['source.mjs', ...binaries], buildDirs: [] });
   assert.equal(result.ok, true);
-  assert.equal(result.filesScanned, 1);
+  assert.equal(result.filesScanned, 5);
+});
+
+test('rejects arbitrary packaged binary documents and screenshots outside exact public allowlists', () => {
+  const root = fixture();
+  const cases = [
+    ['app/ui/assets/master-cv.pdf', '%PDF-1.7\nSynthetic private CV text\n%%EOF\n'],
+    ['docs/screenshots/private/private.png', Buffer.from([137, 80, 78, 71, 0, 1, 2, 3])],
+  ];
+  for (const [relative, content] of cases) {
+    const file = path.join(root, relative);
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, content);
+  }
+  const result = auditRelease({ root, trackedFiles: cases.map(([relative]) => relative), buildDirs: [] });
+  assert.equal(result.ok, false);
+  assert.deepEqual(result.findings, cases.map(([file]) => ({
+    file, line: 1, rule: 'unexpected-binary',
+  })).sort((left, right) => left.file.localeCompare(right.file, 'en')));
+});
+
+test('rejects personal markers in filenames without echoing the private path', () => {
+  const root = fixture();
+  const marker = 'Casey Exampleperson';
+  const relative = 'app/docs/Casey-Exampleperson-notes.md';
+  const file = path.join(root, relative);
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file, 'generic release note\n');
+  const result = auditRelease({ root, trackedFiles: [relative], buildDirs: [], markers: [marker] });
+  assert.equal(result.ok, false);
+  assert.deepEqual(result.findings, [{
+    file: '[redacted-path]', line: 1, rule: 'personal-marker-path-1',
+  }]);
+  assert.equal(JSON.stringify(result).includes('Casey'), false);
 });
 
 test('loads sorted unique markers from file and environment', () => {

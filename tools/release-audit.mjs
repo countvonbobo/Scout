@@ -19,16 +19,30 @@ const SECRET_RULES = Object.freeze([
 const PRIVATE_RUNTIME_ROOTS = new Set([
   '.scout', 'applications', 'chats', 'cv', 'data', 'profile', 'reports',
 ]);
-const SERIALIZED_PRIVACY_RULES = Object.freeze([
-  ['raw-run-state', /"rawRunState"\s*:/g],
-  ['raw-auth-output', /"rawAuthOutput"\s*:/g],
-  ['auth-code', /"(?:authorization|authentication|device|login)Code"\s*:/gi],
-  ['full-prompt', /"prompt"\s*:/g],
-  ['cv-body', /"(?:cvText|cvBody)"\s*:/g],
-  ['advert-body', /"(?:advertBody|fullAdvert|jobAdvertBody)"\s*:/g],
-  ['provider-transcript', /"providerTranscript"\s*:/g],
-  ['tracking-value', /"(?:trackingValue|trackingParameters)"\s*:/g],
+const SERIALIZED_EXTENSIONS = /\.(?:json|jsonl|ndjson|log|out|txt)$/i;
+const PRIVATE_PATH = /\/Users\/(?!Shared(?:\/|["'\s])|Public(?:\/|["'\s])|YOUR|<)[^/"'\s]+|\/home\/(?!YOUR|<)[^/"'\s]+|[A-Za-z]:\\Users\\(?!Public(?:\\|["'\s])|YOUR|<)[^\\/"'\s]+/g;
+const DOCUMENTED_PUBLIC_PATH_FILES = new Set([
+  'docs/INSTALL_VPS.md',
+  'docs/diagnostics/beta15-vps-workspace-incident.md',
+  'tools/deploy-vps.sh',
 ]);
+const PUBLIC_UI_BINARY_ASSETS = new Set([
+  'scout-explaining.png',
+  'scout-found.png',
+  'scout-icon.ico',
+  'scout-icon.png',
+  'scout-idle.png',
+  'scout-searching.png',
+  'scout-static.png',
+  'scout-thinking.png',
+  'scout-warning.png',
+]);
+const PUBLIC_DOC_SCREENSHOTS = new Set([
+  'docs/screenshots/0.1.0-beta.23/codex-remote-fallback.png',
+  'docs/screenshots/0.1.0-beta.23/trustworthy-model-picker.png',
+  'docs/screenshots/0.1.0-beta.23/usage-and-engine-regions.png',
+]);
+const BINARY_OR_DOCUMENT_EXTENSION = /\.(?:7z|bin|bz2|db|dmg|doc|docx|exe|gz|ico|icc|jpeg|jpg|msi|node|odt|pdf|pfb|pkg|png|rtf|sqlite|sqlite3|tar|tgz|ttf|wasm|xz|zip)$/i;
 
 function normaliseRelative(root, file) {
   const relative = path.relative(root, file);
@@ -70,6 +84,87 @@ function secretAssignmentFindings(text) {
   return findings;
 }
 
+function normaliseSerializedKey(key) {
+  return String(key).normalize('NFKC').replace(/[^a-z0-9]/gi, '').toLocaleLowerCase('en-US');
+}
+
+function privacyRuleForKey(key, value, owner = {}, ancestors = []) {
+  const normal = normaliseSerializedKey(key);
+  if (normal === 'events'
+    || (normal === 'state' && ancestors.some((part) => /(?:run|scan|journal)/.test(part)))
+    || (normal.includes('raw') && /(?:run|scan|execution|journal|state|event)/.test(normal))) {
+    return 'raw-run-state';
+  }
+  if (['output', 'payload', 'stdout', 'stderr'].includes(normal)
+    || (normal.includes('raw') && /(?:auth|login|provider|output|response|transcript)/.test(normal))) {
+    return 'raw-auth-output';
+  }
+  if (normal === 'usercode'
+    || /(?:auth|authentication|authorization|device|login).*code/.test(normal)
+    || (normal === 'code' && /^(?:claude|codex)$/i.test(String(owner.provider || '')))
+    || (normal === 'code' && ancestors.some((part) => /(?:auth|device|login|provider|session)/.test(part)))) return 'auth-code';
+  if (normal.includes('prompt')) return 'full-prompt';
+  if (normal === 'resume' || normal === 'mastercv'
+    || (/(?:cv|resume)/.test(normal) && /(?:body|content|document|text)/.test(normal))) return 'cv-body';
+  if (normal.includes('advert') || /job(?:body|description|text|content)/.test(normal)) return 'advert-body';
+  if (normal === 'description' && typeof value === 'string'
+    && (value.length >= 120
+      || ['company', 'role', 'title'].some((field) => Object.hasOwn(owner, field))
+      || ancestors.some((part) => /(?:advert|job|vacancy)/.test(part)))) {
+    return 'advert-body';
+  }
+  if (normal.includes('transcript')) return 'provider-transcript';
+  if (normal.includes('tracking') || /^utm(?:source|medium|campaign|term|content)$/.test(normal)
+    || ['fbclid', 'gclid', 'msclkid'].includes(normal)) return 'tracking-value';
+  return null;
+}
+
+function serializedPrivacyFindings(text) {
+  const findings = [];
+  const seen = new Set();
+  const inspect = (value, owner = value, ancestors = []) => {
+    if (Array.isArray(value)) {
+      for (const item of value) inspect(item, item, ancestors);
+      return;
+    }
+    if (!value || typeof value !== 'object') return;
+    for (const [key, child] of Object.entries(value)) {
+      const rule = privacyRuleForKey(key, child, owner, ancestors);
+      if (rule) {
+        const index = text.search(new RegExp(`["']${key.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}["']\\s*:`, 'i'));
+        const finding = `${rule}:${Math.max(index, 0)}`;
+        if (!seen.has(finding)) {
+          seen.add(finding);
+          findings.push({ line: lineAt(text, Math.max(index, 0)), rule });
+        }
+      }
+      inspect(child, child, [...ancestors, normaliseSerializedKey(key)]);
+    }
+  };
+  const records = [];
+  try {
+    records.push(JSON.parse(text));
+  } catch {
+    for (const line of text.split(/\r?\n/).filter((entry) => entry.trim())) {
+      try { records.push(JSON.parse(line)); } catch { /* handled by fallback key scan below */ }
+    }
+  }
+  for (const record of records) inspect(record);
+
+  // Text exports and damaged JSON still fail closed on high-signal field names.
+  const key = /["']?([A-Za-z][A-Za-z0-9_-]{1,80})["']?\s*:/g;
+  let match;
+  while ((match = key.exec(text)) !== null) {
+    const rule = privacyRuleForKey(match[1], null, {});
+    const finding = `${rule}:${match.index}`;
+    if (rule && !seen.has(finding)) {
+      seen.add(finding);
+      findings.push({ line: lineAt(text, match.index), rule });
+    }
+  }
+  return findings;
+}
+
 function scanText(text, markers, relative = '') {
   const findings = [];
   const lower = text.toLocaleLowerCase('en-US');
@@ -90,22 +185,50 @@ function scanText(text, markers, relative = '') {
     }
   }
   findings.push(...secretAssignmentFindings(text));
-  if (/\.(?:json|jsonl|ndjson)$/i.test(relative)) {
-    for (const [rule, regex] of SERIALIZED_PRIVACY_RULES) {
-      regex.lastIndex = 0;
-      let match;
-      while ((match = regex.exec(text)) !== null) {
-        findings.push({ line: lineAt(text, match.index), rule });
-        if (match[0].length === 0) regex.lastIndex += 1;
-      }
-    }
+  if (SERIALIZED_EXTENSIONS.test(relative)) findings.push(...serializedPrivacyFindings(text));
+  let pathText = text.replaceAll('\\\\', '\\');
+  const documentedPublicPath = [...DOCUMENTED_PUBLIC_PATH_FILES].some((documented) =>
+    relative === documented || relative === `app/${documented}` || relative.endsWith(`/app/${documented}`));
+  if (documentedPublicPath) {
+    pathText = pathText.replaceAll(/\/home\/(?:scout-deploy|ubuntu)/g, '/home/YOUR');
   }
-  const privatePath = /\/Users\/(?!Shared(?:\/|["'\s])|YOUR|<)[^/"'\s]+|[A-Za-z]:\\Users\\(?!Public(?:\\|["'\s])|YOUR|<)[^\\/"'\s]+/g;
+  PRIVATE_PATH.lastIndex = 0;
   let pathMatch;
-  while ((pathMatch = privatePath.exec(text)) !== null) {
-    findings.push({ line: lineAt(text, pathMatch.index), rule: 'private-path' });
+  while ((pathMatch = PRIVATE_PATH.exec(pathText)) !== null) {
+    findings.push({ line: lineAt(pathText, pathMatch.index), rule: 'private-path' });
   }
   return findings;
+}
+
+function privateRuntimeArtifact(relative) {
+  const parts = String(relative).split(/[\\/]+/).filter(Boolean);
+  if (parts[0]?.toLocaleLowerCase('en-US') === 'app') parts.shift();
+  return PRIVATE_RUNTIME_ROOTS.has(parts[0]?.toLocaleLowerCase('en-US'));
+}
+
+function allowedReleaseBinary(relative) {
+  const value = String(relative).replaceAll('\\', '/').toLocaleLowerCase('en-US');
+  const appIndex = value.lastIndexOf('/app/');
+  const packaged = appIndex === -1 ? value : value.slice(appIndex + 1);
+  if (packaged.startsWith('app/node_modules/') || packaged.startsWith('node_modules/')) return true;
+  if (/^(?:.*\/)?runtime\/(?:node|node\.exe|scoutruntime\.exe|typst|typst\.exe)$/.test(value)) return true;
+  if (value === 'scout.exe' || /^dist\/release\/[^/]+\/scout\.exe$/.test(value)) return true;
+  if (/(?:^|\/)dmg-root\/scout\.app\/contents\/macos\/scout$/.test(value)) return true;
+  const asset = packaged.match(/^(?:app\/)?ui\/assets\/([^/]+)$/)?.[1];
+  if (asset && PUBLIC_UI_BINARY_ASSETS.has(asset)) return true;
+  if ([...PUBLIC_DOC_SCREENSHOTS].some((screenshot) =>
+    value === screenshot || value.endsWith(`/app/${screenshot}`) || value.endsWith(`/${screenshot}`))) return true;
+  return false;
+}
+
+function binaryContent(content) {
+  const sample = content.subarray(0, Math.min(content.length, 64 * 1024));
+  if (sample.includes(0)) return true;
+  let controls = 0;
+  for (const byte of sample) {
+    if (byte < 9 || (byte > 13 && byte < 32)) controls += 1;
+  }
+  return sample.length > 0 && controls / sample.length > 0.01;
 }
 
 function filesUnder(directory) {
@@ -163,15 +286,42 @@ export function auditRelease({
   let filesScanned = 0;
   for (const file of files) {
     const content = fs.readFileSync(file);
-    if (content.subarray(0, 8192).includes(0)) continue;
     filesScanned += 1;
-    const text = content.toString('utf8');
     const relative = normaliseRelative(absoluteRoot, file);
-    if (PRIVATE_RUNTIME_ROOTS.has(relative.split('/')[0])) {
-      findings.push({ file: relative, line: 1, rule: 'private-runtime-artifact' });
+    const privateRuntime = privateRuntimeArtifact(relative);
+    const pathFindings = [];
+    const lowerRelative = relative.toLocaleLowerCase('en-US');
+    const compactRelative = lowerRelative.normalize('NFKC').replace(/[^a-z0-9]/g, '');
+    for (let markerIndex = 0; markerIndex < markers.length; markerIndex += 1) {
+      const compactMarker = markers[markerIndex].toLocaleLowerCase('en-US')
+        .normalize('NFKC').replace(/[^a-z0-9]/g, '');
+      if (compactMarker && compactRelative.includes(compactMarker)) {
+        pathFindings.push({ line: 1, rule: `personal-marker-path-${markerIndex + 1}` });
+      }
     }
+    for (const { id, regex } of SECRET_RULES) {
+      regex.lastIndex = 0;
+      if (regex.test(relative)) pathFindings.push({ line: 1, rule: `${id}-path` });
+    }
+    const redactedPath = privateRuntime || pathFindings.length > 0;
+    const publicFile = redactedPath ? '[redacted-path]' : relative;
+    if (privateRuntime) {
+      findings.push({ file: publicFile, line: 1, rule: 'private-runtime-artifact' });
+    }
+    // Executables and archives are allowlisted build inputs, not serialized
+    // workspace state. Classify their path above, then avoid unbounded UTF-8
+    // decoding and random byte-pattern findings.
+    if (binaryContent(content) || BINARY_OR_DOCUMENT_EXTENSION.test(relative)) {
+      if (!privateRuntime && !allowedReleaseBinary(relative)) {
+        findings.push({ file: publicFile, line: 1, rule: 'unexpected-binary' });
+      }
+      findings.push(...pathFindings.map((finding) => ({ file: publicFile, ...finding })));
+      continue;
+    }
+    const text = content.toString('utf8');
+    findings.push(...pathFindings.map((finding) => ({ file: publicFile, ...finding })));
     for (const finding of scanText(text, markers, relative)) {
-      findings.push({ file: relative, ...finding });
+      findings.push({ file: publicFile, ...finding });
     }
   }
   findings.sort((a, b) => a.file.localeCompare(b.file, 'en') || a.line - b.line || a.rule.localeCompare(b.rule, 'en'));

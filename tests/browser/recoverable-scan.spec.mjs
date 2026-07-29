@@ -1,4 +1,30 @@
+import fs from 'node:fs';
+import path from 'node:path';
+import { spawnSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 import { expect, test } from '@playwright/test';
+import { currentLeaseOwner } from '../../ui/lib/scanLease.mjs';
+
+const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
+const REAL_ACCEPTANCE_SUITES = Object.freeze([
+  'ui/lib/runJournal.test.mjs',
+  'ui/lib/runArtifacts.test.mjs',
+  'ui/lib/runRecovery.test.mjs',
+  'ui/lib/scanLease.test.mjs',
+  'ui/lib/scanPipeline.test.mjs',
+  'ui/lib/assessmentBatches.test.mjs',
+  'ui/lib/scanQueue.test.mjs',
+  'ui/lib/mutationCoordinator.test.mjs',
+  'ui/lib/scanMutationProjection.test.mjs',
+  'ui/lib/recoveryBackup.test.mjs',
+  'ui/lib/workspaceSync.test.mjs',
+  'ui/lib/runRetention.test.mjs',
+  'ui/lib/providerHealth.test.mjs',
+  'ui/lib/providerLogin.test.mjs',
+  'ui/lib/providers.test.mjs',
+  'ui/lib/scheduler.test.mjs',
+  'ui/server.test.mjs',
+]);
 
 const PRIVATE_SENTINELS = [
   'PRIVATE-HOST',
@@ -124,6 +150,65 @@ function publicRun(state, label, fields = {}) {
     sourceUrl: `https://example.test/job?${PRIVATE_SENTINELS[5]}`,
   };
 }
+
+test('real fault-injection durability and security suites form one release acceptance boundary', async ({ browserName }) => {
+  test.skip(browserName !== 'chromium', 'the release matrix is browser-independent and runs once');
+  try {
+    currentLeaseOwner();
+  } catch {
+    test.skip(true, 'this macOS host cannot read its own process-start identity; the Linux CI matrix is authoritative');
+  }
+  test.setTimeout(180_000);
+  const result = spawnSync(process.execPath, ['--test', ...REAL_ACCEPTANCE_SUITES], {
+    cwd: ROOT,
+    encoding: 'utf8',
+    windowsHide: true,
+    timeout: 170_000,
+    maxBuffer: 20 * 1024 * 1024,
+  });
+  expect(
+    result.status,
+    `real recovery acceptance failed\n${String(result.stdout || '').slice(-8000)}\n${String(result.stderr || '').slice(-8000)}`,
+  ).toBe(0);
+});
+
+test('real recovery and provider APIs reject a fault-injected private journal identity', async ({ page, request }) => {
+  const workspace = process.env.SCOUT_WORKSPACE;
+  expect(workspace).toBeTruthy();
+  const sentinel = 'PRIVATE-FAULT-JOURNAL-IDENTITY';
+  const corruptRun = path.join(workspace, '.scout', 'runs', sentinel);
+  fs.mkdirSync(corruptRun, { recursive: true });
+  fs.writeFileSync(path.join(corruptRun, 'journal.jsonl'), '{"not":"a valid journal"}\n');
+  try {
+    const [runsResponse, queueResponse, loginResponse] = await Promise.all([
+      request.get('/api/scan/runs'),
+      request.get('/api/scan/queue'),
+      request.get('/api/provider-login/status?provider=codex'),
+    ]);
+    expect(runsResponse.ok()).toBe(true);
+    expect(queueResponse.ok()).toBe(true);
+    expect(loginResponse.ok()).toBe(true);
+    const payloads = JSON.stringify([
+      await runsResponse.json(),
+      await queueResponse.json(),
+      await loginResponse.json(),
+    ]);
+    expect(payloads).not.toContain(sentinel);
+    expect(payloads).not.toContain(workspace);
+    expect(payloads).not.toMatch(/rawRunState|rawAuthOutput|providerTranscript|authCode|prompt|utm_source/i);
+
+    await page.goto('/');
+    await expect(page.getByText(sentinel, { exact: false })).toHaveCount(0);
+    const browserState = await page.evaluate(() => JSON.stringify({
+      local: Object.entries(localStorage),
+      session: Object.entries(sessionStorage),
+    }));
+    expect(browserState).not.toContain(sentinel);
+    expect(browserState).not.toContain(workspace);
+  } finally {
+    fs.rmSync(corruptRun, { recursive: true, force: true });
+  }
+});
 
 test('every durable pipeline and recovery state remains reviewable and privacy-safe', async ({ page }) => {
   const state = {

@@ -633,6 +633,11 @@ test('app.js keeps no Scout animation timing, geometry or alignment data of its 
 test('index.html loads the canonical character module and defines no fixed 16-frame animation', () => {
   const html = fs.readFileSync(new URL('./index.html', import.meta.url), 'utf8');
   assert.match(html, /<script type="module" src="\/lib\/scoutCharacter\.mjs\?v=__SCOUT_UI_BUILD__"><\/script>/);
+  assert.ok(
+    html.indexOf('src="/app.js?v=__SCOUT_UI_BUILD__"')
+      < html.indexOf('src="/lib/scoutCharacter.mjs?v=__SCOUT_UI_BUILD__"'),
+    'the independent app module must execute before a delayed character module',
+  );
   // The old hand-written keyframe table hard-coded 16 cells and rounded thirds,
   // so any state with a different grid or frame rate drifted off its cell. The
   // walk is now a per-grid keyframes rule generated from the definition.

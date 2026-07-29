@@ -71,15 +71,18 @@ request.
 Scout measures run journals, derived artifacts and the queue separately. It
 retains the newest 20 runs, 30 days of full history, one year of compact
 terminal summaries, and every active, queued, partial, failed, unrepaired or
-recovery-referenced run. If a warning becomes a refusal, review the proposed
-encrypted archive and cleanup selection; Scout will not silently delete
+recovery-referenced run. If a warning becomes a refusal, preserve the workspace
+and collect only bounded diagnostics. Scout will not silently delete
 recovery-critical state.
 
 An interrupted cleanup is resumable from its verified encrypted archive and
 receipt. Do not remove the archive, receipt, run directories or queue journal
-manually. Retry the reviewed cleanup. If the archive fails authentication or
-the fence changed, preserve all source data and investigate before selecting
-anything again.
+manually. The current release contains the fenced archive/cleanup engine but no
+general UI or CLI entrypoint. An integration or operator tool that began the
+reviewed cleanup must resume the same selection; otherwise preserve the whole
+workspace and escalate with bounded diagnostics. If the archive fails
+authentication or the fence changed, preserve all source data and investigate
+before selecting anything again.
 
 ## Port or UI problem
 

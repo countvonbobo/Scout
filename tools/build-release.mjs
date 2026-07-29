@@ -81,18 +81,20 @@ export const PUBLIC_SOURCE_FILES = Object.freeze([
 ]);
 
 function normalise(relative) {
-  return relative.split(path.sep).join('/');
+  return String(relative).replaceAll('\\', '/').replace(/^\.\/+/, '');
 }
 
 export function includeReleasePath(relative) {
   const value = normalise(relative);
-  const base = path.posix.basename(value);
-  const root = value.split('/')[0];
+  const lower = value.toLocaleLowerCase('en-US');
+  const base = path.posix.basename(lower);
+  const parts = lower.split('/').filter(Boolean);
+  const root = parts[0] === 'app' ? parts[1] : parts[0];
   if (['.scout', 'applications', 'chats', 'cv', 'data', 'profile', 'reports'].includes(root)) return false;
-  if (value.split('/').some((part) => ['.bin', 'fixtures', 'test', 'tests', 'test-data', '__tests__'].includes(part))) return false;
-  if (base === '.DS_Store' || base === 'Thumbs.db') return false;
+  if (parts.some((part) => ['.bin', 'fixtures', 'test', 'tests', 'test-data', '__tests__', '__snapshots__'].includes(part))) return false;
+  if (base === '.ds_store' || base === 'thumbs.db') return false;
+  if (/\.(?:doc|docx|odt|pdf|rtf)$/i.test(base)) return false;
   if (/\.test\.mjs$/i.test(base)) return false;
-  if (value.split('/').includes('__snapshots__')) return false;
   return true;
 }
 

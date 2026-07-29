@@ -44,6 +44,8 @@ test('release tree filter omits tests and snapshots', () => {
   assert.equal(includeReleasePath('ui/__snapshots__/screen.txt'), false);
   assert.equal(includeReleasePath('node_modules/.bin/mammoth'), false);
   assert.equal(includeReleasePath('node_modules/mammoth/test/test-data/sample.docx'), false);
+  assert.equal(includeReleasePath('ui/assets/master-cv.pdf'), false);
+  assert.equal(includeReleasePath('assets/private-resume.docx'), false);
   for (const privateRuntimePath of [
     'data/scan-runs.jsonl',
     '.scout/runs/run-synthetic/journal.jsonl',
@@ -55,6 +57,15 @@ test('release tree filter omits tests and snapshots', () => {
     'chats/synthetic.json',
   ]) {
     assert.equal(includeReleasePath(privateRuntimePath), false);
+  }
+  for (const bypass of [
+    'Data/private.json',
+    '.SCOUT/runs/private.json',
+    'app/Profile/context.md',
+    'ui/Tests/private.mjs',
+    'ui/Fixtures/private.json',
+  ]) {
+    assert.equal(includeReleasePath(bypass), false);
   }
 });
 

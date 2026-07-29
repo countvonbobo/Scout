@@ -355,8 +355,8 @@ test.describe('Scout character animation', () => {
 });
 
 test.describe('Scout character before its module is available', () => {
-  // Holds the module request so real renders happen in the window between the
-  // classic app.js executing and the deferred module evaluating.
+  // Holds the character module so real renders happen in the window between
+  // the independent app module executing and the character module evaluating.
   async function withHeldModule(page, run) {
     let release;
     const held = new Promise((resolve) => { release = resolve; });
@@ -401,8 +401,8 @@ test.describe('Scout character before its module is available', () => {
   test('a render before the module arrives still produces named, hydratable characters', async ({ page }) => {
     await withHeldModule(page, async (release) => {
       await page.goto('/', { waitUntil: 'commit' });
-      // Holding the module ties up a connection, so the classic script can take
-      // noticeably longer to arrive on some engines than the default poll allows.
+      // Holding one module ties up a connection, so the independent app module
+      // can take noticeably longer to arrive than the default poll allows.
       await expect.poll(() => page.evaluate(() => Boolean(window.Scout)), { timeout: 20000 }).toBe(true);
       expect(await page.evaluate(() => Boolean(window.ScoutCharacter))).toBe(false);
 

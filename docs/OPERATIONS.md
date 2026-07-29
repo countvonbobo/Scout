@@ -121,11 +121,19 @@ The maintained beta deployment uses one private, single-owner Ubuntu VPS:
   deleting only explicitly selected eligible data under the active fence;
   interrupted cleanup resumes from the archive/receipt. Queue compaction keeps
   live work and required terminal evidence.
-- Public APIs, UI, logs, backups and release artifacts exclude credentials,
-  auth codes, full prompts, CV/ad bodies, provider transcripts, raw
-  stdout/stderr, raw run/auth state, private paths and tracking values.
-  Provider/account state remains device-local. Run views use shortened IDs,
-  sanitised ownership, allowlisted reason codes and bounded counts.
+- The recovery, queue, provider-health and guided-login API/UI projections,
+  diagnostics and release artifacts exclude credentials, retained or
+  user-entered authentication codes, full prompts, CV/ad bodies, provider
+  transcripts, raw stdout/stderr, raw run/auth state, private paths and tracking
+  values. Codex guided login has one deliberate exception: its bounded,
+  ephemeral device code is returned to and displayed for the authenticated
+  owner while that in-memory session is active; it is never written to the
+  workspace, logs, browser storage or backup. Provider/account state otherwise
+  remains device-local. Run views use shortened IDs, sanitised ownership,
+  allowlisted reason codes and bounded counts. This does not describe ordinary
+  private workspace features: setup/app information intentionally shows the
+  configured workspace path to its authenticated owner, and career files are
+  displayed in Scout and included under the documented private-backup policy.
 
 Do not assume a developer computer's local application checkout or workspace is live. Diagnose the VPS for production-like bugs unless the user explicitly reports a local-only installation.
 

@@ -64,8 +64,10 @@ stages and assessment batches after a process or machine restart, while stale
 workers are prevented from committing. The Jobs view shows bounded recovery,
 batch and queue state without exposing host identity, private paths, prompts,
 provider output or advert content. Storage-pressure warnings stop new durable
-work before recovery evidence becomes unsafe; reviewed cleanup never deletes
-active or recovery-critical runs.
+work before recovery evidence becomes unsafe. The archive/cleanup engine never
+deletes active or recovery-critical runs, but this release does not expose a
+general cleanup button or CLI command; preserve the workspace and follow a
+reviewed operator handoff if a refusal is reached.
 
 Provider health is tracked separately for Codex and Claude. An unhealthy
 provider blocks only its own work and is never silently replaced. Use the
