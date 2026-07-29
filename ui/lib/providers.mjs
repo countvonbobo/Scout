@@ -53,6 +53,57 @@ function healthSignal(kind, source, reasonCode = null) {
   };
 }
 
+function providerFailureText(value) {
+  const error = value?.error;
+  if (typeof error === 'string') return error.slice(0, 8_192);
+  if (error && typeof error.message === 'string') return error.message.slice(0, 8_192);
+  return typeof value?.message === 'string' ? value.message.slice(0, 8_192) : '';
+}
+
+// Provider failures can contain complete response bodies, local paths, account
+// identifiers, and credential material. Reduce them at the adapter boundary to
+// one allowlisted reason code; callers must never carry the inspected text on.
+export function providerFailureClassification(result) {
+  const status = Number(result?.status ?? result?.statusCode);
+  const errorCode = String(result?.errorCode || result?.code || result?.error?.code || '').toUpperCase();
+  const reasonCode = String(result?.reasonCode || '').toLowerCase();
+  const text = providerFailureText(result);
+
+  if (
+    status === 401
+    || status === 403
+    || result?.authenticationFailed === true
+    || reasonCode === 'authentication-required'
+    || /\b(?:401|403)\b|unauthori[sz]ed|forbidden|authentication (?:failed|required)|(?:not|please) (?:logged|signed) in|(?:invalid|expired|missing) (?:api[- ]?)?(?:key|token|credential)/i.test(text)
+  ) {
+    return { reasonCode: 'authentication-required' };
+  }
+  if (
+    status === 429
+    || result?.rateLimited === true
+    || reasonCode === 'rate-limited'
+    || /\b429\b|too many requests|rate[- ]limit(?:ed|ing| exceeded)?/i.test(text)
+  ) {
+    return { reasonCode: 'rate-limited' };
+  }
+  if (
+    result?.networkUnavailable === true
+    || NETWORK_ERROR_CODES.has(errorCode)
+    || reasonCode === 'network-unavailable'
+    || /\b(?:ECONNABORTED|ECONNREFUSED|ECONNRESET|EHOSTUNREACH|ENETDOWN|ENETUNREACH|ENOTFOUND|ETIMEDOUT)\b|network (?:is )?unavailable|connection (?:refused|reset)|could not resolve (?:host|hostname)|socket hang up/i.test(text)
+  ) {
+    return { reasonCode: 'network-unavailable' };
+  }
+  if (
+    result?.cliUpdateRequired === true
+    || ['cli-update', 'cli-update-required', 'unsupported-cli-version'].includes(reasonCode)
+    || /(?:update|upgrade) (?:the )?(?:provider )?cli|cli (?:update|upgrade) required|(?:outdated|unsupported) cli(?: version)?|(?:unknown|unrecognized|unsupported) (?:option|argument|flag).*(?:--output-schema|--json-schema)/i.test(text)
+  ) {
+    return { reasonCode: 'cli-update-required' };
+  }
+  return { reasonCode: 'provider-error' };
+}
+
 function envValue(env, name) {
   const key = Object.keys(env || {}).find((candidate) => candidate.toLowerCase() === name.toLowerCase());
   return key ? env[key] : undefined;
@@ -394,28 +445,20 @@ export function providerLocalHealthSignal(status, { source = 'provider-operation
 
 export function providerRemoteHealthSignal(result, { source = 'provider-operation' } = {}) {
   const status = Number(result?.status ?? result?.statusCode);
-  const errorCode = String(result?.errorCode || result?.code || '').toUpperCase();
-  const reasonCode = String(result?.reasonCode || '').toLowerCase();
+  const classification = providerFailureClassification(result);
 
   // Authentication responses are authoritative even if a faulty adapter also
   // marks the request successful or local credentials still appear present.
-  if (status === 401 || status === 403 || result?.authenticationFailed === true) {
+  if (classification.reasonCode === 'authentication-required') {
     return healthSignal('remote-auth-failure', source, 'authentication-required');
   }
-  if (status === 429 || result?.rateLimited === true || reasonCode === 'rate-limited') {
+  if (classification.reasonCode === 'rate-limited') {
     return healthSignal('rate-limit', source, 'rate-limited');
   }
-  if (
-    result?.networkUnavailable === true
-    || NETWORK_ERROR_CODES.has(errorCode)
-    || reasonCode === 'network-unavailable'
-  ) {
+  if (classification.reasonCode === 'network-unavailable') {
     return healthSignal('network-failure', source, 'network-unavailable');
   }
-  if (
-    result?.cliUpdateRequired === true
-    || ['cli-update', 'cli-update-required', 'unsupported-cli-version'].includes(reasonCode)
-  ) {
+  if (classification.reasonCode === 'cli-update-required') {
     return healthSignal('cli-update', source, 'cli-update-required');
   }
   if (result?.loginInProgress === true) return healthSignal('login-started', source);
@@ -426,7 +469,7 @@ export function providerRemoteHealthSignal(result, { source = 'provider-operatio
   return healthSignal(
     'provider-failure',
     source,
-    providerHealthReason(reasonCode, 'provider-error'),
+    providerHealthReason(classification.reasonCode, 'provider-error'),
   );
 }
 

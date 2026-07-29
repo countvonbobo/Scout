@@ -10,6 +10,7 @@ import {
   providerCandidates,
   providerCommand,
   providerHealthSignal,
+  providerFailureClassification,
   providerLocalHealthSignal,
   providerRemoteHealthSignal,
   providerStatus,
@@ -370,6 +371,22 @@ test('remote provider responses become distinct bounded signals without response
     const signal = providerRemoteHealthSignal(input);
     assert.deepEqual(signal, expected);
     assert.doesNotMatch(JSON.stringify(signal), /private|person@|Users|token|stdout|stderr|body|status/);
+  }
+});
+
+test('provider failure classification returns only allowlisted safe reason codes', () => {
+  const cases = [
+    [{ error: '403 forbidden token=secret' }, { reasonCode: 'authentication-required' }],
+    [{ error: 'connect ETIMEDOUT /Users/example/private' }, { reasonCode: 'network-unavailable' }],
+    [{ error: 'rate limit exceeded for person@example.test' }, { reasonCode: 'rate-limited' }],
+    [{ error: 'please upgrade the CLI; unsupported --json-schema' }, { reasonCode: 'cli-update-required' }],
+    [{ error: 'opaque provider failure token=secret' }, { reasonCode: 'provider-error' }],
+  ];
+
+  for (const [input, expected] of cases) {
+    const classification = providerFailureClassification(input);
+    assert.deepEqual(classification, expected);
+    assert.doesNotMatch(JSON.stringify(classification), /secret|person@|Users|private|message|stdout|stderr|body/i);
   }
 });
 

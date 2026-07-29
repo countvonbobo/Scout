@@ -3,10 +3,12 @@ import os from 'node:os';
 import path from 'node:path';
 import { parseClaudeLine } from './chatClaude.mjs';
 import { parseCodexLine } from './chatCodex.mjs';
-import { assertSafeModel } from './providers.mjs';
+import { assertSafeModel, providerFailureClassification } from './providers.mjs';
 import { runTurn } from './chatRun.mjs';
 
 const CLOSE_GATED_PROVIDER_CALL = Symbol('scout.close-gated-provider-call');
+
+class StructuredTurnTimeoutError extends Error {}
 
 export class ProviderLifecycleUnclosedError extends Error {
   constructor(message, closure) {
@@ -26,6 +28,23 @@ function parseJsonResult(text) {
   catch (error) { throw new Error(`provider returned invalid structured JSON: ${error.message}`); }
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('provider structured result must be an object');
   return value;
+}
+
+function safeProviderFailure(provider, failure) {
+  const classification = providerFailureClassification(failure);
+  const detail = {
+    'authentication-required': 'authentication is required',
+    'network-unavailable': 'the network is unavailable',
+    'rate-limited': 'the provider rate limit was reached',
+    'cli-update-required': 'the provider CLI must be updated',
+    'provider-error': 'the provider operation failed',
+  }[classification.reasonCode];
+  const error = new Error(`${provider} structured turn failed: ${detail}`);
+  Object.defineProperty(error, 'reasonCode', {
+    value: classification.reasonCode,
+    enumerable: true,
+  });
+  return error;
 }
 
 export function structuredTurnCancellationGraceMs(timeoutMs) {
@@ -64,7 +83,7 @@ async function awaitBoundedTurn(turn, timeoutMs, provider) {
     );
   }
   const duration = timeoutMs % 60_000 === 0 ? `${timeoutMs / 60_000} minutes` : `${timeoutMs} ms`;
-  throw new Error(`${provider} structured turn timed out after ${duration}`);
+  throw new StructuredTurnTimeoutError(`${provider} structured turn timed out after ${duration}`);
 }
 
 export function buildStructuredCodexArgs(schemaFile, options = {}) {
@@ -117,8 +136,16 @@ async function runStructuredTurnOperation({
       parseLine: provider === 'codex' ? parseCodexLine : parseClaudeLine,
       timeoutMs,
     });
-    const result = await awaitBoundedTurn(turn, timeoutMs, provider);
-    if (!result.ok) throw new Error(result.error || `${provider} structured turn failed`);
+    let result;
+    try {
+      result = await awaitBoundedTurn(turn, timeoutMs, provider);
+    } catch (error) {
+      if (error instanceof ProviderLifecycleUnclosedError || error instanceof StructuredTurnTimeoutError) {
+        throw error;
+      }
+      throw safeProviderFailure(provider, error);
+    }
+    if (!result.ok) throw safeProviderFailure(provider, result);
     const inputTokens = Number(result.usage?.input_tokens ?? result.usage?.inputTokens ?? 0);
     if (maxInputTokens != null && inputTokens > maxInputTokens) {
       throw new Error(`${provider} structured turn exceeded its ${maxInputTokens.toLocaleString()} input-token cap (${inputTokens.toLocaleString()})`);

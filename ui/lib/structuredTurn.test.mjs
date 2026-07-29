@@ -7,6 +7,7 @@ import {
   ProviderLifecycleUnclosedError,
   runStructuredTurn,
 } from './structuredTurn.mjs';
+import { providerRemoteHealthSignal } from './providers.mjs';
 
 const schema = { type: 'object', properties: { answer: { type: 'string' } }, required: ['answer'] };
 
@@ -62,6 +63,57 @@ test('structured turns reject malformed output and unsupported CLIs', async () =
     provider: 'claude', status, schema, prompt: 'x', maxInputTokens: 10,
     runTurnFn: () => ({ finished: Promise.resolve({ ok: true, text: '{"answer":"x"}', usage: { input_tokens: 11 } }) }),
   }), /exceeded its 10 input-token cap/);
+});
+
+test('structured provider failures cross the real boundary as safe distinct health classes', async () => {
+  const status = {
+    installed: true,
+    authenticated: true,
+    executable: 'codex',
+    capabilities: { structuredOutput: true },
+  };
+  const cases = [
+    [
+      '401 Unauthorized for person@example.test token=secret',
+      { kind: 'remote-auth-failure', source: 'provider-operation', reasonCode: 'authentication-required' },
+    ],
+    [
+      'request failed: ENETUNREACH /Users/example/private.json',
+      { kind: 'network-failure', source: 'provider-operation', reasonCode: 'network-unavailable' },
+    ],
+    [
+      '429 Too Many Requests for account person@example.test',
+      { kind: 'rate-limit', source: 'provider-operation', reasonCode: 'rate-limited' },
+    ],
+    [
+      'unsupported CLI version: unknown option --output-schema at /Users/example/bin/codex',
+      { kind: 'cli-update', source: 'provider-operation', reasonCode: 'cli-update-required' },
+    ],
+    [
+      '500 provider body token=secret person@example.test /Users/example/private.json',
+      { kind: 'provider-failure', source: 'provider-operation', reasonCode: 'provider-error' },
+    ],
+  ];
+
+  for (const [rawFailure, expectedSignal] of cases) {
+    const error = await runStructuredTurn({
+      provider: 'codex',
+      status,
+      schema,
+      prompt: 'synthetic',
+      runTurnFn: () => ({ finished: Promise.resolve({ ok: false, error: rawFailure }) }),
+    }).then(
+      () => null,
+      (caught) => caught,
+    );
+
+    assert.ok(error instanceof Error);
+    assert.deepEqual(providerRemoteHealthSignal(error), expectedSignal);
+    assert.doesNotMatch(
+      `${error.message} ${JSON.stringify(error)}`,
+      /person@|token|secret|Users|private|stdout|stderr|body/i,
+    );
+  }
 });
 
 test('structured turns wait for adapter closure after stopping a timed-out turn', { timeout: 1_000 }, async () => {
