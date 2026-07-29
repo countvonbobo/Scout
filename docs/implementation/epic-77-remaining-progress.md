@@ -674,3 +674,70 @@ private paths, account data, CV content, adverts, prompts, or transcripts.
   authoritative.
 - Next exact action: push this evidence commit, create the required stacked
   draft PR and wait for all seven required GitHub Actions checks.
+
+## Draft-PR CI remediation and final re-review
+
+- Initial draft-PR run:
+  [GitHub Actions run 30470247535](https://github.com/oliver-hitchings/Scout/actions/runs/30470247535).
+- The first cross-platform run exposed eleven deterministic Node failures:
+  one expired scheduled-window fixture, two invalid queue fixtures, three
+  over-redacted setup/CV errors, four stale raw ranked-selection/error
+  expectations and one discard-counter schema projection defect.
+- CI repair commit: `671201b`
+  (`fix: close cross-platform verification gaps`).
+- RED/GREEN and repair details:
+  - scheduled and queued fixtures now satisfy their existing expiry and
+    compatibility invariants without weakening production validation;
+  - durable run/report recipes preserve the five canonical underscore-named
+    discard counters through a closed allowlist;
+  - ranked runtime tests assert the intended bounded explanation and reason
+    code projections instead of omitted raw selections and diagnostics;
+  - setup threshold and PDF import failures use fixed actionable public
+    classifications, while unknown and parser-specific diagnostics remain
+    redacted;
+  - focused public-error/privacy and discard-schema tests passed; the three
+    setup HTTP regressions passed; the queue/runtime cases reached only the
+    already documented macOS process-start-identity limitation locally.
+- Whole-range review then found one Important guided-login reachability gap:
+  a remote authentication failure could remain authoritative while local CLI
+  detection still reported credentials, leaving no Settings reauthentication
+  action.
+- Review-fix commits:
+  - `42a17ed` (`fix: keep provider reauthentication reachable`);
+  - `ff9435c` (`fix: preserve remote authentication barriers`).
+- RED/GREEN and review-fix details:
+  - RED server, unit and browser regressions reproduced the stale
+    authenticated projection, missing guided/manual sign-in actions and stale
+    compatible provider card;
+  - setup status and setup completion now consume a closed public provider
+    projection that combines CLI capability with durable provider health;
+  - the private `remoteAuthBarrier` forces public `authenticated: false`
+    across intervening login, network, rate-limit, CLI and provider-error
+    states until a real remote success clears it;
+  - invalid or unreadable health records fail closed to unauthenticated plus
+    the fixed allowlisted `provider-error` state, without publishing the
+    barrier, diagnostics, reason history, timestamps or alerts;
+  - Settings keeps guided sign-in and the fixed manual fallback reachable and
+    no longer labels the affected provider compatible;
+  - beta.23 release notes now cover recoverable scans, provider health/login
+    and Scout character behavior as well as provider/chat/Codex-link work.
+- Final focused GREEN:
+  - provider health/login/setup unit suites: 99 passed;
+  - complete Settings browser suite: 52 passed across Chromium and Firefox;
+  - release/app/docs/privacy suite: 88 passed;
+  - release/build suite: 35 passed;
+  - release audit: 515 files, clean.
+- Final complete local evidence:
+  - `npm test`: 1,103 discovered, 845 passed, 253 failed and 5 skipped. Every
+    remaining failure traces to the documented inability of this macOS host
+    to obtain process-start identity or a dependent fixed failure response;
+  - `npm run test:browser`: 150 discovered, 147 passed, 0 failed and 3
+    intentional platform/host skips;
+  - complete-range diff checks: passed.
+- Final complete-range independent re-review through `ff9435c`:
+  - Spec PASS: 0 Critical, 0 Important.
+  - Code quality PASS: 0 Critical, 0 Important.
+  - Privacy/security PASS: 0 Critical, 0 Important.
+- Findings fixed/open: none open.
+- Next exact action: commit this evidence, push the exact reviewed branch and
+  require all seven draft-PR checks to pass before final handoff.
