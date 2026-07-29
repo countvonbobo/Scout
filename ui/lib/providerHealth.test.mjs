@@ -5,11 +5,11 @@ import path from 'node:path';
 import test from 'node:test';
 import {
   PROVIDER_HEALTH_STATES,
-  acknowledgeProviderAlert,
+  acknowledgeProviderAlert as acknowledgeProviderAlertWithAuthority,
   classifyProviderHealth,
-  providerPreflight,
+  providerPreflight as providerPreflightWithAuthority,
   readProviderHealth,
-  recordProviderHealth,
+  recordProviderHealth as recordProviderHealthWithAuthority,
 } from './providerHealth.mjs';
 
 const STATES = [
@@ -53,6 +53,40 @@ function signal(kind, index = 0, source = 'startup') {
 
 function healthFile(root, provider = 'codex') {
   return path.join(root, '.scout', 'provider-health', 'v1', `${provider}.json`);
+}
+
+function immediateLeaseAuthority({ beforeCommit, acquire = () => ({}) } = {}) {
+  return {
+    acquire,
+    commit(lease, callback) {
+      beforeCommit?.(lease);
+      return callback();
+    },
+    release() {},
+  };
+}
+
+const TEST_LEASE_AUTHORITY = immediateLeaseAuthority();
+
+function recordProviderHealth(root, provider, nextSignal, options = {}) {
+  return recordProviderHealthWithAuthority(root, provider, nextSignal, {
+    ...options,
+    _leaseAuthority: options._leaseAuthority ?? TEST_LEASE_AUTHORITY,
+  });
+}
+
+function acknowledgeProviderAlert(root, provider, alertId, options = {}) {
+  return acknowledgeProviderAlertWithAuthority(root, provider, alertId, {
+    ...options,
+    _leaseAuthority: options._leaseAuthority ?? TEST_LEASE_AUTHORITY,
+  });
+}
+
+function providerPreflight(root, provider, purpose, options = {}) {
+  return providerPreflightWithAuthority(root, provider, purpose, {
+    ...options,
+    _leaseAuthority: options._leaseAuthority ?? TEST_LEASE_AUTHORITY,
+  });
 }
 
 test('exports the nine exact durable states and classifies every provider signal', () => {
@@ -258,6 +292,105 @@ test('deduplicates durable alerts and supports explicit acknowledgement', async 
   assert.equal(third.shouldNotify, false);
   assert.equal(third.alertId, first.alertId);
   assert.equal(readProviderHealth(root, 'codex').history.length, 3);
+});
+
+test('busy provider-health authority fails closed without erasing durable evidence', (t) => {
+  const root = temp(t);
+  const authority = immediateLeaseAuthority();
+  const initial = recordProviderHealth(
+    root,
+    'codex',
+    signal('remote-auth-failure', 0, 'post-auth'),
+    { purpose: 'post-auth-failure', _leaseAuthority: authority },
+  );
+  const acknowledged = acknowledgeProviderAlert(root, 'codex', initial.alert.id, {
+    now: new Date(at(1)),
+    _leaseAuthority: authority,
+  });
+  const before = readProviderHealth(root, 'codex');
+  assert.equal(acknowledged.alert.acknowledgedAt, at(1));
+
+  const busy = immediateLeaseAuthority({ acquire: () => null });
+  assert.throws(
+    () => recordProviderHealth(
+      root,
+      'codex',
+      signal('local-credentials-present', 2, 'periodic'),
+      { purpose: 'periodic', _leaseAuthority: busy },
+    ),
+    /authority is busy/i,
+  );
+  assert.throws(
+    () => acknowledgeProviderAlert(root, 'codex', initial.alert.id, {
+      now: new Date(at(3)),
+      _leaseAuthority: busy,
+    }),
+    /authority is busy/i,
+  );
+  assert.deepEqual(readProviderHealth(root, 'codex'), before);
+});
+
+test('provider-health authority serializes unfenced updates around the latest durable state', (t) => {
+  const root = temp(t);
+  const immediate = immediateLeaseAuthority();
+  const first = recordProviderHealth(
+    root,
+    'codex',
+    signal('remote-auth-failure', 0, 'post-auth'),
+    { purpose: 'post-auth-failure', _leaseAuthority: immediate },
+  );
+  acknowledgeProviderAlert(root, 'codex', first.alert.id, {
+    now: new Date(at(1)),
+    _leaseAuthority: immediate,
+  });
+
+  let operation;
+  let settings;
+  let releases = 0;
+  const serialized = {
+    acquire(_root, nextOperation, nextSettings) {
+      operation = nextOperation;
+      settings = nextSettings;
+      return {};
+    },
+    commit(_lease, callback) {
+      recordProviderHealth(
+        root,
+        'codex',
+        signal('local-signed-out', 2, 'periodic'),
+        { purpose: 'periodic', _leaseAuthority: immediate },
+      );
+      return callback();
+    },
+    release() {
+      releases += 1;
+    },
+  };
+  const result = recordProviderHealth(
+    root,
+    'codex',
+    signal('local-credentials-present', 3, 'post-auth'),
+    { purpose: 'post-auth', _leaseAuthority: serialized },
+  );
+
+  assert.deepEqual(operation, {
+    kind: 'provider-health',
+    runId: 'provider-health-codex',
+    provider: 'codex',
+    phase: 'post-auth',
+  });
+  assert.ok(settings.leaseDurationMs > 0 && settings.leaseDurationMs <= 30_000);
+  assert.ok(settings.guardAcquireTimeoutMs >= 0 && settings.guardAcquireTimeoutMs <= 2_000);
+  assert.equal(releases, 1);
+  assert.equal(result.state, 'sign-in-required');
+  assert.equal(result.remoteAuthBarrier, true);
+  assert.equal(result.alert.acknowledgedAt, at(1));
+  assert.deepEqual(
+    result.history.map(({ source }) => source),
+    ['post-auth', 'periodic', 'post-auth'],
+  );
+  const { shouldNotify: _shouldNotify, ...persisted } = result;
+  assert.deepEqual(readProviderHealth(root, 'codex'), persisted);
 });
 
 test('preflight allows only usable provider states and never substitutes providers', async (t) => {

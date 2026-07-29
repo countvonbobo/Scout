@@ -3,9 +3,12 @@ import path from 'node:path';
 import { atomicWriteFile } from './atomicWrite.mjs';
 import {
   LeaseLostError,
+  acquireScanLease,
   assertCurrentFence,
   assertScanLeaseScope,
+  currentLeaseOwner,
   isScanLease,
+  releaseScanLease,
   synchronousFenceCallback,
 } from './scanLease.mjs';
 
@@ -107,6 +110,22 @@ const RECORD_KEYS = Object.freeze([
 ]);
 const HISTORY_KEYS = Object.freeze(['at', 'purpose', 'reasonCode', 'source', 'state']);
 const ALERT_KEYS = Object.freeze(['acknowledgedAt', 'createdAt', 'id', 'state']);
+const PROVIDER_HEALTH_LEASE_SETTINGS = Object.freeze({
+  leaseDurationMs: 15_000,
+  takeoverMarginMs: 0,
+  guardAcquireTimeoutMs: 250,
+});
+const SYSTEM_LEASE_AUTHORITY = Object.freeze({
+  acquire(root, operation, settings) {
+    return acquireScanLease(root, currentLeaseOwner(), operation, settings);
+  },
+  commit(lease, callback) {
+    return assertCurrentFence(lease, synchronousFenceCallback(callback));
+  },
+  release(lease) {
+    return releaseScanLease(lease);
+  },
+});
 
 function exactKeys(value, expected, label) {
   if (!value || typeof value !== 'object' || Array.isArray(value)
@@ -372,7 +391,45 @@ function persistRecord(root, provider, evidence) {
   return { ...structuredClone(record), shouldNotify };
 }
 
+function checkedLeaseAuthority(authority = SYSTEM_LEASE_AUTHORITY) {
+  if (!authority || typeof authority !== 'object'
+    || typeof authority.acquire !== 'function'
+    || typeof authority.commit !== 'function'
+    || typeof authority.release !== 'function') {
+    throw new TypeError('provider health lease authority is invalid');
+  }
+  return authority;
+}
+
+function withProviderHealthAuthority(root, provider, phase, authority, update) {
+  const checked = checkedLeaseAuthority(authority);
+  const lease = checked.acquire(root, {
+    kind: 'provider-health',
+    runId: `provider-health-${provider}`,
+    provider,
+    phase,
+  }, PROVIDER_HEALTH_LEASE_SETTINGS);
+  if (lease === null) {
+    throw new LeaseLostError('provider health authority is busy; update deferred');
+  }
+  let result;
+  let updateError;
+  try {
+    result = checked.commit(lease, update);
+  } catch (error) {
+    updateError = error;
+  }
+  try {
+    checked.release(lease);
+  } catch (error) {
+    if (updateError === undefined) throw error;
+  }
+  if (updateError !== undefined) throw updateError;
+  return result;
+}
+
 export function recordProviderHealth(root, provider, signal, {
+  _leaseAuthority,
   lease,
   now,
   purpose = 'startup',
@@ -385,7 +442,13 @@ export function recordProviderHealth(root, provider, signal, {
     purpose: checkedPurpose,
   };
   if (lease === undefined && evidence.source !== 'provider-operation') {
-    return persistRecord(root, provider, evidence);
+    return withProviderHealthAuthority(
+      root,
+      provider,
+      evidence.source,
+      _leaseAuthority,
+      () => persistRecord(root, provider, evidence),
+    );
   }
   if (!isScanLease(lease)) {
     throw new LeaseLostError('a genuine current scan lease is required for fenced provider health evidence');
@@ -396,25 +459,30 @@ export function recordProviderHealth(root, provider, signal, {
   ));
 }
 
-export function acknowledgeProviderAlert(root, provider, alertId, { now } = {}) {
+export function acknowledgeProviderAlert(root, provider, alertId, {
+  _leaseAuthority,
+  now,
+} = {}) {
   providerName(provider);
-  const current = readProviderHealth(root, provider);
-  if (current.alert === null || current.alert.id !== alertId) {
-    throw new Error('provider health alert is not active');
-  }
-  if (current.alert.acknowledgedAt !== null) return current;
-  const record = {
-    ...current,
-    alert: { ...current.alert, acknowledgedAt: nowTimestamp(now) },
-  };
-  validateRecord(record, provider);
-  const encoded = `${JSON.stringify(record)}\n`;
-  if (Buffer.byteLength(encoded) > FILE_LIMIT_BYTES) {
-    throw new Error('provider health record exceeds its size limit');
-  }
-  const file = providerFile(root, provider, { create: true });
-  atomicWriteFile(file, encoded, { mode: 0o600 });
-  return structuredClone(record);
+  return withProviderHealthAuthority(root, provider, 'provider-operation', _leaseAuthority, () => {
+    const current = readProviderHealth(root, provider);
+    if (current.alert === null || current.alert.id !== alertId) {
+      throw new Error('provider health alert is not active');
+    }
+    if (current.alert.acknowledgedAt !== null) return current;
+    const record = {
+      ...current,
+      alert: { ...current.alert, acknowledgedAt: nowTimestamp(now) },
+    };
+    validateRecord(record, provider);
+    const encoded = `${JSON.stringify(record)}\n`;
+    if (Buffer.byteLength(encoded) > FILE_LIMIT_BYTES) {
+      throw new Error('provider health record exceeds its size limit');
+    }
+    const file = providerFile(root, provider, { create: true });
+    atomicWriteFile(file, encoded, { mode: 0o600 });
+    return structuredClone(record);
+  });
 }
 
 function preflightView(record, purpose, shouldNotify = false) {
@@ -433,6 +501,7 @@ function preflightView(record, purpose, shouldNotify = false) {
 }
 
 export async function providerPreflight(root, provider, purpose, {
+  _leaseAuthority,
   lease,
   now,
   probe,
@@ -450,6 +519,7 @@ export async function providerPreflight(root, provider, purpose, {
       previous: readProviderHealth(root, provider),
     });
     const result = recordProviderHealth(root, provider, nextSignal, {
+      _leaseAuthority,
       lease,
       now,
       purpose: checkedPurpose,
@@ -462,7 +532,12 @@ export async function providerPreflight(root, provider, purpose, {
       const result = recordProviderHealth(root, provider, {
         kind: 'check-started',
         source: source ?? inferredSource(checkedPurpose),
-      }, { lease, now, purpose: checkedPurpose });
+      }, {
+        _leaseAuthority,
+        lease,
+        now,
+        purpose: checkedPurpose,
+      });
       ({ shouldNotify, ...record } = result);
     }
   }
