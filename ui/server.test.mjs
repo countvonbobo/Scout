@@ -169,6 +169,20 @@ test('provider setup status projects only bounded readiness fields', () => {
     capabilities: { structuredOutput: true },
   });
   assert.doesNotMatch(JSON.stringify(publicProviderStatus(raw)), /private|secret|@/);
+  assert.deepEqual(
+    publicProviderStatus({ ...raw, authenticated: true }, {
+      state: 'sign-in-required',
+      reasonCode: 'authentication-required',
+      checkedAt: '2026-07-29T10:00:00.000Z',
+      history: [{ privateDiagnostic: 'do not publish' }],
+    }),
+    {
+      installed: true,
+      authenticated: false,
+      capabilities: { structuredOutput: true },
+      healthState: 'sign-in-required',
+    },
+  );
 });
 
 test('API exception projection uses fixed public copy and never returns diagnostics', () => {

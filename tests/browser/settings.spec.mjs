@@ -710,6 +710,35 @@ test('guided provider login supports code, failure, retry and cancel without bro
   expect(JSON.stringify(stored)).not.toContain('PRIVATE-CODE');
 });
 
+test('a durable remote authentication failure keeps reauthentication reachable', async ({ page }) => {
+  await page.unroute('**/api/setup/status');
+  await page.route('**/api/setup/status', (route) => route.fulfill({
+    contentType: 'application/json',
+    body: JSON.stringify({
+      ...establishedStatus,
+      providers: {
+        ...establishedStatus.providers,
+        codex: {
+          installed: true,
+          authenticated: true,
+          capabilities: { structuredOutput: true },
+          healthState: 'sign-in-required',
+        },
+      },
+    }),
+  }));
+
+  await page.getByRole('button', { name: 'Settings' }).click();
+  const dialog = page.getByRole('dialog');
+  await dialog.getByRole('button', { name: 'AI providers' }).click();
+  const codexCard = dialog.locator('.setup-provider:has([data-provider-login="codex"])');
+  await expect(codexCard.getByRole('button', { name: 'Sign in to Codex with Scout' })).toBeVisible();
+  await expect(codexCard).toContainText('codex login --device-auth');
+  await expect(codexCard).toContainText('Codex needs sign-in');
+  await expect(codexCard).not.toContainText('Codex is signed in');
+  await expect(codexCard).not.toContainText('Installed, signed in and compatible');
+});
+
 test('guided login preserves failed logout state and reports no false success', async ({ page }) => {
   await page.unroute('**/api/setup/status');
   await page.route('**/api/setup/status', (route) => route.fulfill({

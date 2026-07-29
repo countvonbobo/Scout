@@ -84,13 +84,15 @@ export function providerLoginPanelHtml(
   const state = session?.provider === provider ? session.state : null;
   const active = ['starting', 'awaiting-code', 'authenticating', 'validating'].includes(state);
   const retryable = ['failed', 'cancelled', 'expired'].includes(state);
+  const reauthenticationRequired = providerStatus.healthState === 'sign-in-required';
+  const authenticated = providerStatus.authenticated === true && !reauthenticationRequired;
   const canStart = providerStatus.installed === true
-    && providerStatus.authenticated !== true
+    && !authenticated
     && !state
     && !active
     && !retryable;
   const statusText = stateLabels[state]
-    || (providerStatus.authenticated
+    || (authenticated
       ? `${name} is signed in.`
       : providerStatus.installed
         ? `${name} needs sign-in.`
@@ -127,7 +129,7 @@ export function providerLoginPanelHtml(
     <p class="meta" role="status" aria-live="polite">${statusText}</p>
     ${device}${verification}
     <div class="provider-login-actions">${code}${start}${cancel}${retry}${clear}</div>
-    ${providerStatus.authenticated ? '' : `<p class="meta">Manual fallback: open your terminal and run <code>${command}</code>. <a href="${guide}" target="_blank" rel="noreferrer">Official ${name} login guide</a>. Retry only checks sign-in; it does not rerun a missed scan.</p>`}
+    ${authenticated ? '' : `<p class="meta">Manual fallback: open your terminal and run <code>${command}</code>. <a href="${guide}" target="_blank" rel="noreferrer">Official ${name} login guide</a>. Retry only checks sign-in; it does not rerun a missed scan.</p>`}
   </section>`;
 }
 
@@ -1186,16 +1188,18 @@ const Setup = {
   providerCard(name) {
     const provider = this.status?.providers?.[name] || {};
     const selected = (this.status?.config?.ai?.provider || '') === name;
-    const compatible = Boolean(provider.authenticated && provider.capabilities?.structuredOutput !== false);
+    const authenticated = provider.authenticated === true
+      && provider.healthState !== 'sign-in-required';
+    const compatible = Boolean(authenticated && provider.capabilities?.structuredOutput !== false);
     const state = !provider.installed ? 'Not installed'
-      : !provider.authenticated ? 'Installed; sign-in required'
+      : !authenticated ? 'Installed; sign-in required'
         : compatible ? 'Installed, signed in and compatible' : 'Installed and signed in; CLI update required';
     return `<section class="setup-provider ${compatible ? 'available' : ''}">
       <label>
       <input type="radio" name="setup-provider" value="${name}" ${selected ? 'checked' : ''} ${compatible ? '' : 'disabled'}>
       <strong>${name[0].toUpperCase() + name.slice(1)}</strong>
       <span class="meta">${state}</span>
-      ${compatible ? '' : provider.authenticated
+      ${compatible ? '' : authenticated
         ? '<span class="meta">Update this CLI from its official installation guide, then refresh. Scout requires schema-constrained output for bounded workflows.</span>'
         : '<span class="meta">Scout needs an authenticated command-line provider; a desktop-app login alone is not enough. Your provider account may have separate usage limits or costs.</span>'}
       </label>

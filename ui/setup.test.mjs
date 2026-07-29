@@ -71,6 +71,16 @@ test('provider login panel exposes only accessible state-specific guided actions
   assert.match(idle, /aria-live="polite"/);
   assert.doesNotMatch(idle, /provider-login-code/);
 
+  const remoteAuthFailure = providerLoginPanelHtml('codex', {
+    installed: true,
+    authenticated: true,
+    healthState: 'sign-in-required',
+  }, null);
+  assert.match(remoteAuthFailure, /Codex needs sign-in/);
+  assert.match(remoteAuthFailure, /Sign in to Codex with Scout/);
+  assert.match(remoteAuthFailure, /codex login --device-auth/);
+  assert.doesNotMatch(remoteAuthFailure, /Codex is signed in/);
+
   const waiting = providerLoginPanelHtml('claude', {
     installed: true, authenticated: false,
   }, {

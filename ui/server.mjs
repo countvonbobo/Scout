@@ -27,7 +27,9 @@ import { buildSourcePayload, sourceUrlOf, SourceCache } from './lib/source.mjs';
 import {
   assertSafeModel, detectProvidersAsync, providerLocalHealthSignal, runProviderCommand,
 } from './lib/providers.mjs';
-import { providerPreflight, readProviderHealth } from './lib/providerHealth.mjs';
+import {
+  PROVIDER_HEALTH_STATES, providerPreflight, readProviderHealth,
+} from './lib/providerHealth.mjs';
 import { createProviderLoginManager } from './lib/providerLogin.mjs';
 import { runStructuredTurn } from './lib/structuredTurn.mjs';
 import { doctor, publicDoctor } from './lib/doctor.mjs';
@@ -476,21 +478,38 @@ function currentDeviceSettings() {
 
 export const providerDetection = { detect: detectProvidersAsync };
 
-export function publicProviderStatus(value) {
+const PUBLIC_PROVIDER_HEALTH_STATES = new Set(Object.values(PROVIDER_HEALTH_STATES));
+
+export function publicProviderStatus(value, health = null) {
+  const healthState = health === null
+    ? null
+    : PUBLIC_PROVIDER_HEALTH_STATES.has(health?.state)
+      ? health.state
+      : PROVIDER_HEALTH_STATES.PROVIDER_ERROR;
+  const authenticationBlocked = healthState === PROVIDER_HEALTH_STATES.SIGN_IN_REQUIRED;
   return {
     installed: value?.installed === true,
-    authenticated: value?.authenticated === true,
+    authenticated: value?.authenticated === true && !authenticationBlocked,
     capabilities: {
       structuredOutput: value?.capabilities?.structuredOutput === true,
     },
+    ...(healthState === null ? {} : { healthState }),
   };
 }
 
-function publicProviderStatuses(values) {
+function publicProviderStatuses(values, root) {
   return Object.fromEntries(
     ['codex', 'claude']
       .filter((provider) => values?.[provider])
-      .map((provider) => [provider, publicProviderStatus(values[provider])]),
+      .map((provider) => {
+        let health;
+        try {
+          health = readProviderHealth(root, provider);
+        } catch {
+          health = { state: PROVIDER_HEALTH_STATES.PROVIDER_ERROR };
+        }
+        return [provider, publicProviderStatus(values[provider], health)];
+      }),
   );
 }
 
@@ -713,15 +732,16 @@ async function handleRead(req, res, url) {
     stageSearchProfileReview();
     const config = loadWorkspaceConfig(WORKSPACE_ROOT);
     const providers = await providerDetection.detect();
+    const providerStatuses = publicProviderStatuses(providers, WORKSPACE_ROOT);
     const env = loadEnv(WORKSPACE_ROOT);
-    const readiness = setupReadiness(WORKSPACE_ROOT, config, providers, readTracker());
+    const readiness = setupReadiness(WORKSPACE_ROOT, config, providerStatuses, readTracker());
     return sendJson(res, 200, {
       workspaceRoot: WORKSPACE_ROOT,
       appRoot: APP_ROOT,
       appVersion: APP_VERSION,
       platform: process.platform,
       config,
-      providers: publicProviderStatuses(providers),
+      providers: providerStatuses,
       adzunaConfigured: !!(env.ADZUNA_APP_ID && env.ADZUNA_API_KEY),
       trackerExists: fs.existsSync(TRACKER),
       established: readiness.established,
@@ -1579,7 +1599,8 @@ routes['POST /api/setup/complete'] = async (req, res, body) => {
   try {
     const config = loadWorkspaceConfig(WORKSPACE_ROOT);
     if (!config.setup?.completedAt) {
-      const readiness = setupReadiness(WORKSPACE_ROOT, config, await providerDetection.detect(), readTracker());
+      const providers = publicProviderStatuses(await providerDetection.detect(), WORKSPACE_ROOT);
+      const readiness = setupReadiness(WORKSPACE_ROOT, config, providers, readTracker());
       if (!readiness.ready) return replyJson(res, 409, { error: 'review and activate a complete onboarding proposal before finishing setup' });
     }
     config.setup = { ...config.setup, completedAt: new Date().toISOString(), completedSections: completedWorkspaceSections({ completedAt: new Date().toISOString() }) };
