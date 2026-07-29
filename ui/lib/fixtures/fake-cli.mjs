@@ -4,7 +4,7 @@ process.stdin.setEncoding('utf8');
 process.stdin.on('data', (c) => { input += c; });
 process.stdin.on('end', () => {
   const prompt = input.trim();
-  const command = ['FAIL', 'HANG', 'DONE_THEN_FAIL'].find((value) =>
+  const command = ['FAIL', 'HANG', 'DONE_THEN_FAIL', 'OVER_OUTPUT'].find((value) =>
     prompt === value || prompt.endsWith(`User request:\n${value}`));
   if (command === 'FAIL') {
     process.stderr.write('fake failure detail\n');
@@ -21,6 +21,11 @@ process.stdin.on('end', () => {
       session_id: 'fake-sess-1', usage: {},
     }));
     process.exit(3);
+  }
+  if (command === 'OVER_OUTPUT') {
+    process.stdout.write(`${'x'.repeat(4096)}\n`);
+    setInterval(() => {}, 1000);
+    return;
   }
   console.log(JSON.stringify({ type: 'system', subtype: 'init', session_id: 'fake-sess-1' }));
   console.log(JSON.stringify({

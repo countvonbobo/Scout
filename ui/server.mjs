@@ -25,7 +25,7 @@ import { loadPortals, portalSummary } from './lib/ats.mjs';
 import { JOB_CATEGORIES } from './lib/filters.mjs';
 import { buildSourcePayload, sourceUrlOf, SourceCache } from './lib/source.mjs';
 import { assertSafeModel, detectProvidersAsync, providerLocalHealthSignal } from './lib/providers.mjs';
-import { providerPreflight } from './lib/providerHealth.mjs';
+import { providerPreflight, readProviderHealth } from './lib/providerHealth.mjs';
 import { createProviderLoginManager } from './lib/providerLogin.mjs';
 import { runStructuredTurn } from './lib/structuredTurn.mjs';
 import { doctor } from './lib/doctor.mjs';
@@ -438,11 +438,10 @@ const providerLoginWorkingDirectory = fs.mkdtempSync(
 );
 fs.chmodSync(providerLoginWorkingDirectory, 0o700);
 
-export async function confirmProviderLoginHealth(provider, status, {
+export function confirmProviderLoginHealth(provider, status, {
   runStructuredTurnFn = runStructuredTurn,
 } = {}) {
-  try {
-    await runStructuredTurnFn({
+  const turn = runStructuredTurnFn({
       provider,
       status,
       schema: {
@@ -454,29 +453,44 @@ export async function confirmProviderLoginHealth(provider, status, {
       prompt: 'Perform the fixed provider health check. Respond only with {"ready":true}.',
       timeoutMs: 60_000,
       maxInputTokens: 256,
+      maxOutputBytes: 32 * 1024,
+      maxOutputLines: 128,
+      maxLineBytes: 2 * 1024,
       validate(value) {
         if (!value || value.ready !== true || Object.keys(value).join(',') !== 'ready') {
           throw new Error('provider health confirmation is invalid');
         }
         return value;
       },
-    });
-    return { kind: 'remote-success', source: 'post-auth' };
-  } catch (error) {
-    const kind = {
-      'authentication-required': 'remote-auth-failure',
-      'network-unavailable': 'network-failure',
-      'rate-limited': 'rate-limit',
-      'cli-update-required': 'cli-update',
-    }[error?.reasonCode] || 'provider-failure';
-    return { kind, source: 'post-auth' };
-  }
+  });
+  const result = Promise.resolve(turn).then(
+    () => ({ kind: 'remote-success', source: 'post-auth' }),
+    (error) => {
+      const kind = {
+        'authentication-required': 'remote-auth-failure',
+        'network-unavailable': 'network-failure',
+        'rate-limited': 'rate-limit',
+        'cli-update-required': 'cli-update',
+      }[error?.reasonCode] || 'provider-failure';
+      return { kind, source: 'post-auth' };
+    },
+  );
+  Object.defineProperties(result, {
+    stop: { value: () => turn?.stop?.() },
+    closed: { value: turn?.closed || result.then(() => undefined) },
+  });
+  return result;
 }
 
 const runtimeProviderLoginManager = createProviderLoginManager({
   cwd: providerLoginWorkingDirectory,
   providerStatus: async (provider) => (await providerDetection.detect())[provider],
   confirmProviderHealth: confirmProviderLoginHealth,
+  canClearClaudeCredentials: async () => {
+    const current = readProviderHealth(WORKSPACE_ROOT, 'claude');
+    return current.state === 'sign-in-required'
+      && current.reasonCode === 'authentication-required';
+  },
   onHealthSignal: async (provider, signal) => providerPreflight(
     WORKSPACE_ROOT,
     provider,

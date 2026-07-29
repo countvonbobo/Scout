@@ -117,7 +117,13 @@ export function buildStructuredClaudeArgs(schema, options = {}) {
 
 async function runStructuredTurnOperation({
   provider, status, schema, prompt, model = null, timeoutMs = 10 * 60 * 1000,
-  maxInputTokens = null, runTurnFn = runTurn, validate = (value) => value,
+  maxInputTokens = null,
+  maxOutputBytes,
+  maxOutputLines,
+  maxLineBytes,
+  runTurnFn = runTurn,
+  validate = (value) => value,
+  onTurn = () => {},
 } = {}) {
   if (!['codex', 'claude'].includes(provider)) throw new Error('structured provider must be codex or claude');
   if (!status?.installed || !status?.authenticated) throw new Error(`${provider} is not installed and authenticated`);
@@ -135,7 +141,11 @@ async function runStructuredTurnOperation({
       command: status.executable, args, prompt, cwd: taskDir, env: status.env,
       parseLine: provider === 'codex' ? parseCodexLine : parseClaudeLine,
       timeoutMs,
+      ...(maxOutputBytes === undefined ? {} : { maxOutputBytes }),
+      ...(maxOutputLines === undefined ? {} : { maxOutputLines }),
+      ...(maxLineBytes === undefined ? {} : { maxLineBytes }),
     });
+    onTurn(turn);
     let result;
     try {
       result = await awaitBoundedTurn(turn, timeoutMs, provider);
@@ -164,7 +174,33 @@ async function runStructuredTurnOperation({
 }
 
 export function runStructuredTurn(options = {}) {
-  const operation = runStructuredTurnOperation(options);
+  let turn = null;
+  let stopRequested = false;
+  const operation = runStructuredTurnOperation({
+    ...options,
+    onTurn(value) {
+      turn = value;
+      if (stopRequested) {
+        try { turn.stop?.(); } catch {}
+      }
+    },
+  });
+  Object.defineProperties(operation, {
+    stop: {
+      value() {
+        stopRequested = true;
+        try { turn?.stop?.(); } catch {}
+      },
+    },
+    closed: {
+      value: operation.then(
+        () => undefined,
+        (error) => error instanceof ProviderLifecycleUnclosedError
+          ? error.closure
+          : undefined,
+      ),
+    },
+  });
   Object.defineProperty(operation, CLOSE_GATED_PROVIDER_CALL, { value: true });
   return operation;
 }

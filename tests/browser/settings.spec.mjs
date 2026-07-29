@@ -592,7 +592,9 @@ test('guided provider login supports code, failure, retry and cancel without bro
     if (action === 'start') session = snapshot(++startCount === 1 ? 'awaiting-code' : 'succeeded');
     if (action === 'code') session = snapshot('failed');
     if (action === 'retry') session = snapshot(++retryCount === 1 ? 'starting' : 'succeeded');
-    if (action === 'cancel') session = snapshot('expired');
+    if (action === 'cancel') session = snapshot('failed', {
+      reasonCode: 'credentials-expired',
+    });
     if (action === 'clear-claude-credentials') {
       session = null;
       await route.fulfill({

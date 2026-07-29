@@ -38,12 +38,32 @@ export function runTurn({
   env = process.env,
   onEvent = () => {},
   timeoutMs = 600000,
+  maxOutputBytes = 8 * 1024 * 1024,
+  maxOutputLines = 10_000,
+  maxLineBytes = 256 * 1024,
 }) {
+  for (const [label, value] of Object.entries({
+    maxOutputBytes, maxOutputLines, maxLineBytes,
+  })) {
+    if (!Number.isSafeInteger(value) || value <= 0) {
+      throw new TypeError(`${label} must be a positive integer`);
+    }
+  }
   let child = null;
   let stopped = false;
   let timedOut = false;
+  let outputExceeded = false;
   const finished = new Promise((resolve) => {
-    const state = { sessionId: null, deltas: [], files: new Set(), done: null, stderr: '' };
+    const state = {
+      sessionId: null,
+      deltas: [],
+      files: new Set(),
+      done: null,
+      stderr: '',
+      outputBytes: 0,
+      outputLines: 0,
+      partial: { stdout: '', stderr: '' },
+    };
     const invocation = commandInvocation(command, args, { env });
     child = spawn(invocation.command, invocation.args, {
       cwd,
@@ -62,9 +82,34 @@ export function runTurn({
           : `spawn failed: ${err.message}`,
       });
     });
-    child.stderr.on('data', (c) => { state.stderr = (state.stderr + c).slice(-2000); });
+    const observeOutput = (stream, chunk) => {
+      if (outputExceeded) return;
+      const data = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      state.outputBytes += data.length;
+      state.partial[stream] += data.toString('utf8');
+      let newline = state.partial[stream].indexOf('\n');
+      while (newline >= 0 && !outputExceeded) {
+        const line = state.partial[stream].slice(0, newline).replace(/\r$/, '');
+        state.partial[stream] = state.partial[stream].slice(newline + 1);
+        state.outputLines += 1;
+        if (Buffer.byteLength(line, 'utf8') > maxLineBytes) outputExceeded = true;
+        newline = state.partial[stream].indexOf('\n');
+      }
+      if (state.outputBytes > maxOutputBytes
+          || state.outputLines > maxOutputLines
+          || Buffer.byteLength(state.partial[stream], 'utf8') > maxLineBytes) {
+        outputExceeded = true;
+      }
+      if (outputExceeded) killTree(child);
+    };
+    child.stdout.on('data', (chunk) => observeOutput('stdout', chunk));
+    child.stderr.on('data', (chunk) => observeOutput('stderr', chunk));
+    child.stderr.on('data', (c) => {
+      if (!outputExceeded) state.stderr = (state.stderr + c).slice(-2000);
+    });
     const rl = readline.createInterface({ input: child.stdout });
     rl.on('line', (line) => {
+      if (outputExceeded) return;
       let events = [];
       try { events = parseLine(line) || []; } catch { /* skip unparseable line */ }
       for (const ev of events) {
@@ -81,7 +126,15 @@ export function runTurn({
     child.on('close', (code) => {
       clearTimeout(timer);
       const filesTouched = [...state.files];
-      if (timedOut) {
+      if (outputExceeded) {
+        resolve({
+          ok: false,
+          error: 'provider output exceeded the safe output limit',
+          outputExceeded: true,
+          sessionId: state.sessionId,
+          filesTouched,
+        });
+      } else if (timedOut) {
         const duration = timeoutMs % 60000 === 0 ? `${timeoutMs / 60000} minutes` : `${timeoutMs} ms`;
         resolve({ ok: false, error: `timed out after ${duration}`, sessionId: state.sessionId, filesTouched });
       } else if (stopped) {

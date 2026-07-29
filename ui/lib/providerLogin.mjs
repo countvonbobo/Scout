@@ -189,14 +189,54 @@ function createError(message, code) {
   return error;
 }
 
+export async function terminateProviderProcessTree(child, {
+  platform = process.platform,
+  spawn = spawnProcess,
+  timeoutMs = 1_000,
+} = {}) {
+  if (platform !== 'win32' || !Number.isSafeInteger(child?.pid) || child.pid <= 0) {
+    try { child?.kill('SIGKILL'); } catch {}
+    return;
+  }
+  const status = await new Promise((resolve) => {
+    let settled = false;
+    let killer;
+    const finish = (value) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve(value);
+    };
+    const timer = setTimeout(() => finish(null), timeoutMs);
+    timer.unref?.();
+    try {
+      killer = spawn('taskkill.exe', ['/pid', String(child.pid), '/T', '/F'], {
+        shell: false,
+        stdio: 'ignore',
+        windowsHide: true,
+      });
+    } catch {
+      finish(null);
+      return;
+    }
+    killer.once('error', () => finish(null));
+    killer.once('close', (code) => finish(code));
+  });
+  if (status !== 0 && child.exitCode == null && child.signalCode == null) {
+    try { child.kill('SIGKILL'); } catch {}
+  }
+}
+
 export function createProviderLoginManager({
   providerStatus = providerStatusAsync,
   spawn = spawnProcess,
+  processTreeSpawn = spawnProcess,
   confirmProviderHealth = async () => ({
     kind: 'local-credentials-present',
     source: 'post-auth',
   }),
   onHealthSignal = async () => {},
+  canClearClaudeCredentials = async () => false,
   cwd = process.cwd(),
   env = process.env,
   platform = process.platform,
@@ -277,14 +317,24 @@ export function createProviderLoginManager({
   const cancels = new Map();
   const retries = new Map();
   const clearingOwners = new Set();
+  const credentialClearEligible = new Set();
   const trackedChildren = new Set();
   const pendingClearSettlers = new Map();
+  const pendingClearOperations = new Set();
+  const pendingHealthWrites = new Set();
   let shuttingDown = false;
 
   function persistHealth(session, signal) {
-    return Promise.resolve(onHealthSignal(session.provider, signal, {
-      ownerId: session.ownerId,
-    }));
+    const previous = session.healthWriteTail || Promise.resolve();
+    const write = previous.catch(() => {}).then(() => onHealthSignal(
+        session.provider,
+        signal,
+        { ownerId: session.ownerId },
+      ));
+    session.healthWriteTail = write;
+    pendingHealthWrites.add(write);
+    write.finally(() => pendingHealthWrites.delete(write)).catch(() => {});
+    return write;
   }
 
   function emitHealth(session, signal) {
@@ -330,6 +380,15 @@ export function createProviderLoginManager({
     if (!record || record.closed) return Promise.resolve();
     if (record.stopPromise) return record.stopPromise;
     const attempt = (async () => {
+      if (platform === 'win32') {
+        await terminateProviderProcessTree(record.child, {
+          platform,
+          spawn: processTreeSpawn,
+          timeoutMs: Math.min(terminateGraceMs, shutdownDeadlineMs),
+        });
+        await waitForChildClose(record, Math.max(0, deadlineAt - Date.now()));
+        return;
+      }
       try { record.child.kill('SIGTERM'); } catch {}
       const grace = Math.min(
         terminateGraceMs,
@@ -349,6 +408,20 @@ export function createProviderLoginManager({
     return stopTrackedChild(session.processRecord, deadlineAt);
   }
 
+  async function stopConfirmation(session, deadlineAt = Date.now() + shutdownDeadlineMs) {
+    const confirmation = session.confirmation;
+    if (!confirmation) return;
+    try { confirmation.stop?.(); } catch {}
+    const closed = Promise.resolve(confirmation.closed || confirmation).catch(() => {});
+    await Promise.race([
+      closed,
+      new Promise((resolve) => {
+        const timer = setTimeout(resolve, Math.max(0, deadlineAt - Date.now()));
+        timer.unref?.();
+      }),
+    ]);
+  }
+
   function terminalHealth(reasonCode, state) {
     if (state === 'succeeded') {
       return { kind: 'local-credentials-present', source: 'post-auth' };
@@ -365,7 +438,12 @@ export function createProviderLoginManager({
     reportHealth = true,
   } = {}) {
     if (TERMINAL_STATES.has(session.state)) return Promise.resolve();
-    const cleanup = kill ? stopProcess(session, deadlineAt) : Promise.resolve();
+    const cleanup = kill
+      ? Promise.all([
+        stopProcess(session, deadlineAt),
+        stopConfirmation(session, deadlineAt),
+      ])
+      : Promise.resolve();
     clearTimeout(session.timeout);
     session.timeout = null;
     session.state = state;
@@ -379,7 +457,9 @@ export function createProviderLoginManager({
     } else {
       active.delete(activeKey);
     }
-    if (reportHealth) emitHealth(session, terminalHealth(reasonCode, state));
+    const health = reportHealth
+      ? persistHealth(session, terminalHealth(reasonCode, state)).catch(() => {})
+      : Promise.resolve();
     session.buffers = { stdout: '', stderr: '' };
     session.executable = null;
     session.env = null;
@@ -388,7 +468,7 @@ export function createProviderLoginManager({
       if (sessions.get(session.sessionId) === session) sessions.delete(session.sessionId);
     }, retentionMs);
     retention.unref?.();
-    return cleanup;
+    return Promise.all([cleanup, health]).then(() => undefined);
   }
 
   function failOutput(session) {
@@ -517,23 +597,46 @@ export function createProviderLoginManager({
 
   async function completeValidation(session) {
     if (TERMINAL_STATES.has(session.state)) return;
+    let confirmation;
     let signal;
     try {
-      signal = checkedPostAuthSignal(await confirmProviderHealth(
+      confirmation = confirmProviderHealth(
         session.provider,
         session.healthStatus,
-      ));
+      );
+      session.confirmation = confirmation;
+      signal = checkedPostAuthSignal(await confirmation);
+      await Promise.resolve(confirmation?.closed || confirmation);
+      if (TERMINAL_STATES.has(session.state)
+        || session.confirmation !== confirmation) return;
       await persistHealth(session, signal);
+      if (TERMINAL_STATES.has(session.state)
+        || session.confirmation !== confirmation) return;
     } catch {
-      await terminal(session, 'failed', 'health-confirmation-failed');
+      if (!TERMINAL_STATES.has(session.state)) {
+        await terminal(session, 'failed', 'health-confirmation-failed');
+      }
       return;
+    } finally {
+      if (session.confirmation === confirmation) session.confirmation = null;
     }
     const confirmed = signal.kind === 'remote-success'
       || signal.kind === 'local-credentials-present';
+    if (session.provider === 'claude') {
+      if (signal.kind === 'remote-auth-failure') {
+        credentialClearEligible.add(session.ownerId);
+      } else if (confirmed) {
+        credentialClearEligible.delete(session.ownerId);
+      }
+    }
     await terminal(
       session,
       confirmed ? 'succeeded' : 'failed',
-      confirmed ? null : 'health-confirmation-failed',
+      confirmed
+        ? null
+        : session.provider === 'claude' && signal.kind === 'remote-auth-failure'
+          ? 'credentials-expired'
+          : 'health-confirmation-failed',
       { reportHealth: false },
     );
   }
@@ -564,7 +667,8 @@ export function createProviderLoginManager({
     const ownerId = checkedOwner(ownerContext);
     const key = ownerProviderKey(ownerId, provider);
     const existing = active.get(key);
-    if (pendingStarts.has(key)
+    if ((provider === 'claude' && clearingOwners.has(ownerId))
+      || pendingStarts.has(key)
       || (existing && (
         !TERMINAL_STATES.has(existing.state)
         || (existing.processRecord && !existing.processRecord.closed)
@@ -630,6 +734,8 @@ export function createProviderLoginManager({
         healthStatus,
         process: null,
         processRecord: null,
+        confirmation: null,
+        healthWriteTail: Promise.resolve(),
         outputBytes: 0,
         outputLines: 0,
         buffers: { stdout: '', stderr: '' },
@@ -730,7 +836,7 @@ export function createProviderLoginManager({
     return publicSnapshot(session);
   }
 
-  async function clearClaudeCredentials(ownerContext) {
+  async function performClearClaudeCredentials(ownerContext) {
     if (shuttingDown) throw createError('provider login manager is shutting down', 'LOGIN_SHUTDOWN');
     const ownerId = checkedOwner(ownerContext);
     const activeKey = ownerProviderKey(ownerId, 'claude');
@@ -746,9 +852,30 @@ export function createProviderLoginManager({
       'LOGIN_RATE_LIMIT',
     );
     clearingOwners.add(ownerId);
-    const signalSession = { provider: 'claude', ownerId };
+    const signalSession = {
+      provider: 'claude',
+      ownerId,
+      healthWriteTail: Promise.resolve(),
+    };
     let clearRecord = null;
     try {
+      let eligible = credentialClearEligible.has(ownerId);
+      if (!eligible) {
+        try {
+          eligible = await canClearClaudeCredentials({
+            access: ownerContext.access,
+            ownerId,
+          }) === true;
+        } catch {
+          eligible = false;
+        }
+      }
+      if (!eligible) {
+        throw createError(
+          'expired Claude credentials have not been confirmed',
+          'CLAUDE_CREDENTIAL_CLEAR_NOT_ALLOWED',
+        );
+      }
       const status = await providerStatus('claude');
       if (shuttingDown) throw createError('provider login manager is shutting down', 'LOGIN_SHUTDOWN');
       const executable = checkedExecutable(status);
@@ -767,7 +894,7 @@ export function createProviderLoginManager({
         let timer = null;
         let bytes = 0;
         let lines = 0;
-        let partial = { stdout: 0, stderr: 0 };
+        const buffers = { stdout: '', stderr: '' };
         const settle = async (result, { kill = false } = {}) => {
           if (settled) return;
           settled = true;
@@ -798,13 +925,21 @@ export function createProviderLoginManager({
           if (settled) return;
           const data = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
           bytes += data.length;
-          const text = data.toString('utf8');
-          lines += (text.match(/\n/g) || []).length;
-          const finalNewline = text.lastIndexOf('\n');
-          partial[stream] = finalNewline >= 0
-            ? Buffer.byteLength(text.slice(finalNewline + 1), 'utf8')
-            : partial[stream] + data.length;
-          if (bytes > maxOutputBytes || lines > maxOutputLines || partial[stream] > maxLineBytes) {
+          buffers[stream] += data.toString('utf8');
+          let newline = buffers[stream].indexOf('\n');
+          while (newline >= 0 && !settled) {
+            const line = buffers[stream].slice(0, newline).replace(/\r$/, '');
+            buffers[stream] = buffers[stream].slice(newline + 1);
+            lines += 1;
+            if (lines > maxOutputLines
+              || Buffer.byteLength(line, 'utf8') > maxLineBytes) {
+              void settle('failed', { kill: true });
+              return;
+            }
+            newline = buffers[stream].indexOf('\n');
+          }
+          if (bytes > maxOutputBytes
+            || Buffer.byteLength(buffers[stream], 'utf8') > maxLineBytes) {
             void settle('failed', { kill: true });
           }
         };
@@ -815,9 +950,18 @@ export function createProviderLoginManager({
         child.once('close', (statusCode) => { void settle(statusCode === 0 ? 'cleared' : 'failed'); });
       });
       const reasonCode = state === 'cleared' ? null : 'logout-failed';
-      emitHealth(signalSession, state === 'cleared'
-        ? { kind: 'local-signed-out', source: 'post-auth' }
-        : { kind: 'provider-failure', source: 'post-auth' });
+      try {
+        await persistHealth(signalSession, state === 'cleared'
+          ? { kind: 'local-signed-out', source: 'post-auth' }
+          : { kind: 'provider-failure', source: 'post-auth' });
+      } catch {
+        return {
+          provider: 'claude',
+          reasonCode: 'health-write-failed',
+          state: 'failed',
+        };
+      }
+      if (state === 'cleared') credentialClearEligible.delete(ownerId);
       return { provider: 'claude', reasonCode, state };
     } finally {
       if (!clearRecord || clearRecord.closed) {
@@ -826,6 +970,13 @@ export function createProviderLoginManager({
         clearRecord.closedPromise.then(() => clearingOwners.delete(ownerId));
       }
     }
+  }
+
+  function clearClaudeCredentials(ownerContext) {
+    const operation = performClearClaudeCredentials(ownerContext);
+    pendingClearOperations.add(operation);
+    operation.finally(() => pendingClearOperations.delete(operation)).catch(() => {});
+    return operation;
   }
 
   function getProviderLoginSession(sessionIdValue, ownerContext) {
@@ -871,6 +1022,8 @@ export function createProviderLoginManager({
     await Promise.all(
       [...pendingClearSettlers.values()].map((settle) => settle()),
     );
+    await Promise.allSettled([...pendingClearOperations]);
+    await Promise.allSettled([...pendingHealthWrites]);
   }
 
   return Object.freeze({

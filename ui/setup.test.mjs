@@ -106,11 +106,23 @@ test('provider login panel exposes only accessible state-specific guided actions
   }, {
     provider: 'claude',
     sessionId: 'synthetic-session',
-    state: 'expired',
+    state: 'failed',
     codeRequired: false,
-    reasonCode: 'expired',
+    reasonCode: 'credentials-expired',
   });
   assert.match(expired, /Clear expired Claude sign-in/);
+
+  const succeeded = providerLoginPanelHtml('codex', {
+    installed: true, authenticated: false,
+  }, {
+    provider: 'codex',
+    sessionId: 'synthetic-session',
+    state: 'succeeded',
+    codeRequired: false,
+    reasonCode: null,
+  });
+  assert.match(succeeded, /Sign-in succeeded/);
+  assert.doesNotMatch(succeeded, /Sign in to Codex with Scout/);
 });
 
 test('provider login UI keeps its CSRF token and manual code out of browser storage', () => {

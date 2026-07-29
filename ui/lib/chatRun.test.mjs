@@ -59,6 +59,18 @@ test('timeout resolves with a timeout error', async () => {
   assert.match(r.error, /timed out/);
 });
 
+test('output byte and individual-line limits stop the provider turn', async () => {
+  const result = await fakeTurn('OVER_OUTPUT', {
+    timeoutMs: 5_000,
+    maxOutputBytes: 256,
+    maxOutputLines: 8,
+    maxLineBytes: 64,
+  }).finished;
+  assert.equal(result.ok, false);
+  assert.equal(result.outputExceeded, true);
+  assert.match(result.error, /safe output limit/);
+});
+
 test('missing binary resolves with a not-found error', async () => {
   const r = await runTurn({
     command: 'definitely-not-a-real-cli-xyz',

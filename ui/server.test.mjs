@@ -97,6 +97,9 @@ test('guided login confirms health with a bounded real provider turn', async () 
   assert.doesNotMatch(received.prompt, /workspace|profile|job|account|token/i);
   assert.equal(received.timeoutMs, 60_000);
   assert.equal(received.maxInputTokens, 256);
+  assert.equal(received.maxOutputBytes, 32 * 1024);
+  assert.equal(received.maxOutputLines, 128);
+  assert.equal(received.maxLineBytes, 2 * 1024);
 
   const network = new Error('raw private provider failure');
   Object.defineProperty(network, 'reasonCode', { value: 'network-unavailable' });

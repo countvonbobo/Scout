@@ -81,6 +81,7 @@ export function providerLoginPanelHtml(provider, providerStatus = {}, session = 
   const retryable = ['failed', 'cancelled', 'expired'].includes(state);
   const canStart = providerStatus.installed === true
     && providerStatus.authenticated !== true
+    && !state
     && !active
     && !retryable;
   const statusText = stateLabels[state]
@@ -111,7 +112,9 @@ export function providerLoginPanelHtml(provider, providerStatus = {}, session = 
   const retry = retryable
     ? `<button class="act primary" type="button" data-provider-login-action="retry" data-provider="${provider}" data-session-id="${sessionId}">Retry ${name} sign-in</button>`
     : '';
-  const clear = provider === 'claude' && state === 'expired'
+  const clear = provider === 'claude'
+    && state === 'failed'
+    && session?.reasonCode === 'credentials-expired'
     ? '<button class="act" type="button" data-provider-login-action="clear" data-provider="claude">Clear expired Claude sign-in</button>'
     : '';
   return `<section class="provider-login-panel" data-provider-login="${provider}" aria-label="${name} sign-in">

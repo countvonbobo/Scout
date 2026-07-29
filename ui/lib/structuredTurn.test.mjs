@@ -141,6 +141,41 @@ test('structured turns wait for adapter closure after stopping a timed-out turn'
   assert.deepEqual(lifecycle, ['stop', 'closed', 'rejected']);
 });
 
+test('structured turns expose cancellable close-gated ownership and output limits', async () => {
+  let finish;
+  let stopped = 0;
+  let received;
+  const finished = new Promise((resolve) => { finish = resolve; });
+  const operation = runStructuredTurn({
+    provider: 'codex',
+    status: { installed: true, authenticated: true, executable: 'codex', capabilities: { structuredOutput: true } },
+    schema,
+    prompt: 'synthetic',
+    maxOutputBytes: 1024,
+    maxOutputLines: 12,
+    maxLineBytes: 256,
+    runTurnFn: (options) => {
+      received = options;
+      return {
+        finished,
+        stop() {
+          stopped += 1;
+          finish({ ok: false, stopped: true, error: 'stopped' });
+        },
+      };
+    },
+  });
+  assert.equal(typeof operation.stop, 'function');
+  assert.ok(operation.closed instanceof Promise);
+  operation.stop();
+  await assert.rejects(operation, /provider operation failed/);
+  await operation.closed;
+  assert.equal(stopped, 1);
+  assert.equal(received.maxOutputBytes, 1024);
+  assert.equal(received.maxOutputLines, 12);
+  assert.equal(received.maxLineBytes, 256);
+});
+
 test('structured turns expose unresolved closure as a distinct fail-closed outcome', { timeout: 1_000 }, async () => {
   let stopped = 0;
   let taskDirectory;
