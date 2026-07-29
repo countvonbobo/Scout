@@ -8,6 +8,9 @@ import { isMainModule } from '../ui/lib/mainModule.mjs';
 const DEFAULT_BUILD_DIRS = ['dist', path.join('installer', 'output')];
 const IGNORED_DIRECTORY_NAMES = new Set(['.git', 'node_modules']);
 const PLACEHOLDER = /^(?:change-?me|dummy|example|fake|not-?set|placeholder|redacted|replace-?me|test|todo|<your-api-key>|<your-password>|\$\{[A-Z][A-Z0-9_]*\}|\$\{\{\s*[A-Z][A-Z0-9_.-]*\s*\}\})$/i;
+const NON_CREDENTIAL_ASSIGNMENT_TOKENS = new Set([
+  'cancellationtoken', 'csrftoken', 'locktoken', 'providerlogincsrftoken',
+]);
 
 const SECRET_RULES = Object.freeze([
   { id: 'private-key', regex: /-----BEGIN (?:RSA |EC |OPENSSH |DSA )?PRIVATE KEY-----/g },
@@ -72,6 +75,7 @@ function sensitiveAssignmentKey(key) {
   ];
   if (specificSuffixes.some((suffix) => normal.endsWith(suffix))) return true;
   if (normal === 'secret' || normal === 'token' || normal.endsWith('secret')) return true;
+  if (normal.endsWith('token') && !NON_CREDENTIAL_ASSIGNMENT_TOKENS.has(normal)) return true;
   return /^[A-Z][A-Z0-9_-]+$/.test(text)
     && (normal.endsWith('secret') || normal.endsWith('token'));
 }

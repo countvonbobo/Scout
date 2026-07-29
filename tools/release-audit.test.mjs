@@ -353,12 +353,19 @@ test('rejects namespaced credential assignment families without flagging unrelat
     ['session.env', `${'SESSION'}_${'TOKEN'}="opaque session value"\n`],
     ['quoted-key.yaml', `"${'SERVICE'}_${'TOKEN'}": "opaque quoted key value"\n`],
     ['api-token.mjs', `const ${'api'}${'Token'} = "opaque api token value";\n`],
+    ['service-token.mjs', `const ${'service'}${'Token'} = "opaque service credential";\n`],
+    ['provider-token.mjs', `const ${'provider'}${'Token'} = "opaque provider credential";\n`],
+    ['github-token.mjs', `const ${'github'}${'Token'} = "opaque github credential";\n`],
+    ['openai-token.mjs', `const ${'openai'}${'Token'} = "opaque openai credential";\n`],
     ['api-secret.mjs', `const ${'api'}${'Secret'} = "opaque api secret value";\n`],
     ['consumer-secret.mjs', `const ${'consumer'}${'Secret'} = "opaque consumer secret";\n`],
     ['authorization.mjs', `const ${'author'}${'ization'} = "Basic dXNlcjpwYXNzd29yZA==";\n`],
   ];
   for (const [relative, content] of cases) fs.writeFileSync(path.join(root, relative), content);
-  fs.writeFileSync(path.join(root, 'source.mjs'), "const cancellationToken = operation.signal;\nconst csrfToken = `csrf-${provider}`;\n");
+  fs.writeFileSync(
+    path.join(root, 'source.mjs'),
+    "const cancellationToken = operation.signal;\nconst csrfToken = `csrf-${provider}`;\nconst lockToken = 'fixture-lock-token';\n",
+  );
   const result = auditRelease({
     root,
     trackedFiles: [...cases.map(([relative]) => relative), 'source.mjs'],
