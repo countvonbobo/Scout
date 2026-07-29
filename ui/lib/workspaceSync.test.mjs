@@ -73,6 +73,27 @@ function backupLease(root, runId = 'backup-resolution-test') {
   return lease;
 }
 
+function commitRawIndexEntry(root, relative, mode, contentOrOid, message) {
+  let oid = contentOrOid;
+  if (mode !== '160000') {
+    const source = path.join(root, '.scout-raw-entry');
+    fs.writeFileSync(source, contentOrOid);
+    oid = git(root, 'hash-object', '-w', source);
+    fs.rmSync(source);
+  }
+  git(root, 'update-index', '--add', '--cacheinfo', `${mode},${oid},${relative}`);
+  git(root, 'commit', '-m', message);
+}
+
+function commitLocalSideOfRawDivergence(pair, name) {
+  git(pair.deviceTwo, 'config', 'user.name', 'Test');
+  git(pair.deviceTwo, 'config', 'user.email', 'test@example.invalid');
+  fs.writeFileSync(path.join(pair.deviceTwo, 'data', `${name}-local.json`), '{}\n');
+  git(pair.deviceTwo, 'add', 'data');
+  git(pair.deviceTwo, 'commit', '-m', `${name} local change`);
+  git(pair.deviceTwo, 'fetch', 'origin');
+}
+
 test('GitHub repository URLs reject credentials and non-GitHub remotes', () => {
   assert.equal(validateGithubUrl('https://github.com/example/scout-workspace').url, 'https://github.com/example/scout-workspace.git');
   assert.deepEqual(validateGithubUrl('git@github.com:example/scout-workspace.git'), {
@@ -708,6 +729,137 @@ test('resolution refetches, rejects stale tips and creates both recovery refs be
     );
   } finally {
     if (lease) releaseScanLease(lease);
+    fs.rmSync(f.base, { recursive: true, force: true });
+  }
+});
+
+test('resolution merges the exact verified remote object when its tracking ref advances', async () => {
+  const f = await pairedFixture();
+  let lease;
+  try {
+    const divergence = await disjointDivergence(f);
+    const verifiedRemote = git(f.deviceTwo, 'rev-parse', '@{u}');
+    let advanced = false;
+    const racingSpawn = (command, args, options) => {
+      if (!advanced && args[0] === 'merge' && args.includes('--no-ff')) {
+        advanced = true;
+        fs.writeFileSync(path.join(f.root, 'data', 'unconfirmed-remote.json'), '{}\n');
+        git(f.root, 'add', 'data/unconfirmed-remote.json');
+        git(f.root, 'commit', '-m', 'unconfirmed remote advance');
+        git(f.root, 'push', 'origin', 'HEAD');
+        git(f.deviceTwo, 'fetch', 'origin');
+      }
+      return f.spawn(command, args, options);
+    };
+    lease = backupLease(f.deviceTwo, 'backup-moving-ref-race');
+    const result = await resolveBackupDivergence(
+      f.deviceTwo,
+      divergence.resolution.analysisToken,
+      lease,
+      { spawn: racingSpawn },
+    );
+
+    assert.equal(advanced, true);
+    assert.equal(result.state, 'needs-attention');
+    assert.equal(result.resolved, false);
+    assert.equal(fs.existsSync(path.join(f.deviceTwo, 'data', 'unconfirmed-remote.json')), false);
+    const githubRef = git(
+      f.deviceTwo,
+      'for-each-ref',
+      '--format=%(refname)',
+      'refs/scout-recovery',
+    ).split('\n').find((ref) => ref.endsWith('/github'));
+    assert.equal(git(f.deviceTwo, 'rev-parse', githubRef), verifiedRemote);
+  } finally {
+    if (lease) releaseScanLease(lease);
+    fs.rmSync(f.base, { recursive: true, force: true });
+  }
+});
+
+test('disjoint symlink, gitlink and file-mode transitions require manual review', async () => {
+  for (const kind of ['symlink', 'gitlink', 'type-change', 'executable-change']) {
+    const f = await pairedFixture();
+    try {
+      git(f.root, 'config', 'user.name', 'Test');
+      git(f.root, 'config', 'user.email', 'test@example.invalid');
+      if (kind === 'type-change' || kind === 'executable-change') {
+        fs.mkdirSync(path.join(f.root, 'profile'), { recursive: true });
+        fs.writeFileSync(path.join(f.root, 'profile', `${kind}.md`), 'ordinary file\n');
+        git(f.root, 'add', `profile/${kind}.md`);
+        git(f.root, 'commit', '-m', `${kind} baseline`);
+        git(f.root, 'push', 'origin', 'HEAD');
+        git(f.deviceTwo, 'fetch', 'origin');
+        git(f.deviceTwo, 'merge', '--ff-only', '@{u}');
+      }
+
+      if (kind === 'symlink') {
+        commitRawIndexEntry(
+          f.root,
+          'profile/disjoint-link',
+          '120000',
+          '../workspace.json',
+          'add disjoint symlink',
+        );
+      } else if (kind === 'gitlink') {
+        commitRawIndexEntry(
+          f.root,
+          'applications/disjoint-module',
+          '160000',
+          git(f.root, 'rev-parse', 'HEAD'),
+          'add disjoint gitlink',
+        );
+      } else if (kind === 'type-change') {
+        commitRawIndexEntry(
+          f.root,
+          'profile/type-change.md',
+          '120000',
+          '../workspace.json',
+          'replace regular file with symlink',
+        );
+      } else {
+        git(f.root, 'update-index', '--chmod=+x', 'profile/executable-change.md');
+        git(f.root, 'commit', '-m', 'change regular file mode');
+      }
+      git(f.root, 'push', 'origin', 'HEAD');
+      commitLocalSideOfRawDivergence(f, kind);
+
+      const analysis = analyseBackupDivergence(f.deviceTwo, { spawn: f.spawn });
+      assert.equal(analysis.classification, 'manual-required', kind);
+      assert.equal(analysis.canResolve, false, kind);
+      assert.match(analysis.reason, /mode|non-standard|file type/i, kind);
+      assert.doesNotMatch(JSON.stringify(analysis), /disjoint-link|disjoint-module|type-change\.md/i);
+    } finally {
+      fs.rmSync(f.base, { recursive: true, force: true });
+    }
+  }
+});
+
+test('malformed or unmerged raw diff metadata fails closed', async () => {
+  const f = await pairedFixture();
+  try {
+    await disjointDivergence(f);
+    const malformed = analyseBackupDivergence(f.deviceTwo, {
+      spawn: (command, args, options) => (
+        args[0] === 'diff' && args.includes('--raw')
+          ? { status: 0, stdout: ':malformed\0data/example.json\0', stderr: '' }
+          : f.spawn(command, args, options)
+      ),
+    });
+    assert.equal(malformed.classification, 'manual-required');
+    assert.match(malformed.reason, /could not be compared/i);
+
+    const unmergedHeader = `:100644 100644 ${'a'.repeat(40)} ${'b'.repeat(40)} U`;
+    const unmerged = analyseBackupDivergence(f.deviceTwo, {
+      spawn: (command, args, options) => (
+        args[0] === 'diff' && args.includes('--raw')
+          ? { status: 0, stdout: `${unmergedHeader}\0data/conflict.json\0`, stderr: '' }
+          : f.spawn(command, args, options)
+      ),
+    });
+    assert.equal(unmerged.classification, 'manual-required');
+    assert.match(unmerged.reason, /non-standard/i);
+    assert.doesNotMatch(JSON.stringify(unmerged), /conflict\.json/i);
+  } finally {
     fs.rmSync(f.base, { recursive: true, force: true });
   }
 });

@@ -432,14 +432,41 @@ function divergenceToken(localCommit, remoteCommit, branch) {
 }
 
 function changedPaths(root, range, options = {}) {
-  const result = runGit(root, ['diff', '--name-status', '--find-renames', range], options);
+  const result = runGit(root, ['diff', '--raw', '--no-abbrev', '-z', '--find-renames', range], options);
   if (!result.ok) return { ok: false, paths: [], complex: true };
+  if (!result.stdout) return { ok: true, paths: [], complex: false };
+  const records = result.stdout.split('\0');
+  if (records.at(-1) === '') records.pop();
   const paths = [];
   let complex = false;
-  for (const line of result.stdout.split(/\r?\n/).filter(Boolean)) {
-    const [status, ...names] = line.split('\t');
-    if (!/^[AM]$/.test(status)) complex = true;
-    paths.push(...names.filter(Boolean));
+  for (let index = 0; index < records.length;) {
+    const header = records[index++];
+    const match = header.match(
+      /^:([0-7]{6}) ([0-7]{6}) ([0-9a-f]{40,64}) ([0-9a-f]{40,64}) ([A-Z])(\d{0,3})$/,
+    );
+    if (!match) return { ok: false, paths: [], complex: true };
+    const [, oldMode, newMode, , , status, score] = match;
+    if ((status === 'R' || status === 'C') !== Boolean(score)) {
+      return { ok: false, paths: [], complex: true };
+    }
+    const firstPath = records[index++];
+    if (!firstPath) return { ok: false, paths: [], complex: true };
+    paths.push(firstPath);
+    if (status === 'R' || status === 'C') {
+      const secondPath = records[index++];
+      if (!secondPath) return { ok: false, paths: [], complex: true };
+      paths.push(secondPath);
+      complex = true;
+      continue;
+    }
+    const regularModes = new Set(['100644', '100755']);
+    const ordinaryAddition = status === 'A'
+      && oldMode === '000000'
+      && regularModes.has(newMode);
+    const ordinaryModification = status === 'M'
+      && regularModes.has(oldMode)
+      && oldMode === newMode;
+    if (!ordinaryAddition && !ordinaryModification) complex = true;
   }
   return { ok: true, paths: [...new Set(paths)], complex };
 }
@@ -1077,7 +1104,7 @@ export async function resolveBackupDivergence(root, analysisToken, lease, option
     }
     const merge = await runtimeGit(
       root,
-      ['merge', '--no-ff', '--no-edit', `refs/remotes/origin/${branchResult.stdout}`],
+      ['merge', '--no-ff', '--no-edit', remoteResult.stdout],
       fenced,
       { mutation: true },
     );

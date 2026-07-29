@@ -101,3 +101,65 @@ Final exact rerun immediately before commit:
 - The unchanged Windows server-test temporary-directory cleanup race remains a
   test-infrastructure concern. It occurs after all server assertions complete
   and is already documented in the SDD ledger.
+
+## Fix round 1
+
+Independent review found two Important gaps:
+
+1. The final merge named the movable remote-tracking ref instead of the exact
+   remote object authenticated by the confirmation token.
+2. Name/status-only diff parsing treated symlink, gitlink and file-mode changes
+   as ordinary safe additions or modifications.
+
+### RED
+
+Command:
+
+`node --test --test-name-pattern="exact verified remote object|disjoint symlink" ui/lib/workspaceSync.test.mjs`
+
+Observed:
+
+- 0/2 passed.
+- The moving-ref race advanced the remote-tracking ref after final analysis;
+  the current implementation returned `synced` and merged the unconfirmed tip.
+- A real Git `120000` symlink addition was classified `disjoint-safe`.
+
+### Fixes
+
+- The resolver still verifies the branch, local tip and remote-tracking tip,
+  and creates recovery refs for those exact objects. Its merge command now
+  names the verified remote commit OID rather than the movable ref.
+- Diff classification now parses `git diff --raw --no-abbrev -z` records.
+  It accepts only:
+  - additions from mode `000000` to regular-file mode `100644` or `100755`;
+  - modifications whose old/new modes are the same regular-file mode.
+- Rename/copy records, deletion, type/mode changes, symlink `120000`, gitlink
+  `160000`, unmerged status and malformed raw records fail closed.
+- Real Git fixtures create symlink and gitlink index entries without requiring
+  platform symlink privileges. Additional fixtures cover regular-to-symlink
+  and executable-bit transitions.
+
+### GREEN
+
+- `node --test --test-name-pattern="exact verified remote object" ui/lib/workspaceSync.test.mjs`
+  - PASS: 1/1.
+- `node --test --test-name-pattern="disjoint symlink" ui/lib/workspaceSync.test.mjs`
+  - PASS: 1/1, covering four real Git cases.
+- `node --test --test-name-pattern="malformed or unmerged" ui/lib/workspaceSync.test.mjs`
+  - PASS: 1/1.
+- Combined focused regression command:
+
+  `node --test --test-name-pattern="disjoint additions and modifications|overlap, rename, deletion|resolution refetches|exact verified remote object|disjoint symlink|malformed or unmerged|merge failure keeps|backup divergence resolution cannot overlap" ui/lib/workspaceSync.test.mjs`
+
+  - PASS: 8/8 in 123.0 seconds.
+- Final parser-hardening rerun:
+  `node --test --test-name-pattern="malformed or unmerged" ui/lib/workspaceSync.test.mjs`
+  - PASS: 1/1.
+- `node --check ui/lib/workspaceSync.mjs`
+  - PASS.
+- `git diff --check`
+  - PASS; only repository line-ending conversion notices were printed.
+
+### Fix-round concerns
+
+- None open.
