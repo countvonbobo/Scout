@@ -28,6 +28,7 @@ import {
   claimNextScanRequest, completeOrphanedScanRequest, completeScanRequest,
   enqueueOverlappingScanRequest, projectScanQueue,
 } from './scanQueue.mjs';
+import { assertRunStorageWritable } from './runRetention.mjs';
 import {
   ASSESSMENT_RESPONSE_SCHEMA,
   planAssessmentBatches,
@@ -453,8 +454,10 @@ export async function runScanPipeline({
   recordFailure = null,
   queue = null,
   claimedLease = null,
+  storagePolicy = {},
 } = {}) {
   if (!root) throw new TypeError('scan pipeline workspace root is required');
+  assertRunStorageWritable(root, storagePolicy);
   if (recordFailure !== null && typeof recordFailure !== 'function') {
     throw new TypeError('scan pipeline failure recorder must be a function');
   }

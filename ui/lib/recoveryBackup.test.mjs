@@ -16,14 +16,14 @@ const CHANGED_ENV = ['SECRET', 'dummy'].join('=') + '\n';
 
 test('reviewed run archives use the authenticated recovery-key boundary and detect tampering', () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'scout-reviewed-archive-'));
-  const created = createRecoveryKeys('correct horse battery staple');
+  const created = initializeRecoveryBackup(root, 'correct horse battery staple');
   try {
     const written = writeReviewedRunArchive(root, created.dataKey, {
       schemaVersion: 1,
       archiveId: 'a'.repeat(64),
       reviewedSelectionDigest: 'b'.repeat(64),
       runs: [{ runId: 'synthetic-run', files: [{ path: 'journal.jsonl', data: 'PRIVATE-JOURNAL' }] }],
-    });
+    }, { commitFence: (commit) => commit() });
     assert.doesNotMatch(fs.readFileSync(written.file, 'utf8'), /synthetic-run|PRIVATE-JOURNAL/);
     assert.equal(verifyReviewedRunArchive(written.file, created.dataKey).runs[0].runId, 'synthetic-run');
     const record = JSON.parse(fs.readFileSync(written.file, 'utf8'));
@@ -32,6 +32,15 @@ test('reviewed run archives use the authenticated recovery-key boundary and dete
     record.data = changed.toString('base64url');
     fs.writeFileSync(written.file, JSON.stringify(record));
     assert.throws(() => verifyReviewedRunArchive(written.file, created.dataKey), /modified|invalid/i);
+    assert.throws(
+      () => writeReviewedRunArchive(root, crypto.randomBytes(32), {
+        schemaVersion: 1,
+        archiveId: 'c'.repeat(64),
+        reviewedSelectionDigest: 'd'.repeat(64),
+        runs: [],
+      }, { commitFence: (commit) => commit() }),
+      /persisted recovery|data key/i,
+    );
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }

@@ -562,6 +562,10 @@ test('latest scan API exposes only bounded review fields and scan health omits r
   assert.doesNotMatch(text, /private query|full advert|private evidence|provider prompt/);
   const health = await request({ path: '/api/scan-health' });
   assert.doesNotMatch(health.text, /private query/);
+  const storage = JSON.parse(health.text).storagePressure;
+  assert.equal(['healthy', 'warning', 'blocked'].includes(storage.state), true);
+  assert.deepEqual(Object.keys(storage.totals).sort(), ['artifacts', 'queue', 'runs', 'totalBytes']);
+  assert.doesNotMatch(JSON.stringify(storage), /private-run|scan-lease|workspace/i);
 });
 
 test('latest scan API exposes reconciled metrics and bounded explanations only', async () => {

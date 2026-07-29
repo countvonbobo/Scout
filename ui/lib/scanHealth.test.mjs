@@ -385,6 +385,7 @@ test('storage pressure health reports separate bounded totals without private ru
     totalBytes: 197,
     recoveryCritical: { count: 2, bytes: 64, runIds: ['private-run-id'] },
   }, {
+    reserveBytes: 0,
     warningBytes: { runs: 100, artifacts: 100, queue: 100 },
     maximumBytes: { runs: 200, artifacts: 100, queue: 200 },
   });
@@ -410,6 +411,7 @@ test('scan health reads storage warnings from the private run store', () => {
     fs.mkdirSync(artifacts, { recursive: true });
     fs.writeFileSync(path.join(artifacts, 'large.json'), 'x'.repeat(16));
     const health = readPublicStoragePressure(root, {
+      reserveBytes: 0,
       warningBytes: { runs: 100, artifacts: 10, queue: 100 },
       maximumBytes: { runs: 200, artifacts: 20, queue: 200 },
     });

@@ -9,7 +9,12 @@ import {
   planRunCleanup,
 } from './runRetention.mjs';
 import { acquireScanLease, currentLeaseOwner, releaseScanLease } from './scanLease.mjs';
-import { enqueueScanRequest, projectScanQueue } from './scanQueue.mjs';
+import {
+  claimNextScanRequest, completeScanRequest, enqueueScanRequest, projectScanQueue,
+} from './scanQueue.mjs';
+import {
+  initializeRecoveryBackup, loadRecoveryHeader, unlockRecoveryKey, verifyReviewedRunArchive,
+} from './recoveryBackup.mjs';
 
 const roots = [];
 afterEach(() => {
@@ -77,6 +82,10 @@ function manualRequest(id, requestedAt, expiresAt) {
   };
 }
 
+function archiveAuthority(root, passphrase = 'correct horse battery staple') {
+  return { passphrase, ...initializeRecoveryBackup(root, passphrase) };
+}
+
 test('measures journals, derived artifacts and the queue independently', () => {
   const root = temp();
   terminalRun(root, 'run-one', '2026-01-01T00:00:00.000Z', 'complete', '12345');
@@ -137,6 +146,18 @@ test('unsafe journal pressure fails closed and identifies protected storage', ()
     (error) => error?.code === 'SCOUT_STORAGE_PRESSURE'
       && error.measurement.recoveryCritical.runIds.includes('partial-private-id'),
   );
+  const measured = measureRunStorage(root);
+  assert.throws(
+    () => assertRunStorageWritable(root, {
+      maximumBytes: {
+        runs: measured.runs.bytes + 1,
+        artifacts: measured.artifacts.bytes + 100,
+        queue: measured.queue.bytes + 100,
+      },
+      reserveBytes: 1,
+    }),
+    (error) => error?.areas?.includes('runs'),
+  );
 });
 
 test('reviewed cleanup encrypts and verifies the selected source before fenced deletion', () => {
@@ -145,7 +166,8 @@ test('reviewed cleanup encrypts and verifies the selected source before fenced d
   const lease = acquireScanLease(root, currentLeaseOwner(), {
     kind: 'scan', runId: 'retention-cleanup', provider: 'codex', mode: 'primary', phase: 'finalise',
   });
-  const recoveryDataKey = crypto.randomBytes(32);
+  const authority = archiveAuthority(root);
+  const recoveryDataKey = authority.dataKey;
   fs.mkdirSync(path.join(root, '.scout'), { recursive: true });
   fs.writeFileSync(path.join(root, '.scout', 'run-retention-index.json'), `${JSON.stringify({
     schemaVersion: 1,
@@ -177,6 +199,11 @@ test('reviewed cleanup encrypts and verifies the selected source before fenced d
     JSON.parse(fs.readFileSync(result.indexFile, 'utf8')).summaries.map((summary) => summary.runId),
     ['old-complete'],
   );
+  const restartedKey = unlockRecoveryKey(loadRecoveryHeader(root), authority.passphrase);
+  assert.equal(
+    verifyReviewedRunArchive(result.archiveFile, restartedKey).runs[0].runId,
+    'old-complete',
+  );
 });
 
 test('cleanup without the protected recovery key or with a stale fence deletes nothing', () => {
@@ -193,7 +220,7 @@ test('cleanup without the protected recovery key or with a stale fence deletes n
 
   const keyed = planRunCleanup(root, {
     now: new Date('2026-02-01T00:00:00.000Z'), keepNewest: 0,
-    selectedRunIds: ['old-complete'], recoveryDataKey: crypto.randomBytes(32),
+    selectedRunIds: ['old-complete'], recoveryDataKey: archiveAuthority(root).dataKey,
   });
   fs.writeFileSync(path.join(directory, 'artifacts', 'changed.json'), 'changed-after-review');
   assert.throws(() => archiveSelectedRuns(keyed, lease), /changed after review/i);
@@ -208,13 +235,13 @@ test('cleanup rejects a released stale lease before writing or deleting', () => 
   });
   const plan = planRunCleanup(root, {
     now: new Date('2026-02-01T00:00:00.000Z'), keepNewest: 0,
-    selectedRunIds: ['old-complete'], recoveryDataKey: crypto.randomBytes(32),
+    selectedRunIds: ['old-complete'], recoveryDataKey: archiveAuthority(root).dataKey,
   });
   releaseScanLease(lease);
 
   assert.throws(() => archiveSelectedRuns(plan, lease), /lease/i);
   assert.equal(fs.existsSync(directory), true);
-  assert.equal(fs.existsSync(path.join(root, '.scout-backup')), false);
+  assert.equal(fs.existsSync(path.join(root, '.scout-backup', 'v1', 'run-archives')), false);
 });
 
 test('cleanup rejects selection changes made after operator review', () => {
@@ -226,13 +253,146 @@ test('cleanup rejects selection changes made after operator review', () => {
   });
   const plan = planRunCleanup(root, {
     now: new Date('2026-02-01T00:00:00.000Z'), keepNewest: 0,
-    selectedRunIds: ['old-first'], recoveryDataKey: crypto.randomBytes(32),
+    selectedRunIds: ['old-first'], recoveryDataKey: archiveAuthority(root).dataKey,
   });
-  plan.selected.push(plan.candidates.find((candidate) => candidate.runId === 'old-second'));
-
-  assert.throws(() => archiveSelectedRuns(plan, lease), /reviewed selection changed/i);
+  assert.throws(
+    () => plan.selected.push(plan.candidates.find((candidate) => candidate.runId === 'old-second')),
+    TypeError,
+  );
   assert.equal(fs.existsSync(first), true);
   assert.equal(fs.existsSync(second), true);
+});
+
+test('an arbitrary unpersisted data key cannot authorize source deletion', () => {
+  const root = temp();
+  const directory = terminalRun(root, 'old-complete', '2024-01-01T00:00:00.000Z');
+  archiveAuthority(root);
+  const lease = acquireScanLease(root, currentLeaseOwner(), {
+    kind: 'scan', runId: 'retention-cleanup', provider: 'codex', mode: 'primary', phase: 'finalise',
+  });
+  const plan = planRunCleanup(root, {
+    now: new Date('2026-02-01T00:00:00.000Z'), keepNewest: 0,
+    selectedRunIds: ['old-complete'], recoveryDataKey: crypto.randomBytes(32),
+  });
+
+  assert.throws(() => archiveSelectedRuns(plan, lease), /persisted recovery|data key/i);
+  assert.equal(fs.existsSync(directory), true);
+});
+
+test('new recovery evidence after review makes a selected run ineligible before archival', () => {
+  const root = temp();
+  const directory = terminalRun(root, 'old-complete', '2024-01-01T00:00:00.000Z');
+  const authority = archiveAuthority(root);
+  const lease = acquireScanLease(root, currentLeaseOwner(), {
+    kind: 'scan', runId: 'retention-cleanup', provider: 'codex', mode: 'primary', phase: 'finalise',
+  });
+  const plan = planRunCleanup(root, {
+    now: new Date('2026-02-01T00:00:00.000Z'), keepNewest: 0,
+    selectedRunIds: ['old-complete'], recoveryDataKey: authority.dataKey,
+  });
+  fs.writeFileSync(path.join(root, '.scout', 'recovery-selections.jsonl'), `${JSON.stringify({
+    selectedRunId: 'old-complete', skipped: [],
+  })}\n`);
+
+  assert.throws(() => archiveSelectedRuns(plan, lease), /recovery-critical|eligibility changed/i);
+  assert.equal(fs.existsSync(directory), true);
+});
+
+test('a live queue claim created after review protects its referenced run', () => {
+  const root = temp();
+  const directory = terminalRun(root, 'old-complete', '2024-01-01T00:00:00.000Z');
+  const authority = archiveAuthority(root);
+  const plan = planRunCleanup(root, {
+    now: new Date('2026-02-01T00:00:00.000Z'), keepNewest: 0,
+    selectedRunIds: ['old-complete'], recoveryDataKey: authority.dataKey,
+  });
+  const lease = acquireScanLease(root, currentLeaseOwner(), {
+    kind: 'scan', runId: 'old-complete', provider: 'codex', mode: 'primary', phase: 'queue',
+  });
+  enqueueScanRequest(root, {
+    ...manualRequest('live-claim', '2026-01-01T00:00:00.000Z', '2026-01-02T00:00:00.000Z'),
+    lease,
+  });
+  claimNextScanRequest(root, {
+    profileFingerprint: 'a'.repeat(64), configFingerprint: 'b'.repeat(64),
+    purpose: 'job-discovery', schemaVersion: 1,
+  }, lease, new Date('2026-01-01T00:01:00.000Z'));
+
+  assert.throws(() => archiveSelectedRuns(plan, lease), /queued|recovery-critical|eligibility changed/i);
+  assert.equal(fs.existsSync(directory), true);
+});
+
+test('archive commit refuses fence loss immediately before final replacement', () => {
+  const root = temp();
+  const directory = terminalRun(root, 'old-complete', '2024-01-01T00:00:00.000Z');
+  const authority = archiveAuthority(root);
+  const lease = acquireScanLease(root, currentLeaseOwner(), {
+    kind: 'scan', runId: 'retention-cleanup', provider: 'codex', mode: 'primary', phase: 'finalise',
+  });
+  const plan = planRunCleanup(root, {
+    now: new Date('2026-02-01T00:00:00.000Z'), keepNewest: 0,
+    selectedRunIds: ['old-complete'], recoveryDataKey: authority.dataKey,
+  });
+
+  assert.throws(() => archiveSelectedRuns(plan, lease, {
+    beforeArchiveCommit() { releaseScanLease(lease); },
+  }), /lease/i);
+  assert.equal(fs.existsSync(directory), true);
+  const archiveDirectory = path.join(root, '.scout-backup', 'v1', 'run-archives');
+  assert.equal(
+    fs.existsSync(archiveDirectory)
+      && fs.readdirSync(archiveDirectory).some((name) => name.endsWith('.json')),
+    false,
+  );
+});
+
+test('partial deletion resumes from the verified archive and completes receipts exactly once', () => {
+  const root = temp();
+  const first = terminalRun(root, 'old-first', '2024-01-01T00:00:00.000Z');
+  const second = terminalRun(root, 'old-second', '2024-01-02T00:00:00.000Z');
+  const authority = archiveAuthority(root);
+  const lease = acquireScanLease(root, currentLeaseOwner(), {
+    kind: 'scan', runId: 'retention-cleanup', provider: 'codex', mode: 'primary', phase: 'finalise',
+  });
+  const plan = planRunCleanup(root, {
+    now: new Date('2026-02-01T00:00:00.000Z'), keepNewest: 0,
+    selectedRunIds: ['old-first', 'old-second'], recoveryDataKey: authority.dataKey,
+  });
+  assert.throws(() => archiveSelectedRuns(plan, lease, {
+    afterSourceDelete({ index }) {
+      if (index === 0) throw new Error('injected crash after first delete');
+    },
+  }), /injected crash/);
+  assert.equal(fs.existsSync(first), false);
+  assert.equal(fs.existsSync(second), true);
+
+  const resumed = archiveSelectedRuns(plan, lease);
+  assert.equal(resumed.archivedRuns, 2);
+  assert.equal(fs.existsSync(second), false);
+  const manifest = JSON.parse(fs.readFileSync(resumed.operationManifest, 'utf8'));
+  assert.equal(manifest.status, 'completed');
+  assert.deepEqual(manifest.runs.map((run) => run.status), ['deleted', 'deleted']);
+  const audits = fs.readFileSync(path.join(root, '.scout', 'run-retention.jsonl'), 'utf8')
+    .trim().split('\n').map(JSON.parse)
+    .filter((event) => event.operationId === manifest.operationId && event.type === 'archive-completed');
+  assert.equal(audits.length, 1);
+});
+
+test('review digest binds policy and exact compact summary projection', () => {
+  const root = temp();
+  terminalRun(root, 'old-complete', '2025-03-01T00:00:00.000Z');
+  const authority = archiveAuthority(root);
+  const lease = acquireScanLease(root, currentLeaseOwner(), {
+    kind: 'scan', runId: 'retention-cleanup', provider: 'codex', mode: 'primary', phase: 'finalise',
+  });
+  const plan = planRunCleanup(root, {
+    now: new Date('2026-02-01T00:00:00.000Z'), keepNewest: 0,
+    selectedRunIds: ['old-complete'], recoveryDataKey: authority.dataKey,
+  });
+
+  assert.throws(() => { plan.policy.summaryDays = 0; }, TypeError);
+  assert.throws(() => { plan.compactSummaries[0].completedStages.push('private-field'); }, TypeError);
+  assert.doesNotThrow(() => archiveSelectedRuns(plan, lease));
 });
 
 test('queue compaction preserves live work and recent terminal evidence idempotently', () => {
@@ -257,4 +417,91 @@ test('queue compaction preserves live work and recent terminal evidence idempote
   assert.deepEqual(projectScanQueue(root, new Date('2026-07-29T12:00:00.000Z')).requests.map((item) => item.id), ['live-request']);
   assert.deepEqual(fs.readFileSync(path.join(root, '.scout', 'scan-queue.jsonl')), bytes);
   assert.equal(second.changed, false);
+});
+
+test('queue retention age comes from the durable terminal event, not request expiry', () => {
+  const root = temp();
+  const lease = acquireScanLease(root, currentLeaseOwner(), {
+    kind: 'scan', runId: 'retention-cleanup', provider: 'codex', mode: 'primary', phase: 'queue',
+  });
+  enqueueScanRequest(root, {
+    ...manualRequest('old-request-recent-terminal', '2020-01-01T00:00:00.000Z', '2020-01-02T00:00:00.000Z'),
+    lease,
+  });
+  const claim = claimNextScanRequest(root, {
+    profileFingerprint: 'a'.repeat(64), configFingerprint: 'b'.repeat(64),
+    purpose: 'job-discovery', schemaVersion: 1,
+  }, lease, new Date('2020-01-01T00:01:00.000Z'));
+  completeScanRequest(root, claim.id, 'failed', lease, claim.claim);
+
+  compactScanQueue(root, lease, { now: new Date('2026-07-29T12:00:00.000Z') });
+
+  assert.equal(projectScanQueue(root).requests.some((request) => request.id === 'old-request-recent-terminal'), true);
+});
+
+test('queue compaction repairs a crash after atomic replacement without duplicating its audit', () => {
+  const root = temp();
+  const lease = acquireScanLease(root, currentLeaseOwner(), {
+    kind: 'scan', runId: 'retention-cleanup', provider: 'codex', mode: 'primary', phase: 'queue',
+  });
+  enqueueScanRequest(root, {
+    ...manualRequest('old-terminal', '2024-01-01T00:00:00.000Z', '2024-01-02T00:00:00.000Z'),
+    lease,
+  });
+  assert.throws(() => compactScanQueue(root, lease, {
+    now: new Date('2026-07-29T12:00:00.000Z'),
+    afterQueueReplace() { throw new Error('injected queue crash'); },
+  }), /injected queue crash/);
+
+  const resumed = compactScanQueue(root, lease, { now: new Date('2026-07-29T12:00:00.000Z') });
+  assert.equal(resumed.reconciled, true);
+  const audits = fs.readFileSync(path.join(root, '.scout', 'run-retention.jsonl'), 'utf8')
+    .trim().split('\n').map(JSON.parse)
+    .filter((event) => event.type === 'queue-compacted');
+  assert.equal(audits.length, 1);
+});
+
+test('Windows junctions cannot redirect selected runs or the protected archive parent', { skip: process.platform !== 'win32' }, () => {
+  const root = temp();
+  const outsideRuns = fs.mkdtempSync(path.join(os.tmpdir(), 'scout-retention-outside-runs-'));
+  const outsideArchive = fs.mkdtempSync(path.join(os.tmpdir(), 'scout-retention-outside-archive-'));
+  roots.push(outsideRuns, outsideArchive);
+  terminalRun(outsideRuns, 'outside-run', '2024-01-01T00:00:00.000Z');
+  fs.mkdirSync(path.join(root, '.scout'), { recursive: true });
+  fs.symlinkSync(path.join(outsideRuns, '.scout', 'runs'), path.join(root, '.scout', 'runs'), 'junction');
+  assert.throws(
+    () => planRunCleanup(root, { now: new Date('2026-02-01T00:00:00.000Z'), keepNewest: 0 }),
+    /junction|symlink|outside/i,
+  );
+
+  fs.rmSync(path.join(root, '.scout', 'runs'));
+  terminalRun(root, 'old-complete', '2024-01-01T00:00:00.000Z');
+  const authority = archiveAuthority(root);
+  fs.renameSync(path.join(root, '.scout-backup'), path.join(outsideArchive, 'persisted'));
+  fs.symlinkSync(path.join(outsideArchive, 'persisted'), path.join(root, '.scout-backup'), 'junction');
+  const lease = acquireScanLease(root, currentLeaseOwner(), {
+    kind: 'scan', runId: 'retention-cleanup', provider: 'codex', mode: 'primary', phase: 'finalise',
+  });
+  const plan = planRunCleanup(root, {
+    now: new Date('2026-02-01T00:00:00.000Z'), keepNewest: 0,
+    selectedRunIds: ['old-complete'], recoveryDataKey: authority.dataKey,
+  });
+  assert.throws(() => archiveSelectedRuns(plan, lease), /junction|symlink|outside/i);
+  assert.equal(fs.existsSync(path.join(root, '.scout', 'runs', 'old-complete')), true);
+});
+
+test('Windows queue compaction rejects a junction-backed Scout state parent', { skip: process.platform !== 'win32' }, () => {
+  const root = temp();
+  const outside = fs.mkdtempSync(path.join(os.tmpdir(), 'scout-retention-outside-queue-'));
+  roots.push(outside);
+  fs.symlinkSync(outside, path.join(root, '.scout'), 'junction');
+  fs.writeFileSync(path.join(outside, 'scan-queue.jsonl'), '');
+  const lease = acquireScanLease(root, currentLeaseOwner(), {
+    kind: 'scan', runId: 'retention-cleanup', provider: 'codex', mode: 'primary', phase: 'queue',
+  });
+
+  assert.throws(
+    () => compactScanQueue(root, lease, { now: new Date('2026-07-29T12:00:00.000Z') }),
+    /junction|symlink|outside/i,
+  );
 });

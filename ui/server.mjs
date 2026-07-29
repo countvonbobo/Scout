@@ -11,7 +11,8 @@ import { emptyTrackerView, pipeline } from './lib/pipeline.mjs';
 import { cvPdfPath, listCvFiles, renderCvTarget, safeCvPath } from './lib/cv.mjs';
 import { cvDownloadDecision, overrideCvQuality, readCvQuality, runCvQuality } from './lib/cvQuality.mjs';
 import {
-  parseScanRuns, readPublicRunSummaries, readPublicScanQueue, scanHealthFromText,
+  parseScanRuns, readPublicRunSummaries, readPublicScanQueue, readPublicStoragePressure,
+  scanHealthFromText,
 } from './lib/scanHealth.mjs';
 import { readScanLease } from './lib/scanLease.mjs';
 import { scanEstimate } from './lib/scanEstimate.mjs';
@@ -162,7 +163,10 @@ function reportDates() {
 
 function readScanHealth() {
   const text = fs.existsSync(SCAN_RUNS) ? fs.readFileSync(SCAN_RUNS, 'utf8') : '';
-  return scanHealthFromText(text, today());
+  return {
+    ...scanHealthFromText(text, today()),
+    storagePressure: readPublicStoragePressure(WORKSPACE_ROOT),
+  };
 }
 
 function readScanRecords() {

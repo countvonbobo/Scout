@@ -2,6 +2,7 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { atomicWriteFile } from './atomicWrite.mjs';
+import { validatePhysicalWorkspacePath } from './physicalPath.mjs';
 
 export const RECOVERY_FORMAT = 1;
 export const RECOVERY_DIR = '.scout-backup/v1';
@@ -22,6 +23,47 @@ function sha256(buffer) { return crypto.createHash('sha256').update(buffer).dige
 
 function atomicWrite(file, value) {
   atomicWriteFile(file, value, { mode: 0o600 });
+}
+
+function prepareAtomicWrite(file, value) {
+  const directory = path.dirname(file);
+  const temporary = path.join(directory, `.${path.basename(file)}.${process.pid}.${crypto.randomUUID()}.tmp`);
+  const bytes = Buffer.isBuffer(value) ? value : Buffer.from(value, 'utf8');
+  let descriptor;
+  try {
+    descriptor = fs.openSync(temporary, 'wx', 0o600);
+    let offset = 0;
+    while (offset < bytes.length) {
+      const written = fs.writeSync(descriptor, bytes, offset, bytes.length - offset);
+      if (!written) throw new Error('Prepared atomic write made no progress');
+      offset += written;
+    }
+    fs.fsyncSync(descriptor);
+    fs.closeSync(descriptor);
+    descriptor = undefined;
+  } catch (error) {
+    try { if (descriptor !== undefined) fs.closeSync(descriptor); } catch {}
+    try { fs.rmSync(temporary, { force: true }); } catch {}
+    throw error;
+  }
+  return {
+    temporary,
+    commit() {
+      fs.renameSync(temporary, file);
+      let directoryDescriptor;
+      try {
+        directoryDescriptor = fs.openSync(directory, 'r');
+        fs.fsyncSync(directoryDescriptor);
+      } catch (error) {
+        if (process.platform !== 'win32' || !['EPERM', 'EINVAL', 'EISDIR'].includes(error?.code)) throw error;
+      } finally {
+        if (directoryDescriptor !== undefined) fs.closeSync(directoryDescriptor);
+      }
+    },
+    discard() {
+      try { fs.rmSync(temporary, { force: true }); } catch {}
+    },
+  };
 }
 
 function eventLoopTurn() {
@@ -217,28 +259,72 @@ function checkedReviewedRunArchive(payload) {
  * boundary. The caller must supply the already-unlocked recovery data key;
  * this module deliberately does not create a second credential store.
  */
-export function writeReviewedRunArchive(workspaceRoot, dataKey, payload, { assertFence } = {}) {
+export function writeReviewedRunArchive(workspaceRoot, dataKey, payload, {
+  assertFence,
+  commitFence,
+  beforeCommit,
+} = {}) {
+  return writeReviewedRunArchiveCommitted(workspaceRoot, dataKey, payload, {
+    commitFence: commitFence || (assertFence ? (commit) => {
+      assertFence();
+      const result = commit();
+      assertFence();
+      return result;
+    } : null),
+    beforeCommit,
+  });
+}
+
+export function assertPersistedRecoveryDataKey(workspaceRoot, dataKey) {
   if (!Buffer.isBuffer(dataKey) || dataKey.length !== 32) {
-    throw new Error('A protected archive sink with an unlocked recovery data key is required');
+    throw new Error('A persisted recovery data key is required');
   }
+  let header;
+  try {
+    header = readHeader(workspaceRoot);
+    if (!header.index) throw new Error('persisted recovery index is missing');
+    readIndex(header, dataKey);
+  } catch (error) {
+    throw new Error('The data key does not match Scout persisted recovery authority', { cause: error });
+  }
+  return header;
+}
+
+export function writeReviewedRunArchiveCommitted(workspaceRoot, dataKey, payload, {
+  commitFence,
+  beforeCommit,
+} = {}) {
+  assertPersistedRecoveryDataKey(workspaceRoot, dataKey);
+  if (typeof commitFence !== 'function') throw new TypeError('reviewed run archive requires a fenced commit boundary');
   checkedReviewedRunArchive(payload);
-  checkFence(assertFence);
   const directory = path.join(path.resolve(workspaceRoot), RECOVERY_DIR, 'run-archives');
-  fs.mkdirSync(directory, { recursive: true });
-  checkFence(assertFence);
   const opaqueArchiveId = crypto.createHmac('sha256', dataKey)
     .update(`run-archive:${payload.archiveId}`)
     .digest('hex');
   const file = path.join(directory, `${opaqueArchiveId}.json`);
   const plaintext = Buffer.from(stableArchiveJson(payload), 'utf8');
   const encrypted = aesEncrypt(dataKey, plaintext, REVIEWED_RUN_ARCHIVE_AAD);
-  atomicWrite(file, `${JSON.stringify(encrypted)}\n`);
-  checkFence(assertFence);
-  const verified = verifyReviewedRunArchive(file, dataKey);
-  if (stableArchiveJson(verified) !== plaintext.toString('utf8')) {
-    throw new Error('Reviewed run archive verification failed');
+  commitFence(() => {
+    validatePhysicalWorkspacePath(workspaceRoot, directory, 'reviewed archive path');
+    fs.mkdirSync(directory, { recursive: true });
+    validatePhysicalWorkspacePath(workspaceRoot, file, 'reviewed archive path');
+  });
+  const prepared = prepareAtomicWrite(file, `${JSON.stringify(encrypted)}\n`);
+  try {
+    if (typeof beforeCommit === 'function') beforeCommit();
+    return commitFence(() => {
+      validatePhysicalWorkspacePath(workspaceRoot, file, 'reviewed archive path');
+      prepared.commit();
+      const verified = verifyReviewedRunArchive(file, dataKey);
+      if (stableArchiveJson(verified) !== plaintext.toString('utf8')) {
+        throw new Error('Reviewed run archive verification failed');
+      }
+      return { file, archiveId: payload.archiveId, bytes: fs.statSync(file).size };
+    });
+  } catch (error) {
+    prepared.discard();
+    throw error;
   }
-  return { file, archiveId: payload.archiveId, bytes: fs.statSync(file).size };
 }
 
 function stableArchiveJson(value) {

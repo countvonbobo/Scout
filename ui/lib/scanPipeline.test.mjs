@@ -1542,6 +1542,32 @@ test('semantic artifacts provide bounded readable assessment facts without compl
   }
 });
 
+test('fresh scan refuses storage pressure before its first lease, queue or journal append', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'scout-storage-refusal-'));
+  let executions = 0;
+  try {
+    await assert.rejects(
+      runScanPipeline({
+        root,
+        compatibility: RECOVERY_COMPATIBILITY,
+        storagePolicy: {
+          maximumBytes: { runs: 0, artifacts: 0, queue: 0 },
+          reserveBytes: 1,
+        },
+        stages: durableStageHarness(new Map()),
+        onStageCommitted() { executions += 1; },
+      }),
+      (error) => error?.code === 'SCOUT_STORAGE_PRESSURE',
+    );
+    assert.equal(executions, 0);
+    assert.equal(fs.existsSync(path.join(root, '.scout', 'scan-lease.json')), false);
+    assert.equal(fs.existsSync(path.join(root, '.scout', 'scan-queue.jsonl')), false);
+    assert.equal(fs.existsSync(path.join(root, '.scout', 'runs')), false);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test('credential-shaped semantic values are redacted while operators and accountability remain exact', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'scout-safe-semantic-clauses-'));
   const profile = {

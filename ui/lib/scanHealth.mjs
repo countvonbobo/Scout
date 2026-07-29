@@ -3,7 +3,10 @@ import path from 'node:path';
 import { assessmentRecoveryBoundary } from './assessmentBatches.mjs';
 import { projectRunManifest } from './runArtifacts.mjs';
 import { validateRunJournal } from './runJournal.mjs';
-import { measureRunStorage } from './runRetention.mjs';
+import {
+  measureRunStorage, RUN_STORAGE_MAXIMUM_BYTES, RUN_STORAGE_RESERVE_BYTES,
+  RUN_STORAGE_WARNING_BYTES,
+} from './runRetention.mjs';
 import { projectScanQueue } from './scanQueue.mjs';
 import { workspacePaths } from './workspace.mjs';
 
@@ -295,8 +298,11 @@ export function readPublicScanQueue(root, now = new Date()) {
 }
 
 export function publicStoragePressure(measurement = {}, policy = {}) {
-  const maximumBytes = policy.maximumBytes || {};
-  const warningBytes = policy.warningBytes || {};
+  const configuredMaximum = { ...RUN_STORAGE_MAXIMUM_BYTES, ...(policy.maximumBytes || {}) };
+  const reserveBytes = Number(policy.reserveBytes ?? RUN_STORAGE_RESERVE_BYTES);
+  const maximumBytes = Object.fromEntries(Object.entries(configuredMaximum)
+    .map(([area, bytes]) => [area, Math.max(0, Number(bytes) - reserveBytes)]));
+  const warningBytes = { ...RUN_STORAGE_WARNING_BYTES, ...(policy.warningBytes || {}) };
   const warnings = [];
   for (const area of ['runs', 'artifacts', 'queue']) {
     const bytes = Number(measurement?.[area]?.bytes || 0);

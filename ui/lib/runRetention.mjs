@@ -9,8 +9,9 @@ import {
 } from './scanLease.mjs';
 import { projectScanQueue } from './scanQueue.mjs';
 import {
-  verifyReviewedRunArchive, writeReviewedRunArchive,
+  assertPersistedRecoveryDataKey, verifyReviewedRunArchive, writeReviewedRunArchive,
 } from './recoveryBackup.mjs';
+import { validatePhysicalWorkspacePath } from './physicalPath.mjs';
 import { workspacePaths } from './workspace.mjs';
 
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -24,6 +25,10 @@ const DEFAULT_MAXIMUM_BYTES = Object.freeze({
   artifacts: 1024 * 1024 * 1024,
   queue: 64 * 1024 * 1024,
 });
+const DEFAULT_WARNING_BYTES = Object.freeze(Object.fromEntries(
+  Object.entries(DEFAULT_MAXIMUM_BYTES).map(([area, bytes]) => [area, Math.floor(bytes * 0.75)]),
+));
+const DEFAULT_RESERVE_BYTES = 64 * 1024;
 const RETENTION_INDEX_SCHEMA_VERSION = 1;
 const ARCHIVE_SCHEMA_VERSION = 1;
 
@@ -49,7 +54,7 @@ function safeRunDirectory(root, runId) {
   const runsRoot = path.resolve(workspacePaths(root).runs);
   const target = path.resolve(runsRoot, runId);
   if (path.dirname(target) !== runsRoot) throw new Error('retention run path escaped the run store');
-  return target;
+  return validatePhysicalWorkspacePath(root, target, 'retention run path');
 }
 
 function walkFiles(directory, relative = '', files = []) {
@@ -70,6 +75,7 @@ function walkFiles(directory, relative = '', files = []) {
 function runInventory(root) {
   const runsRoot = workspacePaths(root).runs;
   if (!fs.existsSync(runsRoot)) return [];
+  validatePhysicalWorkspacePath(root, runsRoot, 'retention run store');
   const inventory = [];
   for (const entry of fs.readdirSync(runsRoot, { withFileTypes: true })) {
     if (!entry.isDirectory() || entry.isSymbolicLink()) {
@@ -131,6 +137,7 @@ function digestFiles(files) {
 function recoveryReferencedRunIds(root) {
   const file = path.join(path.resolve(root), '.scout', 'recovery-selections.jsonl');
   if (!fs.existsSync(file)) return new Set();
+  validatePhysicalWorkspacePath(root, file, 'recovery selection journal');
   const contents = fs.readFileSync(file, 'utf8');
   if (contents && !contents.endsWith('\n')) throw new Error('recovery selection journal is truncated');
   const ids = new Set();
@@ -214,12 +221,38 @@ function compactSummary(run) {
   };
 }
 
-function selectionDigest(root, generatedAt, selected) {
+function snapshotDigest(file) {
+  if (!fs.existsSync(file)) return sha256('');
+  validatePhysicalWorkspacePath(path.dirname(path.dirname(file)), file, 'retention authority snapshot');
+  return sha256(fs.readFileSync(file));
+}
+
+function authoritySnapshots(root) {
+  const scout = path.join(path.resolve(root), '.scout');
+  return {
+    queueDigest: snapshotDigest(path.join(scout, 'scan-queue.jsonl')),
+    recoverySelectionsDigest: snapshotDigest(path.join(scout, 'recovery-selections.jsonl')),
+  };
+}
+
+function planDigest(plan) {
   return sha256(stableJson({
-    root: path.resolve(root),
-    generatedAt,
-    selected: selected.map(({ runId, digest }) => ({ runId, digest })),
+    schemaVersion: plan.schemaVersion,
+    root: plan.root,
+    generatedAt: plan.generatedAt,
+    policy: plan.policy,
+    candidates: plan.candidates,
+    selected: plan.selected,
+    refusedSelections: plan.refusedSelections,
+    compactSummaries: plan.compactSummaries,
+    authoritySnapshots: plan.authoritySnapshots,
   }));
+}
+
+function deepFreeze(value) {
+  if (!value || typeof value !== 'object' || Object.isFrozen(value)) return value;
+  for (const child of Object.values(value)) deepFreeze(child);
+  return Object.freeze(value);
 }
 
 export function planRunCleanup(root, inputPolicy = {}) {
@@ -283,14 +316,15 @@ export function planRunCleanup(root, inputPolicy = {}) {
     compactSummaries: selected
       .filter((candidate) => Date.parse(candidate.updatedAt) >= summaryBoundary)
       .map((candidate) => candidate.summary),
-    reviewedSelectionDigest: selectionDigest(root, now.toISOString(), selected),
+    authoritySnapshots: authoritySnapshots(root),
   };
+  plan.reviewedSelectionDigest = planDigest(plan);
   Object.defineProperty(plan, 'recoveryDataKey', {
     value: inputPolicy.recoveryDataKey,
     enumerable: false,
     writable: false,
   });
-  return Object.freeze(plan);
+  return deepFreeze(plan);
 }
 
 function currentFence(lease, callback) {
@@ -318,6 +352,22 @@ function checkedSelectedSources(plan) {
   return sources;
 }
 
+function checkedCompactSummary(value) {
+  const keys = ['completedStages', 'outcome', 'recoveryCount', 'runId', 'schemaVersion', 'updatedAt'];
+  if (!value || typeof value !== 'object' || Array.isArray(value)
+    || Object.keys(value).sort().join(',') !== keys.sort().join(',')
+    || value.schemaVersion !== 1
+    || typeof value.runId !== 'string'
+    || typeof value.updatedAt !== 'string'
+    || value.outcome !== 'complete'
+    || !Array.isArray(value.completedStages)
+    || value.completedStages.some((stage) => typeof stage !== 'string')
+    || !Number.isSafeInteger(value.recoveryCount) || value.recoveryCount < 0) {
+    throw new Error('run retention summary is invalid');
+  }
+  return value;
+}
+
 function retentionIndexFile(root) {
   return path.join(path.resolve(root), '.scout', 'run-retention-index.json');
 }
@@ -329,6 +379,7 @@ function readRetentionIndex(root) {
   if (value?.schemaVersion !== RETENTION_INDEX_SCHEMA_VERSION || !Array.isArray(value.summaries)) {
     throw new Error('run retention index is invalid');
   }
+  value.summaries.forEach(checkedCompactSummary);
   return value;
 }
 
@@ -350,46 +401,199 @@ function appendAudit(root, record) {
   }
 }
 
-export function archiveSelectedRuns(plan, lease) {
+function auditEvents(root) {
+  const file = path.join(path.resolve(root), '.scout', 'run-retention.jsonl');
+  if (!fs.existsSync(file)) return [];
+  validatePhysicalWorkspacePath(root, file, 'retention audit');
+  const contents = fs.readFileSync(file, 'utf8');
+  if (contents && !contents.endsWith('\n')) throw new Error('retention audit is truncated');
+  return contents.split('\n').filter(Boolean).map((line) => JSON.parse(line));
+}
+
+function appendAuditOnce(root, record) {
+  const existing = auditEvents(root).find((event) => (
+    event.operationId === record.operationId && event.type === record.type
+  ));
+  if (existing) {
+    const canonical = (event) => {
+      const {
+        eventId: ignoredEventId,
+        recordedAt: ignoredRecordedAt,
+        leaseId: ignoredLeaseId,
+        fencingGeneration: ignoredGeneration,
+        ...durable
+      } = event;
+      void ignoredEventId;
+      void ignoredRecordedAt;
+      void ignoredLeaseId;
+      void ignoredGeneration;
+      return stableJson(durable);
+    };
+    if (canonical(existing) !== canonical(record)) throw new Error('retention audit identity conflicts');
+    return existing;
+  }
+  appendAudit(root, record);
+  return record;
+}
+
+function cleanupOperationFile(plan) {
+  const operationId = sha256(`cleanup:${plan.reviewedSelectionDigest}`);
+  const file = path.join(plan.root, '.scout', 'run-cleanups', operationId, 'manifest.json');
+  return { operationId, file };
+}
+
+function writeCleanupOperation(root, file, manifest) {
+  validatePhysicalWorkspacePath(root, file, 'cleanup operation manifest');
+  atomicWriteFile(file, `${stableJson(manifest)}\n`, { mode: 0o600 });
+}
+
+function readCleanupOperation(root, file) {
+  if (!fs.existsSync(file)) return null;
+  validatePhysicalWorkspacePath(root, file, 'cleanup operation manifest');
+  const value = JSON.parse(fs.readFileSync(file, 'utf8'));
+  const keys = ['archiveFile', 'archiveId', 'operationId', 'planDigest', 'runs', 'schemaVersion', 'status'];
+  if (!value || Object.keys(value).sort().join(',') !== keys.sort().join(',')
+    || value.schemaVersion !== 1
+    || !/^[a-f0-9]{64}$/.test(value.operationId || '')
+    || !/^[a-f0-9]{64}$/.test(value.planDigest || '')
+    || !['prepared', 'archived', 'completed'].includes(value.status)
+    || (value.archiveFile !== null && typeof value.archiveFile !== 'string')
+    || (value.archiveId !== null && !/^[a-f0-9]{64}$/.test(value.archiveId || ''))
+    || !Array.isArray(value.runs)
+    || value.runs.some((run) => (
+      !run || Object.keys(run).sort().join(',') !== 'digest,runId,status'
+      || typeof run.runId !== 'string' || !/^[a-f0-9]{64}$/.test(run.digest || '')
+      || !['pending', 'deleted'].includes(run.status)
+    ))) {
+    throw new Error('cleanup operation manifest is invalid');
+  }
+  return value;
+}
+
+function assertPlanCurrent(plan, { allowMissing = false } = {}) {
+  if (planDigest(plan) !== plan.reviewedSelectionDigest) {
+    throw new Error('reviewed selection changed after operator review');
+  }
+  const snapshots = authoritySnapshots(plan.root);
+  if (stableJson(snapshots) !== stableJson(plan.authoritySnapshots)) {
+    throw new Error('cleanup eligibility changed because recovery-critical durable state changed');
+  }
+  const current = planRunCleanup(plan.root, {
+    now: new Date(plan.generatedAt),
+    ...plan.policy,
+    selectedRunIds: plan.selected.map((selected) => selected.runId),
+    recoveryDataKey: plan.recoveryDataKey,
+  });
+  const eligible = new Set(current.candidates.map((candidate) => candidate.runId));
+  for (const selected of plan.selected) {
+    const directory = path.join(workspacePaths(plan.root).runs, selected.runId);
+    if (!fs.existsSync(directory) && allowMissing) continue;
+    if (!eligible.has(selected.runId)) {
+      throw new Error(`selected run became recovery-critical or otherwise ineligible: ${selected.runId}`);
+    }
+  }
+}
+
+function archivePayloadMatchesPlan(payload, plan) {
+  if (payload.reviewedSelectionDigest !== plan.reviewedSelectionDigest) return false;
+  const archived = payload.runs.map(({ runId, digest }) => ({ runId, digest }));
+  const selected = plan.selected.map(({ runId, digest }) => ({ runId, digest }));
+  return stableJson(archived) === stableJson(selected);
+}
+
+export function archiveSelectedRuns(plan, lease, hooks = {}) {
   if (!plan || plan.schemaVersion !== 1 || !Array.isArray(plan.selected) || !plan.selected.length) {
     throw new TypeError('an explicit non-empty reviewed cleanup selection is required');
   }
   if (!Buffer.isBuffer(plan.recoveryDataKey) || plan.recoveryDataKey.length !== 32) {
     throw new Error('A protected archive sink with an unlocked recovery data key is required');
   }
-  if (selectionDigest(plan.root, plan.generatedAt, plan.selected) !== plan.reviewedSelectionDigest) {
-    throw new Error('reviewed selection changed after operator review');
-  }
   assertScanLeaseScope(lease, plan.root, lease?.runId);
-  const sources = currentFence(lease, () => checkedSelectedSources(plan));
+  currentFence(lease, () => assertPlanCurrent(plan, { allowMissing: true }));
+  // Prove the supplied key belongs to the persisted recovery header before
+  // creating cleanup intent or touching a source.
+  const persistedHeader = path.join(plan.root, '.scout-backup', 'v1', 'header.json');
+  validatePhysicalWorkspacePath(plan.root, persistedHeader, 'persisted recovery authority');
+  assertPersistedRecoveryDataKey(plan.root, plan.recoveryDataKey);
+  const { operationId, file: operationManifest } = cleanupOperationFile(plan);
+  let operation = currentFence(lease, () => {
+    const existing = readCleanupOperation(plan.root, operationManifest);
+    if (existing) {
+      if (existing.operationId !== operationId
+        || existing.planDigest !== plan.reviewedSelectionDigest
+        || !Array.isArray(existing.runs)) throw new Error('cleanup operation manifest conflicts');
+      return existing;
+    }
+    const created = {
+      schemaVersion: 1,
+      operationId,
+      planDigest: plan.reviewedSelectionDigest,
+      status: 'prepared',
+      archiveFile: null,
+      archiveId: null,
+      runs: plan.selected.map(({ runId, digest }) => ({ runId, digest, status: 'pending' })),
+    };
+    writeCleanupOperation(plan.root, operationManifest, created);
+    return created;
+  });
+
+  let payload = null;
+  let written = null;
+  if (operation.archiveFile) {
+    const archiveFile = validatePhysicalWorkspacePath(plan.root, path.join(plan.root, operation.archiveFile), 'reviewed archive');
+    payload = verifyReviewedRunArchive(archiveFile, plan.recoveryDataKey);
+    if (!archivePayloadMatchesPlan(payload, plan)) throw new Error('verified archive conflicts with reviewed cleanup plan');
+    written = { file: archiveFile, archiveId: payload.archiveId };
+  }
+  const sources = payload?.runs || currentFence(lease, () => {
+    assertPlanCurrent(plan);
+    return checkedSelectedSources(plan);
+  });
   const archiveId = sha256(stableJson({
     reviewedSelectionDigest: plan.reviewedSelectionDigest,
     runs: sources.map(({ runId, digest }) => ({ runId, digest })),
   }));
-  const payload = {
+  payload ||= {
     schemaVersion: ARCHIVE_SCHEMA_VERSION,
     archiveId,
     reviewedSelectionDigest: plan.reviewedSelectionDigest,
     runs: sources,
   };
-  const assertFence = () => currentFence(lease, () => true);
-  const written = writeReviewedRunArchive(
+  written ||= writeReviewedRunArchive(
     plan.root,
     plan.recoveryDataKey,
     payload,
-    { assertFence },
+    {
+      commitFence: (commit) => currentFence(lease, () => {
+        assertPlanCurrent(plan);
+        checkedSelectedSources(plan);
+        return commit();
+      }),
+      beforeCommit: hooks.beforeArchiveCommit,
+    },
   );
   const verified = verifyReviewedRunArchive(written.file, plan.recoveryDataKey);
   if (sha256(stableJson(verified)) !== sha256(stableJson(payload))) {
     throw new Error('Reviewed run archive verification failed');
   }
 
+  operation = currentFence(lease, () => {
+    const next = {
+      ...operation,
+      status: 'archived',
+      archiveFile: path.relative(plan.root, written.file).replaceAll('\\', '/'),
+      archiveId,
+    };
+    writeCleanupOperation(plan.root, operationManifest, next);
+    return next;
+  });
+
   const previousIndex = readRetentionIndex(plan.root);
   const summaryBoundary = Date.parse(plan.generatedAt) - plan.policy.summaryDays * DAY_MS;
   const summaries = new Map(previousIndex.summaries
     .filter((summary) => Date.parse(summary.updatedAt || '') >= summaryBoundary)
     .map((summary) => [summary.runId, summary]));
-  for (const summary of plan.compactSummaries) summaries.set(summary.runId, summary);
+  for (const summary of plan.compactSummaries) summaries.set(summary.runId, checkedCompactSummary(summary));
   const nextIndex = {
     schemaVersion: RETENTION_INDEX_SCHEMA_VERSION,
     updatedAt: new Date().toISOString(),
@@ -398,11 +602,16 @@ export function archiveSelectedRuns(plan, lease) {
     )),
   };
   const indexFile = retentionIndexFile(plan.root);
-  currentFence(lease, () => atomicWriteFile(indexFile, `${stableJson(nextIndex)}\n`, { mode: 0o600 }));
-  currentFence(lease, () => appendAudit(plan.root, {
+  currentFence(lease, () => {
+    assertPlanCurrent(plan, { allowMissing: true });
+    validatePhysicalWorkspacePath(plan.root, indexFile, 'run retention index');
+    atomicWriteFile(indexFile, `${stableJson(nextIndex)}\n`, { mode: 0o600 });
+  });
+  currentFence(lease, () => appendAuditOnce(plan.root, {
     schemaVersion: 1,
     eventId: crypto.randomUUID(),
     type: 'archive-reviewed',
+    operationId,
     recordedAt: new Date().toISOString(),
     leaseId: lease.leaseId,
     fencingGeneration: lease.generation,
@@ -411,21 +620,40 @@ export function archiveSelectedRuns(plan, lease) {
     runIds: plan.selected.map((selected) => selected.runId),
   }));
 
-  let archivedRuns = 0;
-  for (const selected of plan.selected) {
+  for (const [index, selected] of plan.selected.entries()) {
+    const receipt = operation.runs.find((run) => run.runId === selected.runId);
+    if (receipt?.status === 'deleted') continue;
+    let removedNow = false;
     currentFence(lease, () => {
+      assertPlanCurrent(plan, { allowMissing: true });
       const directory = safeRunDirectory(plan.root, selected.runId);
-      if (!fs.existsSync(directory) || digestFiles(walkFiles(directory)) !== selected.digest) {
+      if (!fs.existsSync(directory)) return;
+      if (digestFiles(walkFiles(directory)) !== selected.digest) {
         throw new Error('selected run changed after review');
       }
       fs.rmSync(directory, { recursive: true, force: false });
-      archivedRuns += 1;
+      removedNow = true;
+    });
+    if (removedNow && typeof hooks.afterSourceDelete === 'function') hooks.afterSourceDelete({ index, runId: selected.runId });
+    operation = currentFence(lease, () => {
+      assertPlanCurrent(plan, { allowMissing: true });
+      const archivedRun = verified.runs.find((run) => run.runId === selected.runId && run.digest === selected.digest);
+      if (!archivedRun) throw new Error('verified archive does not contain the deleted run');
+      const next = {
+        ...operation,
+        runs: operation.runs.map((run) => (
+          run.runId === selected.runId ? { ...run, status: 'deleted' } : run
+        )),
+      };
+      writeCleanupOperation(plan.root, operationManifest, next);
+      return next;
     });
   }
-  currentFence(lease, () => appendAudit(plan.root, {
+  currentFence(lease, () => appendAuditOnce(plan.root, {
     schemaVersion: 1,
     eventId: crypto.randomUUID(),
     type: 'archive-completed',
+    operationId,
     recordedAt: new Date().toISOString(),
     leaseId: lease.leaseId,
     fencingGeneration: lease.generation,
@@ -433,7 +661,18 @@ export function archiveSelectedRuns(plan, lease) {
     reviewedSelectionDigest: plan.reviewedSelectionDigest,
     runIds: plan.selected.map((selected) => selected.runId),
   }));
-  return { archiveFile: written.file, indexFile, archiveId, archivedRuns };
+  operation = currentFence(lease, () => {
+    const next = { ...operation, status: 'completed' };
+    writeCleanupOperation(plan.root, operationManifest, next);
+    return next;
+  });
+  return {
+    archiveFile: written.file,
+    indexFile,
+    archiveId,
+    archivedRuns: operation.runs.filter((run) => run.status === 'deleted').length,
+    operationManifest,
+  };
 }
 
 function queueEventIds(record) {
@@ -448,6 +687,7 @@ function queueEventIds(record) {
 function queueEvents(root) {
   const file = path.join(path.resolve(root), '.scout', 'scan-queue.jsonl');
   if (!fs.existsSync(file)) return { file, events: [], contents: '' };
+  validatePhysicalWorkspacePath(root, file, 'scan queue journal');
   const contents = fs.readFileSync(file, 'utf8');
   if (contents && !contents.endsWith('\n')) throw new Error('scan queue journal is truncated');
   const events = contents.split('\n').filter(Boolean).map((line) => {
@@ -462,7 +702,99 @@ function queueEvents(root) {
   return { file, events, contents };
 }
 
-export function compactScanQueue(root, lease, { now = new Date(), summaryDays = 365 } = {}) {
+function terminalQueueTime(events, requestId) {
+  const terminal = events.filter((record) => (
+    (['completed', 'expired', 'stale', 'window-covered'].includes(record.type)
+      && record.requestId === requestId)
+    || (record.type === 'scheduled-replaced' && record.supersededRequestId === requestId)
+  )).at(-1);
+  return terminal ? Date.parse(terminal.at || '') : NaN;
+}
+
+function queueCompactionDirectory(root, operationId) {
+  return path.join(path.resolve(root), '.scout', 'queue-compactions', operationId);
+}
+
+function writeQueueOperation(root, operation) {
+  const directory = queueCompactionDirectory(root, operation.operationId);
+  validatePhysicalWorkspacePath(root, directory, 'queue compaction snapshot');
+  atomicWriteFile(path.join(directory, 'before.jsonl'), operation.beforeContents, { mode: 0o600 });
+  atomicWriteFile(path.join(directory, 'after.jsonl'), operation.afterContents, { mode: 0o600 });
+  const manifest = {
+    schemaVersion: 1,
+    operationId: operation.operationId,
+    status: operation.status,
+    beforeDigest: operation.beforeDigest,
+    afterDigest: operation.afterDigest,
+    removedEvents: operation.removedEvents,
+  };
+  atomicWriteFile(path.join(directory, 'manifest.json'), `${stableJson(manifest)}\n`, { mode: 0o600 });
+  return path.join(directory, 'manifest.json');
+}
+
+function completeQueueOperation(root, lease, operation, manifestFile) {
+  currentFence(lease, () => appendAuditOnce(root, {
+    schemaVersion: 1,
+    eventId: crypto.randomUUID(),
+    operationId: operation.operationId,
+    type: 'queue-compacted',
+    recordedAt: new Date().toISOString(),
+    leaseId: lease.leaseId,
+    fencingGeneration: lease.generation,
+    beforeDigest: operation.beforeDigest,
+    afterDigest: operation.afterDigest,
+    removedEvents: operation.removedEvents,
+  }));
+  currentFence(lease, () => {
+    const completed = {
+      schemaVersion: 1,
+      operationId: operation.operationId,
+      status: 'completed',
+      beforeDigest: operation.beforeDigest,
+      afterDigest: operation.afterDigest,
+      removedEvents: operation.removedEvents,
+    };
+    validatePhysicalWorkspacePath(root, manifestFile, 'queue compaction manifest');
+    atomicWriteFile(manifestFile, `${stableJson(completed)}\n`, { mode: 0o600 });
+  });
+}
+
+function reconcileQueueOperation(root, lease, currentDigest) {
+  const base = path.join(path.resolve(root), '.scout', 'queue-compactions');
+  if (!fs.existsSync(base)) return null;
+  validatePhysicalWorkspacePath(root, base, 'queue compaction store');
+  for (const name of fs.readdirSync(base).sort()) {
+    const manifestFile = path.join(base, name, 'manifest.json');
+    if (!fs.existsSync(manifestFile)) continue;
+    validatePhysicalWorkspacePath(root, manifestFile, 'queue compaction manifest');
+    const manifest = JSON.parse(fs.readFileSync(manifestFile, 'utf8'));
+    const keys = ['afterDigest', 'beforeDigest', 'operationId', 'removedEvents', 'schemaVersion', 'status'];
+    if (!manifest || Object.keys(manifest).sort().join(',') !== keys.sort().join(',')
+      || manifest.schemaVersion !== 1
+      || manifest.operationId !== name
+      || !/^[a-f0-9]{64}$/.test(manifest.beforeDigest || '')
+      || !/^[a-f0-9]{64}$/.test(manifest.afterDigest || '')
+      || !['prepared', 'completed'].includes(manifest.status)
+      || !Number.isSafeInteger(manifest.removedEvents) || manifest.removedEvents < 0) {
+      throw new Error('queue compaction manifest is invalid');
+    }
+    if (manifest.afterDigest !== currentDigest || manifest.status === 'completed') continue;
+    const afterFile = path.join(base, name, 'after.jsonl');
+    validatePhysicalWorkspacePath(root, afterFile, 'queue compaction snapshot');
+    const afterContents = fs.readFileSync(afterFile, 'utf8');
+    if (sha256(afterContents) !== currentDigest) throw new Error('queue compaction snapshot is damaged');
+    const operation = { ...manifest, afterContents, beforeContents: '' };
+    completeQueueOperation(root, lease, operation, manifestFile);
+    return { changed: false, reconciled: true, removedEvents: manifest.removedEvents, keptEvents: afterContents.split('\n').filter(Boolean).length };
+  }
+  return null;
+}
+
+export function compactScanQueue(root, lease, {
+  now = new Date(),
+  summaryDays = 365,
+  afterQueueReplace,
+} = {}) {
   now = checkedDate(now, 'queue compaction time');
   if (!Number.isSafeInteger(summaryDays) || summaryDays < 0) {
     throw new TypeError('queue summary retention must be a non-negative whole number');
@@ -476,7 +808,7 @@ export function compactScanQueue(root, lease, { now = new Date(), summaryDays = 
     const expiresAt = Date.parse(request.expiresAt || '');
     const live = request.status === 'claimed' || request.status === 'legacy-claimed'
       || (request.status === 'queued' && Number.isFinite(expiresAt) && expiresAt > now.getTime());
-    const terminalAt = Date.parse(request.completion?.at || request.expiresAt || request.requestedAt || '');
+    const terminalAt = terminalQueueTime(snapshot.events, request.id);
     if (live || (Number.isFinite(terminalAt) && terminalAt >= cutoff)) keepIds.add(request.id);
   }
   // A scheduled replacement depends on the earlier request being replayable.
@@ -494,28 +826,35 @@ export function compactScanQueue(root, lease, { now = new Date(), summaryDays = 
   const kept = snapshot.events.filter((record) => queueEventIds(record).some((id) => keepIds.has(id)));
   const next = kept.length ? `${kept.map((record) => JSON.stringify(record)).join('\n')}\n` : '';
   if (next === snapshot.contents) {
-    return { changed: false, removedEvents: 0, keptEvents: kept.length };
+    return reconcileQueueOperation(root, lease, sha256(snapshot.contents))
+      || { changed: false, removedEvents: 0, keptEvents: kept.length };
   }
+  const beforeDigest = sha256(snapshot.contents);
+  const afterDigest = sha256(next);
+  const operationId = sha256(`queue-compaction:${beforeDigest}:${afterDigest}`);
+  const operation = {
+    operationId,
+    status: 'prepared',
+    beforeDigest,
+    afterDigest,
+    beforeContents: snapshot.contents,
+    afterContents: next,
+    removedEvents: snapshot.events.length - kept.length,
+  };
+  const manifestFile = currentFence(lease, () => writeQueueOperation(root, operation));
   currentFence(lease, () => {
     const current = queueEvents(root);
-    if (sha256(current.contents) !== sha256(snapshot.contents)) {
+    if (sha256(current.contents) !== beforeDigest) {
       throw new Error('scan queue changed during compaction');
     }
+    validatePhysicalWorkspacePath(root, snapshot.file, 'scan queue journal');
     atomicWriteFile(snapshot.file, next, { mode: 0o600 });
   });
-  currentFence(lease, () => appendAudit(root, {
-    schemaVersion: 1,
-    eventId: crypto.randomUUID(),
-    type: 'queue-compacted',
-    recordedAt: new Date().toISOString(),
-    leaseId: lease.leaseId,
-    fencingGeneration: lease.generation,
-    beforeDigest: sha256(snapshot.contents),
-    afterDigest: sha256(next),
-    removedEvents: snapshot.events.length - kept.length,
-  }));
+  if (typeof afterQueueReplace === 'function') afterQueueReplace();
+  completeQueueOperation(root, lease, operation, manifestFile);
   return {
     changed: true,
+    reconciled: false,
     removedEvents: snapshot.events.length - kept.length,
     keptEvents: kept.length,
   };
@@ -524,12 +863,12 @@ export function compactScanQueue(root, lease, { now = new Date(), summaryDays = 
 export function assertRunStorageWritable(root, policy = {}) {
   const measurement = measureRunStorage(root);
   const maximumBytes = { ...DEFAULT_MAXIMUM_BYTES, ...(policy.maximumBytes || {}) };
-  const reserveBytes = Number(policy.reserveBytes ?? 64 * 1024);
+  const reserveBytes = Number(policy.reserveBytes ?? DEFAULT_RESERVE_BYTES);
   if (!Number.isSafeInteger(reserveBytes) || reserveBytes < 0) {
     throw new TypeError('journal storage reserve must be a non-negative whole number');
   }
   const blocked = ['runs', 'artifacts', 'queue'].filter((area) => (
-    measurement[area].bytes + reserveBytes > maximumBytes[area]
+    measurement[area].bytes + reserveBytes >= maximumBytes[area]
   ));
   if (blocked.length) {
     const error = new Error(`Scout cannot safely journal new work: storage pressure in ${blocked.join(', ')}`);
@@ -543,3 +882,5 @@ export function assertRunStorageWritable(root, policy = {}) {
 }
 
 export const RUN_STORAGE_MAXIMUM_BYTES = DEFAULT_MAXIMUM_BYTES;
+export const RUN_STORAGE_WARNING_BYTES = DEFAULT_WARNING_BYTES;
+export const RUN_STORAGE_RESERVE_BYTES = DEFAULT_RESERVE_BYTES;
