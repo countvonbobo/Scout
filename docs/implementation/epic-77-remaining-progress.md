@@ -624,3 +624,28 @@ private paths, account data, CV content, adverts, prompts, or transcripts.
   interrupted result is not counted as verification evidence.
 - Findings fixed/open: the round-10 finding is fixed; complete-range Spec,
   code-quality and privacy/security re-review is pending.
+
+### Whole-epic review round 11
+
+- Verdicts:
+  - Spec PASS: 0 Critical, 0 Important.
+  - Code quality PASS: 0 Critical, 0 Important.
+  - Privacy/security PASS: 0 Critical, 0 Important.
+- Complete reviewed range:
+  `f8732fd005a8b77fa79c7d63abe52c5a08b205bd..a0a4234`.
+- Independent reviewers verified:
+  - hard-coded CSRF and provider-login CSRF values fail closed while dynamic
+    expressions remain source code rather than embedded credentials;
+  - generic camel/lower token-key assignments remain sensitive by default;
+  - only the exact cancellation and lock coordination-key exclusions remain,
+    with no credential-bearing literal found under either;
+  - prior Gates 1–5 acceptance, privacy, publication and manual/automatic
+    update-handoff contracts remain intact.
+- Review verification:
+  - release-audit/build/update suite: 43 passed, 0 failed, 0 skipped;
+  - default release audit: passed for 515 files;
+  - diff checks: passed.
+- Findings fixed/open: none open.
+- Next exact action: run the complete final verification matrix from this
+  review-clean committed tree, push the branch, open the required stacked
+  draft PR and obtain every required GitHub Actions result.
