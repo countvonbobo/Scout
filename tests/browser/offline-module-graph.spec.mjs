@@ -153,6 +153,14 @@ test('a real A-to-B worker activation keeps the exact app module graph bootable 
   networkUnavailable = false;
   await interruptedOfflinePage.close();
 
+  // Return the persistent client to the complete A shell. It stays on that
+  // document while B installs and activates, then asks for an A asset that the
+  // page has not used. HTTP cache is disabled so only the production worker's
+  // exact old-build cache can satisfy the later offline request.
+  servedBuild = 'build-a';
+  await page.goto('/offline-rollover/?stay-on=build-a');
+  await expect(page.locator('meta[name="scout-ui-build"]')).toHaveAttribute('content', 'build-a');
+
   servedBuild = 'build-b';
   failedShellPath = null;
   await page.evaluate(async () => {
@@ -162,10 +170,25 @@ test('a real A-to-B worker activation keeps the exact app module graph bootable 
     });
   });
   await waitForActiveBuild(page, 'build-b');
+  await expect(page.locator('meta[name="scout-ui-build"]')).toHaveAttribute('content', 'build-a');
   await expect.poll(() => page.evaluate(async () => ({
     old: await caches.has('scout-shell-build-a'),
     next: await caches.has('scout-shell-build-b'),
-  }))).toEqual({ old: false, next: true });
+  }))).toEqual({ old: true, next: true });
+
+  const oldClientCdp = await context.newCDPSession(page);
+  await oldClientCdp.send('Network.enable');
+  await oldClientCdp.send('Network.setCacheDisabled', { cacheDisabled: true });
+  networkUnavailable = true;
+  await context.setOffline(true);
+  const oldAsset = await page.evaluate(async () => {
+    const response = await fetch('/offline-rollover/assets/scout-warning.png?v=build-a');
+    return { ok: response.ok, size: (await response.arrayBuffer()).byteLength };
+  });
+  expect(oldAsset.ok).toBe(true);
+  expect(oldAsset.size).toBeGreaterThan(0);
+  await context.setOffline(false);
+  networkUnavailable = false;
 
   const graph = await page.evaluate(async () => {
     const build = 'build-b';
