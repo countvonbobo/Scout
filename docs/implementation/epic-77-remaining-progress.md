@@ -303,7 +303,43 @@ private paths, account data, CV content, adverts, prompts, or transcripts.
   - final Spec PASS, Code quality PASS and Privacy/security PASS; 0 Critical,
     0 Important.
 - Findings fixed/open: every Gate 5 finding fixed; none open.
-- Next exact action: commit the final browser-stabilisation and ledger update,
-  run the clean-worktree final verification matrix, complete fresh full-diff
-  reviews, push the branch, open the required draft PR and obtain the complete
-  GitHub Actions matrix.
+- Next exact action: complete the fresh whole-epic re-review and final clean
+  verification matrix, push the branch, open the required draft PR and obtain
+  the complete GitHub Actions matrix.
+
+## Final whole-epic release review
+
+- Status: review fixes committed; independent re-review pending.
+- Review-fix commit: `5651ac6` (`fix: close final release review blockers`).
+- Initial complete-range verdicts:
+  - Spec FAIL: 0 Critical, 3 Important.
+  - Code quality FAIL: 0 Critical, 2 Important.
+  - Privacy/security FAIL: 0 Critical, 2 Important.
+- Findings reproduced and fixed:
+  - replace the nonexistent aggregate-suite entry with a browser assertion
+    that every aggregate target exists;
+  - detect ordinary credential/auth-state/prompt/advert representations,
+    content-sniff structured payloads after harmless renames, audit tests and
+    fixtures, and recognise private roots at every packaged `app/` boundary;
+  - run the real privacy audit over the generated public-source stage;
+  - consume the single retry only after the successor login starts, releasing
+    it after a transient pre-session failure;
+  - bound provider and deep-link command settlement after TERM/KILL even when
+    a child never emits `close`;
+  - project tool activity and failures to fixed public values while retaining
+    only repo-relative touched-file evidence internally;
+  - replace tracker, chat-history, usage and catalogue exception details with
+    fixed API copy so provider output, credentials, commands and host paths do
+    not reach SSE, API responses or durable transcripts.
+- GREEN after fixes:
+  - focused release-audit/build, provider-login/provider and chat suites:
+    143 discovered, 142 passed, 0 failed, 1 Windows-only skip;
+  - wider provider/setup/chat verification: 155 discovered, 154 passed,
+    0 failed, 1 Windows-only skip;
+  - affected browser files: 92 discovered, 90 passed, 0 failed, 2 intentional
+    platform/host skips;
+  - `npm run release:audit`: passed for 515 source/build files;
+  - diff checks: passed.
+- Findings fixed/open: all initial findings fixed; the fresh complete-range
+  Spec, code-quality and privacy/security re-review verdicts remain required
+  before final verification and publication.
