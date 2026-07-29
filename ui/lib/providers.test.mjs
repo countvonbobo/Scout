@@ -9,6 +9,9 @@ import {
   providerEnvironment,
   providerCandidates,
   providerCommand,
+  providerHealthSignal,
+  providerLocalHealthSignal,
+  providerRemoteHealthSignal,
   providerStatus,
   providerStatusAsync,
 } from './providers.mjs';
@@ -312,4 +315,65 @@ test('provider catalogue discovery caches a refresh and expires explicitly', asy
   assert.notEqual(await discover(), first);
   assert.equal(detects, 2);
   assert.equal(catalogues, 2);
+});
+
+test('local provider status becomes a bounded privacy-safe health signal', () => {
+  const signal = providerLocalHealthSignal({
+    provider: 'codex',
+    installed: true,
+    authenticated: true,
+    version: 'codex-cli 1.2.3 person@example.test',
+    authMessage: 'Logged in as person@example.test',
+    executable: '/Users/example/.local/bin/codex',
+    env: { TOKEN: 'secret' },
+    attempts: [{ source: '/Users/example/.local/bin/codex', result: 'authenticated' }],
+  });
+
+  assert.deepEqual(signal, {
+    kind: 'local-credentials-present',
+    source: 'provider-operation',
+  });
+  assert.doesNotMatch(JSON.stringify(signal), /person@|Users|TOKEN|secret|version|attempts|executable|authMessage/);
+});
+
+test('remote provider responses become distinct bounded signals without response bodies', () => {
+  const cases = [
+    [{ ok: true, status: 204, body: 'private transcript' }, { kind: 'remote-success', source: 'provider-operation' }],
+    [{ ok: false, status: 401, body: 'token=secret person@example.test' }, { kind: 'remote-auth-failure', source: 'provider-operation', reasonCode: 'authentication-required' }],
+    [{ ok: false, status: 403 }, { kind: 'remote-auth-failure', source: 'provider-operation', reasonCode: 'authentication-required' }],
+    [{ ok: false, status: 429 }, { kind: 'rate-limit', source: 'provider-operation', reasonCode: 'rate-limited' }],
+    [{ ok: false, errorCode: 'ENETUNREACH', stderr: '/Users/example private' }, { kind: 'network-failure', source: 'provider-operation', reasonCode: 'network-unavailable' }],
+    [{ ok: false, reasonCode: 'cli-update-required', stdout: 'download from private URL' }, { kind: 'cli-update', source: 'provider-operation', reasonCode: 'cli-update-required' }],
+    [{ loginInProgress: true }, { kind: 'login-started', source: 'provider-operation' }],
+    [{ checking: true }, { kind: 'check-started', source: 'provider-operation' }],
+    [{ ok: false, status: 503, reasonCode: 'token-secret', body: 'provider account identity' }, { kind: 'provider-failure', source: 'provider-operation', reasonCode: 'provider-error' }],
+  ];
+
+  for (const [input, expected] of cases) {
+    const signal = providerRemoteHealthSignal(input);
+    assert.deepEqual(signal, expected);
+    assert.doesNotMatch(JSON.stringify(signal), /private|person@|Users|token|stdout|stderr|body|status/);
+  }
+});
+
+test('remote authentication failure outranks locally present credentials until remote success', () => {
+  const local = {
+    provider: 'claude',
+    installed: true,
+    authenticated: true,
+    authMessage: 'Logged in',
+  };
+  assert.deepEqual(providerHealthSignal({ local, remote: { status: 401 } }), {
+    kind: 'remote-auth-failure',
+    source: 'provider-operation',
+    reasonCode: 'authentication-required',
+  });
+  assert.deepEqual(providerHealthSignal({ local, remote: { ok: true, status: 200 } }), {
+    kind: 'remote-success',
+    source: 'provider-operation',
+  });
+  assert.deepEqual(providerHealthSignal({ local }), {
+    kind: 'local-credentials-present',
+    source: 'provider-operation',
+  });
 });

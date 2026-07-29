@@ -5,6 +5,53 @@ import path from 'node:path';
 import { parseCodexModelCatalogue } from './providerModels.mjs';
 
 export const PROVIDERS = Object.freeze(['codex', 'claude']);
+const PROVIDER_HEALTH_SOURCES = new Set([
+  'startup',
+  'manual-preflight',
+  'scheduled-preflight',
+  'periodic',
+  'post-auth',
+  'provider-operation',
+]);
+const NETWORK_ERROR_CODES = new Set([
+  'ECONNABORTED',
+  'ECONNREFUSED',
+  'ECONNRESET',
+  'EHOSTUNREACH',
+  'ENETDOWN',
+  'ENETUNREACH',
+  'ENOTFOUND',
+  'ETIMEDOUT',
+]);
+const PROVIDER_HEALTH_REASONS = new Set([
+  'checking',
+  'credentials-found',
+  'signed-out',
+  'login-started',
+  'remote-ok',
+  'authentication-required',
+  'network-unavailable',
+  'rate-limited',
+  'cli-update-required',
+  'provider-error',
+]);
+
+function providerHealthSource(value) {
+  return PROVIDER_HEALTH_SOURCES.has(value) ? value : 'provider-operation';
+}
+
+function providerHealthReason(value, fallback) {
+  const reason = String(value || '');
+  return PROVIDER_HEALTH_REASONS.has(reason) ? reason : fallback;
+}
+
+function healthSignal(kind, source, reasonCode = null) {
+  return {
+    kind,
+    source: providerHealthSource(source),
+    ...(reasonCode ? { reasonCode } : {}),
+  };
+}
 
 function envValue(env, name) {
   const key = Object.keys(env || {}).find((candidate) => candidate.toLowerCase() === name.toLowerCase());
@@ -322,6 +369,67 @@ export function providerEnvironment(env = process.env, platform = process.platfo
 
 export function detectProviders(options) {
   return Object.fromEntries(PROVIDERS.map((name) => [name, providerStatus(name, options)]));
+}
+
+// Provider CLIs and remote clients can include account identifiers, paths,
+// credentials and complete response bodies. Health persistence needs only this
+// small allowlisted signal vocabulary, so conversion deliberately never copies
+// arbitrary input fields.
+export function providerLocalHealthSignal(status, { source = 'provider-operation' } = {}) {
+  if (status?.authenticated === true) {
+    return healthSignal('local-credentials-present', source);
+  }
+  return healthSignal(
+    'local-signed-out',
+    source,
+    'signed-out',
+  );
+}
+
+export function providerRemoteHealthSignal(result, { source = 'provider-operation' } = {}) {
+  const status = Number(result?.status ?? result?.statusCode);
+  const errorCode = String(result?.errorCode || result?.code || '').toUpperCase();
+  const reasonCode = String(result?.reasonCode || '').toLowerCase();
+
+  // Authentication responses are authoritative even if a faulty adapter also
+  // marks the request successful or local credentials still appear present.
+  if (status === 401 || status === 403 || result?.authenticationFailed === true) {
+    return healthSignal('remote-auth-failure', source, 'authentication-required');
+  }
+  if (status === 429 || result?.rateLimited === true || reasonCode === 'rate-limited') {
+    return healthSignal('rate-limit', source, 'rate-limited');
+  }
+  if (
+    result?.networkUnavailable === true
+    || NETWORK_ERROR_CODES.has(errorCode)
+    || reasonCode === 'network-unavailable'
+  ) {
+    return healthSignal('network-failure', source, 'network-unavailable');
+  }
+  if (
+    result?.cliUpdateRequired === true
+    || ['cli-update', 'cli-update-required', 'unsupported-cli-version'].includes(reasonCode)
+  ) {
+    return healthSignal('cli-update', source, 'cli-update-required');
+  }
+  if (result?.loginInProgress === true) return healthSignal('login-started', source);
+  if (result?.checking === true) return healthSignal('check-started', source);
+  if (result?.remoteSuccess === true || result?.ok === true || (status >= 200 && status < 300)) {
+    return healthSignal('remote-success', source);
+  }
+  return healthSignal(
+    'provider-failure',
+    source,
+    providerHealthReason(reasonCode, 'provider-error'),
+  );
+}
+
+export function providerHealthSignal({ local = null, remote = null, source = 'provider-operation' } = {}) {
+  // Once a remote check has happened it is stronger evidence than a local CLI
+  // credential-presence probe. A later real remote success clears that barrier.
+  return remote !== null && remote !== undefined
+    ? providerRemoteHealthSignal(remote, { source })
+    : providerLocalHealthSignal(local, { source });
 }
 
 export function createProviderDetector({ status = providerStatusAsync, ttlMs = 5_000, now = Date.now } = {}) {

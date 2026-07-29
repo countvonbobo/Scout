@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { describeScheduleDays, isEveryDay, linuxSystemdUnits, macLaunchAgent, nativeScheduleNames, nextScheduledRun, normaliseScheduleDays, registerDailySchedule, scheduleSummary, scheduledLogicalWindow, scheduledRequestExpiry, schedulerRegistrationScript, taskXml } from './scheduler.mjs';
+import { createProviderHealthMonitor, describeScheduleDays, isEveryDay, linuxSystemdUnits, macLaunchAgent, nativeScheduleNames, nextScheduledRun, normaliseScheduleDays, registerDailySchedule, scheduleSummary, scheduledLogicalWindow, scheduledProviderPreflight, scheduledRequestExpiry, schedulerRegistrationScript, taskXml } from './scheduler.mjs';
 
 test('scheduled task is catch-up enabled, non-overlapping and time limited', () => {
   const xml = taskXml({ command: 'node.exe', args: ['tools/scout.mjs', 'scan'], workingDirectory: 'C:\\Scout', time: '07:30', userId: 'user', now: new Date(2026, 6, 11, 8, 0) });
@@ -184,4 +184,172 @@ test('scheduleSummary reports the selected days and the next matching run', () =
   assert.deepEqual(summary.runs[0].days, MON_WED_FRI);
   assert.equal(summary.runs[0].daysLabel, 'Mon, Wed, Fri');
   assert.equal(new Date(summary.runs[0].nextRunAt).getUTCDay(), 1);
+});
+
+test('scheduled provider preflight checks enabled jobs only with a bounded identity', async () => {
+  const calls = [];
+  const preflight = async (...args) => {
+    calls.push(args);
+    return { ok: true, provider: args[1], state: 'ready', purpose: args[2], verified: true };
+  };
+  assert.deepEqual(
+    await scheduledProviderPreflight('/synthetic/workspace', {
+      id: 'codex-second-pass',
+      enabled: true,
+      provider: 'codex',
+    }, { preflight }),
+    { ok: true, provider: 'codex', state: 'ready', purpose: 'scheduled-job', jobId: 'codex-second-pass', verified: true },
+  );
+  assert.deepEqual(calls, [['/synthetic/workspace', 'codex', 'scheduled-job', { source: 'scheduled-preflight' }]]);
+
+  assert.deepEqual(
+    await scheduledProviderPreflight('/synthetic/workspace', {
+      id: 'claude-primary',
+      enabled: false,
+      provider: 'claude',
+    }, { preflight }),
+    { ok: false, provider: 'claude', purpose: 'scheduled-job', state: 'checking', jobId: 'claude-primary', reasonCode: 'schedule-disabled' },
+  );
+  assert.equal(calls.length, 1);
+  await assert.rejects(
+    scheduledProviderPreflight('/synthetic/workspace', {
+      id: `codex-${'x'.repeat(65)}`,
+      enabled: true,
+      provider: 'codex',
+    }, { preflight }),
+    /job id/,
+  );
+});
+
+test('scheduled provider preflight returns only bounded allowlisted health evidence', async () => {
+  const result = await scheduledProviderPreflight('/synthetic/workspace', {
+    id: 'claude-primary',
+    enabled: true,
+    provider: 'claude',
+  }, {
+    preflight: async () => ({
+      ok: false,
+      provider: 'claude',
+      purpose: 'scheduled-job',
+      state: 'sign-in-required',
+      reasonCode: 'authentication-required',
+      checkedAt: '2026-07-29T08:30:00.000Z',
+      alertId: 'provider-health:claude:sign-in-required',
+      shouldNotify: true,
+      raw: 'token=secret person@example.test /Users/example',
+    }),
+  });
+  assert.deepEqual(result, {
+    ok: false,
+    provider: 'claude',
+    purpose: 'scheduled-job',
+    state: 'sign-in-required',
+    jobId: 'claude-primary',
+    reasonCode: 'authentication-required',
+    checkedAt: '2026-07-29T08:30:00.000Z',
+    alertId: 'provider-health:claude:sign-in-required',
+    shouldNotify: true,
+  });
+  assert.doesNotMatch(JSON.stringify(result), /secret|person@|Users|raw/);
+
+  const redacted = await scheduledProviderPreflight('/synthetic/workspace', {
+    id: 'codex-primary',
+    enabled: true,
+    provider: 'codex',
+  }, {
+    preflight: async () => ({
+      ok: false,
+      state: 'provider-error',
+      reasonCode: 'token-secret',
+      alertId: 'private-user',
+    }),
+  });
+  assert.equal(redacted.reasonCode, 'preflight-failed');
+  assert.equal('alertId' in redacted, false);
+});
+
+test('periodic provider monitor coalesces enabled jobs and isolates providers', async () => {
+  const calls = [];
+  const monitor = createProviderHealthMonitor({
+    root: '/synthetic/workspace',
+    getScheduleJobs: () => [
+      { id: 'claude-primary', enabled: true, provider: 'claude' },
+      { id: 'claude-second', enabled: true, provider: 'claude' },
+      { id: 'codex-second-pass', enabled: true, provider: 'codex' },
+      { id: 'codex-disabled', enabled: false, provider: 'codex' },
+    ],
+    preflight: async (root, provider, purpose) => {
+      calls.push([root, provider, purpose]);
+      if (provider === 'claude') throw new Error('synthetic provider failure with private body');
+      return { ok: true, provider, state: 'ready', purpose };
+    },
+    setInterval: () => ({ unref() {} }),
+    clearInterval() {},
+  });
+
+  const results = await monitor.runNow();
+  assert.deepEqual(calls, [
+    ['/synthetic/workspace', 'claude', 'periodic'],
+    ['/synthetic/workspace', 'codex', 'periodic'],
+  ]);
+  assert.deepEqual(results, [
+    { ok: false, provider: 'claude', purpose: 'periodic', state: 'provider-error', reasonCode: 'preflight-failed' },
+    { ok: true, provider: 'codex', purpose: 'periodic', state: 'ready' },
+  ]);
+  assert.doesNotMatch(JSON.stringify(results), /private body/);
+  monitor.stop();
+});
+
+test('periodic provider monitor is single-flight, supports runNow and stops cleanly', async () => {
+  let calls = 0;
+  let release;
+  let scheduledTick;
+  let cleared = false;
+  const pending = new Promise((resolve) => { release = resolve; });
+  const monitor = createProviderHealthMonitor({
+    root: '/synthetic/workspace',
+    getScheduleJobs: () => [{ id: 'codex-primary', enabled: true, provider: 'codex' }],
+    preflight: async () => {
+      calls += 1;
+      await pending;
+      return { ok: true, provider: 'codex', state: 'ready' };
+    },
+    intervalMs: 60_000,
+    setInterval: (callback, interval) => {
+      assert.equal(interval, 60_000);
+      scheduledTick = callback;
+      return { unref() {} };
+    },
+    clearInterval: () => { cleared = true; },
+  });
+
+  const first = monitor.runNow();
+  const shared = monitor.runNow();
+  scheduledTick();
+  assert.equal(first, shared);
+  await Promise.resolve();
+  await Promise.resolve();
+  assert.equal(calls, 1);
+  release();
+  assert.deepEqual(await first, [{ ok: true, provider: 'codex', purpose: 'periodic', state: 'ready' }]);
+
+  monitor.stop();
+  assert.equal(cleared, true);
+  assert.deepEqual(await monitor.runNow(), []);
+  assert.equal(calls, 1);
+});
+
+test('provider monitor never invokes scan or queue work', async () => {
+  const forbidden = () => { throw new Error('scan or queue invocation is forbidden'); };
+  const monitor = createProviderHealthMonitor({
+    root: '/synthetic/workspace',
+    getScheduleJobs: () => [{ id: 'claude-primary', enabled: true, provider: 'claude' }],
+    preflight: async () => ({ ok: true, provider: 'claude', state: 'ready' }),
+    scan: forbidden,
+    enqueue: forbidden,
+    setInterval: () => ({ unref() {} }),
+    clearInterval() {},
+  });
+  assert.deepEqual(await monitor.runNow(), [{ ok: true, provider: 'claude', purpose: 'periodic', state: 'ready' }]);
+  monitor.stop();
 });
