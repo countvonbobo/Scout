@@ -1,8 +1,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  activityState, applyScoutState, frameOffset, framePosition, scoutAnchor, scoutDefinition, scoutTiming,
-  SCOUT_ANCHORS, SCOUT_STATES,
+  activityState, applyScoutState, frameOffset, framePosition, frameSequence, scoutAnchor,
+  scoutAnimationName, scoutDefinition, scoutKeyframes, scoutStillAnchor, scoutTiming,
+  SCOUT_FRAME_ANCHORS, SCOUT_SHEET_ANCHORS, SCOUT_STATES,
 } from './scoutCharacter.mjs';
 
 const CALM_STATES = ['idle', 'listening', 'sleeping'];
@@ -61,14 +62,14 @@ test('every sprite state resolves to a numeric two-axis anchor and a label', () 
   }
 });
 
-test('anchors are declared once per sprite sheet, never per state or per frame', () => {
+test('the moving animation is anchored once per sprite sheet', () => {
   for (const [state, definition] of Object.entries(SCOUT_STATES)) {
     assert.equal(definition.align, undefined, `${state} must not carry its own anchor`);
-    assert.equal(definition.anchors, undefined, `${state} must not carry per-frame anchors`);
-    assert.ok(SCOUT_ANCHORS[definition.src], `${state} needs an anchor for ${definition.src}`);
+    assert.ok(SCOUT_SHEET_ANCHORS[definition.src], `${state} needs a sheet anchor for ${definition.src}`);
   }
-  // States drawn from one sheet resolve to one anchor, so switching between them
-  // cannot move Scout.
+  // asking, writing and explaining play the very same 16 frames from one sheet.
+  // If they anchored differently, that identical animation would render at a
+  // different offset in each state and Scout would jump on every state change.
   const bySheet = new Map();
   for (const [state, definition] of Object.entries(SCOUT_STATES)) {
     const seen = bySheet.get(definition.src);
@@ -76,22 +77,69 @@ test('anchors are declared once per sprite sheet, never per state or per frame',
     if (seen) assert.deepEqual(anchor, seen.anchor, `${state} must match ${seen.state} on ${definition.src}`);
     else bySheet.set(definition.src, { state, anchor });
   }
-  // Sheets genuinely differ on both axes, so one shared anchor is not enough.
   assert.ok(new Set([...bySheet.values()].map((entry) => entry.anchor.x)).size > 1);
   assert.ok(new Set([...bySheet.values()].map((entry) => entry.anchor.y)).size > 1);
 });
 
-test('an unknown sprite sheet resolves to a neutral anchor rather than throwing', () => {
+test('the reduced-motion still is anchored per sheet and representative frame', () => {
+  for (const [state, definition] of Object.entries(SCOUT_STATES)) {
+    const key = `${definition.src}|${definition.reducedMotionFrame}`;
+    assert.ok(SCOUT_FRAME_ANCHORS[key], `${state} needs a still anchor for ${key}`);
+    const [x, y] = SCOUT_FRAME_ANCHORS[key];
+    assert.deepEqual(scoutStillAnchor(definition), { x, y }, `${state} still anchor`);
+  }
+  // Only what the artwork forces: states that show the same cell of the same
+  // sheet share one still anchor, and no anchor is declared per frame of the
+  // animation, only for the frame that reduced motion actually displays.
+  assert.deepEqual(scoutStillAnchor(scoutDefinition('idle')), scoutStillAnchor(scoutDefinition('sleeping')));
+  assert.deepEqual(scoutStillAnchor(scoutDefinition('found')), scoutStillAnchor(scoutDefinition('success')));
+  assert.notDeepEqual(scoutStillAnchor(scoutDefinition('asking')), scoutStillAnchor(scoutDefinition('explaining')));
+  const representative = new Set(Object.values(SCOUT_STATES).map((d) => `${d.src}|${d.reducedMotionFrame}`));
+  assert.equal(Object.keys(SCOUT_FRAME_ANCHORS).length, representative.size, 'no unused still anchors');
+});
+
+test('an unknown sprite sheet resolves to neutral anchors rather than throwing', () => {
   assert.deepEqual(scoutAnchor({ src: '/assets/not-a-sheet.png' }), { x: 0, y: 0 });
+  assert.deepEqual(scoutStillAnchor({ src: '/assets/not-a-sheet.png', reducedMotionFrame: 3 }), { x: 0, y: 0 });
+});
+
+test('the walk visits exactly the configured number of frames', () => {
+  for (const [state, definition] of Object.entries(SCOUT_STATES)) {
+    const sequence = frameSequence(definition);
+    assert.equal(sequence.length, definition.frames, `${state} must visit its configured frame count`);
+    assert.deepEqual(sequence[0], frameOffset(0, definition));
+    assert.deepEqual(sequence.at(-1), frameOffset(definition.frames - 1, definition));
+  }
+});
+
+test('a sheet whose last row is only partly used stops at its final frame', () => {
+  // frames is authoritative: a 4x4 sheet holding 14 drawn cells must stop after
+  // 14, not walk two unused cells.
+  const partial = { columns: 4, rows: 4, frames: 14, fps: 7, loop: true };
+  const sequence = frameSequence(partial);
+  assert.equal(sequence.length, 14);
+  assert.deepEqual(sequence.at(-1), frameOffset(13, partial));
+  assert.equal(scoutTiming(partial).duration, 2);
+  const css = scoutKeyframes(partial);
+  assert.equal((css.match(/background-position:/g) || []).length, 15, '14 frames plus a holding stop');
+  assert.equal(scoutAnimationName(partial), 'scout-walk-4x4x14');
+  assert.notEqual(scoutAnimationName(partial), scoutAnimationName({ ...partial, frames: 16 }));
+});
+
+test('generated keyframes place every frame on an exact cell', () => {
+  const css = scoutKeyframes(scoutDefinition('idle'));
+  assert.match(css, /^@keyframes scout-walk-4x4x16\{/);
+  assert.doesNotMatch(css, /\d+\.\d+%\s*\}/);
+  for (const position of css.match(/background-position:[^,]+,center/g) || []) {
+    assert.match(position, /background-position:(?:0%|100%|calc\(100% \* \d+ \/ \d+\)) (?:0%|100%|calc\(100% \* \d+ \/ \d+\)),center/);
+  }
 });
 
 test('animation length is derived from each state\'s own frame count and frame rate', () => {
   for (const [state, definition] of Object.entries(SCOUT_STATES)) {
     const timing = scoutTiming(definition);
     assert.equal(timing.duration, definition.frames / definition.fps, `${state} duration must follow its own fps`);
-    assert.equal(timing.rowDuration, definition.columns / definition.fps, `${state} row sweep must follow its own fps`);
-    assert.equal(timing.rowIterations, definition.loop ? 'infinite' : '1');
-    assert.equal(timing.columnIterations, definition.loop ? 'infinite' : String(definition.rows));
+    assert.equal(timing.iterations, definition.loop ? 'infinite' : '1');
   }
 });
 
@@ -132,11 +180,13 @@ test('applyScoutState publishes the state\'s own timing, anchor and still frame'
   const definition = scoutDefinition('sleeping');
   const read = (name) => element.sprite.style.getPropertyValue(name);
   assert.equal(read('--scout-duration'), `${definition.frames / definition.fps}s`);
-  assert.equal(read('--scout-row-duration'), `${definition.columns / definition.fps}s`);
+  assert.equal(read('--scout-walk'), scoutAnimationName(definition));
   assert.equal(read('--scout-columns'), String(definition.columns));
   assert.equal(read('--scout-rows'), String(definition.rows));
   assert.equal(read('--scout-align-x'), `${scoutAnchor(definition).x}%`);
   assert.equal(read('--scout-align-y'), `${scoutAnchor(definition).y}%`);
+  assert.equal(read('--scout-still-align-x'), `${scoutStillAnchor(definition).x}%`);
+  assert.equal(read('--scout-still-align-y'), `${scoutStillAnchor(definition).y}%`);
   assert.equal(element.getAttribute('aria-label'), definition.label);
 });
 
@@ -154,6 +204,6 @@ test('reduced motion pins the configured representative frame instead of frame z
 test('non-looping states stop after a single pass', () => {
   for (const state of ['found', 'success', 'warning', 'welcome']) {
     const timing = scoutTiming(scoutDefinition(state));
-    assert.equal(timing.rowIterations, '1', `${state} must not loop`);
+    assert.equal(timing.iterations, '1', `${state} must not loop`);
   }
 });

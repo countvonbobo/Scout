@@ -60,16 +60,20 @@ export const REPO_ROOT = APP_ROOT; // retained for API compatibility
 export const WORKSPACE_ROOT = resolveWorkspaceRoot({ appRoot: APP_ROOT });
 export const PORT = Number(process.env.PORT) || 8459;
 export const APP_VERSION = JSON.parse(fs.readFileSync(path.join(APP_ROOT, 'package.json'), 'utf8')).version;
-const UI_BUILD_FILES = [
+// Every file the browser caches under this id. A module served to the shell
+// belongs here: leaving one out lets a release change behaviour while installed
+// clients keep the previous `scout-shell-<id>` cache and the previous ?v= URL.
+export const UI_BUILD_FILES = [
   'index.html', 'app.js', 'setup.js', 'reportView.js', 'service-worker.js', 'manifest.webmanifest',
+  'lib/scoutCharacter.mjs',
   'assets/scout-icon.ico', 'assets/scout-icon.png', 'assets/scout-idle.png',
   'assets/scout-thinking.png', 'assets/scout-searching.png', 'assets/scout-explaining.png',
   'assets/scout-found.png', 'assets/scout-warning.png',
 ];
-function computeUiBuildId() {
+export function computeUiBuildId(readFile = (name) => fs.readFileSync(path.join(__dirname, name))) {
   const hash = createHash('sha256');
   for (const name of UI_BUILD_FILES) {
-    hash.update(name).update('\0').update(fs.readFileSync(path.join(__dirname, name))).update('\0');
+    hash.update(name).update('\0').update(readFile(name)).update('\0');
   }
   return hash.digest('hex').slice(0, 16);
 }

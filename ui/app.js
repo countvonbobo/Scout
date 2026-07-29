@@ -12,8 +12,18 @@ const scoutCharacter = () => (typeof window !== 'undefined' ? window.ScoutCharac
 function activityState(activity) {
   return scoutCharacter()?.activityState(activity) || 'thinking';
 }
+// The module is deferred, so a render can land before it evaluates, and it may
+// never evaluate at all if the request fails. Emitting nothing would leave
+// arrival, the chat companion and every assistant message permanently without
+// Scout or its accessible name, because later hydration can only adopt markup
+// that already exists. So emit a bounded, named placeholder carrying the state
+// for the module to hydrate — no timing, alignment or label table, just the
+// character's own name until the canonical one arrives.
 function scoutMarkup(state = 'idle', className = '') {
-  return scoutCharacter()?.scoutMarkup(state, className) || '';
+  const character = scoutCharacter();
+  if (character) return character.scoutMarkup(state, className);
+  const name = String(state).replace(/[^a-z]/gi, '') || 'idle';
+  return `<span class="scout-character ${className}" data-scout-state="${name}" role="img" aria-label="Scout"><span class="scout-sprite" aria-hidden="true"></span></span>`;
 }
 function applyScoutState(element, state, options = {}) {
   return scoutCharacter()?.applyScoutState(element, state, options) || null;

@@ -11,7 +11,7 @@ const previousDeviceSettings = process.env.SCOUT_DEVICE_SETTINGS;
 const testWorkspace = fs.mkdtempSync(path.join(os.tmpdir(), 'scout-server-test-'));
 process.env.SCOUT_WORKSPACE = testWorkspace;
 process.env.SCOUT_DEVICE_SETTINGS = path.join(testWorkspace, 'device-settings.json');
-const { APP_ROOT, APP_VERSION, UI_BUILD_ID, WORKSPACE_ROOT, createServer, operations, providerDetection, restartControl, shutdownControl } = await import('./server.mjs');
+const { APP_ROOT, APP_VERSION, UI_BUILD_FILES, UI_BUILD_ID, WORKSPACE_ROOT, computeUiBuildId, createServer, operations, providerDetection, restartControl, shutdownControl } = await import('./server.mjs');
 const { seedWorkspace, loadWorkspaceConfig, workspacePaths, writeWorkspaceConfig } = await import('./lib/workspace.mjs');
 const { profileFingerprint } = await import('./lib/searchProfile.mjs');
 const { acquireScanLock, releaseScanLock } = await import('../tools/scan-lock.mjs');
@@ -382,6 +382,39 @@ test('served shell and service worker receive the exact UI build id', async () =
   assert.equal(worker.headers['cache-control'], 'no-cache');
   assert.match(worker.text, new RegExp(`const BUILD = '${UI_BUILD_ID}'`));
   assert.doesNotMatch(worker.text, /__SCOUT_UI_BUILD__/);
+});
+
+test('a change to the character module alone moves the UI build fingerprint', () => {
+  const readOriginal = (name) => fs.readFileSync(path.join(APP_ROOT, 'ui', name));
+  assert.equal(computeUiBuildId(readOriginal), UI_BUILD_ID);
+
+  // Only ui/lib/scoutCharacter.mjs differs. If it were missing from the
+  // fingerprint inputs, a module-only release would keep the old build id, the
+  // old `scout-shell-<id>` cache and the old ?v= module URL, so installed PWAs
+  // would go on running the previous character definitions.
+  const mutated = computeUiBuildId((name) => (name === 'lib/scoutCharacter.mjs'
+    ? Buffer.from('export const SCOUT_STATES = {};')
+    : readOriginal(name)));
+  assert.notEqual(mutated, UI_BUILD_ID);
+  assert.ok(UI_BUILD_FILES.includes('lib/scoutCharacter.mjs'));
+});
+
+test('the served shell and offline cache both version the character module', async () => {
+  const versioned = new RegExp(`/lib/scoutCharacter\\.mjs\\?v=${UI_BUILD_ID}`);
+  const page = await request({ path: '/' });
+  assert.match(page.text, versioned);
+
+  // The worker interpolates BUILD itself, so the served copy proves the cached
+  // module URL and the cache name both carry this build id.
+  const worker = await request({ path: '/service-worker.js' });
+  assert.match(worker.text, new RegExp(`const BUILD = '${UI_BUILD_ID}'`));
+  assert.match(worker.text, /const CACHE = `scout-shell-\$\{BUILD\}`/);
+  assert.match(worker.text, /`\/lib\/scoutCharacter\.mjs\?v=\$\{BUILD\}`/);
+  assert.doesNotMatch(worker.text, /__SCOUT_UI_BUILD__/);
+
+  const module = await request({ path: '/lib/scoutCharacter.mjs' });
+  assert.equal(module.status, 200);
+  assert.match(module.headers['content-type'], /text\/javascript/);
 });
 
 test('restart responds first, then schedules the respawn', async () => {

@@ -2,20 +2,40 @@
 // looping, the reduced-motion still frame and the per-state anchor all live
 // here; the browser runtime reads them rather than imposing its own timing.
 
-// One anchor per sprite sheet, shared by every state drawn from it, and nothing
-// finer: each pair is the offset that puts that sheet's drawn footprint — the
-// union of all of its frames — on the centre of the render box. Anchors are
-// percentages of that box, so the same pose is centred at any render size, and
-// states that share a sheet cannot drift apart from each other. Poses used to
-// jump because these were hand-tuned per state and three states carried no
-// anchor at all in the browser runtime.
-export const SCOUT_ANCHORS = Object.freeze({
-  '/assets/scout-idle.png': Object.freeze([4.153, 4.473]),
-  '/assets/scout-explaining.png': Object.freeze([1.278, -1.278]),
-  '/assets/scout-thinking.png': Object.freeze([3.834, 0]),
-  '/assets/scout-searching.png': Object.freeze([2.077, 0]),
-  '/assets/scout-found.png': Object.freeze([4.952, 0.16]),
-  '/assets/scout-warning.png': Object.freeze([3.514, 0]),
+// Anchors are percentages of the render box, so one number centres a pose at
+// any render size. There are exactly two sets, because the artwork forces
+// exactly two — measured from the source PNGs' alpha, not tuned by eye.
+//
+// While Scout moves, the anchor is per sprite sheet: it centres the union of
+// the frames the walk visits. asking, writing and explaining play the identical
+// 16 frames of one sheet, so anything finer would render the same animation at
+// a different offset per state — a visible sideways jump on every state change.
+export const SCOUT_SHEET_ANCHORS = Object.freeze({
+  '/assets/scout-idle.png': Object.freeze([4.067, 4.306]),
+  '/assets/scout-explaining.png': Object.freeze([1.116, -1.515]),
+  '/assets/scout-thinking.png': Object.freeze([3.748, 0.159]),
+  '/assets/scout-searching.png': Object.freeze([1.994, 0.08]),
+  '/assets/scout-found.png': Object.freeze([4.785, 0]),
+  '/assets/scout-warning.png': Object.freeze([3.349, 0.08]),
+});
+
+// Reduced motion shows one still cell, and a still has to be centred on its own
+// terms — the union anchor left several representative frames visibly off, e.g.
+// found/success frame 15 at 44% and warning frame 12 at 58%. Keyed by sheet and
+// representative frame, so idle/sleeping (both frame 0) and found/success (both
+// frame 15) still share one anchor. Nothing is declared for frames that reduced
+// motion never displays.
+export const SCOUT_FRAME_ANCHORS = Object.freeze({
+  '/assets/scout-idle.png|0': Object.freeze([-1.196, 2.313]),
+  '/assets/scout-idle.png|2': Object.freeze([1.834, 2.313]),
+  '/assets/scout-idle.png|12': Object.freeze([-0.558, 8.054]),
+  '/assets/scout-explaining.png|6': Object.freeze([2.472, -1.994]),
+  '/assets/scout-explaining.png|7': Object.freeze([8.852, -2.313]),
+  '/assets/scout-explaining.png|8': Object.freeze([-7.895, -1.834]),
+  '/assets/scout-thinking.png|9': Object.freeze([2.791, 4.386]),
+  '/assets/scout-searching.png|8': Object.freeze([-0.239, 0.08]),
+  '/assets/scout-found.png|15': Object.freeze([10.925, 2.632]),
+  '/assets/scout-warning.png|12': Object.freeze([-4.386, 1.994]),
 });
 
 export const SCOUT_STATES = Object.freeze({
@@ -33,8 +53,13 @@ export const SCOUT_STATES = Object.freeze({
   sleeping: { src: '/assets/scout-idle.png', columns: 4, rows: 4, frames: 16, fps: 4, loop: true, reducedMotionFrame: 0, label: 'Scout is resting' },
 });
 
-export function scoutAnchor(definition, anchors = SCOUT_ANCHORS) {
+export function scoutAnchor(definition, anchors = SCOUT_SHEET_ANCHORS) {
   const [x, y] = anchors[definition?.src] || [0, 0];
+  return { x, y };
+}
+
+export function scoutStillAnchor(definition, anchors = SCOUT_FRAME_ANCHORS) {
+  const [x, y] = anchors[`${definition?.src}|${definition?.reducedMotionFrame}`] || [0, 0];
   return { x, y };
 }
 
@@ -63,16 +88,52 @@ export function frameOffset(frame, definition) {
   return { x: axisOffset(column, definition.columns), y: axisOffset(row, definition.rows) };
 }
 
-// The sprite is walked by two step animations: one sweeping the columns of a
-// row, one stepping down the rows. Both are driven by the state's own fps, so a
-// calm state stays calm and an action state stays quick without a second table.
+// The exact cells the walk visits, in order: `frames` of them and no more. A
+// grid-walking animation would visit columns x rows and silently ignore a
+// frames value that stops short of a full final row.
+export function frameSequence(definition) {
+  return Array.from({ length: definition.frames }, (_, frame) => frameOffset(frame, definition));
+}
+
+export function scoutAnimationName(definition) {
+  return `scout-walk-${definition.columns}x${definition.rows}x${definition.frames}`;
+}
+
+// One keyframes rule per grid signature, generated from the definition rather
+// than written out by hand, so frame count and grid stay authoritative. step-end
+// holds each cell until the next stop; the closing stop repeats the last cell so
+// a non-looping state settles on it.
+export function scoutKeyframes(definition) {
+  const sequence = frameSequence(definition);
+  const stop = (offset, at) => `${at}%{background-position:${offset.x} ${offset.y},center}`;
+  const stops = sequence.map((offset, index) => stop(offset, Number(((index * 100) / sequence.length).toFixed(6))));
+  return `@keyframes ${scoutAnimationName(definition)}{${stops.join('')}${stop(sequence.at(-1), 100)}}`;
+}
+
 export function scoutTiming(definition) {
   return {
     duration: definition.frames / definition.fps,
-    rowDuration: definition.columns / definition.fps,
-    rowIterations: definition.loop ? 'infinite' : '1',
-    columnIterations: definition.loop ? 'infinite' : String(definition.rows),
+    iterations: definition.loop ? 'infinite' : '1',
   };
+}
+
+// Rules are installed once per grid signature into a stylesheet this module
+// owns. CSSOM only — nothing is parsed from a string at the document level.
+let keyframeSheet = null;
+const installedKeyframes = new Set();
+export function ensureScoutKeyframes(definition) {
+  const name = scoutAnimationName(definition);
+  if (installedKeyframes.has(name) || typeof document === 'undefined') return name;
+  if (!keyframeSheet) {
+    const style = document.createElement('style');
+    style.dataset.scoutCharacter = 'keyframes';
+    document.head.append(style);
+    keyframeSheet = style.sheet;
+  }
+  if (!keyframeSheet) return name;
+  keyframeSheet.insertRule(scoutKeyframes(definition), keyframeSheet.cssRules.length);
+  installedKeyframes.add(name);
+  return name;
 }
 
 export function activityState(activity) {
@@ -97,29 +158,33 @@ export function scoutMarkup(state = 'idle', className = '') {
   return `<span class="scout-character ${className}" data-scout-state="${name}" role="img" aria-label="${def.label}"><span class="scout-sprite" aria-hidden="true"></span></span>`;
 }
 
-export function applyScoutState(element, state, { reducedMotion = false } = {}) {
+export function applyScoutState(element, state, { reducedMotion = false, definitions = SCOUT_STATES } = {}) {
   if (!element) return null;
-  const def = scoutDefinition(state);
+  const def = scoutDefinition(state, definitions);
   const sprite = element.matches?.('.scout-sprite') ? element : element.querySelector?.('.scout-sprite');
-  element.dataset.scoutState = state in SCOUT_STATES ? state : 'idle';
+  element.dataset.scoutState = state in definitions ? state : 'idle';
   element.setAttribute('aria-label', def.label);
   if (!sprite) return def;
   const timing = scoutTiming(def);
   const still = frameOffset(def.reducedMotionFrame, def);
+  const anchor = scoutAnchor(def);
+  const stillAnchor = scoutStillAnchor(def);
   sprite.style.setProperty('--scout-src', `url("${assetUrl(def.src)}")`);
   sprite.style.setProperty('--scout-columns', def.columns);
   sprite.style.setProperty('--scout-rows', def.rows);
-  sprite.style.setProperty('--scout-frames', def.frames);
   sprite.style.setProperty('--scout-duration', `${timing.duration}s`);
-  sprite.style.setProperty('--scout-row-duration', `${timing.rowDuration}s`);
-  sprite.style.setProperty('--scout-iterations', timing.rowIterations);
-  sprite.style.setProperty('--scout-column-iterations', timing.columnIterations);
-  const anchor = scoutAnchor(def);
+  sprite.style.setProperty('--scout-iterations', timing.iterations);
+  sprite.style.setProperty('--scout-walk', ensureScoutKeyframes(def));
   sprite.style.setProperty('--scout-align-x', `${anchor.x}%`);
   sprite.style.setProperty('--scout-align-y', `${anchor.y}%`);
+  sprite.style.setProperty('--scout-still-align-x', `${stillAnchor.x}%`);
+  sprite.style.setProperty('--scout-still-align-y', `${stillAnchor.y}%`);
   sprite.style.setProperty('--scout-still-x', still.x);
   sprite.style.setProperty('--scout-still-y', still.y);
   sprite.classList.toggle('reduced-motion', reducedMotion);
+  // Placeholders emitted before this module evaluated show a static fallback
+  // until this marker appears; from here the canonical definition is in force.
+  element.dataset.scoutReady = 'true';
   observeCharacter(element);
   return def;
 }
@@ -146,8 +211,10 @@ export function hydrateScoutCharacters(container) {
 
 if (typeof window !== 'undefined') {
   window.ScoutCharacter = {
-    SCOUT_ANCHORS, SCOUT_STATES, scoutDefinition, scoutAnchor, framePosition, frameOffset,
-    scoutTiming, activityState, scoutMarkup, applyScoutState, hydrateScoutCharacters,
+    SCOUT_FRAME_ANCHORS, SCOUT_SHEET_ANCHORS, SCOUT_STATES,
+    scoutDefinition, scoutAnchor, scoutStillAnchor, framePosition, frameOffset, frameSequence,
+    scoutTiming, scoutAnimationName, scoutKeyframes, ensureScoutKeyframes,
+    activityState, scoutMarkup, applyScoutState, hydrateScoutCharacters,
   };
   // This module is deferred, so anything already painted by app.js is adopted
   // as soon as the canonical definitions land.

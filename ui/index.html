@@ -816,16 +816,21 @@
     .scout-bubble::after { content:''; position:absolute; width:14px; height:14px; background:var(--panel); transform:rotate(45deg); }
     .scout-bubble.tail-left::after { left:-8px; top:38px; border-left:1px solid var(--line); border-bottom:1px solid var(--line); }
     .scout-bubble.tail-right::after { right:-8px; bottom:34px; border-right:1px solid var(--line); border-top:1px solid var(--line); }
-    /* Two step animations walk the sheet: one sweeps a row's columns, one steps
-       down the rows. Both counts and both durations come from the per-state
-       custom properties published by ui/lib/scoutCharacter.mjs, so nothing here
-       assumes a frame count or a frame rate. jump-none keeps the first and last
-       cells inclusive, which is what makes each stop land on a whole cell. */
-    .scout-sprite { position:absolute; inset:0; display:block; width:100%; height:100%; transform:translate(var(--scout-align-x,0),var(--scout-align-y,0)); transform-origin:center; background-image:var(--scout-src),var(--scout-fallback); background-repeat:no-repeat; background-size:calc(var(--scout-columns) * 100%) calc(var(--scout-rows) * 100%),contain; background-position:var(--scout-still-x,0%) var(--scout-still-y,0%),center; animation:scout-frame-column var(--scout-row-duration) steps(var(--scout-columns), jump-none) var(--scout-column-iterations) both,scout-frame-row var(--scout-duration) steps(var(--scout-rows), jump-none) var(--scout-iterations) both; }
-    .scout-sprite.reduced-motion { animation:none; }
+    /* The walk itself is a keyframes rule generated per grid signature by
+       ui/lib/scoutCharacter.mjs and named through --scout-walk, so the frame
+       count, the grid and the frame rate are all decided there and a sheet whose
+       last row is only partly used stops at its real last frame. Nothing here
+       assumes how many cells there are. */
+    .scout-sprite { position:absolute; inset:0; display:block; width:100%; height:100%; transform:translate(var(--scout-align-x,0),var(--scout-align-y,0)); transform-origin:center; background-image:var(--scout-src),var(--scout-fallback); background-repeat:no-repeat; background-size:calc(var(--scout-columns) * 100%) calc(var(--scout-rows) * 100%),contain; background-position:var(--scout-still-x,0%) var(--scout-still-y,0%),center; animation:var(--scout-walk) var(--scout-duration) step-end var(--scout-iterations) both; }
+    /* A still is centred on its own terms, so it uses the representative frame's
+       anchor rather than the anchor that centres the whole walk. */
+    .scout-sprite.reduced-motion { animation:none; transform:translate(var(--scout-still-align-x,0),var(--scout-still-align-y,0)); }
     .scout-offscreen .scout-sprite, .scout-page-hidden .scout-sprite { animation-play-state:paused; }
-    @keyframes scout-frame-column { from { background-position-x:0%; } to { background-position-x:100%; } }
-    @keyframes scout-frame-row { from { background-position-y:0%; } to { background-position-y:100%; } }
+    /* Until the canonical module marks a character ready — or for good, if it
+       never loads — the box keeps its role and name and shows Scout's resting
+       cell instead of an empty slot. One static cell of the shipped 4x4 sheet,
+       never an animation, and never a second copy of the state definitions. */
+    .scout-character:not([data-scout-ready]) .scout-sprite { background-image:url('/assets/scout-idle.png?v=__SCOUT_UI_BUILD__'); background-size:400% 400%; background-position:0 0; animation:none; }
     .chat-companion { display:flex; gap:12px; align-items:center; padding:10px 16px 4px; color:var(--muted); font-size:12px; }
     .chat-companion .scout-character { width:112px; height:112px; }
     .chat-companion .scout-bubble { padding:10px 14px; max-width:360px; }
@@ -846,7 +851,7 @@
     .source-unavailable { border-color:var(--danger); color:var(--danger); }
     @keyframes scout-arrive { from { opacity:0; transform:translateX(30px); } }
     @keyframes scout-arrive-mobile { from { opacity:0; } }
-    @media (prefers-reduced-motion:reduce) { .scout-sprite { animation:none; } .scout-arrival { animation:none; } }
+    @media (prefers-reduced-motion:reduce) { .scout-sprite { animation:none; transform:translate(var(--scout-still-align-x,0),var(--scout-still-align-y,0)); } .scout-arrival { animation:none; } }
     @media (max-width:620px) { .scout-arrival { right:6px; } .scout-arrival-character { width:120px; height:120px; } .scout-arrival-copy { margin-bottom:48px; } }
     @media (max-width:700px) {
       body { overflow-x:hidden; }

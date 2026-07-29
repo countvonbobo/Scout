@@ -519,22 +519,53 @@ test('index.html loads the canonical character module and defines no fixed 16-fr
   const html = fs.readFileSync(new URL('./index.html', import.meta.url), 'utf8');
   assert.match(html, /<script type="module" src="\/lib\/scoutCharacter\.mjs\?v=__SCOUT_UI_BUILD__"><\/script>/);
   // The old hand-written keyframe table hard-coded 16 cells and rounded thirds,
-  // so any state with a different grid or frame rate drifted off its cell.
+  // so any state with a different grid or frame rate drifted off its cell. The
+  // walk is now a per-grid keyframes rule generated from the definition.
   assert.doesNotMatch(html, /@keyframes scout-frames/);
+  assert.doesNotMatch(html, /@keyframes scout-frame-column/);
   const sprite = html.match(/\.scout-sprite \{[^}]*\}/)?.[0] || '';
   assert.ok(sprite, '.scout-sprite rule must exist');
   assert.doesNotMatch(sprite, /\d+\.\d+%/);
-  assert.match(sprite, /steps\(var\(--scout-columns\), *jump-none\)/);
-  assert.match(sprite, /steps\(var\(--scout-rows\), *jump-none\)/);
-  assert.match(sprite, /var\(--scout-row-duration\)/);
+  assert.match(sprite, /animation:var\(--scout-walk\) var\(--scout-duration\) step-end var\(--scout-iterations\)/);
   // Offscreen and hidden-page pausing must survive the rewrite.
   assert.match(html, /\.scout-offscreen \.scout-sprite, \.scout-page-hidden \.scout-sprite \{ animation-play-state:paused; \}/);
+  // Reduced motion holds the representative frame on its own anchor.
+  assert.match(html, /\.scout-sprite\.reduced-motion \{[^}]*animation:none;[^}]*--scout-still-align-x/);
+  assert.match(html, /@media \(prefers-reduced-motion:reduce\) \{[^}]*--scout-still-align-x/);
 });
 
-test('the character module is part of the cached offline shell', () => {
+test('a character rendered before the module arrives is a hydratable, labelled placeholder', () => {
+  const { context } = loadScout();
+  // loadScout runs app.js with no window.ScoutCharacter, which is exactly the
+  // production window between the classic script executing and the deferred
+  // module evaluating — and the permanent state if the module never loads.
+  assert.equal(context.window.ScoutCharacter, undefined);
+  const markup = context.scoutMarkup('found', 'scout-arrival-character');
+  assert.match(markup, /class="scout-character[^"]*scout-arrival-character/);
+  assert.match(markup, /role="img"/);
+  assert.match(markup, /aria-label="Scout"/);
+  assert.match(markup, /data-scout-state="found"/);
+  assert.match(markup, /<span class="scout-sprite" aria-hidden="true"><\/span>/);
+  assert.doesNotMatch(markup, /data-scout-ready/);
+  // A state name can only ever reach the placeholder as a bare identifier.
+  assert.match(context.scoutMarkup('"><script>alert(1)</script>'), /data-scout-state="scriptalertscript"/);
+  assert.doesNotMatch(context.scoutMarkup('"><script>alert(1)</script>'), /<script>/);
+
+  const html = fs.readFileSync(new URL('./index.html', import.meta.url), 'utf8');
+  // Until the module marks a character ready, the box shows Scout's resting
+  // cell rather than an empty slot.
+  assert.match(html, /\.scout-character:not\(\[data-scout-ready\]\) \.scout-sprite \{[^}]*scout-idle\.png/);
+  assert.match(html, /\.scout-character:not\(\[data-scout-ready\]\) \.scout-sprite \{[^}]*animation:none/);
+});
+
+test('the character module is cached offline and carries the UI build fingerprint', () => {
   const worker = fs.readFileSync(new URL('./service-worker.js', import.meta.url), 'utf8');
   assert.match(worker, /\/lib\/scoutCharacter\.mjs\?v=\$\{BUILD\}/);
   assert.match(worker, /url\.pathname === '\/lib\/scoutCharacter\.mjs'/);
+  // A module-only change must move the build id, or the shell cache and the
+  // versioned module URL would both keep serving the previous character.
+  const server = fs.readFileSync(new URL('./server.mjs', import.meta.url), 'utf8');
+  assert.match(server, /UI_BUILD_FILES = \[[\s\S]*'lib\/scoutCharacter\.mjs'/);
 });
 
 test('dynamic category lane machinery is gone', () => {
