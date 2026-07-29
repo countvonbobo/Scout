@@ -1,6 +1,10 @@
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
+import path from 'node:path';
 import { test } from 'node:test';
+import { fileURLToPath } from 'node:url';
+import { parseClaudeLine } from './chatClaude.mjs';
+import { runTurn } from './chatRun.mjs';
 import {
   buildStructuredClaudeArgs,
   buildStructuredCodexArgs,
@@ -10,6 +14,8 @@ import {
 import { providerRemoteHealthSignal } from './providers.mjs';
 
 const schema = { type: 'object', properties: { answer: { type: 'string' } }, required: ['answer'] };
+const HERE = path.dirname(fileURLToPath(import.meta.url));
+const FAKE = path.join(HERE, 'fixtures', 'fake-cli.mjs');
 
 test('structured Codex is ephemeral, read-only, rule-free and schema constrained', () => {
   const args = buildStructuredCodexArgs('C:/temp/schema.json', { platform: 'win32' });
@@ -114,6 +120,37 @@ test('structured provider failures cross the real boundary as safe distinct heal
       /person@|token|secret|Users|private|stdout|stderr|body/i,
     );
   }
+});
+
+test('real turn adapter preserves a bounded remote-auth reason through structured health', async () => {
+  const error = await runStructuredTurn({
+    provider: 'codex',
+    status: {
+      installed: true,
+      authenticated: true,
+      executable: 'codex',
+      capabilities: { structuredOutput: true },
+    },
+    schema,
+    prompt: 'AUTH_FAIL',
+    runTurnFn: (options) => runTurn({
+      ...options,
+      command: process.execPath,
+      args: [FAKE],
+      parseLine: parseClaudeLine,
+    }),
+  }).then(
+    () => null,
+    (caught) => caught,
+  );
+
+  assert.equal(error?.reasonCode, 'authentication-required');
+  assert.deepEqual(providerRemoteHealthSignal(error), {
+    kind: 'remote-auth-failure',
+    source: 'provider-operation',
+    reasonCode: 'authentication-required',
+  });
+  assert.doesNotMatch(`${error.message} ${JSON.stringify(error)}`, /401|person@example|secret|token/i);
 });
 
 test('structured turns wait for adapter closure after stopping a timed-out turn', { timeout: 1_000 }, async () => {

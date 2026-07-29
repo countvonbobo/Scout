@@ -192,9 +192,25 @@ function createError(message, code) {
 export async function terminateProviderProcessTree(child, {
   platform = process.platform,
   spawn = spawnProcess,
+  kill = process.kill,
+  signal = 'SIGKILL',
   timeoutMs = 1_000,
 } = {}) {
-  if (platform !== 'win32' || !Number.isSafeInteger(child?.pid) || child.pid <= 0) {
+  const checkedSignal = signal === 'SIGTERM' ? 'SIGTERM' : 'SIGKILL';
+  if (platform !== 'win32') {
+    if (Number.isSafeInteger(child?.pid) && child.pid > 0) {
+      try {
+        kill(-child.pid, checkedSignal);
+        return;
+      } catch {
+        // A process that closed between observation and signalling is done;
+        // otherwise fall back for a platform that did not create the group.
+      }
+    }
+    try { child?.kill(checkedSignal); } catch {}
+    return;
+  }
+  if (!Number.isSafeInteger(child?.pid) || child.pid <= 0) {
     try { child?.kill('SIGKILL'); } catch {}
     return;
   }
@@ -389,13 +405,19 @@ export function createProviderLoginManager({
         await waitForChildClose(record, Math.max(0, deadlineAt - Date.now()));
         return;
       }
-      try { record.child.kill('SIGTERM'); } catch {}
+      await terminateProviderProcessTree(record.child, {
+        platform,
+        signal: 'SIGTERM',
+      });
       const grace = Math.min(
         terminateGraceMs,
         Math.max(0, deadlineAt - Date.now()),
       );
       if (await waitForChildClose(record, grace)) return;
-      try { record.child.kill('SIGKILL'); } catch {}
+      await terminateProviderProcessTree(record.child, {
+        platform,
+        signal: 'SIGKILL',
+      });
       await waitForChildClose(record, Math.max(0, deadlineAt - Date.now()));
     })();
     record.stopPromise = attempt.finally(() => {
@@ -461,6 +483,9 @@ export function createProviderLoginManager({
       ? persistHealth(session, terminalHealth(reasonCode, state)).catch(() => {})
       : Promise.resolve();
     session.buffers = { stdout: '', stderr: '' };
+    session.codeRequired = false;
+    session.userCode = null;
+    session.verificationUrl = null;
     session.executable = null;
     session.env = null;
     session.healthStatus = null;
@@ -518,6 +543,7 @@ export function createProviderLoginManager({
     });
     return spawn(invocation.command, invocation.args, {
       cwd,
+      ...(platform === 'win32' ? {} : { detached: true }),
       env: session.env,
       shell: false,
       stdio: [stdin, 'pipe', 'pipe'],
@@ -954,6 +980,7 @@ export function createProviderLoginManager({
         try {
           child = spawn(invocation.command, invocation.args, {
             cwd,
+            ...(platform === 'win32' ? {} : { detached: true }),
             env: environment,
             shell: false,
             stdio: ['ignore', 'pipe', 'pipe'],

@@ -41,6 +41,18 @@ test('non-zero exit without a done event returns only a bounded failure code', a
   assert.doesNotMatch(JSON.stringify(r), /fake failure detail/);
 });
 
+test('raw provider authentication failures become a bounded reason before diagnostics are discarded', async () => {
+  const r = await fakeTurn('AUTH_FAIL').finished;
+  assert.deepEqual(r, {
+    ok: false,
+    error: 'Provider authentication is required.',
+    reasonCode: 'authentication-required',
+    sessionId: null,
+    filesTouched: [],
+  });
+  assert.doesNotMatch(JSON.stringify(r), /401|person@example|secret|unauthorized/i);
+});
+
 test('non-zero exit remains a failure even after a successful done event', async () => {
   const r = await fakeTurn('DONE_THEN_FAIL').finished;
   assert.equal(r.ok, false);

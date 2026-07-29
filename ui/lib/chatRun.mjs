@@ -1,7 +1,7 @@
 import { spawn } from 'node:child_process';
 import path from 'node:path';
 import readline from 'node:readline';
-import { commandInvocation } from './providers.mjs';
+import { commandInvocation, providerFailureClassification } from './providers.mjs';
 
 function killTree(child, { force = false } = {}) {
   if (process.platform === 'win32') {
@@ -65,9 +65,18 @@ function providerFailure(detail) {
   const text = String(detail || '').slice(0, 4_096);
   const modelRejected = /\b(?:invalid|unknown|unsupported)\s+model\b/i.test(text)
     || /\bmodel\b.{0,120}\b(?:does not exist|not found|not available|unavailable|unsupported|access denied)\b/i.test(text);
-  return modelRejected
-    ? { error: 'The provider rejected that model.', reasonCode: 'model-rejected' }
-    : { error: 'Provider turn failed.', reasonCode: 'provider-error' };
+  if (modelRejected) {
+    return { error: 'The provider rejected that model.', reasonCode: 'model-rejected' };
+  }
+  const { reasonCode } = providerFailureClassification({ error: text });
+  const error = {
+    'authentication-required': 'Provider authentication is required.',
+    'network-unavailable': 'The provider network is unavailable.',
+    'rate-limited': 'The provider rate limit was reached.',
+    'cli-update-required': 'The provider CLI must be updated.',
+    'provider-error': 'Provider turn failed.',
+  }[reasonCode];
+  return { error, reasonCode };
 }
 
 export function runTurn({

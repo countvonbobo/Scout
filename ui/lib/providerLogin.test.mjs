@@ -162,6 +162,19 @@ test('Windows provider cleanup uses only fixed taskkill process-tree arguments',
   assert.deepEqual(child.killSignals, []);
 });
 
+test('POSIX provider cleanup signals only the detached provider process group', async () => {
+  const child = fakeChild({ closeOnKill: false });
+  child.pid = 4242;
+  const calls = [];
+  await terminateProviderProcessTree(child, {
+    platform: 'darwin',
+    signal: 'SIGTERM',
+    kill(pid, signal) { calls.push({ pid, signal }); },
+  });
+  assert.deepEqual(calls, [{ pid: -4242, signal: 'SIGTERM' }]);
+  assert.deepEqual(child.killSignals, []);
+});
+
 test('Codex login uses only the trusted executable and fixed device-auth/status arguments', async () => {
   const h = harness();
   const started = await h.manager.startProviderLogin('codex', OWNER);
@@ -184,6 +197,7 @@ test('Codex login uses only the trusted executable and fixed device-auth/status 
     options: {
       cwd: '/fixed/scout',
       env: { PATH: '/trusted/bin', HOME: '/synthetic-owner' },
+      ...(process.platform === 'win32' ? {} : { detached: true }),
       shell: false,
       stdio: ['ignore', 'pipe', 'pipe'],
       windowsHide: true,
@@ -203,8 +217,9 @@ test('Codex login uses only the trusted executable and fixed device-auth/status 
 
   const complete = h.manager.getProviderLoginSession(started.sessionId, OWNER);
   assert.equal(complete.state, 'succeeded');
-  assert.equal(complete.verificationUrl, 'https://auth.openai.com/codex/device');
-  assert.equal(complete.userCode, 'ABCD-EFGH');
+  assert.equal(complete.codeRequired, false);
+  assert.equal(complete.verificationUrl, null);
+  assert.equal(complete.userCode, null);
   assert.equal(JSON.stringify(complete).includes('private@example.test'), false);
   assert.equal(JSON.stringify(complete).includes('sk-secret'), false);
   assert.deepEqual(h.health, [
@@ -465,6 +480,7 @@ test('Claude credential clearing is an explicit owner-only fixed logout operatio
     options: {
       cwd: '/fixed/scout',
       env: { PATH: '/trusted/bin', HOME: '/synthetic-owner' },
+      ...(process.platform === 'win32' ? {} : { detached: true }),
       shell: false,
       stdio: ['ignore', 'pipe', 'pipe'],
       windowsHide: true,
