@@ -441,6 +441,12 @@ test('served shell and service worker receive the exact UI build id', async () =
   assert.match(page.text, new RegExp(`scout-icon\\.png\\?v=${UI_BUILD_ID}`));
   assert.doesNotMatch(page.text, /__SCOUT_UI_BUILD__/);
 
+  const app = await request({ path: `/app.js?v=${UI_BUILD_ID}` });
+  assert.equal(app.headers['cache-control'], 'no-cache');
+  assert.match(app.text, new RegExp(`chatDrawerState\\.mjs\\?v=${UI_BUILD_ID}`));
+  assert.match(app.text, new RegExp(`codexDeepLink\\.mjs\\?v=${UI_BUILD_ID}`));
+  assert.doesNotMatch(app.text, /__SCOUT_UI_BUILD__/);
+
   const manifest = await request({ path: '/manifest.webmanifest' });
   assert.equal(manifest.headers['cache-control'], 'no-cache');
   assert.match(manifest.text, new RegExp(`scout-icon\\.png\\?v=${UI_BUILD_ID}`));

@@ -22,6 +22,15 @@ The maintained beta deployment uses one private, single-owner Ubuntu VPS:
 - Scout listens only on `127.0.0.1:8459`.
 - Tailscale Serve provides the owner-only HTTPS route; Funnel and public ports are not used.
 - Codex and Claude authentication belongs to the dedicated unprivileged Scout account on the VPS.
+- When an authenticated installed Codex client supports catalogue discovery,
+  Scout invokes only the fixed read-only `codex debug models` argument vector
+  through the resolved provider executable with `shell: false`. The probe has a
+  7.5-second timeout, a 512 KiB combined-output boundary, and accepts at most
+  100 bounded structured model records. A successful result is cached for five
+  minutes; failed, unsupported, malformed, oversized, or timed-out discovery
+  uses the labelled bundled fallback instead of guessing from session logs.
+  Executable paths, account/auth data, raw stdout/stderr, and rejected raw
+  records never reach the UI, logs, or durable workspace state.
 - Claude runs the 07:30 primary scan and Codex runs the 08:30 second pass in the workspace timezone.
 - The fenced scan lease prevents overlap. A losing scan process may only append
   a compatible durable queue request; idle startup drains older compatible work

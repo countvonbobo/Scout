@@ -486,7 +486,7 @@ async function handleRead(req, res, url) {
     return serveUiTemplate(res, 'index.html', 'text/html; charset=utf-8');
   }
   if (req.method === 'GET' && url.pathname === '/app.js') {
-    return serveStatic(res, path.join(__dirname, 'app.js'), 'text/javascript; charset=utf-8');
+    return serveUiTemplate(res, 'app.js', 'text/javascript; charset=utf-8');
   }
   if (req.method === 'GET' && url.pathname === '/reportView.js') {
     return serveStatic(res, path.join(__dirname, 'reportView.js'), 'text/javascript; charset=utf-8');

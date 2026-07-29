@@ -1,5 +1,5 @@
-import { createChatDrawerState, reduceChatDrawer } from './lib/chatDrawerState.mjs';
-import { openCodexTask as codexTaskLaunchView } from './lib/codexDeepLink.mjs';
+import { createChatDrawerState, reduceChatDrawer } from './lib/chatDrawerState.mjs?v=__SCOUT_UI_BUILD__';
+import { openCodexTask as codexTaskLaunchView } from './lib/codexDeepLink.mjs?v=__SCOUT_UI_BUILD__';
 
 // Keep browser orchestration here while pure state machines live in /lib, where
 // deterministic unit tests exercise them without a DOM. Scout character data
@@ -1240,7 +1240,7 @@ const Scout = {
 
   company(id) {
     if (id === 'setup-onboarding') return 'Scout setup';
-    const e = this.state.data.opportunities.find((o) => o.id === id);
+    const e = (this.state.data?.opportunities || []).find((o) => o.id === id);
     return e ? e.company : id;
   },
 
