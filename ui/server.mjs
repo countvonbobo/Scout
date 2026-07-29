@@ -1,7 +1,8 @@
 import http from 'node:http';
 import { spawn } from 'node:child_process';
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { isMainModule } from './lib/mainModule.mjs';
@@ -25,6 +26,7 @@ import { JOB_CATEGORIES } from './lib/filters.mjs';
 import { buildSourcePayload, sourceUrlOf, SourceCache } from './lib/source.mjs';
 import { assertSafeModel, detectProvidersAsync, providerLocalHealthSignal } from './lib/providers.mjs';
 import { providerPreflight } from './lib/providerHealth.mjs';
+import { createProviderLoginManager } from './lib/providerLogin.mjs';
 import { doctor } from './lib/doctor.mjs';
 import { extractCvText } from './lib/cvImport.mjs';
 import { setupReadiness } from './lib/setupReadiness.mjs';
@@ -287,6 +289,11 @@ const REMOTE_MUTATION_WITHOUT_BACKUP = new Set([
   'POST /api/sync/retry',
   'POST /api/update/check',
   'POST /api/restart',
+  'POST /api/provider-login/start',
+  'POST /api/provider-login/code',
+  'POST /api/provider-login/cancel',
+  'POST /api/provider-login/retry',
+  'POST /api/provider-login/clear-claude-credentials',
 ]);
 
 function applySecurityHeaders(res, url) {
@@ -338,7 +345,9 @@ export function requestAccess(req, url, settings = loadDeviceSettings()) {
   }
 
   const origin = req.headers.origin;
-  if ((origin && !sameOrigin(origin, expectedOrigin, protocol)) || (mutatingApi && access === 'remote-owner' && !origin)) {
+  const providerLoginMutation = mutatingApi && url.pathname.startsWith('/api/provider-login/');
+  if ((origin && !sameOrigin(origin, expectedOrigin, protocol))
+      || (mutatingApi && (access === 'remote-owner' || providerLoginMutation) && !origin)) {
     return { ok: false, error: 'same-origin request required' };
   }
 
@@ -347,6 +356,7 @@ export function requestAccess(req, url, settings = loadDeviceSettings()) {
     || url.pathname.startsWith('/api/sync/')
     || url.pathname.startsWith('/api/workspace/')
     || url.pathname.startsWith('/api/remote-access/')
+    || url.pathname.startsWith('/api/provider-login/')
     || ['POST /api/restart', 'POST /api/setup/proposal', 'POST /api/setup/activate', 'POST /api/setup/recovery'].includes(`${req.method} ${url.pathname}`);
   if (mutatingApi && requiresJson) {
     const mediaType = String(req.headers['content-type'] || '').split(';', 1)[0].trim().toLowerCase();
@@ -401,6 +411,53 @@ function currentDeviceSettings() {
 }
 
 export const providerDetection = { detect: detectProvidersAsync };
+
+export function publicProviderStatus(value) {
+  return {
+    installed: value?.installed === true,
+    authenticated: value?.authenticated === true,
+    capabilities: {
+      structuredOutput: value?.capabilities?.structuredOutput === true,
+    },
+  };
+}
+
+function publicProviderStatuses(values) {
+  return Object.fromEntries(
+    ['codex', 'claude']
+      .filter((provider) => values?.[provider])
+      .map((provider) => [provider, publicProviderStatus(values[provider])]),
+  );
+}
+
+const PROVIDER_LOGIN_OWNER_ID = randomUUID();
+const providerLoginCsrfTokens = new Map();
+const providerLoginWorkingDirectory = fs.mkdtempSync(
+  path.join(os.tmpdir(), 'scout-provider-login-'),
+);
+fs.chmodSync(providerLoginWorkingDirectory, 0o700);
+
+const runtimeProviderLoginManager = createProviderLoginManager({
+  cwd: providerLoginWorkingDirectory,
+  providerStatus: async (provider) => (await providerDetection.detect())[provider],
+  onHealthSignal: async (provider, signal) => providerPreflight(
+    WORKSPACE_ROOT,
+    provider,
+    signal.kind === 'remote-success' ? 'post-auth' : 'post-auth-failure',
+    {
+      source: 'post-auth',
+      probe: async () => signal,
+    },
+  ),
+});
+
+export const providerLoginControl = {
+  manager: runtimeProviderLoginManager,
+  async shutdown() {
+    await this.manager.shutdown();
+    fs.rmSync(providerLoginWorkingDirectory, { recursive: true, force: true });
+  },
+};
 
 function runFixedCapabilityCommand(command, args, {
   timeoutMs = 2_500,
@@ -568,7 +625,7 @@ async function handleRead(req, res, url) {
       appVersion: APP_VERSION,
       platform: process.platform,
       config,
-      providers,
+      providers: publicProviderStatuses(providers),
       adzunaConfigured: !!(env.ADZUNA_APP_ID && env.ADZUNA_API_KEY),
       trackerExists: fs.existsSync(TRACKER),
       established: readiness.established,
@@ -758,12 +815,16 @@ async function handleSource(res, id) {
 }
 
 export function createServer() {
-  return http.createServer((req, res) => {
+  const server = http.createServer((req, res) => {
     const url = new URL(req.url, `http://127.0.0.1:${PORT}`);
     if (!guardRequest(req, res, url)) return;
     const routeKey = `${req.method} ${url.pathname}`;
     if (routes[routeKey]) {
-      const limit = url.pathname === '/api/setup/import-cv' ? 14 * 1024 * 1024 : 1e6;
+      const limit = url.pathname === '/api/setup/import-cv'
+        ? 14 * 1024 * 1024
+        : url.pathname.startsWith('/api/provider-login/')
+          ? 4 * 1024
+          : 1e6;
       const body = new BoundedUtf8Body(limit);
       let bodyFailed = false;
       req.on('data', (chunk) => {
@@ -788,6 +849,8 @@ export function createServer() {
       .then((handled) => { if (handled === null && !res.writableEnded) sendJson(res, 404, { error: 'not found' }); })
       .catch((error) => { if (!res.writableEnded) sendJson(res, 500, { error: error.message }); });
   });
+  server.once('close', () => { void providerLoginControl.shutdown(); });
+  return server;
 }
 
 // --- Mutation wiring (Task 5) ---
@@ -809,6 +872,171 @@ function replyJson(res, status, obj) {
 function parseBody(body) {
   try { return JSON.parse(body || '{}'); } catch { return null; }
 }
+
+const PROVIDER_LOGIN_TERMINAL_STATES = new Set([
+  'cancelled', 'expired', 'failed', 'succeeded',
+]);
+
+function exactJsonBody(body, keys) {
+  const value = parseBody(body);
+  if (!value || typeof value !== 'object' || Array.isArray(value)
+      || Object.keys(value).sort().join('\0') !== [...keys].sort().join('\0')) {
+    return null;
+  }
+  return value;
+}
+
+function providerLoginCsrfToken(access) {
+  if (!providerLoginCsrfTokens.has(access)) {
+    providerLoginCsrfTokens.set(access, randomUUID().replaceAll('-', ''));
+  }
+  return providerLoginCsrfTokens.get(access);
+}
+
+function providerLoginOwnerContext(req, csrfVerified) {
+  return {
+    ownerId: PROVIDER_LOGIN_OWNER_ID,
+    access: req.scoutAccess,
+    originVerified: true,
+    csrfVerified,
+  };
+}
+
+function providerLoginCsrfVerified(req) {
+  const supplied = String(req.headers['x-scout-provider-login-csrf'] || '');
+  const expected = providerLoginCsrfToken(req.scoutAccess);
+  return supplied.length === expected.length && supplied === expected;
+}
+
+function replyProviderLoginError(res, error) {
+  const code = String(error?.code || '');
+  if (code === 'LOGIN_SESSION_UNAVAILABLE') {
+    return replyJson(res, 404, { error: 'provider login session is unavailable' });
+  }
+  if (code.includes('RATE_LIMIT')) {
+    return replyJson(res, 429, { error: 'provider login rate limit reached; wait before retrying' });
+  }
+  if (['LOGIN_ALREADY_ACTIVE', 'LOGIN_SESSION_TERMINAL', 'LOGIN_CODE_NOT_EXPECTED'].includes(code)) {
+    return replyJson(res, 409, { error: 'provider login state changed; refresh its status and retry' });
+  }
+  if (code === 'LOGIN_SHUTDOWN') {
+    return replyJson(res, 503, { error: 'provider login is unavailable while Scout is shutting down' });
+  }
+  return replyJson(res, 400, { error: 'provider login request was rejected' });
+}
+
+function requireProviderLoginCsrf(req, res) {
+  if (providerLoginCsrfVerified(req)) return true;
+  replyJson(res, 403, { error: 'provider login CSRF token required' });
+  return false;
+}
+
+routes['GET /api/provider-login/status'] = (req, res, _body, url) => {
+  const provider = url.searchParams.get('provider');
+  if (!['codex', 'claude'].includes(provider)) {
+    return replyJson(res, 400, { error: 'supported provider required' });
+  }
+  try {
+    const owner = providerLoginOwnerContext(req, true);
+    const sessionId = url.searchParams.get('sessionId');
+    const session = sessionId
+      ? providerLoginControl.manager.getProviderLoginSession(sessionId, owner)
+      : providerLoginControl.manager.getActiveProviderLogin(provider, owner);
+    if (session && session.provider !== provider) {
+      return replyJson(res, 404, { error: 'provider login session is unavailable' });
+    }
+    return replyJson(res, 200, {
+      provider,
+      session,
+      csrfToken: providerLoginCsrfToken(req.scoutAccess),
+    });
+  } catch (error) {
+    return replyProviderLoginError(res, error);
+  }
+};
+
+routes['POST /api/provider-login/start'] = async (req, res, body) => {
+  if (!requireProviderLoginCsrf(req, res)) return;
+  const value = exactJsonBody(body, ['provider']);
+  if (!value || !['codex', 'claude'].includes(value.provider)) {
+    return replyJson(res, 400, { error: 'supported provider required' });
+  }
+  try {
+    const session = await providerLoginControl.manager.startProviderLogin(
+      value.provider,
+      providerLoginOwnerContext(req, true),
+    );
+    return replyJson(res, 202, { session });
+  } catch (error) {
+    return replyProviderLoginError(res, error);
+  }
+};
+
+routes['POST /api/provider-login/code'] = async (req, res, body) => {
+  if (!requireProviderLoginCsrf(req, res)) return;
+  const value = exactJsonBody(body, ['code', 'sessionId']);
+  if (!value) return replyJson(res, 400, { error: 'session and code are required' });
+  try {
+    const session = await providerLoginControl.manager.submitProviderLoginCode(
+      value.sessionId,
+      value.code,
+      providerLoginOwnerContext(req, true),
+    );
+    return replyJson(res, 200, { session });
+  } catch (error) {
+    return replyProviderLoginError(res, error);
+  }
+};
+
+routes['POST /api/provider-login/cancel'] = async (req, res, body) => {
+  if (!requireProviderLoginCsrf(req, res)) return;
+  const value = exactJsonBody(body, ['sessionId']);
+  if (!value) return replyJson(res, 400, { error: 'session is required' });
+  try {
+    const session = await providerLoginControl.manager.cancelProviderLogin(
+      value.sessionId,
+      providerLoginOwnerContext(req, true),
+    );
+    return replyJson(res, 200, { session });
+  } catch (error) {
+    return replyProviderLoginError(res, error);
+  }
+};
+
+routes['POST /api/provider-login/retry'] = async (req, res, body) => {
+  if (!requireProviderLoginCsrf(req, res)) return;
+  const value = exactJsonBody(body, ['provider', 'sessionId']);
+  if (!value || !['codex', 'claude'].includes(value.provider)) {
+    return replyJson(res, 400, { error: 'supported provider and session are required' });
+  }
+  const owner = providerLoginOwnerContext(req, true);
+  try {
+    const previous = providerLoginControl.manager.getProviderLoginSession(value.sessionId, owner);
+    if (previous.provider !== value.provider || !PROVIDER_LOGIN_TERMINAL_STATES.has(previous.state)) {
+      return replyJson(res, 409, { error: 'only a terminal provider login can be retried' });
+    }
+    const session = await providerLoginControl.manager.startProviderLogin(value.provider, owner);
+    return replyJson(res, 202, { session });
+  } catch (error) {
+    return replyProviderLoginError(res, error);
+  }
+};
+
+routes['POST /api/provider-login/clear-claude-credentials'] = async (req, res, body) => {
+  if (!requireProviderLoginCsrf(req, res)) return;
+  const value = exactJsonBody(body, ['confirmed']);
+  if (!value || value.confirmed !== true) {
+    return replyJson(res, 409, { error: 'explicit confirmation is required' });
+  }
+  try {
+    const result = await providerLoginControl.manager.clearClaudeCredentials(
+      providerLoginOwnerContext(req, true),
+    );
+    return replyJson(res, 200, { result });
+  } catch (error) {
+    return replyProviderLoginError(res, error);
+  }
+};
 
 function readDraftSearchProfile() {
   if (!fs.existsSync(WORKSPACE.searchProfileDraft)) return null;
@@ -1527,12 +1755,16 @@ routes['POST /api/restart'] = (req, res, body) => {
     });
   }
   replyJson(res, 200, { ok: true, restarting: true });
-  setTimeout(() => restartControl.respawn(), 200);
+  setTimeout(() => {
+    void providerLoginControl.shutdown().finally(() => restartControl.respawn());
+  }, 200);
 };
 
 routes['POST /api/shutdown'] = (req, res) => {
   replyJson(res, 200, { ok: true, shuttingDown: true });
-  setTimeout(() => shutdownControl.exit(), 200);
+  setTimeout(() => {
+    void providerLoginControl.shutdown().finally(() => shutdownControl.exit());
+  }, 200);
 };
 
 registerCompanyRoutes({ routes, repoRoot: WORKSPACE_ROOT, readTracker, onCheckpoint: queueCheckpoint });

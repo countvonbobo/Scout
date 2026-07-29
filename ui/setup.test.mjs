@@ -12,6 +12,7 @@ import {
   handoffAction,
   operationElapsed,
   operationRemaining,
+  providerLoginPanelHtml,
   scanOutcomeSummary,
   shouldAutoRunFirstScan,
   shouldRequestRecoveryKey,
@@ -58,6 +59,54 @@ test('splitList accepts comma and newline separated settings', () => {
   assert.deepEqual(splitList('Robotics, climate tech\nHealthcare,  '), [
     'Robotics', 'climate tech', 'Healthcare',
   ]);
+});
+
+test('provider login panel exposes only accessible state-specific guided actions', () => {
+  const idle = providerLoginPanelHtml('codex', {
+    installed: true, authenticated: false,
+  }, null);
+  assert.match(idle, /Sign in to Codex with Scout/);
+  assert.match(idle, /codex login --device-auth/);
+  assert.match(idle, /Official Codex login guide/);
+  assert.match(idle, /aria-live="polite"/);
+  assert.doesNotMatch(idle, /provider-login-code/);
+
+  const waiting = providerLoginPanelHtml('claude', {
+    installed: true, authenticated: false,
+  }, {
+    provider: 'claude',
+    sessionId: 'synthetic-session',
+    state: 'awaiting-code',
+    codeRequired: true,
+    reasonCode: null,
+  });
+  assert.match(waiting, /provider-login-code-claude/);
+  assert.match(waiting, /maxlength="256"/);
+  assert.match(waiting, /autocomplete="off"/);
+  assert.match(waiting, /spellcheck="false"/);
+  assert.match(waiting, /Submit code/);
+  assert.match(waiting, /Cancel Claude sign-in/);
+
+  const failed = providerLoginPanelHtml('claude', {
+    installed: true, authenticated: false,
+  }, {
+    provider: 'claude',
+    sessionId: 'synthetic-session',
+    state: 'failed',
+    codeRequired: false,
+    reasonCode: 'validation-failed',
+  });
+  assert.match(failed, /Retry Claude sign-in/);
+  assert.match(failed, /Clear expired Claude sign-in/);
+  assert.match(failed, /claude auth login/);
+  assert.doesNotMatch(failed, /validation-failed/);
+});
+
+test('provider login UI keeps its CSRF token and manual code out of browser storage', () => {
+  const source = fs.readFileSync(new URL('./setup.js', import.meta.url), 'utf8');
+  assert.doesNotMatch(source, /(?:localStorage|sessionStorage).*providerLogin/i);
+  assert.doesNotMatch(source, /providerLogin.*(?:localStorage|sessionStorage)/i);
+  assert.match(source, /codeInput\.value = ''/);
 });
 test('buildConfig creates generic search and commute settings', () => {
   const config = buildConfig({

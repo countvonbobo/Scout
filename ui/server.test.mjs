@@ -15,8 +15,8 @@ const {
   APP_ROOT, APP_VERSION, UI_BUILD_FILES, UI_BUILD_ID, WORKSPACE_ROOT,
   checkStartupProviderHealth, createRuntimeProviderHealthMonitor,
   codexDeepLinkDetection, computeUiBuildId, createServer,
-  inspectCodexDeepLinkHandler, operations, providerDetection, restartControl,
-  shutdownControl,
+  inspectCodexDeepLinkHandler, operations, providerDetection, providerLoginControl,
+  publicProviderStatus, requestAccess, restartControl, shutdownControl,
 } = await import('./server.mjs');
 const { seedWorkspace, loadWorkspaceConfig, workspacePaths, writeWorkspaceConfig } = await import('./lib/workspace.mjs');
 const { profileFingerprint } = await import('./lib/searchProfile.mjs');
@@ -112,6 +112,229 @@ const JSON_HEADERS = () => {
   const host = `127.0.0.1:${port}`;
   return { host, origin: `http://${host}`, 'content-type': 'application/json' };
 };
+
+test('provider setup status projects only bounded readiness fields', () => {
+  const raw = {
+    provider: 'codex',
+    installed: true,
+    authenticated: false,
+    command: '/private/bin/codex',
+    version: 'codex 1.2.3 private@example.test',
+    source: '/private/bin',
+    attempts: [{ raw: 'token=secret' }],
+    authMessage: 'token=secret private@example.test',
+    capabilities: { structuredOutput: true, futurePrivateField: 'secret' },
+  };
+  assert.deepEqual(publicProviderStatus(raw), {
+    installed: true,
+    authenticated: false,
+    capabilities: { structuredOutput: true },
+  });
+  assert.doesNotMatch(JSON.stringify(publicProviderStatus(raw)), /private|secret|@/);
+});
+
+test('provider login access classifies the configured remote owner without requiring backup', () => {
+  const settings = {
+    remoteAccess: {
+      enabled: true,
+      ownerLogin: 'owner@example.test',
+      origin: 'https://scout.example.ts.net',
+    },
+  };
+  const req = {
+    method: 'POST',
+    headers: {
+      host: 'scout.example.ts.net',
+      origin: 'https://scout.example.ts.net',
+      'tailscale-user-login': 'owner@example.test',
+      'content-type': 'application/json',
+    },
+    socket: { remoteAddress: '127.0.0.1' },
+  };
+  assert.deepEqual(
+    requestAccess(req, new URL('https://scout.example.ts.net/api/provider-login/start'), settings),
+    { ok: true, access: 'remote-owner' },
+  );
+  assert.equal(
+    requestAccess(
+      { ...req, headers: { ...req.headers, 'tailscale-user-login': 'other@example.test' } },
+      new URL('https://scout.example.ts.net/api/provider-login/start'),
+      settings,
+    ).ok,
+    false,
+  );
+  assert.equal(
+    requestAccess(
+      { ...req, headers: { ...req.headers, origin: undefined } },
+      new URL('https://scout.example.ts.net/api/provider-login/start'),
+      settings,
+    ).ok,
+    false,
+  );
+});
+
+test('provider login routes require same-origin JSON, ephemeral CSRF and server-derived ownership', async () => {
+  const calls = [];
+  const session = {
+    codeRequired: false,
+    createdAt: '2026-07-29T10:00:00.000Z',
+    expiresAt: '2026-07-29T10:10:00.000Z',
+    provider: 'codex',
+    reasonCode: null,
+    sessionId: '00000000-0000-4000-8000-000000000001',
+    state: 'starting',
+    userCode: null,
+    verificationUrl: null,
+  };
+  const original = providerLoginControl.manager;
+  providerLoginControl.manager = {
+    async startProviderLogin(provider, owner) {
+      calls.push(['start', provider, owner]);
+      return session;
+    },
+    getActiveProviderLogin(provider, owner) {
+      calls.push(['status', provider, owner]);
+      return null;
+    },
+    async submitProviderLoginCode(id, code, owner) {
+      calls.push(['code', id, code, owner]);
+      return { ...session, provider: 'claude', state: 'authenticating' };
+    },
+    async cancelProviderLogin(id, owner) {
+      calls.push(['cancel', id, owner]);
+      return { ...session, state: 'cancelled', reasonCode: 'cancelled' };
+    },
+    getProviderLoginSession(id, owner) {
+      calls.push(['get', id, owner]);
+      return { ...session, state: 'failed', reasonCode: 'login-failed' };
+    },
+    async clearClaudeCredentials(owner) {
+      calls.push(['clear', owner]);
+      return { provider: 'claude', reasonCode: null, state: 'cleared' };
+    },
+    async shutdown() {},
+  };
+  try {
+    const statusResponse = await request({
+      path: '/api/provider-login/status?provider=codex',
+      headers: { host: `127.0.0.1:${port}` },
+    });
+    assert.equal(statusResponse.status, 200);
+    const status = JSON.parse(statusResponse.text);
+    assert.equal(status.provider, 'codex');
+    assert.equal(status.session, null);
+    assert.match(status.csrfToken, /^[A-Za-z0-9_-]{32,128}$/);
+    assert.deepEqual(Object.keys(status).sort(), ['csrfToken', 'provider', 'session']);
+
+    const missingOrigin = await request({
+      method: 'POST',
+      path: '/api/provider-login/start',
+      headers: {
+        host: `127.0.0.1:${port}`,
+        'content-type': 'application/json',
+        'x-scout-provider-login-csrf': status.csrfToken,
+      },
+      body: '{"provider":"codex"}',
+    });
+    assert.equal(missingOrigin.status, 403);
+
+    const wrongType = await request({
+      method: 'POST',
+      path: '/api/provider-login/start',
+      headers: {
+        host: `127.0.0.1:${port}`,
+        origin: `http://127.0.0.1:${port}`,
+        'content-type': 'text/plain',
+        'x-scout-provider-login-csrf': status.csrfToken,
+      },
+      body: '{"provider":"codex"}',
+    });
+    assert.equal(wrongType.status, 415);
+
+    const missingCsrf = await request({
+      method: 'POST',
+      path: '/api/provider-login/start',
+      headers: JSON_HEADERS(),
+      body: '{"provider":"codex"}',
+    });
+    assert.equal(missingCsrf.status, 403);
+
+    const extraField = await request({
+      method: 'POST',
+      path: '/api/provider-login/start',
+      headers: { ...JSON_HEADERS(), 'x-scout-provider-login-csrf': status.csrfToken },
+      body: '{"provider":"codex","command":"sh"}',
+    });
+    assert.equal(extraField.status, 400);
+
+    const started = await request({
+      method: 'POST',
+      path: '/api/provider-login/start',
+      headers: { ...JSON_HEADERS(), 'x-scout-provider-login-csrf': status.csrfToken },
+      body: '{"provider":"codex"}',
+    });
+    assert.equal(started.status, 202);
+    assert.deepEqual(JSON.parse(started.text), { session });
+    const owner = calls.find(([name]) => name === 'start')[2];
+    assert.equal(owner.access, 'local');
+    assert.equal(owner.originVerified, true);
+    assert.equal(owner.csrfVerified, true);
+    assert.match(owner.ownerId, /^[A-Za-z0-9._:-]{1,128}$/);
+    assert.equal(JSON.stringify(owner).includes(status.csrfToken), false);
+
+    const csrfHeaders = {
+      ...JSON_HEADERS(),
+      'x-scout-provider-login-csrf': status.csrfToken,
+    };
+    const code = await request({
+      method: 'POST',
+      path: '/api/provider-login/code',
+      headers: csrfHeaders,
+      body: JSON.stringify({ sessionId: session.sessionId, code: 'CODE-1234' }),
+    });
+    assert.equal(code.status, 200);
+    assert.equal(JSON.parse(code.text).session.state, 'authenticating');
+
+    const cancelled = await request({
+      method: 'POST',
+      path: '/api/provider-login/cancel',
+      headers: csrfHeaders,
+      body: JSON.stringify({ sessionId: session.sessionId }),
+    });
+    assert.equal(cancelled.status, 200);
+    assert.equal(JSON.parse(cancelled.text).session.state, 'cancelled');
+
+    const retried = await request({
+      method: 'POST',
+      path: '/api/provider-login/retry',
+      headers: csrfHeaders,
+      body: JSON.stringify({ provider: 'codex', sessionId: session.sessionId }),
+    });
+    assert.equal(retried.status, 202);
+
+    const unconfirmedClear = await request({
+      method: 'POST',
+      path: '/api/provider-login/clear-claude-credentials',
+      headers: csrfHeaders,
+      body: '{"confirmed":false}',
+    });
+    assert.equal(unconfirmedClear.status, 409);
+    assert.equal(calls.some(([name]) => name === 'clear'), false);
+
+    const cleared = await request({
+      method: 'POST',
+      path: '/api/provider-login/clear-claude-credentials',
+      headers: csrfHeaders,
+      body: '{"confirmed":true}',
+    });
+    assert.equal(cleared.status, 200);
+    assert.deepEqual(JSON.parse(cleared.text), {
+      result: { provider: 'claude', reasonCode: null, state: 'cleared' },
+    });
+  } finally {
+    providerLoginControl.manager = original;
+  }
+});
 
 function profileDraft() {
   return {

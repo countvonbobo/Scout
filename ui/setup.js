@@ -60,6 +60,68 @@ export function splitList(value) {
     .filter(Boolean);
 }
 
+export function providerLoginPanelHtml(provider, providerStatus = {}, session = null) {
+  const name = provider === 'claude' ? 'Claude' : 'Codex';
+  const command = provider === 'claude' ? 'claude auth login' : 'codex login --device-auth';
+  const guide = provider === 'claude'
+    ? 'https://code.claude.com/docs/en/authentication'
+    : 'https://developers.openai.com/codex/auth/';
+  const stateLabels = {
+    starting: 'Starting the provider sign-in flow…',
+    'awaiting-code': 'The provider is waiting for the one-time code.',
+    authenticating: 'The provider is checking the submitted code…',
+    validating: 'Checking the provider sign-in…',
+    succeeded: 'Sign-in succeeded. Refresh provider status before scanning.',
+    failed: 'Sign-in did not complete. Retry or use the manual fallback.',
+    cancelled: 'Sign-in was cancelled.',
+    expired: 'The sign-in window expired. Retry to start a new flow.',
+  };
+  const state = session?.provider === provider ? session.state : null;
+  const active = ['starting', 'awaiting-code', 'authenticating', 'validating'].includes(state);
+  const retryable = ['failed', 'cancelled', 'expired'].includes(state);
+  const canStart = providerStatus.installed === true
+    && providerStatus.authenticated !== true
+    && !active
+    && !retryable;
+  const statusText = stateLabels[state]
+    || (providerStatus.authenticated
+      ? `${name} is signed in.`
+      : providerStatus.installed
+        ? `${name} needs sign-in.`
+        : `${name} is not installed.`);
+  const sessionId = escapeProfileText(session?.sessionId || '');
+  const device = provider === 'codex' && session?.userCode
+    ? `<p class="provider-login-device-code">Device code: <strong>${escapeProfileText(session.userCode)}</strong></p>`
+    : '';
+  const verification = session?.verificationUrl
+    ? `<p><a href="${escapeProfileText(session.verificationUrl)}" target="_blank" rel="noreferrer">Open the provider sign-in page</a></p>`
+    : '';
+  const code = provider === 'claude' && state === 'awaiting-code' && session?.codeRequired
+    ? `<label class="setup-field" for="provider-login-code-claude">One-time provider code
+      <input id="provider-login-code-claude" type="text" maxlength="256" autocomplete="off" autocapitalize="off" spellcheck="false">
+      </label>
+      <button class="act primary" type="button" data-provider-login-action="code" data-provider="claude" data-session-id="${sessionId}">Submit code</button>`
+    : '';
+  const start = canStart
+    ? `<button class="act primary" type="button" data-provider-login-action="start" data-provider="${provider}">Sign in to ${name} with Scout</button>`
+    : '';
+  const cancel = active
+    ? `<button class="act" type="button" data-provider-login-action="cancel" data-provider="${provider}" data-session-id="${sessionId}">Cancel ${name} sign-in</button>`
+    : '';
+  const retry = retryable
+    ? `<button class="act primary" type="button" data-provider-login-action="retry" data-provider="${provider}" data-session-id="${sessionId}">Retry ${name} sign-in</button>`
+    : '';
+  const clear = provider === 'claude' && ['failed', 'expired'].includes(state)
+    ? '<button class="act" type="button" data-provider-login-action="clear" data-provider="claude">Clear expired Claude sign-in</button>'
+    : '';
+  return `<section class="provider-login-panel" data-provider-login="${provider}" aria-label="${name} sign-in">
+    <p class="meta" role="status" aria-live="polite">${statusText}</p>
+    ${device}${verification}
+    <div class="provider-login-actions">${code}${start}${cancel}${retry}${clear}</div>
+    ${providerStatus.authenticated ? '' : `<p class="meta">Manual fallback: open your terminal and run <code>${command}</code>. <a href="${guide}" target="_blank" rel="noreferrer">Official ${name} login guide</a>. Retry only checks sign-in; it does not rerun a missed scan.</p>`}
+  </section>`;
+}
+
 export function buildConfig(form, current = {}) {
   const salary = String(form.salaryMinimum || '').trim();
   return {
@@ -236,6 +298,8 @@ const Setup = {
   searchProfile: null,
   operations: { proposal: null, scan: null },
   operationTimers: {},
+  providerLoginState: { codex: null, claude: null },
+  providerLoginPollTimer: null,
   backgroundOperations: new Set(),
   showVerificationPass: false,
   // The wizard step a retune or resume began from. Back returns to the settings
@@ -459,6 +523,8 @@ const Setup = {
     this.settingsOpen = false;
     this.view = 'closed';
     this.settingsSection = null;
+    if (this.providerLoginPollTimer) clearTimeout(this.providerLoginPollTimer);
+    this.providerLoginPollTimer = null;
     this.el('setup-close').classList.add('hidden');
     this.el('setup-overlay').classList.add('hidden');
   },
@@ -763,6 +829,131 @@ const Setup = {
       <button id="settings-refresh-providers" class="act" type="button">Refresh status</button></p>`;
     this.el('settings-save-provider').addEventListener('click', () => this.saveProviderSetting());
     this.el('settings-refresh-providers').addEventListener('click', () => this.refreshStatus({ keepOpen: true }));
+    this.bindProviderLoginControls();
+    this.ensureProviderLoginStatus();
+  },
+
+  providerLoginVisible() {
+    return (this.view === 'section' && this.settingsSection === 'providers')
+      || (this.view === 'onboarding' && STEPS[this.step] === 'AI provider')
+      || (this.view === 'retune' && STEPS[this.step] === 'AI provider');
+  },
+
+  ensureProviderLoginStatus() {
+    for (const provider of ['codex', 'claude']) {
+      if (!this.providerLoginState[provider]?.csrfToken
+          && !this.providerLoginState[provider]?.loading) {
+        void this.refreshProviderLogin(provider);
+      }
+    }
+  },
+
+  async refreshProviderLogin(provider) {
+    const current = this.providerLoginState[provider];
+    this.providerLoginState[provider] = { ...current, loading: true };
+    const sessionId = current?.session?.sessionId;
+    const query = new URLSearchParams({ provider });
+    if (sessionId) query.set('sessionId', sessionId);
+    try {
+      const result = await requestJson(`/api/provider-login/status?${query}`);
+      this.providerLoginState[provider] = { ...result, loading: false };
+      if (this.providerLoginVisible()) {
+        if (this.view === 'section') this.renderProviderSettings();
+        else this.renderProviders();
+      }
+      this.scheduleProviderLoginPoll();
+    } catch (error) {
+      this.providerLoginState[provider] = { ...current, loading: false };
+      this.setMessage('Guided provider sign-in is unavailable. Use the manual fallback shown below.', 'warning');
+    }
+  },
+
+  scheduleProviderLoginPoll() {
+    if (this.providerLoginPollTimer) clearTimeout(this.providerLoginPollTimer);
+    this.providerLoginPollTimer = null;
+    const active = Object.values(this.providerLoginState).some(({ session } = {}) => (
+      ['starting', 'awaiting-code', 'authenticating', 'validating'].includes(session?.state)
+    ));
+    if (!active || !this.providerLoginVisible()) return;
+    this.providerLoginPollTimer = setTimeout(() => {
+      this.providerLoginPollTimer = null;
+      for (const provider of ['codex', 'claude']) {
+        const state = this.providerLoginState[provider]?.session?.state;
+        if (['starting', 'awaiting-code', 'authenticating', 'validating'].includes(state)) {
+          void this.refreshProviderLogin(provider);
+        }
+      }
+    }, 1_000);
+  },
+
+  bindProviderLoginControls() {
+    document.querySelectorAll('[data-provider-login-action]').forEach((button) => {
+      button.addEventListener('click', () => {
+        void this.providerLoginAction(
+          button.dataset.providerLoginAction,
+          button.dataset.provider,
+          button.dataset.sessionId || null,
+        );
+      });
+    });
+  },
+
+  async providerLoginAction(action, provider, sessionId) {
+    let entry = this.providerLoginState[provider];
+    if (!entry?.csrfToken) {
+      await this.refreshProviderLogin(provider);
+      entry = this.providerLoginState[provider];
+    }
+    if (!entry?.csrfToken) return;
+    const headers = {
+      'content-type': 'application/json',
+      'x-scout-provider-login-csrf': entry.csrfToken,
+    };
+    let endpoint = action;
+    let payload;
+    if (action === 'start') payload = { provider };
+    else if (action === 'cancel') payload = { sessionId };
+    else if (action === 'retry') payload = { provider, sessionId };
+    else if (action === 'code') {
+      const codeInput = this.el(`provider-login-code-${provider}`);
+      const code = codeInput?.value || '';
+      if (codeInput) codeInput.value = '';
+      payload = { sessionId, code };
+    } else if (action === 'clear') {
+      if (!confirm('Clear the expired Claude sign-in on this device? Scout will never do this automatically.')) return;
+      endpoint = 'clear-claude-credentials';
+      payload = { confirmed: true };
+    } else return;
+
+    this.setMessage(action === 'cancel' ? 'Cancelling provider sign-in…' : 'Updating provider sign-in…');
+    try {
+      const result = await requestJson(`/api/provider-login/${endpoint}`, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify(payload),
+      });
+      const session = result.session || null;
+      this.providerLoginState[provider] = { ...entry, session };
+      if (action === 'clear') {
+        this.providerLoginState.claude = { ...entry, session: null };
+        this.setMessage('Expired Claude sign-in cleared. Start a new sign-in when ready.', 'good');
+      } else {
+        this.setMessage(
+          session?.state === 'cancelled'
+            ? 'Provider sign-in cancelled.'
+            : 'Provider sign-in updated.',
+          session?.state === 'failed' ? 'error' : 'good',
+        );
+      }
+      if (this.providerLoginVisible()) {
+        if (this.view === 'section') this.renderProviderSettings();
+        else this.renderProviders();
+      }
+      this.scheduleProviderLoginPoll();
+    } catch (error) {
+      this.setMessage(error.message, 'error');
+      await this.refreshProviderLogin(provider);
+    }
   },
 
   async saveProviderSetting() {
@@ -968,18 +1159,17 @@ const Setup = {
     const state = !provider.installed ? 'Not installed'
       : !provider.authenticated ? 'Installed; sign-in required'
         : compatible ? 'Installed, signed in and compatible' : 'Installed and signed in; CLI update required';
-    const login = name === 'codex' ? 'codex' : 'claude auth login';
-    const guide = name === 'codex' ? 'https://developers.openai.com/codex/cli/' : 'https://docs.anthropic.com/en/docs/claude-code/setup';
-    const platform = this.status?.platform === 'win32' ? 'Windows PowerShell'
-      : this.status?.platform === 'darwin' ? 'Terminal on macOS' : 'your Linux terminal';
-    return `<label class="setup-provider ${compatible ? 'available' : ''}">
+    return `<section class="setup-provider ${compatible ? 'available' : ''}">
+      <label>
       <input type="radio" name="setup-provider" value="${name}" ${selected ? 'checked' : ''} ${compatible ? '' : 'disabled'}>
       <strong>${name[0].toUpperCase() + name.slice(1)}</strong>
       <span class="meta">${state}</span>
       ${compatible ? '' : provider.authenticated
-        ? `<span class="meta">Update this CLI from its <a href="${guide}" target="_blank" rel="noreferrer">official installation guide</a>, then refresh. Scout requires schema-constrained output for bounded workflows.</span>`
-        : `<span class="meta"><a href="${guide}" target="_blank" rel="noreferrer">Official installation guide for macOS, Linux and Windows</a>. Install the standalone or user-local CLI, open ${platform}, run <code>${login}</code>, complete its official CLI login flow, then refresh. Scout needs an authenticated command-line provider; a desktop-app login alone is not enough. Your provider account may have separate usage limits or costs.</span>`}
-    </label>`;
+        ? '<span class="meta">Update this CLI from its official installation guide, then refresh. Scout requires schema-constrained output for bounded workflows.</span>'
+        : '<span class="meta">Scout needs an authenticated command-line provider; a desktop-app login alone is not enough. Your provider account may have separate usage limits or costs.</span>'}
+      </label>
+      ${providerLoginPanelHtml(name, provider, this.providerLoginState[name]?.session)}
+    </section>`;
   },
 
   renderProviders() {
@@ -996,6 +1186,8 @@ const Setup = {
       await this.refreshStatus({ keepOpen: true });
       this.setBusy(false);
     });
+    this.bindProviderLoginControls();
+    this.ensureProviderLoginStatus();
     this.el('setup-next').textContent = 'Continue';
   },
 

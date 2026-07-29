@@ -50,6 +50,13 @@ test.beforeEach(async ({ page }) => {
   await page.route('**/api/operations?type=*', async (route) => {
     await route.fulfill({ contentType: 'application/json', body: JSON.stringify({ operation: null }) });
   });
+  await page.route('**/api/provider-login/status?*', async (route) => {
+    const provider = new URL(route.request().url()).searchParams.get('provider');
+    await route.fulfill({
+      contentType: 'application/json',
+      body: JSON.stringify({ provider, session: null, csrfToken: `csrf-${provider}-synthetic-000000000000` }),
+    });
+  });
   await page.goto('/');
   await expect(page.locator('#sync-status')).toBeVisible();
   await expect.poll(() => page.evaluate(() => Boolean(
@@ -529,6 +536,98 @@ test('settings is a single usable scroll surface on a phone viewport', async ({ 
   const appBox = await appDevice.boundingBox();
   expect(appBox.y).toBeGreaterThanOrEqual(0);
   expect(appBox.y + appBox.height).toBeLessThanOrEqual(740);
+});
+
+test('guided provider login supports code, failure, retry and cancel without browser persistence', async ({ page }) => {
+  await page.unroute('**/api/setup/status');
+  await page.route('**/api/setup/status', async (route) => {
+    await route.fulfill({
+      contentType: 'application/json',
+      body: JSON.stringify({
+        ...establishedStatus,
+        providers: {
+          ...establishedStatus.providers,
+          claude: { installed: true, authenticated: false, capabilities: { structuredOutput: true } },
+        },
+      }),
+    });
+  });
+  await page.unroute('**/api/provider-login/status?*');
+  let session = null;
+  let retryCount = 0;
+  const requests = [];
+  const snapshot = (state, fields = {}) => ({
+    codeRequired: state === 'awaiting-code',
+    createdAt: '2026-07-29T10:00:00.000Z',
+    expiresAt: '2026-07-29T10:10:00.000Z',
+    provider: 'claude',
+    reasonCode: state === 'failed' ? 'validation-failed' : null,
+    sessionId: '00000000-0000-4000-8000-000000000002',
+    state,
+    userCode: null,
+    verificationUrl: null,
+    ...fields,
+  });
+  await page.route('**/api/provider-login/**', async (route) => {
+    const request = route.request();
+    const url = new URL(request.url());
+    const action = url.pathname.split('/').at(-1);
+    if (action === 'status') {
+      await route.fulfill({
+        contentType: 'application/json',
+        body: JSON.stringify({
+          provider: 'claude', session, csrfToken: 'csrf-claude-synthetic-000000000000',
+        }),
+      });
+      return;
+    }
+    requests.push({
+      action,
+      csrf: request.headers()['x-scout-provider-login-csrf'],
+      body: request.postDataJSON(),
+    });
+    if (action === 'start') session = snapshot('awaiting-code');
+    if (action === 'code') session = snapshot('failed');
+    if (action === 'retry') session = snapshot(++retryCount === 1 ? 'starting' : 'succeeded');
+    if (action === 'cancel') session = snapshot('cancelled');
+    await route.fulfill({
+      status: action === 'start' || action === 'retry' ? 202 : 200,
+      contentType: 'application/json',
+      body: JSON.stringify({ session }),
+    });
+  });
+
+  await page.getByRole('button', { name: 'Settings' }).click();
+  const dialog = page.getByRole('dialog');
+  await dialog.getByRole('button', { name: 'AI providers' }).click();
+  await dialog.getByRole('button', { name: 'Sign in to Claude with Scout' }).click();
+  const codeInput = dialog.getByLabel('One-time provider code');
+  await expect(codeInput).toBeVisible();
+  await codeInput.fill('PRIVATE-CODE');
+  await dialog.getByRole('button', { name: 'Submit code' }).click();
+  await expect(dialog.getByRole('button', { name: 'Retry Claude sign-in' })).toBeVisible();
+  await expect(dialog.getByRole('button', { name: 'Clear expired Claude sign-in' })).toBeVisible();
+  await expect(dialog).toContainText('claude auth login');
+  await expect(dialog).not.toContainText('validation-failed');
+
+  await dialog.getByRole('button', { name: 'Retry Claude sign-in' }).click();
+  await expect(dialog.getByRole('button', { name: 'Cancel Claude sign-in' })).toBeVisible();
+  await dialog.getByRole('button', { name: 'Cancel Claude sign-in' }).click();
+  await expect(dialog.getByRole('button', { name: 'Retry Claude sign-in' })).toBeVisible();
+  await dialog.getByRole('button', { name: 'Retry Claude sign-in' }).click();
+  await expect(dialog).toContainText('Sign-in succeeded');
+
+  expect(requests.map(({ action }) => action)).toEqual([
+    'start', 'code', 'retry', 'cancel', 'retry',
+  ]);
+  for (const request of requests) {
+    expect(request.csrf).toBe('csrf-claude-synthetic-000000000000');
+  }
+  const stored = await page.evaluate(() => ({
+    local: Object.entries(localStorage),
+    session: Object.entries(sessionStorage),
+  }));
+  expect(JSON.stringify(stored)).not.toContain('PRIVATE-CODE');
 });
 
 test('phone All view reaches its rightmost column and keeps strong-match controls on screen', async ({ page }) => {
