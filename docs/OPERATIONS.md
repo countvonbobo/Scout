@@ -25,7 +25,7 @@ The maintained beta deployment uses one private, single-owner Ubuntu VPS:
 - When an authenticated installed Codex client supports catalogue discovery,
   Scout invokes only the fixed read-only `codex debug models` argument vector
   through the resolved provider executable with `shell: false`. The probe has a
-  7.5-second timeout, a 512 KiB combined-output boundary, and accepts at most
+  7.5-second timeout, a 512 KiB boundary for each output stream, and accepts at most
   100 bounded structured model records. A successful result is cached for five
   minutes; failed, unsupported, malformed, oversized, or timed-out discovery
   uses the labelled bundled fallback instead of guessing from session logs.
