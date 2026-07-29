@@ -82,6 +82,38 @@ function manualRequest(id, requestedAt, expiresAt) {
   };
 }
 
+function legacyQueueCompaction(root, operationId, recordedAt, {
+  auditCount = 1,
+  conflictingDigest = false,
+} = {}) {
+  const beforeDigest = crypto.createHash('sha256').update(`before:${operationId}`).digest('hex');
+  const afterDigest = crypto.createHash('sha256').update(`after:${operationId}`).digest('hex');
+  const directory = path.join(root, '.scout', 'queue-compactions', operationId);
+  fs.mkdirSync(directory, { recursive: true });
+  fs.writeFileSync(path.join(directory, 'before.jsonl'), `before:${operationId}\n`);
+  fs.writeFileSync(path.join(directory, 'after.jsonl'), `after:${operationId}\n`);
+  fs.writeFileSync(path.join(directory, 'manifest.json'), `${stableJson({
+    schemaVersion: 1,
+    operationId,
+    status: 'completed',
+    beforeDigest,
+    afterDigest,
+    removedEvents: 1,
+  })}\n`);
+  return Array.from({ length: auditCount }, () => ({
+    schemaVersion: 1,
+    eventId: crypto.randomUUID(),
+    operationId,
+    type: 'queue-compacted',
+    recordedAt,
+    leaseId: 'lease-legacy-retention',
+    fencingGeneration: 1,
+    beforeDigest: conflictingDigest ? 'f'.repeat(64) : beforeDigest,
+    afterDigest,
+    removedEvents: 1,
+  }));
+}
+
 function archiveAuthority(root, passphrase = 'correct horse battery staple') {
   return { passphrase, ...initializeRecoveryBackup(root, passphrase) };
 }
@@ -520,6 +552,77 @@ test('repeated queue compactions retain bounded receipts and never prune an inte
     .trim().split('\n').map(JSON.parse)
     .filter((event) => event.type === 'queue-compacted');
   assert.equal(audits.length <= 20, true);
+});
+
+test('legacy queue receipts retain the newest twenty by their unique durable audit time', () => {
+  const root = temp();
+  const lease = acquireScanLease(root, currentLeaseOwner(), {
+    kind: 'scan', runId: 'retention-cleanup', provider: 'codex', mode: 'primary', phase: 'queue',
+  });
+  const operationIds = Array.from({ length: 21 }, (_, index) => (
+    crypto.createHash('sha256').update(`legacy-receipt:${index}`).digest('hex')
+  )).sort();
+  const audits = operationIds.flatMap((operationId, index) => legacyQueueCompaction(
+    root,
+    operationId,
+    `2025-01-${String(21 - index).padStart(2, '0')}T12:00:00.000Z`,
+  ));
+  fs.writeFileSync(
+    path.join(root, '.scout', 'run-retention.jsonl'),
+    `${audits.map(stableJson).join('\n')}\n`,
+  );
+
+  compactScanQueue(root, lease, { now: new Date('2026-07-29T12:00:00.000Z') });
+
+  const operationRoot = path.join(root, '.scout', 'queue-compactions');
+  assert.deepEqual(fs.readdirSync(operationRoot).sort(), operationIds.slice(0, 20).sort());
+  for (let index = 0; index < 20; index += 1) {
+    const directory = path.join(operationRoot, operationIds[index]);
+    assert.deepEqual(fs.readdirSync(directory), ['manifest.json']);
+    const manifest = JSON.parse(fs.readFileSync(path.join(directory, 'manifest.json'), 'utf8'));
+    assert.equal(manifest.schemaVersion, 2);
+    assert.equal(manifest.completedAt, audits[index].recordedAt);
+  }
+  const retainedAudits = fs.readFileSync(path.join(root, '.scout', 'run-retention.jsonl'), 'utf8')
+    .trim().split('\n').map(JSON.parse);
+  assert.deepEqual(
+    retainedAudits.map((event) => event.operationId).sort(),
+    operationIds.slice(0, 20).sort(),
+  );
+});
+
+test('legacy queue receipt folding fails closed when its durable audit is missing, ambiguous or conflicting', () => {
+  for (const auditCase of ['missing', 'ambiguous', 'conflicting']) {
+    const root = temp();
+    const lease = acquireScanLease(root, currentLeaseOwner(), {
+      kind: 'scan', runId: 'retention-cleanup', provider: 'codex', mode: 'primary', phase: 'queue',
+    });
+    const operationId = crypto.createHash('sha256').update(`legacy-${auditCase}`).digest('hex');
+    const audits = legacyQueueCompaction(root, operationId, '2025-01-01T12:00:00.000Z', {
+      auditCount: auditCase === 'missing' ? 0 : auditCase === 'ambiguous' ? 2 : 1,
+      conflictingDigest: auditCase === 'conflicting',
+    });
+    if (audits.length) {
+      fs.writeFileSync(
+        path.join(root, '.scout', 'run-retention.jsonl'),
+        `${audits.map(stableJson).join('\n')}\n`,
+      );
+    }
+
+    assert.throws(
+      () => compactScanQueue(root, lease, { now: new Date('2026-07-29T12:00:00.000Z') }),
+      /legacy queue compaction audit/i,
+    );
+    const directory = path.join(root, '.scout', 'queue-compactions', operationId);
+    assert.deepEqual(
+      fs.readdirSync(directory).sort(),
+      ['after.jsonl', 'before.jsonl', 'manifest.json'],
+    );
+    assert.equal(
+      JSON.parse(fs.readFileSync(path.join(directory, 'manifest.json'), 'utf8')).schemaVersion,
+      1,
+    );
+  }
 });
 
 test('Windows junctions cannot redirect selected runs or the protected archive parent', { skip: process.platform !== 'win32' }, () => {

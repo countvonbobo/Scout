@@ -790,8 +790,50 @@ function queueOperations(root) {
   });
 }
 
+function legacyQueueCompletionTime(manifest, events) {
+  const matches = events.filter((event) => (
+    event?.type === 'queue-compacted' && event.operationId === manifest.operationId
+  ));
+  if (matches.length !== 1) {
+    throw new Error('legacy queue compaction audit must be unique');
+  }
+  const event = matches[0];
+  const keys = [
+    'afterDigest', 'beforeDigest', 'eventId', 'fencingGeneration', 'leaseId',
+    'operationId', 'recordedAt', 'removedEvents', 'schemaVersion', 'type',
+  ];
+  if (Object.keys(event).sort().join(',') !== keys.sort().join(',')
+    || event.schemaVersion !== 1
+    || typeof event.eventId !== 'string' || !event.eventId
+    || typeof event.leaseId !== 'string' || !event.leaseId
+    || !Number.isSafeInteger(event.fencingGeneration) || event.fencingGeneration < 1
+    || typeof event.recordedAt !== 'string' || Number.isNaN(Date.parse(event.recordedAt))
+    || event.beforeDigest !== manifest.beforeDigest
+    || event.afterDigest !== manifest.afterDigest
+    || event.removedEvents !== manifest.removedEvents) {
+    throw new Error('legacy queue compaction audit does not match its receipt');
+  }
+  return event.recordedAt;
+}
+
 function reduceCompletedQueueOperations(root) {
   const operations = queueOperations(root);
+  const audit = auditEvents(root);
+  const migrations = operations
+    .filter(({ manifest }) => manifest.schemaVersion === 1 && manifest.status === 'completed')
+    .map((operation) => ({
+      operation,
+      completedAt: legacyQueueCompletionTime(operation.manifest, audit),
+    }));
+  for (const { operation, completedAt } of migrations) {
+    const migrated = {
+      ...operation.manifest,
+      schemaVersion: 2,
+      completedAt,
+    };
+    atomicWriteFile(operation.manifestFile, `${stableJson(migrated)}\n`, { mode: 0o600 });
+    operation.manifest = migrated;
+  }
   const completed = operations.filter(({ manifest }) => manifest.status === 'completed');
   completed.sort((left, right) => {
     const timeDifference = Date.parse(right.manifest.completedAt || 0)
