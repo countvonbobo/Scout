@@ -1219,3 +1219,52 @@ not acceptance of `d5ebca2`.
 - Exact next action: normally push this checkpoint, update draft PR #82,
   require all seven CI jobs to pass, then implement Important 11's
   format-independent sensitive-field and private-path coverage.
+
+## 2026-07-30 PR #82 review checkpoint 9
+
+- Important 10 CI run
+  [30538977383](https://github.com/oliver-hitchings/Scout/actions/runs/30538977383)
+  passed all seven required jobs at exact pushed head
+  `5091e2cad0b2c8dd3c0b90c297134aa03fab0456`.
+- Important 11 is implemented in
+  `0d975c6ae4c1e3d5b4e8f50f4ecba97baec36735`. The RED regressions proved
+  that YAML and TOML `rawRunState`, `raw_run_state` and `prompt` fields passed
+  the release audit, as did the complete adversarial profile-path matrix for
+  root homes, alternate Unix homes, UNC shares and real usernames beginning
+  with placeholder-like text.
+- State-shaped scanning now covers YAML, YML and TOML as well as the existing
+  JSON, JSONL, NDJSON, log, output and text formats. Its syntax-independent
+  fallback accepts both colon and equals field syntax. Successfully parsed
+  JSON/JSONL is not rescanned as damaged text, public skill
+  `default_prompt` metadata remains distinct from captured prompt fields, and
+  unparsed generic process-output words remain unclassified without
+  provenance. Parsed generic `output` and `payload` handling remains open
+  under Minor 3.
+- Private-path classification now uses exact segments rather than prefix
+  exemptions. It detects `/root`, `/var/root` through the root segment,
+  `/Users`, `/home` and derived Unix home families, drive-letter Windows
+  profiles, and UNC `Users`, `home`, `homes` and `profiles` shares. Only exact
+  public or documented placeholder segments are exempt; adversarial
+  `yourname`, `yourself`, `YourAccount` and mixed-case equivalents fail. The
+  findings continue to contain only file, line and rule metadata, never the
+  matched private value.
+- The explicit stage regression now proves that YAML and TOML leaks inside a
+  selected production dependency are inspected at the installer boundary.
+- Verification for Important 11:
+  - RED focused boundary: 2 failed and 1 exact-placeholder control passed;
+  - focused release audit: 29 passed;
+  - focused release build and audit suite: 40 passed;
+  - fresh release stage and marker-required audit: 1,582 files scanned,
+    passed;
+  - complete `npm test`: 1,133 discovered, 1,127 passed, 0 failed and 6
+    platform skips;
+  - complete cross-browser acceptance: 168 discovered, 157 passed, 0 failed
+    and 11 intentional Chromium-only skips;
+  - `git diff --check`: passed.
+- Still open from review `4812913188`: Important 12 and Minor 3. Important 12
+  remains a rolling ledger repair and requires another update at the final
+  exact pushed head.
+- Exact next action: normally push this checkpoint, update draft PR #82,
+  require all seven CI jobs to pass, then repair the remaining generic
+  `output`/`payload` provenance false positive before the final exact-head
+  ledger reconciliation.
