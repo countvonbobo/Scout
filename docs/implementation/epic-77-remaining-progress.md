@@ -1142,3 +1142,38 @@ not acceptance of `d5ebca2`.
   stage-mode privacy audit inspect the actual selected production dependency
   payload and proving extra private JSON, text, log and runtime files inside a
   selected package are detected.
+
+## 2026-07-30 PR #82 review checkpoint 7
+
+- Important 9 CI run
+  [30536900055](https://github.com/oliver-hitchings/Scout/actions/runs/30536900055)
+  failed only the Windows Chromium job at exact pushed head
+  `f5f0d26d79faeb309257e5c64d4dbdc0a07db750`; the other six required
+  jobs passed, including all four Node, staging and audit jobs.
+- The Windows browser evidence showed two manifestations of one test-clock
+  mismatch in the production recovery matrix. The lease used a frozen
+  injected wall and monotonic clock, but its production heartbeat silently
+  rebased onto real elapsed time. On the slower runner the genuine one-second
+  fence could therefore expire before the intended injected finalisation
+  interruption, yielding a truthful `lease-lost` result; the stale-worker
+  case could likewise report the loss at `select` instead of at `finalise`.
+  The production fencing response was correct and no timeout was increased.
+- Commit `700e6c2` passes the same controlled wall and monotonic clock to the
+  production heartbeat in both scenarios. Machine speed can no longer expire
+  the synthetic lease, while the tests retain their one-second duration,
+  explicit clock advance, successor takeover, stale-write rejection,
+  interrupted-run recovery and exact journal assertions.
+- Verification for the CI repair:
+  - both affected fault paths: 40 passed across 20 consecutive repetitions
+    each;
+  - complete production recovery matrix: 14 passed;
+  - complete `npm test`: 1,128 discovered, 1,122 passed, 0 failed and 6
+    platform skips;
+  - complete cross-browser acceptance: 168 discovered, 157 passed, 0 failed
+    and 11 intentional Chromium-only skips;
+  - `git diff --check`: passed.
+- Still open from review `4812913188`: Important 10–12 and Minor 3. Important
+  12 remains a rolling ledger repair and requires another update at the final
+  exact pushed head.
+- Exact next action: normally push this checkpoint, update draft PR #82,
+  require all seven replacement CI jobs to pass, then begin Important 10.
