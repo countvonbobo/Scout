@@ -57,13 +57,17 @@ if (command === 'race-acquire') {
   );
   write({ acquired: Boolean(lease), lease });
 } else if (command === 'heartbeat-owner') {
-  const [ready, stop, runId, duration, interval, margin] = args;
+  const [ready, runId, duration, interval, margin] = args;
   const options = timing(duration, margin);
   const lease = acquireScanLease(root, currentLeaseOwner(), operation(runId), options);
   if (!lease) throw new Error('heartbeat owner could not acquire the lease');
   const heartbeat = startLeaseHeartbeat(lease, { intervalMs: Number(interval) });
   fs.writeFileSync(ready, JSON.stringify(lease), 'utf8');
-  await waitFor(stop);
+  await new Promise((resolve) => {
+    process.stdin.once('data', resolve);
+    process.stdin.once('end', resolve);
+    process.stdin.resume();
+  });
   heartbeat.stop();
   releaseScanLease(lease);
   write({ acquired: true, lost: heartbeat.lost, lease });

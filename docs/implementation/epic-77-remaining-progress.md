@@ -1002,3 +1002,23 @@ not acceptance of `d5ebca2`.
 - Exact next action: normally push this checkpoint, update draft PR #82 and
   require the real Windows integration plus all other CI jobs to pass, then
   implement Important 8's production-interface Gate 5 fault matrix.
+
+### Important 7 Windows CI follow-up
+
+- CI run
+  [30532451491](https://github.com/oliver-hitchings/Scout/actions/runs/30532451491)
+  at exact head `7f28ca766701e1c3081aad79124208dc6334f46d` passed six of
+  seven jobs. Windows Node/audit alone failed the cross-process heartbeat
+  regression after the lease contender completed its bounded identity work
+  later than the heartbeat-owner fixture's unrelated five-second stop-file
+  polling deadline. The production heartbeat/takeover assertion itself had
+  succeeded; the child exited while waiting for the parent to create its
+  cleanup file, but the parent was still awaiting the contender.
+- The repair replaces that circular timed filesystem cleanup handshake with an
+  explicit parent-to-child stdin stop signal. It does not increase a lease,
+  guard, liveness-observation or takeover timeout and does not relax the
+  production assertions. The parent still stops the owner in `finally`, and
+  the child still releases its genuine live lease before reporting.
+- GREEN verification before publication: the exact cross-process regression
+  passed ten consecutive isolated runs. A replacement all-seven CI run is
+  required before Important 8 may be published as complete.

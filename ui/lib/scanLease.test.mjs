@@ -37,7 +37,7 @@ function operation(runId) {
 
 function child(args) {
   const processHandle = spawn(process.execPath, [fixture, ...args], {
-    stdio: ['ignore', 'pipe', 'pipe'],
+    stdio: ['pipe', 'pipe', 'pipe'],
     windowsHide: true,
   });
   let stdout = '';
@@ -83,12 +83,11 @@ test('separate processes racing for one workspace produce exactly one winner', a
 test('an independent heartbeat prevents a competing process from taking over', async () => {
   const root = temp();
   const ready = path.join(root, 'heartbeat-ready');
-  const stop = path.join(root, 'heartbeat-stop');
   const leaseDurationMs = 350;
   const heartbeatIntervalMs = 40;
   const takeoverMarginMs = 50;
   const owner = child([
-    'heartbeat-owner', root, ready, stop, 'run-heartbeat',
+    'heartbeat-owner', root, ready, 'run-heartbeat',
     String(leaseDurationMs), String(heartbeatIntervalMs), String(takeoverMarginMs),
   ]);
   await waitUntil(() => fs.existsSync(ready), 'heartbeat owner did not acquire');
@@ -107,7 +106,7 @@ test('an independent heartbeat prevents a competing process from taking over', a
       'acquire', root, 'run-contender', String(leaseDurationMs), String(takeoverMarginMs),
     ]).result;
   } finally {
-    fs.writeFileSync(stop, '', 'utf8');
+    owner.process.stdin.end('stop\n');
     ownerResult = await owner.result;
   }
 
