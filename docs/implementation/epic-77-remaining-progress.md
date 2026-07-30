@@ -1177,3 +1177,45 @@ not acceptance of `d5ebca2`.
   exact pushed head.
 - Exact next action: normally push this checkpoint, update draft PR #82,
   require all seven replacement CI jobs to pass, then begin Important 10.
+
+## 2026-07-30 PR #82 review checkpoint 8
+
+- Replacement CI run
+  [30537833020](https://github.com/oliver-hitchings/Scout/actions/runs/30537833020)
+  passed all seven required jobs at exact pushed head
+  `d1247dfe2ee47d8ac2c0e60a1f550b69ba18fd7a`.
+- Important 10 is implemented in
+  `b0000619edcb3c0fffa1c4d15c0e7d0b77c6f45a`. The RED tests proved that
+  explicit stage mode scanned only the non-dependency file and that the real
+  staged installer admitted selected-package JSON, text and runtime state
+  without the privacy audit noticing it.
+- Explicit `--stage` traversal now includes every installed `node_modules`
+  file. Ordinary tracked-source and build-directory audits retain their
+  dependency exclusion. Every staged dependency text file receives configured
+  personal-marker and concrete-token checks; raw-state, credential and path
+  heuristics additionally inspect JSON, JSONL, NDJSON, log, output and text
+  payloads while excluding reviewed package metadata. This avoids treating
+  third-party source, documentation, type declarations and source maps as
+  private workspace state.
+- The adversarial stage boundary covers extra private JSON, text, log and
+  runtime-journal files inside a selected package. A second regression uses
+  the real release builder, confirms the selected dependency files physically
+  enter the installer stage, and requires the spawned stage audit to reject
+  them. The clean real installer audit now scans 1,582 files rather than the
+  previous 182-file non-dependency projection.
+- Verification for Important 10:
+  - RED dependency boundaries: 2 failed;
+  - focused release build and audit suite: 37 passed;
+  - marker-required real release-stage audit: 1,582 files scanned, passed;
+  - release workflow and documentation suite: 17 passed;
+  - complete `npm test`: 1,130 discovered, 1,124 passed, 0 failed and 6
+    platform skips;
+  - complete cross-browser acceptance: 168 discovered, 157 passed, 0 failed
+    and 11 intentional Chromium-only skips;
+  - `git diff --check`: passed.
+- Still open from review `4812913188`: Important 11–12 and Minor 3. Important
+  12 remains a rolling ledger repair and requires another update at the final
+  exact pushed head.
+- Exact next action: normally push this checkpoint, update draft PR #82,
+  require all seven CI jobs to pass, then implement Important 11's
+  format-independent sensitive-field and private-path coverage.
