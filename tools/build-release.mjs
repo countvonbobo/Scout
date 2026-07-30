@@ -86,8 +86,13 @@ function normalise(relative) {
 
 export function includeCopiedTreePath(relative) {
   const value = normalise(relative);
-  const base = path.posix.basename(value).toLocaleLowerCase('en-US');
-  if (base === 'workspace.json' || base === '.env' || base.startsWith('.env.')) return false;
+  const lower = value.toLocaleLowerCase('en-US');
+  const base = path.posix.basename(lower);
+  if (
+    base === 'workspace.json'
+    && lower !== 'templates/workspace/workspace.json'
+  ) return false;
+  if (base === '.env' || base.startsWith('.env.')) return false;
   if (/\.(?:bak|backup|log(?:\.\d+)?|swp|swo|temp|tmp)$/i.test(base)) return false;
   if (base.endsWith('~') || base.startsWith('.#')) return false;
   return true;
@@ -111,7 +116,13 @@ export function includeReleasePath(relative) {
 export function includePublicSourcePath(relative) {
   const value = normalise(relative);
   if (!includeCopiedTreePath(value)) return false;
-  if (value === 'output' || value.startsWith('output/')) return false;
+  const lower = value.toLocaleLowerCase('en-US');
+  if (
+    lower === 'output'
+    || lower.startsWith('output/')
+    || lower === 'installer/output'
+    || lower.startsWith('installer/output/')
+  ) return false;
   return true;
 }
 
@@ -187,7 +198,7 @@ export function stagePublicSource({
   for (const entry of PUBLIC_SOURCE_FILES) {
     const source = required(resolvedRoot, entry.source);
     const target = path.join(resolvedStage, entry.target);
-    if (entry.tree) copyTree(source, target, '', includePublicSourcePath);
+    if (entry.tree) copyTree(source, target, normalise(entry.target), includePublicSourcePath);
     else {
       fs.mkdirSync(path.dirname(target), { recursive: true });
       fs.copyFileSync(source, target);
@@ -241,7 +252,7 @@ export function stageRelease({
   for (const entry of RELEASE_FILES) {
     const source = required(resolvedRoot, entry.source);
     const target = path.join(appDir, entry.target);
-    if (entry.tree) copyTree(source, target);
+    if (entry.tree) copyTree(source, target, normalise(entry.target));
     else {
       fs.mkdirSync(path.dirname(target), { recursive: true });
       fs.copyFileSync(source, target);

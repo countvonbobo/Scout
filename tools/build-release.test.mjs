@@ -65,6 +65,7 @@ test('release manifest is allowlisted and excludes private workspace roots', () 
 
 test('release tree filter omits tests and snapshots', () => {
   assert.equal(includeReleasePath('ui/lib/workspace.mjs'), true);
+  assert.equal(includeReleasePath('templates/workspace/workspace.json'), true);
   assert.equal(includeReleasePath('ui/lib/workspace.test.mjs'), false);
   assert.equal(includeReleasePath('ui/lib/fixtures/fake-cli.mjs'), false);
   assert.equal(includeReleasePath('ui/__snapshots__/screen.txt'), false);
@@ -151,6 +152,7 @@ test('public source manifest includes tests and workflows but excludes private r
   assert.ok(!sources.includes('tools/commute-data.test.mjs'));
   assert.equal(includePublicSourcePath('output/Scout.exe'), false);
   assert.equal(includePublicSourcePath('Scout.iss'), true);
+  assert.equal(includePublicSourcePath('templates/workspace/workspace.json'), true);
 });
 
 test('public source staging contains contributor inputs without private workspace or built artifacts', () => {
@@ -164,6 +166,10 @@ test('public source staging contains contributor inputs without private workspac
       if (entry.source === 'installer') {
         fs.mkdirSync(path.join(target, 'output'), { recursive: true });
         fs.writeFileSync(path.join(target, 'output', 'Scout.exe'), 'built');
+      }
+      if (entry.source === 'templates') {
+        fs.mkdirSync(path.join(target, 'workspace'), { recursive: true });
+        fs.writeFileSync(path.join(target, 'workspace', 'workspace.json'), '{}');
       }
       if (entry.source === 'ui') writePrivateCopyFixtures(target);
     } else {
@@ -182,6 +188,10 @@ test('public source staging contains contributor inputs without private workspac
   assert.equal(fs.existsSync(path.join(staged.stageDir, 'ui', 'source.txt')), true);
   assert.equal(fs.existsSync(path.join(staged.stageDir, '.github', 'source.txt')), true);
   assert.equal(fs.existsSync(path.join(staged.stageDir, 'installer', 'output')), false);
+  assert.equal(
+    fs.existsSync(path.join(staged.stageDir, 'templates', 'workspace', 'workspace.json')),
+    true,
+  );
   assert.equal(fs.existsSync(path.join(staged.stageDir, 'profile')), false);
   assertPrivateCopyFixturesAbsent(path.join(staged.stageDir, 'ui'));
 });
@@ -221,6 +231,10 @@ test('staging copies only manifest content and bundled runtime', () => {
       fs.mkdirSync(target, { recursive: true });
       fs.writeFileSync(path.join(target, 'runtime.mjs'), 'ok');
       fs.writeFileSync(path.join(target, 'runtime.test.mjs'), 'private fixture');
+      if (entry.source === 'templates') {
+        fs.mkdirSync(path.join(target, 'workspace'), { recursive: true });
+        fs.writeFileSync(path.join(target, 'workspace', 'workspace.json'), '{}');
+      }
       if (entry.source === 'ui') writePrivateCopyFixtures(target);
     } else {
       fs.mkdirSync(path.dirname(target), { recursive: true });
@@ -239,6 +253,10 @@ test('staging copies only manifest content and bundled runtime', () => {
   assert.equal(fs.existsSync(path.join(staged.appDir, 'ui', 'runtime.mjs')), true);
   assert.equal(fs.existsSync(path.join(staged.appDir, 'ui', 'runtime.test.mjs')), false);
   assertPrivateCopyFixturesAbsent(path.join(staged.appDir, 'ui'));
+  assert.equal(
+    fs.existsSync(path.join(staged.appDir, 'templates', 'workspace', 'workspace.json')),
+    true,
+  );
   assert.equal(fs.existsSync(path.join(staged.appDir, 'profile')), false);
   assert.equal(fs.existsSync(path.join(staged.appDir, 'README.md')), true);
   assert.equal(fs.existsSync(path.join(staged.appDir, 'docs', 'QUICK_START.md')), true);
