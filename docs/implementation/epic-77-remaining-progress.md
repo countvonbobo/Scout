@@ -1551,3 +1551,116 @@ record that exact reconciliation SHA and CI run without rewriting history.
   review, complete post-review behavior bridge, real publication state and
   exact green reconciliation state without claiming a descendant was reviewed
   by the historical Changes requested decision.
+
+## Gate A10 — existing next-beta readiness reconciliation
+
+- Status: implementation and local acceptance complete; protected merge,
+  issue closure and epic checkbox updates remain deliberately deferred.
+- Verification head before this ledger-only change:
+  `72f4571eead481e33808fe85588a61c01befd622`.
+
+### PR #71 — safe backup divergence
+
+- Recommendation: **supersede** the backup-divergence portion of draft PR #71
+  with the integrated implementation. Do not merge its branch into PR #82.
+- Duplicate behavior retained: sanitised ahead/behind diagnosis, refusal of
+  ambiguous or overlapping changes, confirmation before resolution, recovery
+  references, a normal merge and push, and explicit no-reset/no-rebase/
+  no-force-push guidance.
+- Integrated behavior is stricter than the original candidate: the analysis
+  is bound to exact verified tips and object IDs; malformed diff metadata,
+  symlinks, gitlinks, mode changes, deletions, renames and dirty state fail
+  closed; both recovery refs precede an exact no-FF merge; stale analysis and
+  tracking-ref movement are rejected; merge/push failure preserves both
+  histories; and backup resolution uses the same lease and mutation
+  coordinator as tracker/report/scan writes.
+- Real production-interface race evidence:
+  - `backup divergence resolution cannot overlap a tracker or report
+    mutation`;
+  - `backup divergence confirmation cannot acquire authority while a scan
+    owns the fence`.
+  Both passed, 2/2, against real temporary Git repositories and the real HTTP
+  route.
+- Unique unrelated commit `3f95b5c` reorders Speculative before Jobs. It is
+  intentionally excluded because the operator did not approve that separate
+  product change. Jobs remains first in both navigation and content order.
+- PR #71 must remain draft/open for the protected reviewer to accept the
+  supersede recommendation or choose a split. This work does not close it.
+
+### Issue #72 — Scout character
+
+- The canonical state table controls sheets, cells, frame rates, looping,
+  still frames and anchors. A real state change explicitly replaces the CSS
+  animation lifecycle so persistent-element transitions to `success` and
+  `warning` begin at frame zero and finish exactly one complete walk.
+- Focused Node verification: 70/70 passed.
+- Real Chromium and Firefox character acceptance: 24/24 passed, including
+  in-place one-shot transitions, every configured cell, per-state timing,
+  partial sheets, reduced motion, labelled pre-module fallback, and
+  representative-frame centring at 44px and 112px.
+
+### Issues #73 and #74 — models and asynchronous usage
+
+- Model catalogues retain trustworthy provenance, readable trade-offs,
+  effective-default explanations, explicit bundled fallback and stale/
+  rejected model states. Custom IDs remain a deliberate advanced escape hatch.
+- Drawer state is generation-bound and reducer-owned. Usage and engine
+  responses preserve each other in both completion orders; stale responses
+  from an older refresh, closed drawer or different chat are ignored.
+- Focused model, drawer, chat and Codex-fallback verification: 56/56 passed.
+- Real Chromium and Firefox chat-drawer acceptance: 34/34 passed, including
+  both response orders, unavailable usage, refreshed/fallback/stale/rejected
+  catalogues, chat switching/closure and keyboard operation.
+
+### Issue #75 — supported Codex navigation and fallback
+
+- Direct navigation is offered only for a bounded, device-local supported
+  handler. Remote browsers, missing handlers, unsupported platforms, hostile
+  task IDs and unacknowledged/failed launches receive an exact copyable task
+  identity and resume guidance; Scout never claims that an anchor click
+  succeeded.
+- The server regression now creates and restores its own device settings and
+  restores its handler inspector in cleanup. It passed twice in separate
+  standalone processes, 1/1 each time, proving that it no longer depends on
+  test order or leaked global state.
+- The Chromium and Firefox drawer acceptance above also passed the supported,
+  missing, remote, failed-navigation, hostile-ID and mixed stale-model cases.
+
+### Issue #76 — provider health and guided reauthentication
+
+- Same-provider authentication mutation authority prevents local preflight or
+  health writes from replacing `login-in-progress`; the other provider remains
+  independent. Authority is released only after child closure and durable
+  terminal health persistence.
+- Login output is record-complete before parsing. Ambiguous chunk prefixes
+  cannot publish a Codex device code or URL, and Claude OAuth links preserve
+  only a complete strictly allowlisted equivalent query required by the
+  provider flow.
+- Ordinary chat, bounded fit assessment and onboarding route remote-auth
+  results through durable provider health without automatically resending
+  provider work. The failed message/work remains available for explicit retry.
+- A direct scan re-detects the selected provider after startup queue drain and
+  passes that same fresh trusted status into the scan, preventing stale
+  pre-queue authentication from authorising work.
+- Windows reused-PID recovery is progress-aware, grants one acquisition pass
+  after genuine stale cleanup, continues to wait when cleanup makes no
+  progress and remains fail-closed for unverifiable live owners. Heartbeats
+  renew through their opaque local capability without redundant identity
+  probes.
+- The exact six reviewed defect regressions passed 12/12 locally; the genuine
+  Windows process-observation integration was the single expected macOS skip.
+- Full affected provider-health, login, provider, scheduling, chat,
+  onboarding, scan-pipeline, lease, CLI and server matrix: 377 discovered,
+  376 passed, 0 failed and 1 Windows-only skip.
+- Chromium and Firefox reconnect UI acceptance: 8/8 passed, covering
+  device/manual code, durable alerts, failure, explicit retry, cancellation,
+  failed clear-session behavior, stale polls, duplicate suppression and no
+  browser persistence.
+
+### Explicit exclusions and state
+
+- The old Wails v3 draft PR #15 is excluded from this release inventory and
+  Epic #77 scope. No Wails source or migration is imported by Gate A10.
+- PR #82 remains draft. PR #71 remains draft/open. Issues #72–#76 remain open.
+  No protected merge, issue closure or epic completion checkbox is performed
+  by this reconciliation.
