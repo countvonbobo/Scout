@@ -63,6 +63,77 @@ test('published profile preserves strengths, provenance and unknown policies', (
   assert.match(profile.id, /^profile-[a-f0-9]{12}$/);
 });
 
+test('published profile supports the complete domain-neutral preference foundation', () => {
+  const preference = (value, strength = 'nice-to-have') => ({
+    value, strength, provenance: 'explicit',
+  });
+  const draft = genericProfileDraft({
+    primaryTitles: [preference('Operations lead', 'strong-preference')],
+    compensation: {
+      currency: 'EUR',
+      period: 'month',
+      rateType: 'salary',
+      amountType: 'base',
+      certainty: 'exact',
+      minimum: 4200,
+      minimumStrength: 'strong-preference',
+      unknownPolicy: 'penalise',
+    },
+  });
+  draft.target = {
+    ...draft.target,
+    adjacentTitles: [preference('Programme coordinator')],
+    responsibilities: [preference('Service improvement')],
+    skills: [preference('Stakeholder facilitation')],
+    qualifications: [preference('Professional registration', 'mandatory')],
+    eligibility: [preference('Work authorisation', 'mandatory')],
+    mobility: [preference('Regional travel')],
+    seniority: [preference('lead')],
+    workingPatterns: [preference('hybrid')],
+    employmentTypes: [preference('permanent')],
+    employers: [preference('Public service')],
+    industries: [preference('Healthcare')],
+  };
+  draft.negative = {
+    ...draft.negative,
+    excludedLocations: [preference('Overseas-only', 'strong-negative')],
+    excludedSeniority: [preference('executive', 'strong-negative')],
+    excludedWorkingPatterns: [preference('night-only', 'strong-negative')],
+    excludedEmployers: [preference('Unregulated broker', 'hard-exclusion')],
+  };
+  draft.selection = { breadth: 'balanced', relevanceThreshold: 45, exploration: 0.1 };
+
+  const profile = publishSearchProfile(draft, { publishedAt: NOW });
+
+  assert.equal(profile.target.adjacentTitles[0].value, 'Programme coordinator');
+  assert.equal(profile.target.responsibilities[0].value, 'Service improvement');
+  assert.equal(profile.target.qualifications[0].strength, 'mandatory');
+  assert.equal(profile.target.eligibility[0].strength, 'mandatory');
+  assert.equal(profile.compensation.amountType, 'base');
+  assert.equal(profile.compensation.certainty, 'exact');
+  assert.deepEqual(profile.selection, {
+    breadth: 'balanced', relevanceThreshold: 45, exploration: 0.1,
+  });
+});
+
+test('profile publication rejects invalid compensation and unbounded search behaviour', () => {
+  assert.throws(() => publishSearchProfile(genericProfileDraft({
+    compensation: { amountType: 'mystery' },
+  }), { publishedAt: NOW }), /compensation\.amountType/i);
+  assert.throws(() => publishSearchProfile(genericProfileDraft({
+    compensation: { certainty: 'probably' },
+  }), { publishedAt: NOW }), /compensation\.certainty/i);
+
+  const invalidSelection = genericProfileDraft();
+  invalidSelection.selection = {
+    breadth: 'everything', relevanceThreshold: -1, exploration: 1000,
+  };
+  assert.throws(
+    () => publishSearchProfile(invalidSelection, { publishedAt: NOW }),
+    /search profile\.selection/i,
+  );
+});
+
 test('unconfirmed inference cannot publish as a hard exclusion', () => {
   const draft = genericProfileDraft({
     excludedTitles: [{ value: 'Manager', strength: 'hard-exclusion', provenance: 'unconfirmed-inference' }],

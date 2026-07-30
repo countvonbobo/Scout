@@ -176,4 +176,7 @@ test('configuration distinguishes field influence and published-profile authorit
   assert.match(configuration, /profile\.displayName.*no scan-decision effect/is);
   assert.match(configuration, /setup\.completedAt.*does not change\s+collection, filtering, ranking or assessment/is);
   assert.match(configuration, /deployment-only.*not stored in `workspace\.json`/is);
+  assert.match(configuration, /amountType.*base.*total.*rate.*unknown/is);
+  assert.match(configuration, /certainty.*exact.*range.*estimated.*unknown/is);
+  assert.match(configuration, /selection\.breadth.*relevanceThreshold.*exploration/is);
 });

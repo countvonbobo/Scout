@@ -69,7 +69,8 @@ queries collected by the current release.
 | --- | --- |
 | `target.primaryTitles`, `target.titles`, `target.locations`, `target.workingPatterns`, `target.employmentTypes`, `target.seniority`, `target.employers`, `target.sectors` | Confirmed mandatory rules may filter when supported by advert evidence; all configured strengths contribute to deterministic ranking. |
 | `negative.excludedTitles`, `excludedEmployers`, `excludedEmploymentTypes`, `excludedLocations`, `excludedResponsibilities` | Only explicit or confirmed hard exclusions remove a vacancy; strong negatives reduce deterministic rank. |
-| `compensation` | Controls conservative like-for-like comparison, unknown-value handling, exclusion and rank contribution. |
+| `compensation` | Controls conservative like-for-like comparison, unknown-value handling, exclusion and rank contribution. Optional `amountType` (`base`, `total`, `rate` or `unknown`) and `certainty` (`exact`, `range`, `estimated` or `unknown`) make pay evidence explicit; omitted fields remain valid for existing version-1 profiles. |
+| `selection.breadth`, `selection.relevanceThreshold`, `selection.exploration` | Bound how widely the deterministic result set is selected. Breadth is `focused`, `balanced` or `broad`; the threshold is 0–100 and exploration is 0–1. The whole section is optional for existing version-1 profiles. |
 | Profile `id`, version and publication time | Identify the immutable decision input and recovery compatibility; they do not add preferences by themselves. |
 
 ## Workspace runtime configuration

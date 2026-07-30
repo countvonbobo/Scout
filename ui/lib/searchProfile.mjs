@@ -14,6 +14,9 @@ export const PROVENANCE = Object.freeze([
 ]);
 
 export const UNKNOWN_POLICIES = Object.freeze(['include', 'penalise', 'exclude']);
+export const COMPENSATION_AMOUNT_TYPES = Object.freeze(['base', 'total', 'rate', 'unknown']);
+export const COMPENSATION_CERTAINTIES = Object.freeze(['exact', 'range', 'estimated', 'unknown']);
+export const SEARCH_BREADTHS = Object.freeze(['focused', 'balanced', 'broad']);
 
 function isPlainObject(value) {
   if (!value || typeof value !== 'object') return false;
@@ -82,17 +85,40 @@ export function validateSearchProfile(profile) {
   validateRuleLists(profile.negative, 'search profile.negative');
 
   const {
-    currency, period, rateType, minimum, minimumStrength, unknownPolicy,
+    currency, period, rateType, amountType, certainty, minimum, minimumStrength, unknownPolicy,
   } = profile.compensation;
   if (currency !== null && (typeof currency !== 'string' || !currency.trim())) throw new Error('search profile.compensation.currency must be a currency or null');
   if (typeof period !== 'string' || !period.trim()) throw new Error('search profile.compensation.period is required');
   if (rateType !== undefined && rateType !== null && (typeof rateType !== 'string' || !rateType.trim())) {
     throw new Error('search profile.compensation.rateType must be a rate type or null');
   }
+  if (amountType !== undefined) {
+    requireEnum(amountType, COMPENSATION_AMOUNT_TYPES, 'search profile.compensation.amountType');
+  }
+  if (certainty !== undefined) {
+    requireEnum(certainty, COMPENSATION_CERTAINTIES, 'search profile.compensation.certainty');
+  }
   if (minimum !== null && (!Number.isFinite(minimum) || minimum < 0)) throw new Error('search profile.compensation.minimum must be a non-negative number or null');
   requireEnum(minimumStrength, PREFERENCE_STRENGTHS, 'search profile.compensation.minimumStrength');
   if (minimumStrength === 'hard-exclusion') throw new Error('search profile.compensation hard exclusion requires a rule provenance');
   requireEnum(unknownPolicy, UNKNOWN_POLICIES, 'search profile.compensation.unknownPolicy');
+
+  if (profile.selection !== undefined) {
+    requirePlainObject(profile.selection, 'search profile.selection');
+    const fields = Object.keys(profile.selection);
+    if (fields.some((field) => !['breadth', 'exploration', 'relevanceThreshold'].includes(field))) {
+      throw new Error('search profile.selection contains an unsupported field');
+    }
+    requireEnum(profile.selection.breadth, SEARCH_BREADTHS, 'search profile.selection.breadth');
+    const threshold = profile.selection.relevanceThreshold;
+    if (!Number.isFinite(threshold) || threshold < 0 || threshold > 100) {
+      throw new Error('search profile.selection.relevanceThreshold must be between 0 and 100');
+    }
+    const exploration = profile.selection.exploration;
+    if (!Number.isFinite(exploration) || exploration < 0 || exploration > 1) {
+      throw new Error('search profile.selection.exploration must be between 0 and 1');
+    }
+  }
 
   if (profile.status === 'published') {
     if (typeof profile.publishedAt !== 'string' || Number.isNaN(Date.parse(profile.publishedAt))) throw new Error('published search profile requires a valid publishedAt');
@@ -132,6 +158,8 @@ export function draftProfileFromLegacy(config = {}, context = '') {
       currency: typeof config.currency === 'string' && config.currency.trim() ? config.currency : null,
       period: 'year',
       rateType: minimum === null ? null : 'salary',
+      amountType: minimum === null ? 'unknown' : 'base',
+      certainty: minimum === null ? 'unknown' : 'exact',
       minimum,
       minimumStrength: minimum === null ? 'neutral' : 'strong-preference',
       unknownPolicy: 'include',
