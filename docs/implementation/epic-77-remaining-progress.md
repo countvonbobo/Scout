@@ -960,3 +960,45 @@ not acceptance of `d5ebca2`.
 - Exact next action: normally push this checkpoint, update draft PR #82, then
   implement Important 7 by reproducing the Windows reused-PID guard-budget
   exhaustion with deterministic observations before changing recovery.
+
+## 2026-07-30 PR #82 review checkpoint 4
+
+- Important 6 CI run
+  [30531385486](https://github.com/oliver-hitchings/Scout/actions/runs/30531385486)
+  passed all seven required jobs at exact head
+  `82aa7609133ac09866ac4c2d034193010b02f721`.
+- Fixed Important 7 in
+  `05842b7d4b4816f3a9ebd2129c5f733588cd0463`. The deterministic RED
+  makes each of two reused-PID observations consume 1,100 ms of the unchanged
+  2,000 ms guard budget. Recovery revalidated and moved the stale guard, then
+  redundantly observed the same metadata a third time, quarantined it and
+  returned busy without trying the now-free canonical guard.
+- GREEN uses the injected monotonic clock for the existing guard deadline,
+  retains the exact metadata revalidated under recovery authority and does
+  not re-observe that same owner while quarantining the moved guard. Recovery
+  state now distinguishes retry after actual cleanup/race progress from wait
+  when the blocking state did not change. A successful cleanup receives one
+  immediate canonical acquisition pass even if the original deadline elapsed;
+  a failed quarantine still waits and returns busy.
+- Deterministic regressions prove two observations only, post-cleanup
+  acquisition, no acquisition after injected quarantine contention and
+  fail-closed preservation when a live owner cannot be verified. A separate
+  Windows-only integration uses the real process-start observer against the
+  current live PID with a different persisted start identity.
+- Verification for Important 7:
+  - deterministic progress/no-progress/fail-closed regressions: 3 passed;
+  - complete lease suite: 62 discovered, 61 passed and 1 Windows-only skip;
+  - combined lease, queue and durable pipeline suites: 152 discovered, 151
+    passed and 1 Windows-only skip;
+  - complete `npm test`: 1,127 discovered, 1,121 passed, 0 failed and 6
+    platform skips;
+  - release/build audit tests: 35 passed;
+  - source release audit: 519 files, passed;
+  - fresh stage construction and staged release audit: 182 files, passed;
+  - `git diff --check`: passed.
+- Still open from review `4812913188`: Important 8–12 and Minor 3. Important
+  12 remains a rolling ledger repair and requires another update at the final
+  exact pushed head.
+- Exact next action: normally push this checkpoint, update draft PR #82 and
+  require the real Windows integration plus all other CI jobs to pass, then
+  implement Important 8's production-interface Gate 5 fault matrix.
