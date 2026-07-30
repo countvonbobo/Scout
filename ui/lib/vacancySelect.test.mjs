@@ -4,9 +4,12 @@ import { selectVacancies } from './vacancySelect.mjs';
 
 function ranked({
   vacancyId, score = 80, employerId = 'employer-a', source = 'ats', laneId = 'lane-a',
-  change = 'unchanged', assessedAt = null,
+  roleFamily = 'engineering', location = 'London', change = 'unchanged', assessedAt = null,
 } = {}) {
-  return { vacancyId, preRankScore: score, employerId, source, laneId, change, assessedAt };
+  return {
+    vacancyId, preRankScore: score, employerId, source, laneId,
+    roleFamily, location, change, assessedAt,
+  };
 }
 
 function rankedFixture({ dominantEmployer, alternatives }) {
@@ -29,6 +32,46 @@ test('one employer cannot consume the budget while strong alternatives exist', (
 
   assert.ok(result.selected.filter((job) => job.employerId === 'dominant').length <= 3);
   assert.ok(new Set(result.selected.map((job) => job.source)).size > 1);
+});
+
+test('one role family cannot consume the budget while strong alternatives exist', () => {
+  const result = selectVacancies([
+    ...Array.from({ length: 12 }, (_, index) => ranked({
+      vacancyId: `engineering-${index}`,
+      score: 100 - index / 100,
+      roleFamily: 'engineering',
+      employerId: 'shared-employer',
+    })),
+    ...Array.from({ length: 6 }, (_, index) => ranked({
+      vacancyId: `alternative-family-${index}`,
+      score: 90 - index / 100,
+      roleFamily: index % 2 ? 'operations' : 'research',
+      employerId: 'shared-employer',
+    })),
+  ], { limit: 10, threshold: 40, exploration: 0, seed: 'run-1' });
+
+  assert.ok(result.selected.filter((job) => job.roleFamily === 'engineering').length <= 5);
+  assert.equal(result.constraintsRelaxed.includes('roleFamily'), false);
+});
+
+test('one location cannot consume the budget while strong alternatives exist', () => {
+  const result = selectVacancies([
+    ...Array.from({ length: 12 }, (_, index) => ranked({
+      vacancyId: `london-${index}`,
+      score: 100 - index / 100,
+      location: 'London',
+      employerId: 'shared-employer',
+    })),
+    ...Array.from({ length: 6 }, (_, index) => ranked({
+      vacancyId: `alternative-location-${index}`,
+      score: 90 - index / 100,
+      location: index % 2 ? 'Manchester' : 'Bristol',
+      employerId: 'shared-employer',
+    })),
+  ], { limit: 10, threshold: 40, exploration: 0, seed: 'run-1' });
+
+  assert.ok(result.selected.filter((job) => job.location === 'London').length <= 5);
+  assert.equal(result.constraintsRelaxed.includes('location'), false);
 });
 
 test('weak sources receive no guaranteed places', () => {
@@ -55,6 +98,37 @@ test('relaxes a diversity limit only when eligible jobs cannot fill the budget',
   assert.equal(result.selected.length, 6);
   assert.deepEqual(result.constraintsRelaxed, ['lane']);
   assert.ok(result.reasons.every((reason) => typeof reason === 'object' && reason.vacancyId));
+});
+
+test('role-family and location limits relax only when their alternatives cannot fill the budget', () => {
+  for (const [field, dominant, second, third, expected] of [
+    ['roleFamily', 'engineering', 'operations', 'research', 'roleFamily'],
+    ['location', 'London', 'Manchester', 'Bristol', 'location'],
+  ]) {
+    const result = selectVacancies([
+      ...Array.from({ length: 4 }, (_, index) => ranked({
+        vacancyId: `${expected}-dominant-${index}`,
+        score: 100 - index,
+        employerId: 'shared-employer',
+        [field]: dominant,
+      })),
+      ranked({
+        vacancyId: `${expected}-second`,
+        score: 90,
+        employerId: 'shared-employer',
+        [field]: second,
+      }),
+      ranked({
+        vacancyId: `${expected}-third`,
+        score: 89,
+        employerId: 'shared-employer',
+        [field]: third,
+      }),
+    ], { limit: 6, threshold: 40, exploration: 0, seed: 'run-1' });
+
+    assert.equal(result.selected.length, 6);
+    assert.deepEqual(result.constraintsRelaxed, [expected]);
+  }
 });
 
 test('equal scores prefer materially changed, then unseen, then older assessed vacancies', () => {
@@ -92,11 +166,15 @@ test('exploration preserves diversity limits that were not relaxed', () => {
     ...Array.from({ length: 7 }, (_, index) => ranked({
       vacancyId: `alternative-${index}`, score: 80 - index, employerId: `alternative-${index}`,
       source: index % 2 ? 'board' : 'ats', laneId: index % 3 ? 'lane-b' : 'lane-c',
+      roleFamily: index % 2 ? 'operations' : 'research',
+      location: index % 2 ? 'Manchester' : 'Bristol',
     })),
   ], { limit: 10, threshold: 40, exploration: 5, seed: 'run-1' });
 
   assert.equal(result.constraintsRelaxed.includes('employer'), false);
   assert.ok(result.selected.filter((job) => job.employerId === 'dominant').length <= 3);
+  assert.ok(result.selected.filter((job) => job.roleFamily === 'engineering').length <= 5);
+  assert.ok(result.selected.filter((job) => job.location === 'London').length <= 5);
 });
 
 test('stable vacancy identifiers use code-unit order rather than the host locale', () => {

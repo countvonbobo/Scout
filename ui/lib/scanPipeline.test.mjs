@@ -49,6 +49,49 @@ test('ranked discovery is independent of source and portal order', () => {
   assert.deepEqual(forward.candidates.map((item) => item.candidateId), ['candidate-001', 'candidate-002']);
 });
 
+test('ranked discovery preserves role-family and location metadata for soft diversification', () => {
+  const profile = {
+    version: 1, status: 'published', id: 'profile-diversity',
+    target: { primaryTitles: [{ value: 'Ideal Role', strength: 'mandatory', provenance: 'explicit' }] },
+    negative: {},
+    compensation: {
+      currency: null, period: 'year', minimum: null, minimumStrength: 'neutral', unknownPolicy: 'include',
+    },
+  };
+  const job = (id, { roleFamily = 'engineering', location = 'London' } = {}) => ({
+    company: 'Shared Employer',
+    title: 'Ideal Role',
+    url: `https://example.test/${id}`,
+    providerId: id,
+    roleFamily,
+    location,
+  });
+  const dominantFamilies = Array.from({ length: 12 }, (_, index) => job(`family-a-${index}`));
+  const alternativeFamilies = Array.from({ length: 6 }, (_, index) => job(`family-z-${index}`, {
+    roleFamily: index % 2 ? 'operations' : 'research',
+  }));
+  const familyResult = prepareRankedDiscovery({
+    sources: { ats: { count: 18, jobs: [...dominantFamilies, ...alternativeFamilies] } },
+    profile, tracker: { opportunities: [] }, runId: 'role-family-diversity', limit: 10,
+  });
+
+  assert.ok(familyResult.ranked.every(({ roleFamily }) => roleFamily));
+  assert.ok(familyResult.selection.selected.filter(({ roleFamily }) => roleFamily === 'engineering').length <= 5);
+  assert.equal(familyResult.selection.constraintsRelaxed.includes('roleFamily'), false);
+
+  const dominantLocations = Array.from({ length: 12 }, (_, index) => job(`location-a-${index}`));
+  const alternativeLocations = Array.from({ length: 6 }, (_, index) => job(`location-z-${index}`, {
+    location: index % 2 ? 'Manchester' : 'Bristol',
+  }));
+  const locationResult = prepareRankedDiscovery({
+    sources: { ats: { count: 18, jobs: [...dominantLocations, ...alternativeLocations] } },
+    profile, tracker: { opportunities: [] }, runId: 'location-diversity', limit: 10,
+  });
+
+  assert.ok(locationResult.selection.selected.filter(({ location }) => location === 'London').length <= 5);
+  assert.equal(locationResult.selection.constraintsRelaxed.includes('location'), false);
+});
+
 test('durable ranked stages preserve the established ranked discovery result', async () => {
   const profile = {
     version: 1, status: 'published', id: 'profile-durable',

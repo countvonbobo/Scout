@@ -19,6 +19,10 @@ function text(value) {
   return result || null;
 }
 
+function metadataText(value) {
+  return text(value)?.slice(0, 120) || null;
+}
+
 function field(value, provenance) {
   return { value: value ?? null, provenance: value == null ? 'unknown' : provenance };
 }
@@ -107,7 +111,9 @@ function diagnosticCode(warning) {
   return 'normalisation-warning';
 }
 
-export function normaliseObservation(job, { sourceName, fetchedAt, laneId } = {}) {
+export function normaliseObservation(job, {
+  sourceName, fetchedAt, laneId, roleFamily,
+} = {}) {
   const source = text(sourceName) || text(job?.source);
   if (!job || !source) return null;
   const canonicalUrl = canonicaliseUrl(job.url || job.sourceUrl);
@@ -133,9 +139,15 @@ export function normaliseObservation(job, { sourceName, fetchedAt, laneId } = {}
   ], warnings, 'seniority');
   const fullTime = extraction(description, [['full-time', /\bfull[ -]?time\b/i], ['part-time', /\bpart[ -]?time\b/i]]);
   if (fullTime.ambiguous) warnings.push('ambiguous working pattern was left unknown');
+  const observationLaneId = metadataText(laneId);
+  const observationRoleFamily = metadataText(
+    job.roleFamilyId || job.roleFamily || job.targetRoleFamily || roleFamily,
+  );
   const fingerprintInput = { ...job, url: canonicalUrl || text(job.url), sourceUrl: canonicalUrl || text(job.sourceUrl) };
   const rawFingerprint = fingerprint(stableJson(fingerprintInput));
-  const observationId = fingerprint(`${source}\n${recordId || canonicalUrl || ''}\n${rawFingerprint}`);
+  const observationId = fingerprint(
+    `${source}\n${recordId || canonicalUrl || ''}\n${observationLaneId || ''}\n${observationRoleFamily || ''}\n${rawFingerprint}`,
+  );
   const result = {
     observationId,
     source,
@@ -163,7 +175,8 @@ export function normaliseObservation(job, { sourceName, fetchedAt, laneId } = {}
     fetchedAt: text(fetchedAt),
     firstSeenAt: text(job.firstSeenAt) || text(fetchedAt),
     lastSeenAt: text(job.lastSeenAt) || text(fetchedAt),
-    laneId: text(laneId),
+    laneId: observationLaneId,
+    roleFamily: observationRoleFamily,
     warnings,
     rawFingerprint,
     diagnostics: {

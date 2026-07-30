@@ -96,6 +96,7 @@ test('normalisation preserves complete structured source evidence and lifecycle 
     qualifications: ['Professional registration'],
     eligibility: ['Right to work'],
     industry: 'Healthcare',
+    roleFamily: 'clinical-operations',
     salaryMin: 5000,
     salaryMax: 5500,
     salaryCurrency: 'EUR',
@@ -115,6 +116,8 @@ test('normalisation preserves complete structured source evidence and lifecycle 
   assert.deepEqual(observation.qualifications.value, ['Professional registration']);
   assert.deepEqual(observation.eligibility.value, ['Right to work']);
   assert.equal(observation.industry.value, 'Healthcare');
+  assert.equal(observation.laneId, 'lane-clinical');
+  assert.equal(observation.roleFamily, 'clinical-operations');
   assert.deepEqual(observation.compensation.value, {
     minimum: 5000,
     maximum: 5500,
@@ -133,6 +136,30 @@ test('normalisation preserves complete structured source evidence and lifecycle 
   ]) {
     assert.equal(observation.fieldProvenance[field], 'explicit-source');
   }
+});
+
+test('lane and explicit role-family provenance participate in observation identity', () => {
+  const job = {
+    providerId: 'job-role-family',
+    title: 'Engineer',
+    company: 'Acme',
+    url: 'https://jobs.example/role-family',
+  };
+  const first = normaliseObservation(job, {
+    sourceName: 'fixture', fetchedAt: NOW, laneId: 'lane-primary', roleFamily: 'engineering',
+  });
+  const second = normaliseObservation(job, {
+    sourceName: 'fixture', fetchedAt: NOW, laneId: 'lane-adjacent', roleFamily: 'operations',
+  });
+
+  assert.notEqual(first.observationId, second.observationId);
+  assert.deepEqual(
+    [first, second].map(({ laneId, roleFamily }) => ({ laneId, roleFamily })),
+    [
+      { laneId: 'lane-primary', roleFamily: 'engineering' },
+      { laneId: 'lane-adjacent', roleFamily: 'operations' },
+    ],
+  );
 });
 
 test('normalisation retains only bounded redacted diagnostics and a raw fingerprint', () => {

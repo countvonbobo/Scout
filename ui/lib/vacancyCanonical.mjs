@@ -99,6 +99,11 @@ function dateBound(observations, name, direction) {
   return [...values].sort((left, right) => direction * compareStable(left, right))[0];
 }
 
+function metadataValues(observations, name) {
+  return [...new Set(observations.map((observation) => String(observation?.[name] || '').trim().slice(0, 120))
+    .filter(Boolean))].sort(compareStable);
+}
+
 function canonicalVacancy(observations) {
   const orderedObservations = sortObservations(observations);
   const semanticObservation = [...orderedObservations]
@@ -114,6 +119,8 @@ function canonicalVacancy(observations) {
   const fields = Object.fromEntries(DISPLAY_FIELDS.map((name) => [name, displayField(orderedObservations, name)]));
   const canonicalUrl = orderedObservations.map((observation) => observation?.canonicalUrl).find(Boolean) || null;
   const sourceReferences = mergeSourceReferences(...orderedObservations);
+  const laneIds = metadataValues(orderedObservations, 'laneId');
+  const roleFamilies = metadataValues(orderedObservations, 'roleFamily');
   return {
     observations: orderedObservations,
     canonicalUrl,
@@ -123,6 +130,10 @@ function canonicalVacancy(observations) {
     closingAt: dateBound(orderedObservations, 'closingAt', 1),
     firstSeenAt: dateBound(orderedObservations, 'firstSeenAt', 1),
     lastSeenAt: dateBound(orderedObservations, 'lastSeenAt', -1),
+    laneIds,
+    laneId: laneIds[0] || null,
+    roleFamilies,
+    roleFamily: roleFamilies[0] || null,
     ...(semanticObservation ? { semanticEvidence: semanticObservation.semanticEvidence } : {}),
     ...fields,
     ...Object.fromEntries(LIST_FIELDS.map((name) => [name, listDisplayField(orderedObservations, name)])),

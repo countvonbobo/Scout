@@ -11,12 +11,12 @@ const DESCRIPTION = 'Design and operate reliable platform services, mentor engin
 function observation({
   source = 'adzuna', providerId = `${source}-1`, url = DIRECT_URL,
   location = 'London', seniority = 'senior', employmentType = 'permanent',
-  description = DESCRIPTION, ...overrides
+  description = DESCRIPTION, laneId = 'lane-1', roleFamily = '', ...overrides
 } = {}) {
   return normaliseObservation({
     providerId, url, title: 'Platform Engineer', company: 'Acme Ltd', location,
-    seniority, employmentType, description, ...overrides,
-  }, { sourceName: source, fetchedAt: '2026-07-26T20:00:00.000Z', laneId: 'lane-1' });
+    seniority, employmentType, description, roleFamily, ...overrides,
+  }, { sourceName: source, fetchedAt: '2026-07-26T20:00:00.000Z', laneId });
 }
 
 test('cross-source copies become one canonical vacancy with all observations', () => {
@@ -80,6 +80,8 @@ test('a live vacancy returning from a closed state is reopened', () => {
 test('canonical vacancies preserve structured evidence and observed lifecycle bounds', () => {
   const first = observation({
     source: 'adzuna',
+    laneId: 'lane-primary',
+    roleFamily: 'platform',
     employerReference: 'acme-careers',
     responsibilities: ['Operate services'],
     skills: ['Incident response'],
@@ -94,6 +96,8 @@ test('canonical vacancies preserve structured evidence and observed lifecycle bo
   const second = observation({
     source: 'greenhouse',
     providerId: 'greenhouse-1',
+    laneId: 'lane-adjacent',
+    roleFamily: 'site-reliability',
     responsibilities: ['Operate services', 'Mentor engineers'],
     skills: ['Incident response', 'Observability'],
     qualifications: ['Cloud certification'],
@@ -118,4 +122,8 @@ test('canonical vacancies preserve structured evidence and observed lifecycle bo
   assert.equal(vacancy.closingAt, '2026-08-01T00:00:00.000Z');
   assert.equal(vacancy.firstSeenAt, '2026-07-01T00:00:00.000Z');
   assert.equal(vacancy.lastSeenAt, '2026-07-04T00:00:00.000Z');
+  assert.deepEqual(vacancy.laneIds, ['lane-adjacent', 'lane-primary']);
+  assert.equal(vacancy.laneId, 'lane-adjacent');
+  assert.deepEqual(vacancy.roleFamilies, ['platform', 'site-reliability']);
+  assert.equal(vacancy.roleFamily, 'platform');
 });

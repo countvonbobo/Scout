@@ -1224,6 +1224,8 @@ function observationInputs(sources) {
       sourceName: job?.source || sourceName,
       fetchedAt: source?.fetchedAt || source?.generatedAt || null,
       laneId: job?.laneId || job?.source || source?.laneId || sourceName,
+      roleFamily: job?.roleFamilyId || job?.roleFamily
+        || source?.roleFamilyId || source?.roleFamily || null,
     })).filter(Boolean);
     observations.push(...normalised);
     funnelSources[sourceName] = {
@@ -1395,6 +1397,8 @@ function semanticObservation(job, sourceName, source, profile, { durableUrls = t
     sourceName: job?.source || sourceName,
     fetchedAt: source?.fetchedAt || source?.generatedAt || null,
     laneId: job?.laneId || job?.source || source?.laneId || sourceName,
+    roleFamily: job?.roleFamilyId || job?.roleFamily
+      || source?.roleFamilyId || source?.roleFamily || null,
   });
   if (!observation) return null;
   const description = String(job?.description || '');
