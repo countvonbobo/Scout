@@ -1338,6 +1338,47 @@ not acceptance of `d5ebca2`.
   #82, require all seven CI jobs to pass, then perform Important 12's final
   durable-ledger and exact-head reconciliation.
 
+## 2026-07-30 PR #82 review checkpoint 13
+
+- Minor 3 CI run
+  [30544560153](https://github.com/oliver-hitchings/Scout/actions/runs/30544560153)
+  passed all three browser jobs and the Ubuntu, ARM macOS and Intel macOS
+  Node/audit jobs at exact pushed head
+  `2d11162e7c280f0bc257bd49f661252c0b65126c`. Windows alone failed
+  `competing processes serialize overlap enqueues through the workspace
+  guard`; release staging and audit were skipped after `npm test` failed.
+- The Minor 3 audit matrix passed on Windows. The unrelated failure was a
+  one-shot Windows filesystem busy result while a four-process queue
+  contender published the canonical guard junction. Guard cleanup already
+  treated that platform result as transient, but canonical publication
+  omitted it from the existing lost-race codes and allowed it to escape.
+- Repair commit `db143488e5ef1c34a863c5c3df0d1e8ae7012d99`
+  classifies only that Windows busy publication result with the existing
+  contention path. The contender re-observes and retries inside the unchanged
+  monotonic acquisition budget; unexpected I/O failures still propagate.
+  No lease, heartbeat, guard or test timeout changed.
+- A deterministic RED regression injects exactly one busy result at canonical
+  guard publication and requires the second publication attempt to acquire
+  inside its original 100ms test budget.
+- Verification for the guard-publication repair:
+  - focused RED regression: 1 failed;
+  - deterministic busy publication plus exact four-process queue contention:
+    20 consecutive runs, 40 passed and 0 failed;
+  - complete lease and queue suites: 88 discovered, 87 passed, 0 failed and 1
+    Windows-only skip;
+  - complete `npm test`: 1,136 discovered, 1,130 passed, 0 failed and 6
+    platform skips;
+  - complete cross-browser acceptance: 168 discovered, 157 passed, 0 failed
+    and 11 intentional Chromium-only skips;
+  - source release audit: 519 files scanned, passed;
+  - fresh marker-required release-stage audit: 1,582 files scanned, passed;
+  - `git diff --check`: passed.
+- Still open from review `4812913188`: Important 12 only. Exact-head
+  reconciliation remains blocked on all seven replacement CI jobs passing.
+- Exact next action: normally push this repair checkpoint, update draft PR
+  #82, require all seven replacement CI jobs to pass, then perform Important
+  12's final durable-ledger and exact-head reconciliation.
+
 ## 2026-07-30 PR #82 review checkpoint 11
 
 - Important 11 replacement CI run
