@@ -1268,3 +1268,34 @@ not acceptance of `d5ebca2`.
   require all seven CI jobs to pass, then repair the remaining generic
   `output`/`payload` provenance false positive before the final exact-head
   ledger reconciliation.
+
+## 2026-07-30 PR #82 review checkpoint 10
+
+- Important 11 CI run
+  [30540383849](https://github.com/oliver-hitchings/Scout/actions/runs/30540383849)
+  failed all four Node jobs during `npm test` at exact pushed head
+  `a06d61ef4a62c92fd72ce0df3f05dfcb7c983f2c`. All three browser jobs
+  passed.
+- Every Node platform failed the same clean-tree release-audit integration
+  assertion. The new detector correctly rejected two root-account
+  path-shaped examples added to this public ledger after the implementation
+  suite had run. Release staging and audit steps were skipped because the Node
+  gate failed.
+- Commit `ce17134f002f81457fb59170d485039aa65fb5e1` records the behavior
+  without embedding private-path-shaped literals. It also makes the
+  clean-tree assertion report the audit's already bounded file, line and rule
+  metadata, so a future failure identifies its public source without exposing
+  matched values.
+- Verification for the CI repair:
+  - combined release build and audit suite: 40 passed across 20 consecutive
+    repetitions, 800 total test executions;
+  - fresh marker-required release-stage audit: 1,582 files scanned, passed;
+  - complete `npm test`: 1,133 discovered, 1,127 passed, 0 failed and 6
+    platform skips;
+  - the failed-head CI run's three browser jobs all passed;
+  - `git diff --check`: passed.
+- Still open from review `4812913188`: Important 12 and Minor 3. Important 12
+  remains a rolling ledger repair and requires another update at the final
+  exact pushed head.
+- Exact next action: normally push this repair checkpoint, update draft PR
+  #82, require all seven replacement CI jobs to pass, then implement Minor 3.
