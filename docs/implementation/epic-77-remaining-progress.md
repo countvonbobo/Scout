@@ -906,6 +906,16 @@ not acceptance of `d5ebca2`.
   - release/build audit tests: 35 passed;
   - fresh staged release audit: 519 files, passed;
   - `git diff --check`: passed.
+- Important 5 CI run `30529475151` passed six jobs but failed Ubuntu Node
+  because an existing assessment regression compared whole-suite wall time to
+  1,000 ms. The same test completed 20/20 isolated runs in 190–225 ms, while
+  the loaded Ubuntu runner delayed it to 1,774 ms. Commit
+  `871ef5ef419f6df18c93f8407add30ce5c554f27` keeps the unchanged 35 ms
+  production watchdog and instead asserts the exact bounded provider sequence:
+  one `batch` attempt and one `retry`, each receiving 35 ms, while the
+  independent heartbeat advances. Twenty repeated isolated runs, all 14
+  assessment tests and complete `npm test` (1,121 discovered, 1,116 passed, 5
+  skips, 0 failed) pass.
 - Still open from the exact-head review: Important 6–12 and Minor 3. Important
   12 remains a rolling ledger repair and requires a final exact-head update.
 - Exact next action: commit and normally push this ledger checkpoint, update
