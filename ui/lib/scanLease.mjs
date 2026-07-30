@@ -977,6 +977,7 @@ export function assertScanLeaseScope(lease, root, runId, directory, journalFile)
 }
 
 function currentProcessOwns(lease) {
+  runtimeFor(lease).hooks.beforeCurrentOwnerObservation?.();
   return sameOwner(lease.owner, currentLeaseOwner());
 }
 
@@ -1435,9 +1436,15 @@ export function appendObservedScanQueueEvent(root, observed, input, inputOptions
   }
 }
 
-export function renewScanLease(lease) {
+function renewScanLeaseCapability(lease, { observeCurrentOwner = true } = {}) {
   const settings = runtimeFor(lease);
-  if (!currentProcessOwns(lease) || locallyExpired(settings)) throw new LeaseLostError();
+  // A hydrated lease is an opaque in-process capability: its private runtime
+  // metadata cannot be reconstructed from the durable JSON record. Direct
+  // callers still prove process identity, while the heartbeat that already
+  // owns this capability avoids a redundant platform process-start probe.
+  if ((observeCurrentOwner && !currentProcessOwns(lease)) || locallyExpired(settings)) {
+    throw new LeaseLostError();
+  }
   try {
     return withGuard(settings.root, lease.owner, settings, () => {
       assertNoLegacyCoexistence(settings.root);
@@ -1463,6 +1470,10 @@ export function renewScanLease(lease) {
     if (error instanceof GuardBusyError) throw error;
     throw error;
   }
+}
+
+export function renewScanLease(lease) {
+  return renewScanLeaseCapability(lease);
 }
 
 export function releaseScanLease(lease) {
@@ -1545,7 +1556,7 @@ export function startLeaseHeartbeat(lease, options = {}) {
     const forwardJump = wallAdvance - monotonicAdvance > intervalMs;
     if (monotonic >= renewalDue || forwardJump) {
       try {
-        renewScanLease(lease);
+        renewScanLeaseCapability(lease, { observeCurrentOwner: false });
         renewalDue = monotonicNow() + intervalMs;
       } catch (error) {
         if (error instanceof LeaseLostError || monotonicNow() >= settings.monotonicDeadline) {

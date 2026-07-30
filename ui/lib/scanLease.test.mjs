@@ -981,6 +981,40 @@ test('a forward wall jump triggers heartbeat renewal while monotonic time remain
   releaseScanLease(lease);
 });
 
+test('heartbeat renews from its opaque local capability without another process identity probe', () => {
+  const root = temp();
+  let wall = Date.parse('2026-07-27T10:00:00.000Z');
+  let monotonic = 0;
+  let ownerObservations = 0;
+  const timers = [];
+  const lease = acquireScanLease(root, currentLeaseOwner(), operation('run-no-reprobe'), {
+    wallNow: () => wall,
+    monotonicNow: () => monotonic,
+    _testHooks: {
+      beforeCurrentOwnerObservation() {
+        ownerObservations += 1;
+        throw new Error('heartbeat redundantly observed its own process identity');
+      },
+    },
+  });
+  const heartbeat = startLeaseHeartbeat(lease, {
+    intervalMs: 15_000,
+    wallNow: () => wall,
+    monotonicNow: () => monotonic,
+    setTimeoutFn: (callback) => { timers.push(callback); return timers.length; },
+    clearTimeoutFn: () => {},
+  });
+
+  wall += 15_000;
+  monotonic += 15_000;
+  timers.shift()();
+
+  assert.equal(readScanLease(root).heartbeatSequence, 1);
+  assert.equal(ownerObservations, 0);
+  assert.equal(heartbeat.lost, false);
+  heartbeat.stop();
+});
+
 test('a backward wall jump cannot postpone the monotonic renewal deadline', () => {
   const root = temp();
   let wall = Date.parse('2026-07-27T10:00:00.000Z');
