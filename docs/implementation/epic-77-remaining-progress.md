@@ -1022,3 +1022,14 @@ not acceptance of `d5ebca2`.
 - GREEN verification before publication: the exact cross-process regression
   passed ten consecutive isolated runs. A replacement all-seven CI run is
   required before Important 8 may be published as complete.
+- Replacement run
+  [30534312496](https://github.com/oliver-hitchings/Scout/actions/runs/30534312496)
+  then exposed an independent macOS ARM test defect: the provider-timeout
+  regression assigned fake PID `4242` but called the real OS process-group
+  signal function. That process group existed on the shared runner, so the
+  real `SIGTERM` succeeded outside the fake child and only fallback `SIGKILL`
+  appeared in the fake signal log. The production boundary now accepts the
+  same injectable process-group signal dependency used by other provider
+  lifecycle tests, and the regression asserts exact `-pid`, `SIGTERM`,
+  `SIGKILL` calls without signalling a real process. Ten consecutive focused
+  runs pass; another replacement all-seven CI run remains required.

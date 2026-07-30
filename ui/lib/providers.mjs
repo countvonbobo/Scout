@@ -204,6 +204,7 @@ export function providerStatus(provider, {
 function terminateProviderCommand(child, {
   force = false,
   platform = process.platform,
+  kill = process.kill,
 } = {}) {
   if (platform === 'win32') {
     if (Number.isSafeInteger(child?.pid) && child.pid > 0) {
@@ -221,7 +222,7 @@ function terminateProviderCommand(child, {
   }
   const signal = force ? 'SIGKILL' : 'SIGTERM';
   try {
-    if (Number.isSafeInteger(child?.pid) && child.pid > 0) process.kill(-child.pid, signal);
+    if (Number.isSafeInteger(child?.pid) && child.pid > 0) kill(-child.pid, signal);
     else child?.kill(signal);
   } catch {
     try { child?.kill(signal); } catch { /* it may already have exited */ }
@@ -237,6 +238,7 @@ export function runProviderCommand(command, args, options = {}) {
       closeDeadlineMs = 2_000,
       spawn = spawnProcess,
       platform = process.platform,
+      kill = process.kill,
       ...spawnOptions
     } = options;
     let child;
@@ -278,10 +280,10 @@ export function runProviderCommand(command, args, options = {}) {
       });
     };
     const stop = () => {
-      terminateProviderCommand(child, { platform });
+      terminateProviderCommand(child, { platform, kill });
       if (!forcedTimer) {
         forcedTimer = setTimeout(
-          () => terminateProviderCommand(child, { force: true, platform }),
+          () => terminateProviderCommand(child, { force: true, platform, kill }),
           terminateGraceMs,
         );
         forcedTimer.unref?.();

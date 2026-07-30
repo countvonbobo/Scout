@@ -68,6 +68,7 @@ test('provider command timeout escalates and settles even when close never arriv
     child.killSignals.push(signal);
     return true;
   };
+  const processGroupSignals = [];
   const started = Date.now();
   const result = await runProviderCommand('synthetic-provider', ['--version'], {
     timeoutMs: 10,
@@ -75,10 +76,17 @@ test('provider command timeout escalates and settles even when close never arriv
     closeDeadlineMs: 40,
     spawn: () => child,
     platform: 'linux',
+    kill(pid, signal) {
+      processGroupSignals.push({ pid, signal });
+    },
   });
   assert.equal(result.timedOut, true);
   assert.equal(result.status, null);
-  assert.deepEqual(child.killSignals, ['SIGTERM', 'SIGKILL']);
+  assert.deepEqual(processGroupSignals, [
+    { pid: -4242, signal: 'SIGTERM' },
+    { pid: -4242, signal: 'SIGKILL' },
+  ]);
+  assert.deepEqual(child.killSignals, []);
   assert.ok(Date.now() - started < 500);
 });
 
