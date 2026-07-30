@@ -14,7 +14,7 @@ Every permitted client connects through Tailscale Serve to Scout on the VPS. Whe
 
 The response may say `savedLocally: true` and `syncQueued: true`: the durable VPS write has completed and the remote push is queued. **Settings -> Backup** shows `synced`, `offline`, or `needs attention` and the last successful time. Offline changes remain on the VPS and retry; Scout never force-pushes or silently resolves divergent histories.
 
-Remote pages remain readable when backup is disabled, but Beta 16 rejects remote state-changing requests until encrypted private backup is enabled. Backup connection, disablement, deploy-key generation, and recovery-key display are host-local administration operations. This prevents a phone session from silently creating unbacked canonical state or changing recovery ownership.
+Remote pages remain readable when backup is disabled, but Scout rejects remote state-changing requests until encrypted private backup is enabled. Backup connection, disablement, deploy-key generation, and recovery-key display are host-local administration operations. This prevents a phone session from silently creating unbacked canonical state or changing recovery ownership.
 
 ## Scope and exclusions
 

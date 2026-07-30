@@ -1896,3 +1896,72 @@ record that exact reconciliation SHA and CI run without rewriting history.
   - fresh staged installer/privacy audit including production dependencies:
     1,591 files, 0 findings;
   - `git diff --check`: passed.
+
+## Phase 6 — release provenance and external handoffs
+
+- Repository-side release provenance is complete at behavior commit
+  `06ae6529ceddf21f2fe02762adb78b6236171488`. Tagged packages are covered by
+  GitHub/Sigstore keyless attestations generated from `checksums.txt`, retained
+  as release evidence and verified with `gh attestation verify` before
+  publication.
+- The public verification guide distinguishes checksums, workflow identity and
+  native operating-system publisher signing. The final audit corrected its
+  macOS example to the actual `.dmg` artifact and records Developer ID
+  Application plus notarisation, not an inapplicable installer certificate.
+- Native Authenticode and Apple signing remain blocked on operator-controlled
+  publisher identities, credentials, protected environments, custody,
+  renewal/revocation policy and clean-machine validation. They are not claimed
+  as implemented.
+- The public remote-hosting contract and maintenance instructions are
+  verified. The private operator-context file and an authorised live host were
+  unavailable, so the private deployment record, live migration, rollback and
+  owner acceptance remain blocked rather than inferred.
+- PR #71 and dependency PRs #79–#81 were re-compared at final integrated
+  history. Their unique/superseded boundaries are recorded on GitHub; all stay
+  draft/open for the maintainer's decision.
+
+## Fresh final-product audit
+
+- The audit was performed from a clean dependency install and a new generated
+  release stage rather than reusing the earlier zero-finding verdict.
+- **Important — first-scan authority mismatch.** Reproduction: activate a
+  reviewed five-file proposal in a fresh workspace. Setup immediately started
+  provider work even though the runtime correctly required the newly staged
+  complete search profile to be explicitly published. A reload could also
+  close setup before surfacing that review. Root cause: the onboarding handoff
+  treated proposal readiness as scan authority and did not project published
+  profile state. RED browser/server/unit assertions proved the missing review
+  and readiness state. The repair removes auto-start, renders the complete
+  profile review in the first-scan step, disables the scan until publication,
+  resumes an unpublished fresh workspace there after reload and retains the
+  runtime's independent fail-closed check.
+- **Minor — release-signing guidance used the wrong macOS package and
+  credential.** RED release-documentation assertions reproduced the `.pkg`
+  example and Developer ID Installer wording. The guide now uses the actual
+  `.dmg` artifact and Developer ID Application/notarisation boundary.
+- **Minor — automation guidance omitted the implemented weekday-only
+  alternating preset.** RED documentation assertions reproduced the omission.
+  The guide now documents all five choices and the exact non-overlapping
+  Monday/Wednesday/Friday and Tuesday/Thursday split.
+- **Minor — current security and VPS guidance was stale.** RED documentation
+  assertions reproduced checksum-only integrity guidance and a needless
+  Beta 16 label on current remote-mutation behavior. The current security guide
+  now explains checksum plus attestation boundaries and the VPS guide uses
+  version-neutral active behavior.
+- Focused GREEN after these fixes: server 51/51; setup, documentation and
+  release workflow 47/47; the full first-run Chromium/Firefox file repeated
+  three times, 36/36; and the final explicit one-scan-start assertion repeated
+  three times per browser, 6/6.
+- Complete GREEN on the audit tree: clean `npm ci` found zero vulnerabilities;
+  `npm test` discovered 1,235 tests with 1,229 passes, 0 failures and 6
+  intentional platform skips; Chromium/Firefox discovered 172 browser tests
+  with 161 passes, 0 failures and 11 intentional browser/platform skips.
+- The tracked/build privacy audit passed for 553 files. A newly built actual
+  staged tree, including production dependencies, passed for 1,592 files with
+  a synthetic audit canary. A new public-source export passed its dedicated
+  audit. No actual personal marker was available, so operator-specific marker
+  acceptance remains explicitly unproved.
+- A stale ignored public-source build was deliberately rejected by the first
+  release-audit attempt. It was moved out of the worktree and all release
+  outputs were regenerated before the passing evidence above; no audit rule
+  was weakened.

@@ -118,7 +118,7 @@ Public/ATS sources work without Adzuna. Adzuna is optional and uses `ADZUNA_APP_
 
 ## 6. Run and review the first scan
 
-Scout starts the first supervised scan automatically when the required setup answers have been saved. Keep Scout open while it searches; setup and the dashboard show the current phase, elapsed time and an approximate remaining range. Use **Scan now** in the dashboard header for another scan. The command-line equivalent is:
+After you activate the reviewed five-file proposal, Scout shows the complete staged search profile in the first-scan step. Review its rules and unknown-value policies, publish it explicitly, then choose **Run first scan now**. Scout does not start provider work merely because setup answers were saved. Keep Scout open while it searches; setup and the dashboard show the current phase, elapsed time and an approximate remaining range. Use **Scan now** in the dashboard header for another scan. The command-line equivalent is:
 
 ```powershell
 & $ScoutNode $ScoutCli doctor

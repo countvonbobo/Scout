@@ -19,8 +19,8 @@ Windows and macOS packages remain operating-system unsigned. Windows SmartScreen
    **macOS**
 
    ```sh
-   shasum -a 256 Scout-<version>-macos-<architecture>.pkg
-   grep 'Scout-<version>-macos-<architecture>.pkg' checksums.txt
+   shasum -a 256 Scout-<version>-macos-<architecture>.dmg
+   grep 'Scout-<version>-macos-<architecture>.dmg' checksums.txt
    ```
 
    **Linux**
@@ -84,7 +84,7 @@ If the repository, workflow or GitHub identity is suspected to be compromised, d
 Attestation does not replace native package signing. Completing operating-system publisher identity requires operator-controlled credentials and policy that are deliberately absent from the public repository:
 
 - acquire an Authenticode code-signing certificate for the chosen Windows publisher identity, protect it in a release-only GitHub Environment, define approval and renewal procedures, and validate the signed installer on a clean Windows system;
-- enrol the chosen Apple publisher identity, provision Developer ID Installer/Application credentials and notarisation access in a release-only GitHub Environment, define approval and renewal procedures, and validate Gatekeeper assessment on a clean macOS system; and
+- enrol the chosen Apple publisher identity, provision Developer ID Application signing and notarisation credentials in a release-only GitHub Environment, define approval and renewal procedures, and validate Gatekeeper assessment on a clean macOS system; and
 - document the authorised legal/publisher identity, credential custodians, expiry monitoring, emergency revocation and replacement process before enabling either signing path.
 
 Until those decisions and credentials exist, releases must continue to say that Windows and macOS packages are unsigned and users should expect platform warnings.

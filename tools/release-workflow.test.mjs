@@ -53,6 +53,8 @@ test('release documentation defines checksum, keyless identity and platform-sign
   assert.match(supplyChain, /Authenticode/);
   assert.match(supplyChain, /Developer ID/);
   assert.match(supplyChain, /checksums? verify bytes.*not.*publisher identity/is);
+  assert.match(supplyChain, /Scout-<version>-macos-<architecture>\.dmg/);
+  assert.doesNotMatch(supplyChain, /Developer ID Installer/);
 });
 
 test('release workflow builds and smoke tests every supported platform', () => {

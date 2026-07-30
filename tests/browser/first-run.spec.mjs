@@ -174,3 +174,69 @@ test('the first-run restore form can be dismissed again', async ({ page }) => {
   await expect(dialog.getByRole('button', { name: 'Restore securely' })).toBeHidden();
   await expect(dialog.getByRole('button', { name: 'Restore existing workspace' })).toBeEnabled();
 });
+
+test('fresh onboarding publishes the reviewed search profile before offering the first scan', async ({ page }) => {
+  await stubSupportingRoutes(page);
+  let published = null;
+  let scanStarts = 0;
+  const draft = {
+    schemaVersion: 1,
+    status: 'draft',
+    id: 'draft-profile',
+    rules: [],
+    compensation: { minimum: null, currency: 'GBP', period: 'year', unknownPolicy: 'include' },
+    unknownPolicies: { location: 'include' },
+  };
+  await page.route('**/api/setup/status', async (route) => {
+    await route.fulfill({
+      contentType: 'application/json',
+      body: JSON.stringify({
+        ...createdStatus,
+        ready: true,
+        config: { ...createdStatus.config, ai: { ...createdStatus.config.ai, provider: 'codex' } },
+      }),
+    });
+  });
+  await page.route('**/api/search-profile/publish', async (route) => {
+    published = { ...draft, id: 'published-profile', status: 'published', publishedAt: '2026-07-30T12:00:00.000Z' };
+    await route.fulfill({
+      contentType: 'application/json',
+      body: JSON.stringify({ published }),
+    });
+  });
+  await page.route('**/api/search-profile', async (route) => {
+    await route.fulfill({
+      contentType: 'application/json',
+      body: JSON.stringify({ draft, published, draftRevision: 'draft-revision' }),
+    });
+  });
+  await page.route('**/api/search-profile/adaptive', async (route) => {
+    await route.fulfill({
+      contentType: 'application/json',
+      body: JSON.stringify({ questionnaire: { questions: [] }, lanePlan: null, laneRevision: null }),
+    });
+  });
+  await page.route('**/api/scan', async (route) => {
+    scanStarts += 1;
+    await route.fulfill({
+      status: 202,
+      contentType: 'application/json',
+      body: JSON.stringify({ operation: { id: 'scan-1', type: 'scan', status: 'queued' } }),
+    });
+  });
+
+  await page.goto('/');
+  const dialog = page.getByRole('dialog');
+  await expect(dialog.getByRole('heading', { name: 'Review your search profile' })).toBeVisible();
+  const run = dialog.getByRole('button', { name: 'Run first scan now' });
+  await expect(run).toBeDisabled();
+  expect(scanStarts).toBe(0);
+
+  await dialog.getByLabel('I reviewed this complete profile and want to publish it').check();
+  await dialog.getByRole('button', { name: 'Publish this reviewed profile' }).click();
+  await expect(run).toBeEnabled();
+  await expect(page.locator('#setup-status')).toContainText('Search profile published');
+  expect(scanStarts).toBe(0);
+  await run.click();
+  await expect.poll(() => scanStarts).toBe(1);
+});

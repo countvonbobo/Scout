@@ -191,8 +191,8 @@ export function handoffAction(ready) {
   return { label: ready ? 'Continue to first scan' : 'Activate a proposal to continue', defer: false, ready: Boolean(ready) };
 }
 
-export function shouldAutoRunFirstScan(scanHealth = {}, ready = true) {
-  return Boolean(ready && !scanHealth.lastRunAt);
+export function firstScanProfileReady(searchProfile, hasHistory = false) {
+  return Boolean(hasHistory || searchProfile?.published);
 }
 
 export function shouldRequestRecoveryKey(status = {}, pendingRecoveryKey = null) {
@@ -349,7 +349,7 @@ export function searchProfileReviewHtml(state = {}) {
   const compensationText = draft
     ? `${escapeProfileText(compensation.minimum == null ? 'No minimum' : `${compensation.currency || 'currency not set'} ${compensation.minimum} per ${compensation.period}`)}; unknown compensation facts: ${escapeProfileText(compensation.unknownPolicy || 'not configured')}.`
     : 'No compensation policy recorded.';
-  return `<section class="setup-callout" id="search-profile-review"><h3>Review your published search profile</h3>
+  return `<section class="setup-callout" id="search-profile-review"><h3>Review your search profile</h3>
     ${noDraft}
     <section><h4>Primary work</h4><p>${profileRuleText(draft, 'target', 'primaryTitles', null)}</p></section>
     <section><h4>Adjacent work</h4><p>${profileRuleText(draft, 'target', 'titles', null)}</p></section>
@@ -646,6 +646,11 @@ const Setup = {
         return;
       }
       if (!keepOpen && scanRunning && !this.status.setupComplete) {
+        this.resumeAt(6);
+        return;
+      }
+      if (!keepOpen && this.status.ready && !this.status.established
+        && !this.status.searchProfilePublished) {
         this.resumeAt(6);
         return;
       }
@@ -1015,6 +1020,14 @@ const Setup = {
     if (!this.searchProfile) void this.loadSearchProfileReview();
   },
 
+  renderSearchProfileContext() {
+    if (this.view === 'onboarding' && this.step === STEPS.length - 1) {
+      this.renderFirstScan();
+      return;
+    }
+    this.renderSearchSettings();
+  },
+
   async loadSearchProfileReview() {
     try {
       const [profile, adaptive] = await Promise.all([
@@ -1023,6 +1036,7 @@ const Setup = {
       ]);
       this.searchProfile = { ...profile, adaptive };
       if (this.view === 'section' && this.settingsSection === 'search') this.renderSearchSettings();
+      else if (this.view === 'onboarding' && this.step === STEPS.length - 1) this.renderFirstScan();
     } catch (error) {
       this.setMessage(error.message, 'error');
     }
@@ -1066,7 +1080,7 @@ const Setup = {
           questionnaire: result.questionnaire,
         },
       };
-      this.renderSearchSettings();
+      this.renderSearchProfileContext();
       this.setMessage('Selected structured search answers saved for complete review.', 'good');
     } catch (error) {
       this.setMessage(error.message, 'error');
@@ -1124,7 +1138,7 @@ const Setup = {
         lanePlan: result.lanePlan,
         laneRevision: result.laneRevision,
       };
-      this.renderSearchSettings();
+      this.renderSearchProfileContext();
       this.setMessage('Reviewed unproductive search lanes retired. They remain restorable.', 'good');
     } catch (error) {
       this.setMessage(error.message, 'error');
@@ -1146,7 +1160,7 @@ const Setup = {
         lanePlan: result.lanePlan,
         laneRevision: result.laneRevision,
       };
-      this.renderSearchSettings();
+      this.renderSearchProfileContext();
       this.setMessage('Search lane restored with its full history.', 'good');
     } catch (error) {
       this.setMessage(error.message, 'error');
@@ -1813,6 +1827,8 @@ const Setup = {
     const healthy = Boolean(health.lastRunAt && health.healthy);
     const configuredJobs = (this.status?.config?.schedule?.jobs || []).some((job) => job.enabled !== false);
     const hasHistory = Boolean(health.lastRunAt) || configuredJobs;
+    const freshOnboarding = this.view === 'onboarding' && !hasHistory;
+    const profileReady = firstScanProfileReady(this.searchProfile, hasHistory);
     const provider = this.status?.config?.ai?.provider;
     const primaryId = `${provider}-primary`;
     const primaryRun = (schedule.runs || []).find((run) => run.id === primaryId);
@@ -1840,9 +1856,16 @@ const Setup = {
       <div class="setup-conversation"><div class="setup-scout"><span class="setup-scout-frame" role="img" aria-label="Scout is ready to search"></span></div><div class="scout-bubble tail-left">
       <h2>${hasHistory ? 'Your first scan is ready to review' : 'Run your first search with me'}</h2>
       <p>I search using your approved role families and search lanes, then apply your locations, exclusions, compensation preferences and evidence-based scoring. I do not use unrelated AI conversations.</p>
+      ${freshOnboarding
+        ? this.searchProfile?.published
+          ? '<div class="setup-callout"><strong>Search profile published</strong><p>Your reviewed immutable profile and search lanes are ready for the supervised first scan.</p></div>'
+          : this.searchProfile
+            ? searchProfileReviewHtml(this.searchProfile)
+            : '<div class="setup-callout"><strong>Loading your search-profile draft…</strong><p>Scout must load and publish the complete reviewed profile before the first scan.</p></div>'
+        : ''}
       <div class="setup-callout"><strong>${hasHistory ? 'Supervised scan completed' : 'Supervised first scan'}</strong><p>${healthy ? `Last run: ${this.escape(formatLocalDateTime(health.lastRunAt, this.status?.config?.locale))}.` : 'A full source check can take several minutes and no application will be sent.'}</p>${outcome ? `<p><strong>${this.escape(outcome.headline)}</strong>${outcome.breakdown.length ? ` — ${this.escape(outcome.breakdown.join(', '))}` : ''}. Zero keepers can be a valid strict result.</p><p><a href="#reports" data-report-date="${this.escape(String(health.lastRunAt).slice(0, 10))}">Review the dated scan report</a></p>` : ''}</div>
       ${this.operationPanelHtml('scan')}
-      <p><button id="setup-run-scan" class="act primary" type="button" ${scanning ? 'disabled' : ''}>${scanning ? 'Scan running…' : hasHistory ? 'Scan now' : 'Run first scan now'}</button></p>
+      <p><button id="setup-run-scan" class="act primary" type="button" ${(scanning || !profileReady) ? 'disabled' : ''}>${scanning ? 'Scan running…' : hasHistory ? 'Scan now' : 'Run first scan now'}</button></p>
       <div class="setup-callout"><strong>Daily scan schedule</strong><p>Each provider job is independent. First-run setup only offers your selected provider.</p>
       ${scheduleRow(primaryId, provider, 'primary', primaryRun, '07:30')}
       ${this.view === 'section' && other && !showSecond ? '<p><button id="setup-add-verification" class="act" type="button">Add verification pass</button></p>' : ''}
@@ -1850,6 +1873,10 @@ const Setup = {
       </div></div>
       ${includeBackup ? this.backupPanelHtml() : ''}`;
     this.el('setup-run-scan').addEventListener('click', () => this.runSupervisedScan());
+    this.el('search-profile-adaptive-save')?.addEventListener('click', () => this.saveAdaptiveSearchAnswers());
+    this.el('search-profile-save')?.addEventListener('click', () => this.saveSearchProfileDraft());
+    this.el('search-profile-publish')?.addEventListener('click', () => this.publishSearchProfile());
+    if (freshOnboarding && !this.searchProfile) void this.loadSearchProfileReview();
     this.el('setup-add-verification')?.addEventListener('click', () => { this.showVerificationPass = true; this.renderFirstScan({ includeBackup }); });
     // A preset ticks the day boxes it stands for; editing the boxes directly
     // switches the preset to Custom so the two controls never disagree.
@@ -1882,6 +1909,12 @@ const Setup = {
   },
 
   async runSupervisedScan() {
+    const hasHistory = Boolean(this.status?.scanHealth?.lastRunAt)
+      || (this.status?.config?.schedule?.jobs || []).some((job) => job.enabled !== false);
+    if (this.view === 'onboarding' && !firstScanProfileReady(this.searchProfile, hasHistory)) {
+      this.setMessage('Review and publish the complete search profile before the first scan.', 'error');
+      return;
+    }
     this.setMessage('Starting the supervised scan…');
     try {
       const provider = this.status?.config?.ai?.provider;
@@ -2370,7 +2403,6 @@ const Setup = {
         if (!this.status?.ready) throw new Error('Generate, review and activate a complete proposal before the first scan.');
         this.step += 1;
         this.render();
-        if (shouldAutoRunFirstScan(this.status?.scanHealth, this.status?.ready)) setTimeout(() => this.runSupervisedScan(), 0);
         return;
       }
       if (this.step === STEPS.length - 1) {

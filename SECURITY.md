@@ -34,4 +34,6 @@ Keep the operating system and provider CLIs current, use a private encrypted bac
 
 ## Release integrity
 
-Published releases should include a SHA-256 checksum. The release pipeline must run the automated personal-data and secret audit described in [docs/RELEASE.md](docs/RELEASE.md). An unsigned beta may show a SmartScreen warning; a checksum confirms the file matches the release, not that it is trusted or vulnerability-free.
+Tagged releases produced by the current workflow include SHA-256 checksums and a GitHub/Sigstore keyless attestation covering each package digest. Verify both as described in [release package verification and signing](docs/SUPPLY_CHAIN_SECURITY.md). The release pipeline must also run the automated personal-data and secret audit described in [docs/RELEASE.md](docs/RELEASE.md).
+
+Windows and macOS beta packages remain operating-system unsigned, so SmartScreen or Gatekeeper may warn. A checksum detects changed bytes and an attestation binds those bytes to the Scout release workflow; neither proves that the package is trusted, vulnerability-free, or natively signed by an operating-system publisher.

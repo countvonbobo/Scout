@@ -192,3 +192,20 @@ test('configuration distinguishes field influence and published-profile authorit
   assert.match(configuration, /certainty.*exact.*range.*estimated.*unknown/is);
   assert.match(configuration, /selection\.breadth.*relevanceThreshold.*exploration/is);
 });
+
+test('automation documents both non-overlapping two-provider presets', () => {
+  const automation = fs.readFileSync(path.join(root, 'docs', 'AUTOMATION.md'), 'utf8');
+  assert.match(automation, /Alternating with the other provider/);
+  assert.match(automation, /Alternating weekdays \(no weekends\)/);
+  assert.match(automation, /primary.*Monday, Wednesday and Friday/is);
+  assert.match(automation, /verification.*Tuesday and Thursday/is);
+});
+
+test('current security and VPS guides describe the active release and remote-mutation contracts', () => {
+  const security = fs.readFileSync(path.join(root, 'SECURITY.md'), 'utf8');
+  const backup = fs.readFileSync(path.join(root, 'docs', 'VPS_BACKUP_AND_STATE.md'), 'utf8');
+  assert.match(security, /GitHub\/Sigstore.*attestation/is);
+  assert.match(security, /docs\/SUPPLY_CHAIN_SECURITY\.md/);
+  assert.doesNotMatch(backup, /\bBeta 16\b/);
+  assert.match(backup, /remote.*(?:mutation|state-changing request).*backup.*enabled/is);
+});

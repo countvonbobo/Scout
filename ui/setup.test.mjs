@@ -6,6 +6,7 @@ import {
   ALTERNATING_DAYS,
   buildConfig,
   bytesToBase64,
+  firstScanProfileReady,
   formatLocalDateTime,
   matchingPreset,
   presetDays,
@@ -14,7 +15,6 @@ import {
   operationRemaining,
   providerLoginPanelHtml,
   scanOutcomeSummary,
-  shouldAutoRunFirstScan,
   shouldRequestRecoveryKey,
   adaptiveQuestionnaireHtml,
   employerRegistryHtml,
@@ -355,10 +355,11 @@ test('bounded proposal activation gates the first scan', () => {
   assert.deepEqual(handoffAction(true), { label: 'Continue to first scan', defer: false, ready: true });
 });
 
-test('a first scan starts automatically only when the workspace has never scanned', () => {
-  assert.equal(shouldAutoRunFirstScan({}), true);
-  assert.equal(shouldAutoRunFirstScan({}, false), false);
-  assert.equal(shouldAutoRunFirstScan({ lastRunAt: '2026-07-12T10:00:00.000Z' }), false);
+test('a fresh first scan stays gated until its search profile is published', () => {
+  assert.equal(firstScanProfileReady(null), false);
+  assert.equal(firstScanProfileReady({ draft: {} }), false);
+  assert.equal(firstScanProfileReady({ published: { id: 'profile-1' } }), true);
+  assert.equal(firstScanProfileReady(null, true), true);
 });
 
 test('recovery keys are requested only from the Scout host', () => {

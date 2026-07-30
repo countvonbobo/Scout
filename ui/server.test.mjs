@@ -624,6 +624,7 @@ test('search-profile routes review a complete draft and publish only the current
   fs.writeFileSync(path.join(WORKSPACE_ROOT, '.scout', 'onboarding', 'activated.json'), '{"approved":true}\n', 'utf8');
   const setupStatus = await request({ method: 'GET', path: '/api/setup/status' });
   assert.equal(setupStatus.status, 200);
+  assert.equal(JSON.parse(setupStatus.text).searchProfilePublished, false);
   const migrated = await request({ method: 'GET', path: '/api/search-profile' });
   assert.equal(migrated.status, 200);
   assert.equal(JSON.parse(migrated.text).draft?.status, 'draft');
@@ -703,6 +704,9 @@ test('search-profile routes review a complete draft and publish only the current
     true,
   );
   assert.deepEqual(JSON.parse(fs.readFileSync(paths.searchProfilePublished, 'utf8')), result.published);
+  const publishedStatus = await request({ method: 'GET', path: '/api/setup/status' });
+  assert.equal(publishedStatus.status, 200);
+  assert.equal(JSON.parse(publishedStatus.text).searchProfilePublished, true);
   const lanePlan = JSON.parse(fs.readFileSync(paths.searchLanes, 'utf8'));
   assert.equal(lanePlan.profileId, result.published.id);
   assert.ok(lanePlan.lanes.some(({ profileFields }) => (
