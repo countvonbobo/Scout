@@ -275,6 +275,79 @@ test('staging copies only manifest content and bundled runtime', () => {
   assert.equal(audit.status, 0);
 });
 
+test('the real staged production dependency payload cannot bypass the privacy audit', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'scout-release-dependency-root-'));
+  const stageDir = fs.mkdtempSync(path.join(os.tmpdir(), 'scout-release-dependency-stage-'));
+  const runtimeDir = fs.mkdtempSync(path.join(os.tmpdir(), 'scout-release-dependency-runtime-'));
+  const nodeExecutable = path.join(runtimeDir, 'node');
+  const typstExecutable = path.join(runtimeDir, 'typst');
+  const marker = 'Synthetic Dependency Private Marker';
+  fs.writeFileSync(nodeExecutable, 'runtime');
+  fs.writeFileSync(typstExecutable, 'typst-runtime');
+
+  for (const entry of RELEASE_FILES) {
+    const target = path.join(root, entry.source);
+    if (entry.tree) {
+      fs.mkdirSync(target, { recursive: true });
+      fs.writeFileSync(path.join(target, 'runtime.mjs'), 'ok');
+      if (entry.source === 'templates') {
+        fs.mkdirSync(path.join(target, 'workspace'), { recursive: true });
+        fs.writeFileSync(path.join(target, 'workspace', 'workspace.json'), '{}');
+      }
+      continue;
+    }
+    fs.mkdirSync(path.dirname(target), { recursive: true });
+    const content = entry.source === 'package.json'
+      ? '{"version":"1.0.0","dependencies":{"selected-package":"1.0.0"}}'
+      : entry.source === 'package-lock.json'
+      ? '{"lockfileVersion":3,"packages":{"":{"dependencies":{"selected-package":"1.0.0"}},"node_modules/selected-package":{"version":"1.0.0"}}}'
+      : 'ok';
+    fs.writeFileSync(target, content);
+  }
+
+  const dependency = path.join(root, 'node_modules', 'selected-package');
+  fs.mkdirSync(path.join(dependency, 'nested'), { recursive: true });
+  fs.writeFileSync(path.join(dependency, 'index.js'), 'export default true;\n');
+  fs.writeFileSync(path.join(dependency, 'private.json'), JSON.stringify({
+    prompt: 'Synthetic private provider prompt.',
+  }));
+  fs.writeFileSync(path.join(dependency, 'private.txt'), `${marker}\n`);
+  fs.writeFileSync(
+    path.join(dependency, 'nested', 'runtime-state.jsonl'),
+    `${JSON.stringify({ events: [{ stage: 'synthetic-private-stage' }] })}\n`,
+  );
+
+  const staged = stageRelease({
+    root,
+    stageDir,
+    nodeExecutable,
+    typstExecutable,
+    platform: process.platform,
+  });
+  assert.equal(
+    fs.existsSync(path.join(staged.appDir, 'node_modules', 'selected-package', 'private.json')),
+    true,
+  );
+  assert.equal(
+    fs.existsSync(path.join(staged.appDir, 'node_modules', 'selected-package', 'private.txt')),
+    true,
+  );
+  assert.equal(
+    fs.existsSync(path.join(
+      staged.appDir,
+      'node_modules',
+      'selected-package',
+      'nested',
+      'runtime-state.jsonl',
+    )),
+    true,
+  );
+  assert.throws(
+    () => auditPublicSourceStage({ root: ROOT, stageDir, markers: marker }),
+    /public source privacy audit failed/,
+  );
+});
+
 test('checksums use SHA-256 and do not hash the manifest into itself', () => {
   const output = fs.mkdtempSync(path.join(os.tmpdir(), 'scout-release-output-'));
   const artifact = path.join(output, 'Scout.exe');

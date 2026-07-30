@@ -516,6 +516,65 @@ test('stage mode scans an exported tree without requiring Git metadata', () => {
   assert.match(writes.join(''), /Release audit passed/);
 });
 
+test('stage mode audits installed dependency JSON, text, log and runtime payloads', () => {
+  const root = fixture();
+  const marker = 'Synthetic Dependency Private Marker';
+  fs.mkdirSync(path.join(root, 'app', 'node_modules', 'selected-package', '.scout'), {
+    recursive: true,
+  });
+  fs.writeFileSync(path.join(root, 'app', 'README.md'), '# Scout\n');
+  fs.writeFileSync(
+    path.join(root, 'app', 'node_modules', 'selected-package', 'private.json'),
+    JSON.stringify({ prompt: 'Synthetic private provider prompt.' }),
+  );
+  fs.writeFileSync(
+    path.join(root, 'app', 'node_modules', 'selected-package', 'private.txt'),
+    `${marker}\n`,
+  );
+  fs.writeFileSync(
+    path.join(root, 'app', 'node_modules', 'selected-package', 'provider.log'),
+    'provider_transcript: synthetic-private-provider-output\n',
+  );
+  fs.writeFileSync(
+    path.join(root, 'app', 'node_modules', 'selected-package', '.scout', 'run-state.jsonl'),
+    `${JSON.stringify({ events: [{ stage: 'synthetic-private-stage' }] })}\n`,
+  );
+
+  const sourceAudit = auditRelease({
+    root,
+    trackedFiles: ['app/README.md'],
+    buildDirs: ['app/node_modules'],
+    markers: [marker],
+  });
+  assert.equal(sourceAudit.ok, true);
+  assert.equal(sourceAudit.filesScanned, 1);
+
+  const writes = [];
+  const originalWrite = process.stdout.write;
+  const originalExitCode = process.exitCode;
+  process.stdout.write = (value) => { writes.push(String(value)); return true; };
+  try {
+    const stagedAudit = main(['--root', root, '--stage'], {
+      SCOUT_RELEASE_MARKERS: marker,
+    });
+    assert.equal(stagedAudit.ok, false);
+    assert.equal(stagedAudit.filesScanned, 5);
+    assert.deepEqual(
+      stagedAudit.findings.map(({ file, rule }) => [file, rule]),
+      [
+        ['app/node_modules/selected-package/.scout/run-state.jsonl', 'raw-run-state'],
+        ['app/node_modules/selected-package/private.json', 'full-prompt'],
+        ['app/node_modules/selected-package/private.txt', 'personal-marker-1'],
+        ['app/node_modules/selected-package/provider.log', 'provider-transcript'],
+      ],
+    );
+  } finally {
+    process.stdout.write = originalWrite;
+    process.exitCode = originalExitCode;
+  }
+  assert.match(writes.join(''), /Release audit failed with 4 finding/);
+});
+
 test('ranked discovery production sources stay neutral and release bundles omit raw observation caches', () => {
   const productionText = RANKED_DISCOVERY_SOURCES
     .map((relative) => fs.readFileSync(path.join(ROOT, relative), 'utf8')).join('\n');

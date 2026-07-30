@@ -250,7 +250,22 @@ function serializedByContent(text, relative) {
   }
 }
 
-function scanText(text, markers, relative = '') {
+function dependencyArtifact(relative) {
+  return String(relative).split(/[\\/]+/).some((part) =>
+    part.toLocaleLowerCase('en-US') === 'node_modules');
+}
+
+function dependencyDataArtifact(relative) {
+  const base = path.posix.basename(String(relative).replaceAll('\\', '/'))
+    .toLocaleLowerCase('en-US');
+  // Installed vendor code, documentation and source maps contain example
+  // field names and paths. Every dependency file still receives marker and
+  // concrete-token checks; state-shaped heuristics apply to data payloads,
+  // excluding the package metadata selected by the reviewed lockfile.
+  return base !== 'package.json' && SERIALIZED_EXTENSIONS.test(base);
+}
+
+function scanText(text, markers, relative = '', { dependency = false } = {}) {
   const findings = [];
   const lower = text.toLocaleLowerCase('en-US');
   for (let markerIndex = 0; markerIndex < markers.length; markerIndex += 1) {
@@ -269,6 +284,7 @@ function scanText(text, markers, relative = '') {
       if (match[0].length === 0) regex.lastIndex += 1;
     }
   }
+  if (dependency && !dependencyDataArtifact(relative)) return findings;
   findings.push(...secretAssignmentFindings(text));
   if (serializedByContent(text, relative)) findings.push(...serializedPrivacyFindings(text));
   let pathText = text.replaceAll('\\\\', '\\');
@@ -321,7 +337,7 @@ function binaryContent(content) {
   return sample.length > 0 && controls / sample.length > 0.01;
 }
 
-function filesUnder(directory) {
+function filesUnder(directory, { includeDependencies = false } = {}) {
   if (!fs.existsSync(directory)) return [];
   const result = [];
   const visit = (entry) => {
@@ -331,7 +347,12 @@ function filesUnder(directory) {
       result.push(entry);
       return;
     }
-    if (!stat.isDirectory() || IGNORED_DIRECTORY_NAMES.has(path.basename(entry))) return;
+    if (!stat.isDirectory()) return;
+    const name = path.basename(entry);
+    if (
+      IGNORED_DIRECTORY_NAMES.has(name)
+      && (name !== 'node_modules' || !includeDependencies)
+    ) return;
     for (const name of fs.readdirSync(entry).sort()) visit(path.join(entry, name));
   };
   visit(directory);
@@ -409,7 +430,9 @@ export function auditRelease({
     }
     const text = content.toString('utf8');
     findings.push(...pathFindings.map((finding) => ({ file: publicFile, ...finding })));
-    for (const finding of scanText(text, markers, relative)) {
+    for (const finding of scanText(text, markers, relative, {
+      dependency: dependencyArtifact(relative),
+    })) {
       findings.push({ file: publicFile, ...finding });
     }
   }
@@ -433,7 +456,8 @@ export function main(argv = process.argv.slice(2), env = process.env) {
   const explicitBuildDirs = valuesAfter('--build', argv);
   const stagedTree = argv.includes('--stage');
   const stagedFiles = stagedTree
-    ? filesUnder(root).map((file) => normaliseRelative(root, file))
+    ? filesUnder(root, { includeDependencies: true })
+      .map((file) => normaliseRelative(root, file))
     : undefined;
   const result = auditRelease({
     root,
