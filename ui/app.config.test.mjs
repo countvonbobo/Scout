@@ -38,13 +38,38 @@ test('custom CV recommendations are preselected but remain optional', () => {
   assert.match(html, /app\.js\?v=__SCOUT_UI_BUILD__/);
 });
 
-test('strict CSP-compatible UI markup uses delegated actions instead of inline handlers', () => {
+test('strict CSP-compatible UI markup uses delegated actions instead of inline handlers', async () => {
   const source = fs.readFileSync(new URL('./app.js', import.meta.url), 'utf8');
   const html = fs.readFileSync(new URL('./index.html', import.meta.url), 'utf8');
+  const workerListeners = new Map();
+  const openedCaches = [];
+  const workerSource = fs.readFileSync(new URL('./service-worker.js', import.meta.url), 'utf8')
+    .replace('__SCOUT_UI_BUILD__', 'csp-contract-build');
+  vm.runInNewContext(workerSource, {
+    URL,
+    caches: {
+      open(name) {
+        openedCaches.push(name);
+        return Promise.resolve({ addAll: async () => {} });
+      },
+    },
+    self: {
+      addEventListener(type, listener) { workerListeners.set(type, listener); },
+      clients: { claim() {} },
+      location: { origin: 'https://scout.test' },
+      skipWaiting() {},
+    },
+  }, { filename: 'ui/service-worker.js' });
+  let install;
+  workerListeners.get('install')({
+    waitUntil(promise) { install = promise; },
+  });
+  await install;
+
   assert.doesNotMatch(source, /\son(?:click|change|input|keydown|submit)\s*=/i);
   assert.doesNotMatch(html, /\son(?:click|change|input|keydown|submit)\s*=/i);
   assert.match(html, /app\.js\?v=__SCOUT_UI_BUILD__/);
-  assert.match(fs.readFileSync(new URL('./service-worker.js', import.meta.url), 'utf8'), /scout-shell-\$\{BUILD\}/);
+  assert.deepEqual(openedCaches, ['scout-shell-csp-contract-build']);
   assert.match(source, /data-action="open-entry"/);
   assert.match(source, /\.card\[data-id\]/);
   assert.match(source, /bindDelegatedActions/);

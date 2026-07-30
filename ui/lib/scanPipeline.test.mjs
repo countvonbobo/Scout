@@ -629,6 +629,42 @@ function durableStageHarness(calls) {
   }]));
 }
 
+test('committed durable stage boundaries let the existing heartbeat run between synchronous stages', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'scout-stage-boundary-heartbeat-'));
+  let now = Date.parse('2026-07-30T08:00:00.000Z');
+  const calls = new Map();
+  const baseStages = durableStageHarness(calls);
+  const stages = Object.fromEntries(DURABLE_STAGES.map((stageId) => [stageId, async (context) => {
+    now += 20;
+    return baseStages[stageId](context);
+  }]));
+  try {
+    const result = await runScanPipeline({
+      root,
+      compatibility: RECOVERY_COMPATIBILITY,
+      stages,
+      leaseOptions: {
+        wallNow: () => now,
+        monotonicNow: () => now,
+        leaseDurationMs: 50,
+        takeoverMarginMs: 0,
+      },
+      heartbeatOptions: {
+        intervalMs: 10,
+        wallNow: () => now,
+        monotonicNow: () => now,
+        setTimeoutFn(callback) { return setImmediate(callback); },
+        clearTimeoutFn(timer) { clearImmediate(timer); },
+      },
+    });
+
+    assert.equal(result.outcome, 'complete', JSON.stringify(result.failures));
+    assert.deepEqual([...calls.keys()], DURABLE_STAGES);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test('durable scan finalisation assesses real candidates in recoverable batches with partial repair', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'scout-real-assessment-batches-'));
   const candidates = Array.from({ length: 12 }, (_, index) => ({

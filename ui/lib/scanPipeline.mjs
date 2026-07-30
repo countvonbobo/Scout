@@ -732,6 +732,11 @@ export async function runScanPipeline({
         priorArtifact = value;
         outputs.set(stageId, value);
         await onStageCommitted({ stageId, run, lease, artifact, manifest });
+        // Stage execution, privacy projection and artifact validation are
+        // intentionally synchronous. Yield only after the artifact and event
+        // are durable so the existing timer heartbeat can renew its genuine
+        // fence between individually bounded stages.
+        await new Promise((resolve) => setImmediate(resolve));
       }
       if (finalize !== null) {
         if (typeof finalize !== 'function') throw new TypeError('scan pipeline finalizer must be a function');
