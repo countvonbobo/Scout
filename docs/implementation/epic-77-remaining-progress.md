@@ -1033,3 +1033,58 @@ not acceptance of `d5ebca2`.
   lifecycle tests, and the regression asserts exact `-pid`, `SIGTERM`,
   `SIGKILL` calls without signalling a real process. Ten consecutive focused
   runs pass; another replacement all-seven CI run remains required.
+
+## 2026-07-30 PR #82 review checkpoint 5
+
+- Important 7's final replacement CI run
+  [30534610810](https://github.com/oliver-hitchings/Scout/actions/runs/30534610810)
+  passed all seven required jobs at exact pushed head
+  `0285fd26aca1899a0b7b8c6fac203a844f8c7b10`: four Node/audit jobs and
+  three browser-acceptance jobs.
+- Important 8 is implemented in three focused commits:
+  - `4458c184202dabfdfac63428789e4a845c14f3d6` repairs production recovery
+    candidate selection for a journal with a valid hash-checked prefix and a
+    torn final append. The RED regression showed the candidate was rejected
+    before fenced recovery could quarantine the incomplete tail. Empty or
+    wholly invalid journals still fail closed, while a valid prefix now reaches
+    the existing recovery/quarantine boundary.
+  - `5452ad8189e4983971516334c44a0aecf07acf82` closes and destroys the
+    heartbeat-owner fixture's stdin after its explicit stop signal. This
+    preserves the real cross-process heartbeat/takeover assertion while
+    preventing a completed child from retaining an input handle under the
+    concurrent full suite.
+  - `2db30f304c168e66d64c34ab184d9b024164557e` replaces fixture-only Gate 5
+    confidence with production-interface fault injection.
+- The production fault matrix now exercises every durable discovery boundary;
+  initial assessment, focused repair, per-job retry, exhaustion and completed
+  work reuse; stale assessment fencing; tracker/report mutation faults before,
+  during and after replacement; ambiguous mutation state; backup/mutation
+  exclusion; simultaneous leases, heartbeat/takeover, owner death and boot
+  identity; torn and invalid-hash journals; manifest rebuild; queue
+  deduplication, expiry, supersession, orphan recovery and automatic handoff;
+  reviewed archive cleanup, interrupted cleanup and queue compaction; storage
+  pressure, backup, tamper rejection and one-way legacy migration.
+- Valid run state is created through the durable pipeline and read through the
+  real `/api/scan/runs` route and production UI. The #72–#76 browser
+  composition uses the production route consumers and separately verifies the
+  real bounded device-local Codex capability route before exercising the
+  composed UI states.
+- Verification for Important 8:
+  - exact cross-process heartbeat regression: 10 consecutive passes;
+  - source release audit: 519 files, passed;
+  - combined lease, queue and durable pipeline suites: 153 discovered, 152
+    passed and 1 documented Windows-only skip;
+  - real Chromium Gate 5 matrix: 14 passed;
+  - complete `npm test`: 1,128 discovered, 1,122 passed, 0 failed and 6
+    documented platform skips;
+  - complete cross-browser acceptance: 168 discovered, 157 passed, 0 failed
+    and 11 intentional Chromium-only skips;
+  - fresh stage construction and staged release audit: 182 files, passed;
+  - `git diff --check`: passed.
+- Still open from review `4812913188`: Important 9–12 and Minor 3. Important
+  12 remains a rolling ledger repair and requires another update at the final
+  exact pushed head.
+- Exact next action: normally push this checkpoint, update draft PR #82,
+  require all seven CI jobs to pass, then implement Important 9 by injecting
+  nested ignored private files into the real release-stage boundary and
+  proving the combined stage-plus-audit gate fails closed.
