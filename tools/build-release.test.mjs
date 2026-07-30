@@ -58,6 +58,7 @@ test('release manifest is allowlisted and excludes private workspace roots', () 
   assert.ok(sources.includes('docs/releases'));
   assert.ok(sources.includes('docs/diagnostics'));
   assert.ok(sources.includes('docs/RELEASE.md'));
+  assert.ok(sources.includes('docs/SUPPLY_CHAIN_SECURITY.md'));
   assert.ok(sources.includes('tools/remote-hosting-preflight.mjs'));
   assert.ok(!sources.includes('docs/CODEX_HANDOFF.md'));
   assert.ok(!sources.includes('docs/PLAN.md'));

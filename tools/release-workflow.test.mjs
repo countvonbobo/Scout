@@ -10,6 +10,7 @@ const workflow = fs.readFileSync(new URL('../.github/workflows/windows-release.y
 const ci = fs.readFileSync(new URL('../.github/workflows/ci.yml', import.meta.url), 'utf8');
 const workspaceRepair = fs.readFileSync(new URL('../.github/workflows/vps-workspace-repair.yml', import.meta.url), 'utf8');
 const deploy = fs.readFileSync(new URL('./deploy-vps.sh', import.meta.url), 'utf8');
+const supplyChain = fs.readFileSync(new URL('../docs/SUPPLY_CHAIN_SECURITY.md', import.meta.url), 'utf8');
 
 test('tagged release workflow validates version and requires private markers', () => {
   assert.match(workflow, /Tag does not match package version/);
@@ -29,6 +30,29 @@ test('release publication has scoped write permission and publishes checksum', (
   assert.match(workflow, /checksums\.txt/);
   const globalWrite = workflow.match(/^permissions:\s*\n\s*contents: write/m);
   assert.equal(globalWrite, null);
+});
+
+test('tagged releases keylessly attest and verify every checksum subject before publication', () => {
+  assert.match(workflow, /publish:[\s\S]*permissions:[\s\S]*id-token: write/);
+  assert.match(workflow, /publish:[\s\S]*permissions:[\s\S]*attestations: write/);
+  assert.match(workflow, /uses: actions\/attest@v4[\s\S]*subject-checksums: release-assets\/checksums\.txt/);
+  assert.match(workflow, /steps\.attest\.outputs\.bundle-path/);
+  assert.match(workflow, /checksums\.intoto\.jsonl/);
+  assert.match(workflow, /gh attestation verify/);
+  assert.doesNotMatch(workflow, /COSIGN_(?:PRIVATE_KEY|PASSWORD)/);
+});
+
+test('release documentation defines checksum, keyless identity and platform-signing boundaries', () => {
+  assert.match(supplyChain, /checksums\.intoto\.jsonl/);
+  assert.match(supplyChain, /gh attestation verify/);
+  assert.match(supplyChain, /--custom-trusted-root/);
+  assert.match(supplyChain, /GitHub OIDC/);
+  assert.match(supplyChain, /no long-lived (?:project )?signing key/i);
+  assert.match(supplyChain, /rotation/i);
+  assert.match(supplyChain, /revocation|compromised release/i);
+  assert.match(supplyChain, /Authenticode/);
+  assert.match(supplyChain, /Developer ID/);
+  assert.match(supplyChain, /checksums? verify bytes.*not.*publisher identity/is);
 });
 
 test('release workflow builds and smoke tests every supported platform', () => {

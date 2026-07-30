@@ -40,7 +40,8 @@ Read [CONTRIBUTING.md](../CONTRIBUTING.md), then use:
 - [repository layout](REPOSITORY_LAYOUT.md) for public/private data boundaries;
 - [operations context](OPERATIONS.md) for the maintained VPS topology and change path;
 - [scan protocol](SCOUT_SCAN_PROTOCOL.md) for scan behaviour;
-- [release process](RELEASE.md) for packaging and publishing; and
+- [release process](RELEASE.md) for packaging and publishing;
+- [release package verification and signing](SUPPLY_CHAIN_SECURITY.md) for checksums, attestations and platform-signing boundaries; and
 - [documentation maintenance](DOCUMENTATION.md) whenever a change affects users, setup, operations, security, or support.
 
 Historical release notes live in [`docs/releases`](releases/). They describe a release as it was and are not current setup instructions.

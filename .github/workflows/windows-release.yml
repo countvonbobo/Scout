@@ -227,12 +227,34 @@ jobs:
     runs-on: ubuntu-22.04
     permissions:
       contents: write
+      id-token: write
+      attestations: write
     steps:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with: { path: release-assets, merge-multiple: true }
       - name: Create combined checksums
         run: cd release-assets && sha256sum Scout-* > checksums.txt
+      - name: Attest every release package from the checksum manifest
+        id: attest
+        uses: actions/attest@v4
+        with:
+          subject-checksums: release-assets/checksums.txt
+      - name: Preserve and verify the keyless attestation bundle
+        env:
+          ATTESTATION_BUNDLE: ${{ steps.attest.outputs.bundle-path }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          (cd release-assets && sha256sum --check checksums.txt)
+          cp "$ATTESTATION_BUNDLE" release-assets/checksums.intoto.jsonl
+          while read -r digest asset; do
+            test -n "$digest"
+            test -f "release-assets/$asset"
+            gh attestation verify "release-assets/$asset" \
+              --repo "$GITHUB_REPOSITORY" \
+              --bundle release-assets/checksums.intoto.jsonl
+          done < release-assets/checksums.txt
       - name: Publish prerelease
         env: { GH_TOKEN: "${{ github.token }}" }
         run: |

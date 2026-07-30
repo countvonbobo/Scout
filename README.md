@@ -10,7 +10,7 @@ Scout never submits an application or sends outreach. Your CV, profile, tracker,
 
 ## Status
 
-Scout `0.1.x` is a cross-platform public beta. Windows SmartScreen and macOS Gatekeeper may warn because packages are unsigned. Verify the SHA-256 checksum published with every release. See [Known issues](docs/KNOWN_ISSUES.md) for confirmed current limitations.
+Scout `0.1.x` is a cross-platform public beta. Windows SmartScreen and macOS Gatekeeper may warn because packages are unsigned. Verify the SHA-256 checksum and, when supplied, the GitHub artifact attestation published with the release; see [release package verification](docs/SUPPLY_CHAIN_SECURITY.md). See [Known issues](docs/KNOWN_ISSUES.md) for confirmed current limitations.
 
 ## What Scout does
 

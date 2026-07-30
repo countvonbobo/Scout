@@ -29,7 +29,7 @@ Release only from this clean-history public application repository. Never copy c
    `installer/output/`. The current installer creates UI shortcuts but does not
    add the CLI to `PATH`.
 7. Test on clean Windows, macOS and Ubuntu runners: install; first launch; provider detection; supervised/scheduled scans; missed-run/overlap/timeout; upgrade; and uninstall preserving the workspace.
-8. Tag the reviewed commit with the exact package version prefixed by `v`. The cross-platform workflow builds all packages, runs native smoke tests and required-marker audits, deploys and health-checks the exact tag on the approved private Beta VPS, then publishes one checksum manifest and the release notes. A failed or unapproved VPS deployment prevents publication.
+8. Tag the reviewed commit with the exact package version prefixed by `v`. The cross-platform workflow builds all packages, runs native smoke tests and required-marker audits, deploys and health-checks the exact tag on the approved private Beta VPS, then publishes one checksum manifest, a keyless GitHub/Sigstore attestation bundle covering every package digest, and the release notes. A failed or unapproved VPS deployment prevents publication. Follow [release package verification and signing](SUPPLY_CHAIN_SECURITY.md) for the ownership, verification, rotation, incident and remaining platform-signing contract.
 
 ### Release tags are immutable
 
@@ -62,4 +62,4 @@ The release audit detects configured personal markers and likely secret assignme
 
 Use semantic application versions and explicit workspace `schemaVersion`. Release notes must identify migrations, privacy/network changes, provider/source changes and manual actions. Retain the previous installer and checksums for rollback, but never publish a private workspace or its backups.
 
-Beta packages remain unsigned until a certificate and secure signing pipeline exist. Checksums verify bytes only; they do not provide publisher identity.
+Windows and macOS beta packages remain operating-system unsigned until operator-controlled publisher credentials and policy exist. Checksums verify bytes only; the tagged-release workflow's keyless GitHub/Sigstore attestations separately bind package digests to this repository and workflow. See [release package verification and signing](SUPPLY_CHAIN_SECURITY.md).
