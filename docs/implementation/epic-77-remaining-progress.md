@@ -1088,3 +1088,57 @@ not acceptance of `d5ebca2`.
   require all seven CI jobs to pass, then implement Important 9 by injecting
   nested ignored private files into the real release-stage boundary and
   proving the combined stage-plus-audit gate fails closed.
+
+## 2026-07-30 PR #82 review checkpoint 6
+
+- Important 8 CI run
+  [30535714483](https://github.com/oliver-hitchings/Scout/actions/runs/30535714483)
+  passed all seven required jobs at exact pushed head
+  `c2783a1d304ea2df59822d02c032eae758458739`.
+- Full-suite verification exposed a separate readiness-publication race in the
+  cross-process heartbeat fixture. Under sufficient load the parent could see
+  the ready pathname after creation but before its JSON content was visible,
+  then throw before entering child cleanup. Commit
+  `c81bf595a58375b786f11924929569fff7b71fc2` publishes that synthetic
+  readiness document through a same-directory atomic rename and moves
+  readiness parsing under unconditional cleanup. The lease duration, takeover
+  margin and liveness assertions are unchanged.
+- Important 9 is implemented in
+  `b59e81a1cbf72fba72573750f69ecbee336acd23` and
+  `95270fe200171f19b76ac88b86e81117d28fa2bf`. The RED tests placed
+  case-variant nested `.env`, `workspace.json`, log, temporary and backup
+  files inside real public-source and installer staging trees; both boundaries
+  copied them, and the unit policy admitted them.
+- A shared case-insensitive copied-tree predicate now excludes those private
+  artifact classes from release trees, public-source trees and the production
+  dependency copy. Public-source tree copies no longer bypass the predicate.
+  The synthetic stage contains a configured private marker in each adversarial
+  file and proves the combined stage-plus-real-audit gate remains green only
+  because none of those inputs reaches the staged tree.
+- The first real stage after that repair correctly caught an over-broad
+  `workspace.json` rule: it removed Scout's required generic
+  `templates/workspace/workspace.json`. The follow-up gives copy filters their
+  source-root context and permits only that exact reviewed public template;
+  arbitrary nested workspace configuration remains excluded. The real stage
+  returned to 182 files, retains the template and passes its privacy audit.
+- Verification for Important 9:
+  - RED staging/policy regressions: 3 failed for the private-file leak, then 4
+    failed for required-template preservation;
+  - focused GREEN staging/policy regressions: 4 passed;
+  - release staging, privacy-audit and documentation suites: 42 passed;
+  - heartbeat regression: 20 consecutive passes;
+  - complete lease suite: 62 discovered, 61 passed and 1 Windows-only skip;
+  - complete `npm test` after the readiness repair and primary staging fix:
+    1,128 discovered, 1,122 passed, 0 failed and 6 platform skips;
+  - real public-source stage with configured synthetic marker: passed;
+  - fresh release stage: 182 files, required workspace template present and
+    staged privacy audit passed;
+  - `git diff --check`: passed.
+- Still open from review `4812913188`: Important 10–12 and Minor 3. Important
+  12 remains a rolling ledger repair and requires another update at the final
+  exact pushed head.
+- Exact next action: normally push this checkpoint, update draft PR #82,
+  require all seven CI jobs to pass, then implement Important 10 by making the
+  stage-mode privacy audit inspect the actual selected production dependency
+  payload and proving extra private JSON, text, log and runtime files inside a
+  selected package are detected.
