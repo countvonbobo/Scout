@@ -9,6 +9,7 @@ import {
   classifyProviderHealth,
   providerPreflight as providerPreflightWithAuthority,
   readProviderHealth,
+  recordProviderResultHealth,
   recordProviderHealth as recordProviderHealthWithAuthority,
 } from './providerHealth.mjs';
 import {
@@ -334,6 +335,53 @@ test('busy provider-health authority fails closed without erasing durable eviden
     /authority is busy/i,
   );
   assert.deepEqual(readProviderHealth(root, 'codex'), before);
+});
+
+test('settled provider results retry only the bounded health transition and preserve remote-auth authority', async (t) => {
+  const root = temp(t);
+  let acquisitions = 0;
+  const delays = [];
+  const authority = immediateLeaseAuthority({
+    acquire() {
+      acquisitions += 1;
+      return acquisitions < 3 ? null : {};
+    },
+  });
+  const rawFailure = {
+    ok: false,
+    status: 401,
+    error: `Unauthorized for person@example.test ${['token', 'private-secret'].join('=')}`,
+  };
+
+  const recorded = await recordProviderResultHealth(root, 'codex', rawFailure, {
+    purpose: 'manual-run',
+    _leaseAuthority: authority,
+    _retryDelaysMs: [0, 5, 10],
+    _sleep: async (milliseconds) => { delays.push(milliseconds); },
+  });
+
+  assert.equal(acquisitions, 3);
+  assert.deepEqual(delays, [5, 10]);
+  assert.equal(recorded.state, 'sign-in-required');
+  assert.equal(recorded.remoteAuthBarrier, true);
+  assert.doesNotMatch(fs.readFileSync(healthFile(root), 'utf8'), /person@|token|private-secret/i);
+
+  const local = recordProviderHealth(
+    root,
+    'codex',
+    signal('local-credentials-present', 1, 'post-auth'),
+    { purpose: 'post-auth' },
+  );
+  assert.equal(local.state, 'sign-in-required');
+  assert.equal(local.remoteAuthBarrier, true);
+
+  const success = await recordProviderResultHealth(root, 'codex', { ok: true }, {
+    purpose: 'manual-run',
+    _leaseAuthority: immediateLeaseAuthority(),
+    _retryDelaysMs: [0],
+  });
+  assert.equal(success.state, 'ready');
+  assert.equal(success.remoteAuthBarrier, false);
 });
 
 test('provider-health authority serializes unfenced updates around the latest durable state', (t) => {

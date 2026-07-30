@@ -18,6 +18,7 @@ import {
 import { loadWorkspaceConfig, modelForProvider } from './workspace.mjs';
 import { detectProviderModelCataloguesAsync, providerStatus } from './providers.mjs';
 import { runStructuredTurn } from './structuredTurn.mjs';
+import { recordProviderResultHealth } from './providerHealth.mjs';
 import {
   interviewPrepAgentPrompt, interviewPrepPrefills, readInterviewPrep,
 } from './interviewPrep.mjs';
@@ -123,7 +124,8 @@ function stopTurnOnDisconnect(req, res, id) {
 export function registerChatRoutes({
   routes, repoRoot, readTracker, runTurnFn = runTurn, saveChatFn = saveChat, providerStatusFn = providerStatus,
   providerCataloguesFn = detectProviderModelCataloguesAsync,
-  runCvQualityFn = runCvQuality, runStructuredTurnFn = runStructuredTurn, onCheckpoint = () => {},
+  runCvQualityFn = runCvQuality, runStructuredTurnFn = runStructuredTurn,
+  recordProviderResultHealthFn = recordProviderResultHealth, onCheckpoint = () => {},
 }) {
   const catalogueReasonCodes = new Set([
     'catalogue-check-failed',
@@ -148,6 +150,14 @@ export function registerChatRoutes({
     while (values.size > 100) values.delete(values.values().next().value);
   };
   function checkpoint(reason) { Promise.resolve(onCheckpoint(reason)).catch(() => {}); }
+  async function observeProviderResult(provider, result) {
+    try {
+      await recordProviderResultHealthFn(repoRoot, provider, result, { purpose: 'manual-run' });
+    } catch {
+      // The provider result remains authoritative. A health-authority failure
+      // must never turn a completed operation into an invitation to resend it.
+    }
+  }
   // A conversation may pin its own model. Without one it follows the provider
   // default from settings, so existing chats keep working unchanged.
   function engineStatus(engine, modelOverride = null) {
@@ -391,13 +401,17 @@ export function registerChatRoutes({
     }
     running.set(id, t1);
     let r1;
+    let r1Health;
     try {
       r1 = await t1.finished;
+      r1Health = r1;
     } catch (e) {
+      r1Health = e;
       r1 = { ok: false, reasonCode: 'provider-error' };
     } finally {
       if (running.get(id) === t1) running.delete(id);
     }
+    await observeProviderResult(from, r1Health);
     if (!r1.ok || !r1.text) {
       const failure = safeTurnFailure(r1);
       const message = `Summary failed: ${failure.message}`;
@@ -444,13 +458,17 @@ export function registerChatRoutes({
     }
     running.set(id, t2);
     let r2;
+    let r2Health;
     try {
       r2 = await t2.finished;
+      r2Health = r2;
     } catch (e) {
+      r2Health = e;
       r2 = { ok: false, reasonCode: 'provider-error' };
     } finally {
       if (running.get(id) === t2) running.delete(id);
     }
+    await observeProviderResult(to, r2Health);
 
     appendMessage(chat, 'user', opening, nowIso());
     if (r2.sessionId) chat.cliSessionId = r2.sessionId;
@@ -529,13 +547,17 @@ export function registerChatRoutes({
     running.set(id, turn);
     stopTurnOnDisconnect(req, res, id);
     let r;
+    let healthResult;
     try {
       r = await turn.finished;
+      healthResult = r;
     } catch (e) {
+      healthResult = e;
       r = { ok: false, reasonCode: 'provider-error' };
     } finally {
       running.delete(id);
     }
+    await observeProviderResult(engine, healthResult);
     if (attemptedModel && isSafeModelId(attemptedModel)) {
       if (r.ok) rejectedModels.get(engine).delete(attemptedModel);
       else if (r.reasonCode === 'model-rejected') rememberRejectedModel(engine, attemptedModel);
@@ -587,7 +609,16 @@ export function registerChatRoutes({
         'Identify unsupported and employer-declared mandatory gaps. Invent nothing. Do not access files, use tools, apply, or send outreach.',
         `User request: ${text}`, JSON.stringify(context),
       ].join('\n\n');
-      const result = await runStructuredTurnFn({ provider: engine, status, schema: FIT_SCHEMA, prompt, model, maxInputTokens: 50_000 });
+      let result;
+      try {
+        result = await runStructuredTurnFn({
+          provider: engine, status, schema: FIT_SCHEMA, prompt, model, maxInputTokens: 50_000,
+        });
+      } catch (error) {
+        await observeProviderResult(engine, error);
+        throw error;
+      }
+      await observeProviderResult(engine, { ...result, ok: true });
       const value = result.value;
       const answer = [
         value.summary, '', `Strengths: ${value.strengths.length ? value.strengths.join('; ') : 'none evidenced'}`,

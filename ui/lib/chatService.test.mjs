@@ -10,6 +10,7 @@ import { parseClaudeLine } from './chatClaude.mjs';
 import { emptyChat, loadChat, saveChat } from './chatStore.mjs';
 import { HANDOFF_SUMMARY_PROMPT } from './chatPrompts.mjs';
 import { interviewPrepPath } from './interviewPrep.mjs';
+import { readProviderHealth } from './providerHealth.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const FAKE = path.join(HERE, 'fixtures', 'fake-cli.mjs');
@@ -579,6 +580,80 @@ test('bounded fit assessment receives the selected job, identifies its provider 
   routes['GET /api/chat'](new EventEmitter(), get, '', new URL(`http://127.0.0.1/api/chat?id=${ID}`));
   await get.finished;
   assert.equal(JSON.parse(get.text()).chat.engine, 'claude');
+});
+
+test('ordinary chat records remote-auth failure without resending and preserves the failed message for explicit retry', async () => {
+  const root = tmpRoot();
+  let invocations = 0;
+  let nextResult = {
+    ok: false,
+    status: 401,
+    error: `Unauthorized for person@example.test ${['token', 'private-secret'].join('=')}`,
+    filesTouched: [],
+  };
+  const routes = routeFixture(root, {
+    runTurnFn: () => {
+      invocations += 1;
+      return {
+        stop() {},
+        finished: Promise.resolve(nextResult),
+      };
+    },
+  });
+
+  const failed = await callRoute(
+    routes['POST /api/chat/send'],
+    JSON.stringify({ id: ID, engine: 'codex', text: 'Keep this draft for retry.' }),
+  );
+
+  assert.equal(invocations, 1);
+  assert.equal(sseEvents(failed.text()).at(-1).event, 'error');
+  const saved = loadChat(root, ID);
+  assert.equal(saved.messages.find((message) => message.role === 'user').text, 'Keep this draft for retry.');
+  assert.doesNotMatch(JSON.stringify(saved), /person@|token|private-secret/i);
+  assert.equal(readProviderHealth(root, 'codex').state, 'sign-in-required');
+  assert.equal(readProviderHealth(root, 'codex').remoteAuthBarrier, true);
+
+  nextResult = {
+    ok: true,
+    text: 'Retried only after confirmation.',
+    updates: ['Retried only after confirmation.'],
+    sessionId: 'explicit-retry',
+    filesTouched: [],
+    usage: {},
+  };
+  const retried = await callRoute(
+    routes['POST /api/chat/send'],
+    JSON.stringify({ id: ID, engine: 'codex', text: 'I confirm this retry.' }),
+  );
+  assert.equal(invocations, 2);
+  assert.equal(sseEvents(retried.text()).at(-1).event, 'done');
+  assert.equal(readProviderHealth(root, 'codex').state, 'ready');
+  assert.equal(readProviderHealth(root, 'codex').remoteAuthBarrier, false);
+});
+
+test('bounded fit assessment records remote-auth failure without automatically retrying provider work', async () => {
+  const root = tmpRoot();
+  let invocations = 0;
+  const routes = routeFixture(root, {
+    runStructuredTurnFn: async () => {
+      invocations += 1;
+      const error = new Error('codex structured turn failed: authentication is required');
+      Object.defineProperty(error, 'reasonCode', { value: 'authentication-required' });
+      throw error;
+    },
+  });
+
+  const failed = await callRoute(
+    routes['POST /api/chat/send'],
+    JSON.stringify({ id: ID, engine: 'codex', mode: 'fit-assessment', text: 'Assess once.' }),
+  );
+
+  assert.equal(invocations, 1);
+  assert.equal(sseEvents(failed.text()).at(-1).event, 'error');
+  assert.equal(readProviderHealth(root, 'codex').state, 'sign-in-required');
+  assert.equal(readProviderHealth(root, 'codex').remoteAuthBarrier, true);
+  assert.equal(loadChat(root, ID).messages.find((message) => message.role === 'user').text, 'Assess once.');
 });
 
 test('completed assistant updates persist as separate chat messages', async () => {

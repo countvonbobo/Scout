@@ -8,6 +8,7 @@ import {
   activatedProposalRecovery, discardOnboardingProposal, readOnboardingProposal, recoverActivatedProposal,
   validateOnboardingProposal,
 } from './onboardingProposal.mjs';
+import { readProviderHealth } from './providerHealth.mjs';
 import { DEFAULT_WORKSPACE_CONFIG, writeWorkspaceConfig } from './workspace.mjs';
 
 function root() {
@@ -79,6 +80,30 @@ test('proposal staging, explicit zero-AI activation and discard are isolated', a
   assert.equal(readOnboardingProposal(dir), null);
   assert.equal(discardOnboardingProposal(dir).ok, true);
   assert.equal(fs.existsSync(path.join(dir, '.scout', 'onboarding', 'activated.json')), true);
+});
+
+test('onboarding records remote-auth failure without resending proposal generation', async () => {
+  const dir = root();
+  let invocations = 0;
+  const remoteAuthFailure = async () => {
+    invocations += 1;
+    const error = new Error('codex structured turn failed: authentication is required');
+    Object.defineProperty(error, 'reasonCode', { value: 'authentication-required' });
+    throw error;
+  };
+
+  await assert.rejects(
+    createOnboardingProposal(dir, 'codex', {
+      providerStatusFn: status,
+      runStructuredTurnFn: remoteAuthFailure,
+    }),
+    /authentication is required/,
+  );
+
+  assert.equal(invocations, 1);
+  assert.equal(readProviderHealth(dir, 'codex').state, 'sign-in-required');
+  assert.equal(readProviderHealth(dir, 'codex').remoteAuthBarrier, true);
+  assert.equal(readOnboardingProposal(dir), null);
 });
 
 test('activation rejects stale targets and rolls back every active file if doctor fails', async () => {

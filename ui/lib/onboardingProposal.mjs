@@ -6,6 +6,7 @@ import { doctor } from './doctor.mjs';
 import { loadWorkspaceConfig, validateWorkspaceConfig, workspacePaths } from './workspace.mjs';
 import { providerStatus } from './providers.mjs';
 import { runStructuredTurn } from './structuredTurn.mjs';
+import { recordProviderResultHealth } from './providerHealth.mjs';
 
 export const ONBOARDING_INPUT_LIMIT = 80_000;
 export const ONBOARDING_FILES = Object.freeze([
@@ -248,6 +249,7 @@ function writeStaged(root, files) {
 
 export async function createOnboardingProposal(root, provider, {
   providerStatusFn = providerStatus, runStructuredTurnFn = runStructuredTurn, now = () => new Date().toISOString(),
+  recordProviderResultHealthFn = recordProviderResultHealth,
   onProgress = () => {},
 } = {}) {
   onProgress({ phase: 'Preparing approved evidence', current: 1, total: 4 });
@@ -262,11 +264,26 @@ export async function createOnboardingProposal(root, provider, {
     JSON.stringify({ config, evidence: input.evidence }),
   ].join('\n\n');
   onProgress({ phase: `Generating proposal with ${provider}`, current: 2, total: 4 });
-  const turn = await runStructuredTurnFn({
-    provider, status, schema: ONBOARDING_SCHEMA, prompt,
-    model: config.ai?.provider === provider ? config.ai?.model : null,
-    validate: (value) => validateOnboardingProposal(value, input.evidence), maxInputTokens: 60_000,
-  });
+  const observeProviderResult = async (result) => {
+    try {
+      await recordProviderResultHealthFn(root, provider, result, { purpose: 'manual-run' });
+    } catch {
+      // Proposal work has already settled. Health contention must not cause an
+      // automatic second provider turn or replace the original outcome.
+    }
+  };
+  let turn;
+  try {
+    turn = await runStructuredTurnFn({
+      provider, status, schema: ONBOARDING_SCHEMA, prompt,
+      model: config.ai?.provider === provider ? config.ai?.model : null,
+      validate: (value) => validateOnboardingProposal(value, input.evidence), maxInputTokens: 60_000,
+    });
+  } catch (error) {
+    await observeProviderResult(error);
+    throw error;
+  }
+  await observeProviderResult({ ...turn, ok: true });
   onProgress({ phase: 'Validating and staging proposal', current: 3, total: 4 });
   const proposalId = crypto.randomUUID();
   const files = renderOnboardingFiles(config, turn.value);

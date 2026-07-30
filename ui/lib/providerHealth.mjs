@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { atomicWriteFile } from './atomicWrite.mjs';
 import { readProviderAuthMutation } from './providerAuthMutation.mjs';
+import { providerRemoteHealthSignal } from './providers.mjs';
 import {
   LeaseLostError,
   acquireScanLease,
@@ -116,6 +117,9 @@ const PROVIDER_HEALTH_LEASE_SETTINGS = Object.freeze({
   takeoverMarginMs: 0,
   guardAcquireTimeoutMs: 250,
 });
+const PROVIDER_RESULT_RETRY_DELAYS_MS = Object.freeze([
+  0, 50, 100, 200, 400, 800, 1_600, 3_200, 6_400,
+]);
 const SYSTEM_LEASE_AUTHORITY = Object.freeze({
   acquire(root, operation, settings) {
     return acquireScanLease(root, currentLeaseOwner(), operation, settings);
@@ -447,7 +451,7 @@ export function recordProviderHealth(root, provider, signal, {
     ...checkedSignal(authoritativeSignal, source ?? inferredSource(checkedPurpose), now),
     purpose: checkedPurpose,
   };
-  if (lease === undefined && evidence.source !== 'provider-operation') {
+  if (lease === undefined) {
     return withProviderHealthAuthority(
       root,
       provider,
@@ -463,6 +467,51 @@ export function recordProviderHealth(root, provider, signal, {
   return assertCurrentFence(lease, synchronousFenceCallback(
     () => persistRecord(root, provider, evidence),
   ));
+}
+
+function checkedRetryDelays(value) {
+  if (!Array.isArray(value) || value.length < 1 || value.length > 12
+    || value[0] !== 0
+    || value.some((delay) => !Number.isSafeInteger(delay) || delay < 0 || delay > 10_000)) {
+    throw new TypeError('provider health retry delays are invalid');
+  }
+  return value;
+}
+
+function sleep(milliseconds) {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds));
+}
+
+// Provider work is already settled before this hook is called. Authority
+// contention therefore retries only the small allowlisted health transition:
+// it can never resend a chat message, assessment, onboarding turn, or scan.
+export async function recordProviderResultHealth(root, provider, result, {
+  _leaseAuthority,
+  _retryDelaysMs = PROVIDER_RESULT_RETRY_DELAYS_MS,
+  _sleep = sleep,
+  lease,
+  now,
+  purpose = 'manual-run',
+} = {}) {
+  if (typeof _sleep !== 'function') throw new TypeError('provider health retry sleep is invalid');
+  const delays = checkedRetryDelays(_retryDelaysMs);
+  const signal = providerRemoteHealthSignal(result, { source: 'provider-operation' });
+  let busyError;
+  for (let attempt = 0; attempt < delays.length; attempt += 1) {
+    if (attempt > 0) await _sleep(delays[attempt]);
+    try {
+      return recordProviderHealth(root, provider, signal, {
+        _leaseAuthority,
+        lease,
+        now,
+        purpose,
+      });
+    } catch (error) {
+      if (!(error instanceof LeaseLostError) || attempt === delays.length - 1) throw error;
+      busyError = error;
+    }
+  }
+  throw busyError;
 }
 
 export function acknowledgeProviderAlert(root, provider, alertId, {

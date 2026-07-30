@@ -11,9 +11,11 @@ import { fetchConfiguredPortals } from '../ui/lib/ats.mjs';
 import { fetchHiringCafe } from '../ui/lib/hiringCafe.mjs';
 import { loadEnv } from '../ui/lib/env.mjs';
 import {
-  assertSafeModel, providerLocalHealthSignal, providerRemoteHealthSignal, providerStatus,
+  assertSafeModel, providerLocalHealthSignal, providerStatus,
 } from '../ui/lib/providers.mjs';
-import { providerPreflight, recordProviderHealth } from '../ui/lib/providerHealth.mjs';
+import {
+  providerPreflight, recordProviderResultHealth,
+} from '../ui/lib/providerHealth.mjs';
 import { setupReadiness } from '../ui/lib/setupReadiness.mjs';
 import { runStructuredTurn } from '../ui/lib/structuredTurn.mjs';
 import {
@@ -536,7 +538,7 @@ export async function runScanWith(root, provider, mode, {
   heartbeatOptions = {},
   mutationHooks = {},
   providerPreflightFn = providerPreflight,
-  recordProviderHealthFn = recordProviderHealth,
+  recordProviderResultHealthFn = recordProviderResultHealth,
 } = {}) {
   if (!['codex', 'claude'].includes(provider)) throw new Error('provider must be codex or claude');
   if (!['primary', 'second-pass', 'broadened'].includes(mode)) throw new Error('mode must be primary, broadened or second-pass');
@@ -664,7 +666,7 @@ export async function runScanWith(root, provider, mode, {
             heartbeatOptions,
             mutationHooks,
             providerPreflightFn,
-            recordProviderHealthFn,
+            recordProviderResultHealthFn,
           });
           if (queued.status === 'in-progress'
             && queued.reason === 'operator-intervention-required'
@@ -832,16 +834,16 @@ export async function runScanWith(root, provider, mode, {
                   model, validate: (value) => value, timeoutMs, maxInputTokens,
                 });
                 void Promise.resolve(invocation).then(
-                  (remoteResult) => recordProviderHealthFn(
+                  (remoteResult) => recordProviderResultHealthFn(
                     root,
                     provider,
-                    providerRemoteHealthSignal(remoteResult, { source: 'provider-operation' }),
+                    remoteResult,
                     { lease, purpose: providerHealthPurpose },
                   ),
-                  (error) => recordProviderHealthFn(
+                  (error) => recordProviderResultHealthFn(
                     root,
                     provider,
-                    providerRemoteHealthSignal(error, { source: 'provider-operation' }),
+                    error,
                     { lease, purpose: providerHealthPurpose },
                   ),
                 ).catch(() => {});
