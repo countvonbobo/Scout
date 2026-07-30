@@ -96,6 +96,7 @@ export function workspacePaths(root) {
     searchLanes: path.join(workspaceRoot, 'data', 'search-lanes.json'),
     portals: path.join(workspaceRoot, 'data', 'ats-portals.json'),
     employers: path.join(workspaceRoot, 'data', 'employers.json'),
+    feedbackLearning: path.join(workspaceRoot, 'data', 'feedback-learning.json'),
     sources: path.join(workspaceRoot, 'data', 'sources.md'),
     reports: path.join(workspaceRoot, 'reports'),
     applications: path.join(workspaceRoot, 'applications'),

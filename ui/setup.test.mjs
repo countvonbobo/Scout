@@ -18,11 +18,47 @@ import {
   shouldRequestRecoveryKey,
   adaptiveQuestionnaireHtml,
   employerRegistryHtml,
+  feedbackLearningHtml,
   searchLanePlanHtml,
   searchProfileReviewHtml,
   splitList,
   validateCvName,
 } from './setup.js';
+
+test('feedback learning review separates job events, pending proposals and published undo', () => {
+  const html = feedbackLearningHtml({
+    revision: 'a'.repeat(64),
+    active: {
+      id: 'learning-v1',
+      changes: [{
+        kind: 'rank-adjustment', field: 'location', value: '<script>Manchester</script>',
+        weight: 4, scope: 'profile-wide',
+      }],
+    },
+    feedbackEvents: [{
+      id: 'feedback-1', opportunityId: 'job-1', decision: 'promising', reason: 'positive',
+      explanation: '<img src=x onerror=alert(1)>', recordedAt: '2026-07-30T10:00:00.000Z',
+      profileId: 'profile-1', learningVersionId: 'learning-baseline',
+    }],
+    proposals: [{
+      id: 'proposal-1', status: 'pending', sourceEventIds: ['feedback-1'],
+      explanation: 'Reviewed proposal', change: {
+        kind: 'rank-adjustment', field: 'location', value: 'Manchester',
+        weight: 4, scope: 'profile-wide',
+      },
+    }],
+    versions: [{
+      id: 'learning-v1', explanation: 'Reviewed proposal',
+      publishedAt: '2026-07-30T11:00:00.000Z', undoOf: null,
+    }],
+  });
+
+  assert.match(html, /Job feedback never changes tracker status or ranking by itself/);
+  assert.match(html, /data-learning-publish="proposal-1"/);
+  assert.match(html, /Undo active learned version/);
+  assert.doesNotMatch(html, /<script>|<img/);
+  assert.match(html, /&lt;script&gt;Manchester/);
+});
 
 test('employer settings expose bounded health, policy and reversible priority controls safely', () => {
   const html = employerRegistryHtml({

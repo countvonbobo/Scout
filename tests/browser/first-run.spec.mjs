@@ -156,7 +156,7 @@ test('settings sections open the step that edits them', async ({ page }) => {
   // Back from a retune entry step returns to the hub rather than walking
   // further backwards into first-run onboarding.
   await dialog.getByRole('button', { name: 'Back to settings' }).click();
-  await expect(dialog.locator('.settings-card')).toHaveCount(8);
+  await expect(dialog.locator('.settings-card')).toHaveCount(9);
 });
 
 test('the first-run restore form can be dismissed again', async ({ page }) => {

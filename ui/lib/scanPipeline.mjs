@@ -1198,6 +1198,10 @@ export function readVacancyDecisionHistory(root, { limit = VACANCY_DECISION_HIST
           ? item.contentFingerprint
           : null,
         profileId: boundedText(item.profileId || run.profile_id, 80),
+        learningVersionId: boundedText(
+          item.learningVersionId || run.learning_version_id || 'learning-baseline',
+          80,
+        ),
         assessedAt: boundedText(run.timestamp, 80),
       });
       if (records.length >= boundedLimit) return records;
@@ -1248,7 +1252,7 @@ function observationInputs(sources) {
 // response order cannot leak into provider-facing identities.
 export function prepareRankedDiscovery({
   sources, profile, tracker = { opportunities: [] }, runId = '', limit = DEFAULT_CANDIDATE_LIMIT,
-  relevanceThreshold, decisionHistory = [],
+  relevanceThreshold, decisionHistory = [], learningPolicy = null,
 } = {}) {
   if (!profile || profile.status !== 'published') throw new Error('ranked discovery requires a published search profile');
   const input = observationInputs(sources);
@@ -1256,8 +1260,8 @@ export function prepareRankedDiscovery({
   const initialFunnel = createDiscoveryFunnel(input.funnelSources);
   const canonical = canonicaliseObservations(observations);
   const vacancies = canonical.vacancies.map(assessmentVacancy);
-  const filtered = filterVacancies(vacancies, profile);
-  const ranked = rankVacancies(filtered.eligible, profile, tracker?.opportunities || []);
+  const filtered = filterVacancies(vacancies, profile, { learningPolicy });
+  const ranked = rankVacancies(filtered.eligible, profile, tracker?.opportunities || [], { learningPolicy });
   const lifecycle = partitionVacanciesForAssessment(ranked, decisionHistory, { profileId: profile.id });
   const configuredThreshold = Number(relevanceThreshold ?? profile?.selection?.relevanceThreshold ?? 1);
   const threshold = Number.isFinite(configuredThreshold) ? Math.max(Number.EPSILON, configuredThreshold) : 1;
@@ -1293,6 +1297,7 @@ export function prepareRankedDiscovery({
     observations,
     vacancies,
     exclusions,
+    reconsidered: filtered.reconsidered || [],
     ranked,
     selection,
     funnel,
@@ -1304,9 +1309,9 @@ const RANKED_STAGE_ARTIFACT_FIELDS = Object.freeze({
   collect: Object.freeze(['generatedAt', 'lanes', 'queries', 'sources']),
   normalise: Object.freeze(['generatedAt', 'initialFunnel', 'observations', 'queries']),
   deduplicate: Object.freeze(['duplicateObservations', 'initialFunnel', 'normalisedCount', 'vacancies']),
-  filter: Object.freeze(['duplicateObservations', 'eligible', 'exclusions', 'initialFunnel', 'normalisedCount', 'uniqueVacancies']),
-  rank: Object.freeze(['duplicateObservations', 'exclusions', 'initialFunnel', 'normalisedCount', 'ranked', 'uniqueVacancies']),
-  select: Object.freeze(['candidates', 'exclusions', 'funnel', 'ranked', 'selection']),
+  filter: Object.freeze(['duplicateObservations', 'eligible', 'exclusions', 'initialFunnel', 'normalisedCount', 'reconsidered', 'uniqueVacancies']),
+  rank: Object.freeze(['duplicateObservations', 'exclusions', 'initialFunnel', 'normalisedCount', 'ranked', 'reconsidered', 'uniqueVacancies']),
+  select: Object.freeze(['candidates', 'exclusions', 'funnel', 'ranked', 'reconsidered', 'selection']),
 });
 const OMIT_PRIVATE_STAGE_KEY = /^(?:access[-_]?token|advert[-_]?body|api[-_]?(?:key|token)|auth(?:orization)?|body|cookies?|credentials?|cv|description|headers?|html|master[-_]?cv|password|payload|profile[-_]?evidence|prompt|raw[-_]?(?:html|response)|requirements|response|secret(?:[-_]?(?:key|token))?|token|transcript)$/i;
 const URL_STAGE_KEY = /(?:^url$|url$)/i;
@@ -1616,6 +1621,7 @@ export function createRankedDiscoveryStages({
   profile,
   tracker = { opportunities: [] },
   decisionHistory = [],
+  learningPolicy = null,
   limit = DEFAULT_CANDIDATE_LIMIT,
   relevanceThreshold,
 } = {}) {
@@ -1649,7 +1655,7 @@ export function createRankedDiscoveryStages({
       };
     }),
     filter: withRankedArtifactCodec('filter', function filterStage({ priorArtifact }) {
-      const filtered = filterVacancies(priorArtifact.vacancies, profile);
+      const filtered = filterVacancies(priorArtifact.vacancies, profile, { learningPolicy });
       const vacancyById = new Map(priorArtifact.vacancies.map((vacancy) => [
         String(vacancy.vacancyId || vacancy.canonicalUrl),
         vacancy,
@@ -1660,6 +1666,7 @@ export function createRankedDiscoveryStages({
         duplicateObservations: priorArtifact.duplicateObservations,
         uniqueVacancies: priorArtifact.vacancies.length,
         eligible: filtered.eligible,
+        reconsidered: filtered.reconsidered || [],
         exclusions: filtered.excluded.map((item) => {
           const vacancy = vacancyById.get(String(item.vacancyId));
           return {
@@ -1678,7 +1685,13 @@ export function createRankedDiscoveryStages({
         duplicateObservations: priorArtifact.duplicateObservations,
         uniqueVacancies: priorArtifact.uniqueVacancies,
         exclusions: priorArtifact.exclusions,
-        ranked: rankVacancies(priorArtifact.eligible, profile, tracker?.opportunities || []),
+        reconsidered: priorArtifact.reconsidered,
+        ranked: rankVacancies(
+          priorArtifact.eligible,
+          profile,
+          tracker?.opportunities || [],
+          { learningPolicy },
+        ),
       };
     }),
     select: withRankedArtifactCodec('select', function selectStage({ run, priorArtifact }) {
@@ -1710,6 +1723,7 @@ export function createRankedDiscoveryStages({
       }));
       return {
         exclusions: priorArtifact.exclusions,
+        reconsidered: priorArtifact.reconsidered,
         ranked: priorArtifact.ranked,
         selection,
         funnel,
@@ -1983,7 +1997,15 @@ function sourceHealth(sources) {
   }]));
 }
 
-function mergeTracker(existing, candidates, assessments, policy, date, profileId = null) {
+function mergeTracker(
+  existing,
+  candidates,
+  assessments,
+  policy,
+  date,
+  profileId = null,
+  learningVersionId = 'learning-baseline',
+) {
   const byId = new Map(existing.opportunities.map((entry) => [entry.id, entry]));
   const discarded = { ...EMPTY_DISCARDED };
   const reviewed = [];
@@ -2012,6 +2034,7 @@ function mergeTracker(existing, candidates, assessments, policy, date, profileId
         ? candidate.contentFingerprint
         : vacancyContentFingerprint(candidate),
       profileId: boundedText(profileId, 80),
+      learningVersionId: boundedText(learningVersionId, 80),
       categoryId: null,
       outcome, score: gate.score,
       reasons: reasons.map((reason) => boundedText(reason)).filter(Boolean).slice(0, REVIEW_REASON_LIMIT),
@@ -2038,6 +2061,23 @@ function mergeTracker(existing, candidates, assessments, policy, date, profileId
       tags: [...new Set([...(previous?.tags || []), ...(candidate.tags || []), ...(gate.eligibility === 'check' ? ['Check mandatory requirement'] : []), ...(changedAdvert ? ['Updated advert — review'] : [])])],
       sources: [...new Set([...(previous?.sources || []), ...urls])], sourceReferences: references,
       jobIdentity: jobIdentity(candidate),
+      profileId: boundedText(profileId, 80),
+      learningVersionId: boundedText(learningVersionId, 80),
+      rankingHistory: [
+        ...(previous?.rankingHistory || []),
+        {
+          rankedAt: date,
+          profileId: boundedText(profileId, 80),
+          learningVersionId: boundedText(learningVersionId, 80),
+          preRankScore: Number(candidate.preRankScore || 0),
+        },
+      ].filter((item, index, items) => (
+        index === items.findIndex((candidateItem) => (
+          candidateItem.rankedAt === item.rankedAt
+          && candidateItem.profileId === item.profileId
+          && candidateItem.learningVersionId === item.learningVersionId
+        ))
+      )).slice(-32),
       notes: previous && Object.hasOwn(previous, 'notes') ? previous.notes : assessment.summary,
       lastChecked: date, foundVia: candidate.source, contacts: previous?.contacts || [], log: previous?.log || [],
       ...(changedAdvert ? { advertUpdate: { detectedAt: date, previousFingerprint: previous.jobIdentity?.advertFingerprint || '', currentFingerprint: jobIdentity(candidate).advertFingerprint } } : {}),
@@ -2087,6 +2127,7 @@ function buildScanArtifacts(root, {
   assessmentFailures = [],
   livenessSummary = { checked: 0, gone: 0, unverified: 0 }, verificationScoped = false,
   staleInboxEntries = [], inboxRechecked = 0, funnel = null, selection = [], discoveryEngine = 'legacy-discovery', profileId = null,
+  learningVersionId = 'learning-baseline',
   ranked = [], selectionDecision = null, runId = null,
   timestamp: requestedTimestamp = null,
 }) {
@@ -2110,7 +2151,15 @@ function buildScanArtifacts(root, {
   const degraded = configuredFailures.length > 0 || errors.length > 0;
   const existing = JSON.parse(fs.readFileSync(paths.tracker, 'utf8'));
   const merged = assessmentResult
-    ? mergeTracker(existing, candidates, assessmentResult.assessments, policy, date, profileId)
+    ? mergeTracker(
+      existing,
+      candidates,
+      assessmentResult.assessments,
+      policy,
+      date,
+      profileId,
+      learningVersionId,
+    )
     : { tracker: existing, keepersAdded: 0, keepersUpdated: 0, discarded: { ...EMPTY_DISCARDED }, reviewed: [] };
   const inboxArchived = archiveStaleInboxEntries(merged.tracker, staleInboxEntries, date);
   const baseFunnel = funnel && error ? {
@@ -2173,7 +2222,8 @@ function buildScanArtifacts(root, {
     adverts_checked: livenessSummary.checked, adverts_closed: livenessSummary.gone,
     adverts_unverified: livenessSummary.unverified, verification_scoped: verificationScoped,
     inbox_rechecked: inboxRechecked, inbox_archived: inboxArchived,
-    profile_id: profileId, discovery_engine: discoveryEngine,
+    profile_id: profileId, learning_version_id: learningVersionId,
+    discovery_engine: discoveryEngine,
     ...(reconciledFunnel ? { funnel: reconciledFunnel } : {}),
     ...(selection_summary ? { selection_summary } : {}),
     ...(boundedAssessmentFailures.length ? { assessment_failures: boundedAssessmentFailures } : {}),

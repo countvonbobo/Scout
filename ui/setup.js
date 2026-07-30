@@ -45,6 +45,7 @@ export const RETUNE_ENTRY_STEPS = Object.freeze({
 });
 const SETTINGS_SECTIONS = [
   ['search', 'Search & profile', 'Roles, locations, compensation, commute and exclusions'],
+  ['learning', 'Feedback & learning', 'Job feedback, reviewed proposals, versions and undo'],
   ['employers', 'Employers', 'Named-employer priority, careers monitoring and health'],
   ['providers', 'AI providers', 'Choose the signed-in provider Scout uses'],
   ['sources', 'Sources', 'Public sources and optional Adzuna credentials'],
@@ -434,6 +435,71 @@ export function employerRegistryHtml(registry = null) {
   </section>`;
 }
 
+export function feedbackLearningHtml(ledger = null) {
+  if (!ledger) return '<p class="meta">Loading private feedback and learned preferences…</p>';
+  const escape = escapeProfileText;
+  const pending = (ledger.proposals || []).filter(({ status }) => status === 'pending');
+  const events = (ledger.feedbackEvents || []).slice(-20).reverse();
+  const versions = (ledger.versions || []).slice().reverse();
+  const activeChanges = ledger.active?.changes || [];
+  const eventOptions = events.map((event) => (
+    `<option value="${escape(event.id)}">${escape(event.decision)} — ${escape(event.reason)} — ${escape(event.opportunityId)}</option>`
+  )).join('');
+  const proposals = pending.map((proposal) => (
+    `<section class="setup-callout" data-learning-proposal="${escape(proposal.id)}">
+      <strong>${escape(proposal.change.kind)}: ${escape(proposal.change.field || proposal.change.profileRuleId)}
+      ${escape(proposal.change.value || '')}</strong>
+      <p>${escape(proposal.explanation)}</p>
+      <p class="meta">Scope: ${escape(proposal.change.scope)}${proposal.change.scopeValue
+    ? ` (${escape(proposal.change.scopeValue)})` : ''}; source feedback: ${escape(proposal.sourceEventIds.join(', '))}</p>
+      <label><span><input type="checkbox" data-learning-publish-confirm="${escape(proposal.id)}"> I reviewed this exact change and want to publish it</span></label>
+      <p><button class="act" type="button" data-learning-publish="${escape(proposal.id)}">Publish reviewed change</button></p>
+    </section>`
+  )).join('') || '<p class="meta">No pending learned-preference proposals.</p>';
+  const changeList = activeChanges.map((change) => (
+    `<li>${escape(change.kind)} — ${escape(change.field || change.profileRuleId)} `
+    + `${escape(change.value || '')}${change.weight ? ` (${change.weight > 0 ? '+' : ''}${escape(change.weight)})` : ''}; `
+    + `${escape(change.scope)}${change.scopeValue ? ` (${escape(change.scopeValue)})` : ''}</li>`
+  )).join('') || '<li>No learned ranking changes are active.</li>';
+  const eventList = events.map((event) => (
+    `<li><strong>${escape(event.decision)}</strong> — ${escape(event.reason)} — ${escape(event.explanation)}
+    <span class="meta">Job only; ${escape(event.recordedAt)}; profile ${escape(event.profileId)};
+    learning ${escape(event.learningVersionId)}.</span></li>`
+  )).join('') || '<li>No explicit feedback recorded yet.</li>';
+  const versionList = versions.map((version) => (
+    `<li>${escape(version.id)} — ${escape(version.explanation)} — ${escape(version.publishedAt)}
+    ${version.undoOf ? `; undo of ${escape(version.undoOf)}` : ''}</li>`
+  )).join('');
+  return `<section id="feedback-learning-review">
+    <p>Job feedback never changes tracker status or ranking by itself. A learned change is a separate proposal and affects future ranking only after exact review and confirmation.</p>
+    <h3>Active published behavior</h3>
+    <p class="meta">Version ${escape(ledger.active?.id || 'learning-baseline')}</p>
+    <ul>${changeList}</ul>
+    <h3>Pending proposals</h3>${proposals}
+    <details><summary>Propose a transparent change from feedback</summary>
+      ${events.length ? `<div class="setup-grid">
+        <label class="setup-field">Source job feedback<select id="learning-source-event">${eventOptions}</select></label>
+        <label class="setup-field">Change kind<select id="learning-kind"><option value="rank-adjustment">Rank adjustment</option><option value="reconsider-rule">Reconsider a published profile rule</option></select></label>
+        <label class="setup-field">Scope<select id="learning-scope"><option value="profile-wide">Profile-wide</option><option value="role-family">Role family</option><option value="employer">Employer</option></select></label>
+        <label class="setup-field">Field<select id="learning-field"><option>title</option><option>employer</option><option>location</option><option>seniority</option><option>responsibilities</option></select></label>
+        <label class="setup-field">Field match value<input id="learning-value" maxlength="160"></label>
+        <label class="setup-field">Scope value (employer or role family)<input id="learning-scope-value" maxlength="160"></label>
+        <label class="setup-field">Weight (-10 to 10)<input id="learning-weight" type="number" min="-10" max="10" value="2"></label>
+        <label class="setup-field">Profile rule ID for reconsideration<input id="learning-rule-id" maxlength="160"></label>
+        <label class="setup-field wide">Why this change is justified<textarea id="learning-explanation" maxlength="1000"></textarea></label>
+      </div><p><button id="learning-propose" class="act" type="button">Create reviewable proposal</button></p>`
+    : '<p class="meta">Record job feedback before proposing a change.</p>'}
+    </details>
+    <details><summary>Recent job-only feedback</summary><ul>${eventList}</ul></details>
+    <details><summary>Published version history</summary><ul>${versionList}</ul></details>
+    ${ledger.active?.id !== 'learning-baseline' ? `<section class="setup-callout">
+      <label class="setup-field wide">Undo explanation<textarea id="learning-undo-explanation" maxlength="1000"></textarea></label>
+      <label><span><input id="learning-undo-confirm" type="checkbox"> I reviewed this rollback and want to restore the previous published behavior</span></label>
+      <p><button id="learning-undo" class="act" type="button">Undo active learned version</button></p>
+    </section>` : ''}
+  </section>`;
+}
+
 async function requestJson(pathname, options) {
   const response = await fetch(pathname, options);
   const body = await response.json().catch(() => ({}));
@@ -463,6 +529,7 @@ const Setup = {
   statusRetry: null,
   searchProfile: null,
   employerRegistry: null,
+  feedbackLearning: null,
   operations: { proposal: null, scan: null },
   operationTimers: {},
   providerLoginState: { codex: null, claude: null },
@@ -912,6 +979,7 @@ const Setup = {
     const definition = SETTINGS_SECTIONS.find(([id]) => id === section) || SETTINGS_SECTIONS[0];
     this.prepareDismissibleView({ title: definition[1], subtitle: definition[2], back: true });
     if (section === 'search') return this.renderSearchSettings();
+    if (section === 'learning') return this.renderFeedbackLearningSettings();
     if (section === 'employers') return this.renderEmployerSettings();
     if (section === 'providers') return this.renderProviderSettings();
     if (section === 'sources') return this.renderSourceSettings();
@@ -1092,6 +1160,110 @@ const Setup = {
     });
     this.el('employer-add')?.addEventListener('click', () => this.saveEmployer(null));
     if (!this.employerRegistry) void this.loadEmployerRegistry();
+  },
+
+  renderFeedbackLearningSettings() {
+    this.el('setup-body').innerHTML = feedbackLearningHtml(this.feedbackLearning);
+    this.el('learning-propose')?.addEventListener('click', () => this.proposeLearning());
+    this.el('setup-body').querySelectorAll('[data-learning-publish]').forEach((button) => {
+      button.addEventListener('click', () => this.publishLearning(button.dataset.learningPublish));
+    });
+    this.el('learning-undo')?.addEventListener('click', () => this.undoLearning());
+    if (!this.feedbackLearning) void this.loadFeedbackLearning();
+  },
+
+  async loadFeedbackLearning() {
+    try {
+      this.feedbackLearning = await requestJson('/api/feedback-learning');
+      if (this.view === 'section' && this.settingsSection === 'learning') {
+        this.renderFeedbackLearningSettings();
+      }
+    } catch (error) {
+      this.setMessage(error.message, 'error');
+    }
+  },
+
+  async proposeLearning() {
+    const kind = this.el('learning-kind').value;
+    const change = kind === 'rank-adjustment' ? {
+      kind,
+      scope: this.el('learning-scope').value,
+      field: this.el('learning-field').value,
+      value: this.el('learning-value').value.trim(),
+      weight: Number(this.el('learning-weight').value),
+      scopeValue: this.el('learning-scope-value').value.trim(),
+    } : {
+      kind,
+      scope: this.el('learning-scope').value,
+      value: this.el('learning-value').value.trim(),
+      profileRuleId: this.el('learning-rule-id').value.trim(),
+    };
+    try {
+      const result = await requestJson('/api/learning/proposals', {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          revision: this.feedbackLearning.revision,
+          sourceEventIds: [this.el('learning-source-event').value],
+          explanation: this.el('learning-explanation').value.trim(),
+          change,
+        }),
+      });
+      this.feedbackLearning = result.ledger;
+      this.renderFeedbackLearningSettings();
+      this.setMessage('Learned preference saved as a pending review proposal.', 'good');
+    } catch (error) {
+      this.setMessage(error.message, 'error');
+      await this.loadFeedbackLearning();
+    }
+  },
+
+  async publishLearning(proposalId) {
+    const confirmed = this.el('setup-body')
+      .querySelector(`[data-learning-publish-confirm="${proposalId}"]`)?.checked;
+    if (!confirmed) {
+      this.setMessage('Confirm that you reviewed this exact learned change.', 'error');
+      return;
+    }
+    try {
+      const result = await requestJson('/api/learning/publish', {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          revision: this.feedbackLearning.revision,
+          proposalId,
+          confirmed: true,
+        }),
+      });
+      this.feedbackLearning = result.ledger;
+      this.renderFeedbackLearningSettings();
+      this.setMessage('Reviewed learned preference published for future ranking.', 'good');
+    } catch (error) {
+      this.setMessage(error.message, 'error');
+      await this.loadFeedbackLearning();
+    }
+  },
+
+  async undoLearning() {
+    if (!this.el('learning-undo-confirm')?.checked) {
+      this.setMessage('Confirm that you reviewed this learning rollback.', 'error');
+      return;
+    }
+    try {
+      const result = await requestJson('/api/learning/undo', {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          revision: this.feedbackLearning.revision,
+          versionId: this.feedbackLearning.active.id,
+          explanation: this.el('learning-undo-explanation').value.trim(),
+          confirmed: true,
+        }),
+      });
+      this.feedbackLearning = result.ledger;
+      this.renderFeedbackLearningSettings();
+      this.setMessage('Previous learned ranking behavior restored.', 'good');
+    } catch (error) {
+      this.setMessage(error.message, 'error');
+      await this.loadFeedbackLearning();
+    }
   },
 
   async loadEmployerRegistry() {

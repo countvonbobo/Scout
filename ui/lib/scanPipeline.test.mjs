@@ -163,6 +163,7 @@ test('durable ranked stages preserve the established ranked discovery result', a
 
   assert.deepEqual(priorArtifact, {
     exclusions: expected.exclusions,
+    reconsidered: expected.reconsidered,
     ranked: expected.ranked,
     selection: expected.selection,
     funnel: expected.funnel,
@@ -252,6 +253,100 @@ test('ranked discovery backfills assessment capacity instead of re-assessing an 
   })), [{ company: 'Already Reviewed', reason: 'unchanged-rejection' }]);
   assert.equal(result.candidates.length, 1);
   assert.equal(result.funnel.selected, 1);
+});
+
+test('published learning reranks unassessed jobs, reconsiders scoped exclusions and reuses prior decisions', () => {
+  const profile = {
+    version: 1, status: 'published', id: 'profile-learning-flow',
+    target: {
+      primaryTitles: [{
+        value: 'Data Engineer',
+        strength: 'mandatory',
+        provenance: 'explicit',
+      }],
+    },
+    negative: {},
+    compensation: {
+      currency: null, period: 'year', minimum: null,
+      minimumStrength: 'neutral', unknownPolicy: 'include',
+    },
+  };
+  const sources = { ats: { count: 3, jobs: [
+    {
+      company: 'Reviewed Co', title: 'Data Engineer', location: 'London',
+      url: 'https://example.test/reviewed', providerId: 'reviewed',
+    },
+    {
+      company: 'Preferred Co', title: 'Data Engineer', location: 'Manchester',
+      url: 'https://example.test/preferred', providerId: 'preferred',
+    },
+    {
+      company: 'Adjacent Co', title: 'Software Engineer', location: 'Bristol',
+      url: 'https://example.test/adjacent', providerId: 'adjacent',
+    },
+  ] } };
+  const initial = prepareRankedDiscovery({
+    sources, profile, tracker: { opportunities: [] }, runId: 'learning-initial', limit: 3,
+  });
+  const reviewed = initial.ranked.find(({ company }) => company === 'Reviewed Co');
+  const result = prepareRankedDiscovery({
+    sources,
+    profile,
+    tracker: { opportunities: [] },
+    decisionHistory: [{
+      company: reviewed.company,
+      role: reviewed.role,
+      url: reviewed.url,
+      source: reviewed.source,
+      outcome: 'below_threshold',
+      profileId: profile.id,
+      contentFingerprint: reviewed.contentFingerprint,
+    }],
+    learningPolicy: {
+      id: 'learning-reviewed',
+      version: 1,
+      changes: [
+        {
+          kind: 'rank-adjustment',
+          field: 'location',
+          value: 'Manchester',
+          weight: 8,
+          scope: 'profile-wide',
+          proposalId: 'proposal-location',
+        },
+        {
+          kind: 'reconsider-rule',
+          profileRuleId: 'rule-data-engineer',
+          scope: 'role-family',
+          value: 'Software Engineer',
+          proposalId: 'proposal-adjacent',
+        },
+        {
+          kind: 'rank-adjustment',
+          field: 'title',
+          value: 'Software Engineer',
+          weight: 8,
+          scope: 'role-family',
+          scopeValue: 'Software Engineer',
+          proposalId: 'proposal-adjacent-rank',
+        },
+      ],
+    },
+    runId: 'learning-published',
+    limit: 2,
+  });
+
+  assert.equal(result.ranked[0].company, 'Preferred Co');
+  assert.equal(result.ranked[0].learningAdjustment, 8);
+  assert.deepEqual(result.reconsidered.map(({ vacancyId }) => vacancyId), [
+    result.ranked.find(({ company }) => company === 'Adjacent Co').vacancyId,
+  ]);
+  assert.deepEqual(result.selection.selected.map(({ company }) => company), [
+    'Preferred Co', 'Adjacent Co',
+  ]);
+  assert.deepEqual(result.selection.assessmentSkipped.map(({ company, lifecycle }) => ({
+    company, reason: lifecycle.reason,
+  })), [{ company: 'Reviewed Co', reason: 'unchanged-rejection' }]);
 });
 
 test('deterministic exclusion accounting counts unique vacancies while retaining every rule explanation', () => {
@@ -577,7 +672,7 @@ test('forty zero-keeper candidates produce a bounded sanitised audit without tra
   assert.deepEqual(artifacts.run.discarded, { hard_exclusion: 0, mandatory_unmet: 16, below_threshold: 0, provider_discarded: 24, advert_closed: 0 });
   assert.equal(artifacts.run.reviewed.length, 40);
   assert.deepEqual(Object.keys(artifacts.run.reviewed[0]).sort(), [
-    'categoryId', 'company', 'contentFingerprint', 'outcome', 'profileId', 'reasons',
+    'categoryId', 'company', 'contentFingerprint', 'learningVersionId', 'outcome', 'profileId', 'reasons',
     'role', 'score', 'source', 'sourceUrl', 'vacancyId',
   ].sort());
   assert.doesNotMatch(JSON.stringify(artifacts.run.reviewed), /full advert|profileEvidence|Built systems/);
@@ -587,7 +682,7 @@ test('forty zero-keeper candidates produce a bounded sanitised audit without tra
   assert.equal(history[0].outcome, 'provider_discarded');
   assert.match(history[0].contentFingerprint, /^[a-f0-9]{64}$/);
   assert.deepEqual(Object.keys(history[0]).sort(), [
-    'assessedAt', 'company', 'contentFingerprint', 'outcome', 'profileId',
+    'assessedAt', 'company', 'contentFingerprint', 'learningVersionId', 'outcome', 'profileId',
     'role', 'source', 'url', 'vacancyId',
   ].sort());
 });

@@ -1,3 +1,5 @@
+import { applyLearningToRankedVacancies } from './feedbackLearning.mjs';
+
 export const STRENGTH_WEIGHT = Object.freeze({
   mandatory: 1,
   'strong-preference': 0.8,
@@ -451,11 +453,13 @@ function compareRanked(left, right) {
   return 0;
 }
 
-export function rankVacancies(vacancies, profile, history = []) {
+export function rankVacancies(vacancies, profile, history = [], {
+  learningPolicy = null,
+} = {}) {
   const candidates = vacancies || [];
   const referenceTimestamp = freshnessReference(candidates);
   const historyIndex = historyIdentityIndex(history);
-  return candidates.map((vacancy) => {
+  const ranked = candidates.map((vacancy) => {
     const dimensions = dimensionsFor(vacancy, profile, { referenceTimestamp, historyIndex });
     const positiveMaximum = dimensions.reduce((total, dimension) => total + dimension.maximum, 0);
     const rawScore = dimensions.reduce((total, dimension) => total + dimension.score, 0);
@@ -475,4 +479,7 @@ export function rankVacancies(vacancies, profile, history = []) {
       stableTieBreak: stableTieBreak(vacancy),
     };
   }).sort(compareRanked);
+  return learningPolicy?.changes?.some(({ kind }) => kind === 'rank-adjustment')
+    ? applyLearningToRankedVacancies(ranked, learningPolicy)
+    : ranked;
 }

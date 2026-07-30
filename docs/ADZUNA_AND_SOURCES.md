@@ -47,9 +47,12 @@ Assessment selection remains score-first and never admits a below-threshold vaca
 
 Configured sources and reviewed employer pages are discovery inputs, not a
 promise to discover every employer or opening. Scout retains employers from
-selected canonical adverts as normal-priority review evidence; it does not
-learn new search rules from feedback. Review and publish profile changes
-yourself before a later scan uses them.
+selected canonical adverts as normal-priority review evidence. Explicit job
+feedback remains separate from tracker status and ranking. A bounded learned
+rank adjustment or exact rule reconsideration affects a later scan only after
+you create, inspect and explicitly publish the separate proposal in
+**Settings → Feedback & learning**. Learned changes never create a hidden hard
+exclusion and every published version can be inspected and undone.
 
 Respect site terms, robots/rate limits and personal-data rules. Do not work around access controls.
 

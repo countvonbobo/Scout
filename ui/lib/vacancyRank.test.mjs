@@ -322,3 +322,28 @@ test('the generic ranker gives six distinct profile fixtures their matching vaca
     assert.equal(rankVacancies(jobs, profile({ primaryTitles: [rule(title, 'mandatory')] }))[0].vacancyId, expected);
   }
 });
+
+test('published learning adjusts ranking transparently without changing base profile evidence', () => {
+  const jobs = [
+    vacancy({ vacancyId: 'london', title: 'Engineer', location: 'London' }),
+    vacancy({ vacancyId: 'manchester', title: 'Engineer', location: 'Manchester' }),
+  ];
+  const ranked = rankVacancies(jobs, profile(), [], {
+    learningPolicy: {
+      id: 'learning-v1',
+      changes: [{
+        kind: 'rank-adjustment',
+        field: 'location',
+        value: 'Manchester',
+        weight: 8,
+        scope: 'profile-wide',
+        proposalId: 'proposal-v1',
+      }],
+    },
+  });
+
+  assert.equal(ranked[0].vacancyId, 'manchester');
+  assert.equal(ranked[0].preRankScore, Math.min(100, ranked[0].basePreRankScore + 8));
+  assert.equal(ranked[0].learningVersionId, 'learning-v1');
+  assert.equal(ranked[0].learningContributions[0].proposalId, 'proposal-v1');
+});

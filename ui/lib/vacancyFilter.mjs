@@ -157,17 +157,43 @@ function compensationExclusions(vacancy, profile) {
     }, confidence(source), true)];
 }
 
-export function filterVacancies(vacancies, profile) {
+function learningScopeMatches(vacancy, change) {
+  if (change.scope === 'profile-wide') return true;
+  const actual = change.scope === 'employer'
+    ? fieldValue(vacancy, 'employer')
+    : fieldValue(vacancy, 'title');
+  return normalise(valueOf(actual)) === normalise(change.value);
+}
+
+function reconsideredByLearning(vacancy, match, learningPolicy) {
+  return (learningPolicy?.changes || []).some((change) => (
+    change.kind === 'reconsider-rule'
+    && change.profileRuleId === match.profileRuleId
+    && learningScopeMatches(vacancy, change)
+  ));
+}
+
+export function filterVacancies(vacancies, profile, {
+  learningPolicy = null,
+} = {}) {
   const eligible = [];
   const excluded = [];
+  const reconsidered = [];
   for (const vacancy of vacancies || []) {
     const matches = [
       ...responsibilityExclusions(vacancy, profile),
       ...structuredExclusions(vacancy, profile),
       ...compensationExclusions(vacancy, profile),
     ];
-    if (matches.length) excluded.push(...matches);
+    const active = matches.filter((match) => !reconsideredByLearning(vacancy, match, learningPolicy));
+    reconsidered.push(...matches.filter((match) => reconsideredByLearning(vacancy, match, learningPolicy))
+      .map((match) => ({
+        ...match,
+        learningVersionId: learningPolicy.id,
+        reconsidered: true,
+      })));
+    if (active.length) excluded.push(...active);
     else eligible.push(vacancy);
   }
-  return { eligible, excluded };
+  return learningPolicy ? { eligible, excluded, reconsidered } : { eligible, excluded };
 }

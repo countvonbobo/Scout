@@ -147,3 +147,25 @@ test('structured title and employer rules read compacted runtime candidate field
   });
   assert.equal(employer.excluded[0].code, 'excluded-employer');
 });
+
+test('confirmed learned reconsideration is scoped, versioned and preserves exclusion evidence', () => {
+  const rankedProfile = profile({
+    primaryTitles: [rule('Data Engineer', 'mandatory')],
+  });
+  const policy = {
+    id: 'learning-reviewed',
+    changes: [{
+      kind: 'reconsider-rule',
+      profileRuleId: 'rule-data-engineer',
+      scope: 'role-family',
+      value: 'Software Engineer',
+    }],
+  };
+  const result = filterVacancies([softwareJob], rankedProfile, { learningPolicy: policy });
+
+  assert.deepEqual(result.eligible, [softwareJob]);
+  assert.deepEqual(result.excluded, []);
+  assert.equal(result.reconsidered[0].profileRuleId, 'rule-data-engineer');
+  assert.equal(result.reconsidered[0].learningVersionId, 'learning-reviewed');
+  assert.equal(result.reconsidered[0].reconsidered, true);
+});

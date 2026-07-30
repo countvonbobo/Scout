@@ -1834,3 +1834,61 @@ record that exact reconciliation SHA and CI run without rewriting history.
   - generated public-source privacy audit: passed for 538 files;
   - fresh release-stage audit: passed for 1,589 files;
   - source and full-range diff checks: passed.
+
+## Gate D — explicit feedback and reversible learning
+
+- Status: implementation and local verification complete on exact green Gate C
+  base `95c8437039f622cee59e8627faf424584f94af13`; commit, push and protected CI
+  remain required.
+- A strict private schema-v1 ledger keeps bounded job-only feedback separate
+  from tracker status, pending proposals separate from active policy and
+  immutable published versions separate from their reversible active pointer.
+- Events cover applied, interview, promising, saved, rejected, not interested,
+  duplicate and already seen, with explicit location, salary, seniority,
+  responsibility, employer and role-family reasons. Each event retains its
+  original profile and learning version.
+- Learned changes are transparent bounded field/value score adjustments or
+  exact scoped reconsideration of one published rule. Non-global adjustments
+  require and enforce an explicit employer or role-family scope value. Changes
+  cannot create hard exclusions, do nothing while pending and require current
+  revision plus exact confirmation before publication.
+- The active learning version participates in queue and rank compatibility.
+  Published adjustments rerank deterministically, confirmed reconsideration
+  retains the original exclusion evidence and unchanged prior assessments
+  remain reusable.
+- Undo appends a new immutable version containing the prior parent's behavior;
+  it does not delete decisions, events, proposals or history.
+- Settings exposes active changes, recent events, pending proposals, exact
+  publication, version history and confirmed undo. Job cards expose a separate
+  explicit feedback action that states ranking did not change.
+- RED: the initial focused test failed with `ERR_MODULE_NOT_FOUND` for the
+  absent feedback-learning domain.
+- Systematic follow-up findings and fixes:
+  - the generated public-source audit correctly rejected the generic serialized
+    key `events`, which is reserved for raw execution state. The ledger now
+    names its bounded durable collection `feedbackEvents`; the privacy rule was
+    not exempted or weakened;
+  - the first learned-adjustment sorter discarded the established
+    posted-date/employer/title tie-break for equal adjustments. A focused RED
+    regression reproduced the reversal and the implementation now preserves
+    the base ranking contract;
+  - non-global rank scopes were initially descriptive only. They now require a
+    separate bounded scope value and enforce exact employer or role-family
+    matching;
+  - validation now rejects duplicate references, malformed baseline ancestry,
+    duplicate/non-monotonic version numbers, stale active pointers and
+    inconsistent publication state.
+- GREEN:
+  - focused feedback, durable pipeline, real server route, filter, rank and UI
+    matrix: 182 passed, 0 failed;
+  - complete Node/audit suite: 1,231 discovered, 1,225 passed, 0 failed and 6
+    intentional platform skips;
+  - the 10,000-vacancy no-padding regression passed in 47.91 seconds without a
+    timeout or artifact-cap change;
+  - complete Chromium/Firefox browser matrix: 159 passed, 0 failed and 11
+    intentional skips out of 170;
+  - fresh release stage built successfully;
+  - tracked-source privacy audit: 546 files, 0 findings;
+  - fresh staged installer/privacy audit including production dependencies:
+    1,591 files, 0 findings;
+  - `git diff --check`: passed.

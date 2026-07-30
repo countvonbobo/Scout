@@ -1628,6 +1628,114 @@ test('POST /api/status accepts the shortlist status and persists it', async () =
   assert.equal(saved.status, 'shortlist');
 });
 
+test('feedback, proposal, publication and undo remain separate revisioned mutations', { concurrency: false }, async () => {
+  seedWorkspace(APP_ROOT, testWorkspace);
+  const trackerFile = path.join(testWorkspace, 'data', 'opportunities.json');
+  const id = 'feedback-test-2026-07';
+  fs.writeFileSync(trackerFile, `${JSON.stringify({
+    updated: '2026-07-30',
+    opportunities: [{
+      id,
+      company: 'Feedback Test',
+      role: 'Platform Engineer',
+      location: 'Manchester',
+      status: 'new',
+      score: 70,
+      profileId: 'profile-aaaaaaaaaaaa',
+      learningVersionId: 'learning-baseline',
+      jobIdentity: { providerId: 'vacancy-feedback-test' },
+    }],
+  }, null, 2)}\n`);
+
+  const initial = JSON.parse((await request({ path: '/api/feedback-learning' })).text);
+  const feedbackResponse = await request({
+    method: 'POST',
+    path: '/api/feedback',
+    headers: JSON_HEADERS(),
+    body: JSON.stringify({
+      revision: initial.revision,
+      opportunityId: id,
+      decision: 'promising',
+      reason: 'positive',
+      explanation: 'The responsibilities are a strong fit.',
+    }),
+  });
+  assert.equal(feedbackResponse.status, 200, feedbackResponse.text);
+  const feedback = JSON.parse(feedbackResponse.text).ledger;
+  assert.equal(feedback.feedbackEvents[0].scope, 'job');
+  assert.deepEqual(feedback.active.changes, []);
+  assert.equal(
+    JSON.parse(fs.readFileSync(trackerFile, 'utf8')).opportunities[0].status,
+    'new',
+    'feedback must not silently mutate tracker status',
+  );
+
+  const proposalResponse = await request({
+    method: 'POST',
+    path: '/api/learning/proposals',
+    headers: JSON_HEADERS(),
+    body: JSON.stringify({
+      revision: feedback.revision,
+      sourceEventIds: [feedback.feedbackEvents[0].id],
+      explanation: 'Review a modest preference for Manchester.',
+      change: {
+        kind: 'rank-adjustment',
+        field: 'location',
+        value: 'Manchester',
+        weight: 6,
+        scope: 'profile-wide',
+      },
+    }),
+  });
+  assert.equal(proposalResponse.status, 200, proposalResponse.text);
+  const proposed = JSON.parse(proposalResponse.text).ledger;
+  assert.equal(proposed.proposals[0].status, 'pending');
+  assert.deepEqual(proposed.active.changes, []);
+
+  const publishResponse = await request({
+    method: 'POST',
+    path: '/api/learning/publish',
+    headers: JSON_HEADERS(),
+    body: JSON.stringify({
+      revision: proposed.revision,
+      proposalId: proposed.proposals[0].id,
+      confirmed: true,
+    }),
+  });
+  assert.equal(publishResponse.status, 200, publishResponse.text);
+  const published = JSON.parse(publishResponse.text).ledger;
+  assert.equal(published.active.changes[0].weight, 6);
+
+  const undoResponse = await request({
+    method: 'POST',
+    path: '/api/learning/undo',
+    headers: JSON_HEADERS(),
+    body: JSON.stringify({
+      revision: published.revision,
+      versionId: published.active.id,
+      confirmed: true,
+      explanation: 'Restore the previous ranking behavior.',
+    }),
+  });
+  assert.equal(undoResponse.status, 200, undoResponse.text);
+  assert.deepEqual(JSON.parse(undoResponse.text).ledger.active.changes, []);
+
+  const stale = await request({
+    method: 'POST',
+    path: '/api/feedback',
+    headers: JSON_HEADERS(),
+    body: JSON.stringify({
+      revision: initial.revision,
+      opportunityId: id,
+      decision: 'saved',
+      reason: 'positive',
+      explanation: 'Stale write.',
+    }),
+  });
+  assert.equal(stale.status, 409);
+  assert.equal(JSON.parse(stale.text).conflict, true);
+});
+
 test('a UI mutation racing scan completion preserves every tracked user field', { concurrency: false }, async () => {
   seedWorkspace(APP_ROOT, testWorkspace);
   const trackerFile = path.join(testWorkspace, 'data', 'opportunities.json');

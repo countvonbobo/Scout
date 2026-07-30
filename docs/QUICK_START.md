@@ -127,7 +127,12 @@ Scout starts the first supervised scan automatically when the required setup ans
 
 Use `claude` instead if selected. Review the dated report and tracker changes. For a published profile, scan health shows source records, source/portal errors separately from failed records, unique vacancies after deduplication, unique confirmed-rule exclusions, the eligible ranked pool, the above-threshold detailed-assessment set and any assessment failures. Zero-score unrelated vacancies are not added merely to fill the assessment budget. Compensation is compared only when currency, period and rate type agree; an `exclude` unknown policy rejects both missing and non-comparable compensation. The selected set is bounded; a scan does not claim that every discovered vacancy received a provider assessment. Confirm that exclusions, salary handling and locations behave as intended before relying on results.
 
-Scout can only rank jobs returned by your configured sources. Missing or ambiguous advert facts remain unknown, and Scout does not yet add employers outside those sources or learn new hard rules from feedback.
+Scout can only rank jobs returned by your configured sources and reviewed
+employer monitoring. Missing or ambiguous advert facts remain unknown.
+**Feedback** on a job records a separate private event; it does not silently
+change status or ranking. Use **Settings → Feedback & learning** to inspect
+events, create a transparent bounded proposal, explicitly publish it, or undo
+the active learned version. One rejection never becomes a hard exclusion.
 
 If the supervised primary scan keeps zero roles, Scout automatically performs one broader discovery pass. It widens source queries, not your approved gates: salary, hard exclusions, location/commute, mandatory evidence and scoring remain in force. The completed result stays visible as “reviewed / kept”; **Review this scan** shows concise reasons for every discarded candidate without adding weak roles to the tracker.
 

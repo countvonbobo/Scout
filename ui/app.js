@@ -226,6 +226,7 @@ const Scout = {
   scanRunning: false,
   scanOperationTimer: null,
   latestScan: null,
+  feedbackLearning: null,
   lastSyncPullAt: null,
   companyHistory: null,
   uiBuildId: SCOUT_UI_BUILD,
@@ -342,12 +343,13 @@ const Scout = {
   },
 
   async loadOpportunities() {
-    const [data, cvFiles, latest, durableRuns, durableQueue] = await Promise.all([
+    const [data, cvFiles, latest, durableRuns, durableQueue, feedbackLearning] = await Promise.all([
       this.api('/api/opportunities'),
       this.api('/api/cv'),
       this.api('/api/scans/latest').catch(() => ({ scan: null })),
       this.api('/api/scan/runs').catch(() => ({ state: 'waiting', runs: [] })),
       this.api('/api/scan/queue').catch(() => ({ state: 'waiting', requests: [] })),
+      this.api('/api/feedback-learning').catch(() => null),
     ]);
     this.state.data = data;
     this.state.cvFiles = cvFiles;
@@ -357,6 +359,7 @@ const Scout = {
     this.scanQueue = durableQueue && Array.isArray(durableQueue.requests)
       ? durableQueue
       : { state: 'waiting', requests: [] };
+    this.feedbackLearning = feedbackLearning;
     this.applyWorkspaceConfig(this.state.data.workspaceConfig, { render: false });
     const h = this.state.data.scanHealth;
     const activeRun = this.scanRuns.find((run) => !['complete', 'partial', 'abandoned', 'failed'].includes(run.state));
@@ -786,6 +789,7 @@ const Scout = {
       <div class="detail"></div>
       <div class="triage-actions">
         <button class="act triage-no" data-action="triage-no" data-id="${this.esc(e.id)}">No</button>
+        <button class="act" data-action="record-feedback" data-id="${this.esc(e.id)}">Feedback</button>
         <button class="act triage-yes" data-action="triage-yes" data-id="${this.esc(e.id)}">Yes, shortlist</button>
       </div>
     </div>`;
@@ -1235,10 +1239,50 @@ const Scout = {
           ? `<button class="act" data-action="see-cover-letter" data-slug="${this.esc(slug)}">see cover letter</button>`
           : `<button class="act bridge" data-action="open-chat" data-id="${this.esc(e.id)}" data-prefill="coverLetter">create custom cover letter</button>`}
         <button class="act" data-action="open-company-history" data-id="${this.esc(e.id)}">company history</button>
+        <button class="act" data-action="record-feedback" data-id="${this.esc(e.id)}">record feedback</button>
         <button class="act bridge" data-action="open-chat" data-id="${this.esc(e.id)}" data-prefill="fit">fit and evidence gaps</button>
         <button class="act bridge" data-action="open-chat" data-id="${this.esc(e.id)}" data-prefill="ask">ask about this job</button>
         <button class="act${prepRecommended ? ' bridge' : ''}" data-action="open-interview-prep" data-id="${this.esc(e.id)}">interview prep</button>
       </div>`;
+  },
+
+  async recordJobFeedback(id, presetDecision = null) {
+    const decisions = [
+      'applied', 'interview', 'promising', 'saved', 'rejected',
+      'not-interested', 'duplicate', 'already-seen',
+    ];
+    const reasons = [
+      'location', 'salary', 'seniority', 'responsibilities', 'employer',
+      'role-family', 'other', 'positive', 'duplicate', 'already-seen',
+    ];
+    const decision = presetDecision || window.prompt?.(
+      `Decision (${decisions.join(', ')}):`,
+      'not-interested',
+    );
+    if (!decisions.includes(decision)) return null;
+    const reason = window.prompt?.(`Reason (${reasons.join(', ')}):`, decision === 'promising' ? 'positive' : 'other');
+    if (!reasons.includes(reason)) return null;
+    const explanation = window.prompt?.('Explain this job-specific feedback:', '');
+    if (!String(explanation || '').trim()) return null;
+    if (!this.feedbackLearning?.revision) {
+      this.feedbackLearning = await this.api('/api/feedback-learning');
+    }
+    const result = await this.api('/api/feedback', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        revision: this.feedbackLearning.revision,
+        opportunityId: id,
+        decision,
+        reason,
+        explanation: String(explanation).trim(),
+      }),
+    });
+    if (result?.ok) {
+      this.feedbackLearning = result.ledger;
+      window.alert?.('Job feedback recorded. Ranking did not change; any learned preference must be proposed and reviewed in Settings.');
+    }
+    return result;
   },
 
   async post(pathname, payload, { retryTrackerConflict = true } = {}) {
@@ -2865,6 +2909,7 @@ const Scout = {
       case 'triage-no': return this.triageNo(id);
       case 'undo-dismiss': return this.undoDismiss(id);
       case 'remove-shortlist': return this.removeFromShortlist(id);
+      case 'record-feedback': return this.recordJobFeedback(id);
       case 'restore': return this.restoreEntry(id);
       default: return undefined;
     }

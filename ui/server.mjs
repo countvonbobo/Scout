@@ -76,6 +76,11 @@ import {
   reconcileEmployerDiscoveries, updateEmployerRegistryEntry, writeEmployerRegistry,
 } from './lib/employerRegistry.mjs';
 import {
+  activeLearningPolicy, createLearningLedger, learningLedgerRevision,
+  loadLearningLedger, proposeLearningChange, publishLearningProposal,
+  recordFeedback, undoLearningVersion, writeLearningLedger,
+} from './lib/feedbackLearning.mjs';
+import {
   loadWorkspaceConfig, migrateWorkspace, resolveWorkspaceRoot, seedWorkspace, syncManagedInstructions,
   workspacePaths, writeWorkspaceConfig,
 } from './lib/workspace.mjs';
@@ -1304,6 +1309,151 @@ function currentEmployerRegistry() {
     { now: () => recordedAt },
   );
 }
+
+function currentLearningLedger() {
+  return loadLearningLedger(WORKSPACE_ROOT)
+    || createLearningLedger({ now: () => '2000-01-01T00:00:00.000Z' });
+}
+
+function learningLedgerForRevision(revision) {
+  const ledger = currentLearningLedger();
+  const currentRevision = learningLedgerRevision(ledger);
+  if (revision !== currentRevision) {
+    const error = new Error('The feedback ledger changed while this page was open.');
+    error.currentRevision = currentRevision;
+    throw error;
+  }
+  return ledger;
+}
+
+function replyLearningConflict(res, error) {
+  return replyJson(res, 409, {
+    conflict: true,
+    currentRevision: error.currentRevision,
+    ...publicApiError('Feedback or learned preferences changed. Refresh and retry.'),
+  });
+}
+
+function publicLearningLedger(ledger) {
+  return {
+    schemaVersion: ledger.schemaVersion,
+    generation: ledger.generation,
+    updatedAt: ledger.updatedAt,
+    revision: learningLedgerRevision(ledger),
+    active: activeLearningPolicy(ledger),
+    feedbackEvents: ledger.feedbackEvents,
+    proposals: ledger.proposals,
+    versions: ledger.versions,
+  };
+}
+
+routes['GET /api/feedback-learning'] = (req, res) => {
+  try {
+    return replyJson(res, 200, publicLearningLedger(currentLearningLedger()));
+  } catch {
+    return replyJson(res, 500, publicApiError('Feedback history could not be read.'));
+  }
+};
+
+routes['POST /api/feedback'] = (req, res, body) => {
+  const value = parseBody(body);
+  if (!value || typeof value.revision !== 'string'
+    || typeof value.opportunityId !== 'string') {
+    return replyJson(res, 400, {
+      error: 'feedback, opportunity ID and current revision are required',
+    });
+  }
+  try {
+    return withSearchPlanMutation(res, 'feedback', () => {
+      const ledger = learningLedgerForRevision(value.revision);
+      const tracker = readTrackerSnapshot(TRACKER_FILE).data;
+      const opportunity = findEntry(tracker, value.opportunityId);
+      const profile = loadPublishedSearchProfile(WORKSPACE_ROOT);
+      const next = recordFeedback(ledger, {
+        opportunityId: opportunity.id,
+        vacancyId: opportunity.jobIdentity?.vacancyId
+          || opportunity.jobIdentity?.providerId
+          || opportunity.id,
+        decision: value.decision,
+        reason: value.reason,
+        explanation: value.explanation,
+        profileId: opportunity.profileId || profile?.id || 'legacy-profile',
+        learningVersionId: opportunity.learningVersionId || ledger.activeVersionId,
+      });
+      writeLearningLedger(WORKSPACE_ROOT, next);
+      void queueCheckpoint('ui: record job feedback');
+      return replyJson(res, 200, { ok: true, ledger: publicLearningLedger(next) });
+    });
+  } catch (error) {
+    if (Object.hasOwn(error, 'currentRevision')) return replyLearningConflict(res, error);
+    return replyJson(res, 400, publicApiError('Job feedback could not be recorded.'));
+  }
+};
+
+routes['POST /api/learning/proposals'] = (req, res, body) => {
+  const value = parseBody(body);
+  if (!value || typeof value.revision !== 'string') {
+    return replyJson(res, 400, {
+      error: 'learning proposal and current revision are required',
+    });
+  }
+  try {
+    return withSearchPlanMutation(res, 'learning-proposal', () => {
+      const ledger = learningLedgerForRevision(value.revision);
+      const next = proposeLearningChange(ledger, value);
+      writeLearningLedger(WORKSPACE_ROOT, next);
+      void queueCheckpoint('ui: propose learned preference');
+      return replyJson(res, 200, { ok: true, ledger: publicLearningLedger(next) });
+    });
+  } catch (error) {
+    if (Object.hasOwn(error, 'currentRevision')) return replyLearningConflict(res, error);
+    return replyJson(res, 400, publicApiError('Learned preference could not be proposed.'));
+  }
+};
+
+routes['POST /api/learning/publish'] = (req, res, body) => {
+  const value = parseBody(body);
+  if (!value || typeof value.revision !== 'string'
+    || value.confirmed !== true || typeof value.proposalId !== 'string') {
+    return replyJson(res, 400, {
+      error: 'proposal ID, explicit confirmation and current revision are required',
+    });
+  }
+  try {
+    return withSearchPlanMutation(res, 'learning-publish', () => {
+      const ledger = learningLedgerForRevision(value.revision);
+      const next = publishLearningProposal(ledger, value);
+      writeLearningLedger(WORKSPACE_ROOT, next);
+      void queueCheckpoint('ui: publish learned preference');
+      return replyJson(res, 200, { ok: true, ledger: publicLearningLedger(next) });
+    });
+  } catch (error) {
+    if (Object.hasOwn(error, 'currentRevision')) return replyLearningConflict(res, error);
+    return replyJson(res, 400, publicApiError('Learned preference could not be published.'));
+  }
+};
+
+routes['POST /api/learning/undo'] = (req, res, body) => {
+  const value = parseBody(body);
+  if (!value || typeof value.revision !== 'string'
+    || value.confirmed !== true || typeof value.versionId !== 'string') {
+    return replyJson(res, 400, {
+      error: 'version ID, explanation, explicit confirmation and current revision are required',
+    });
+  }
+  try {
+    return withSearchPlanMutation(res, 'learning-undo', () => {
+      const ledger = learningLedgerForRevision(value.revision);
+      const next = undoLearningVersion(ledger, value);
+      writeLearningLedger(WORKSPACE_ROOT, next);
+      void queueCheckpoint('ui: undo learned preference');
+      return replyJson(res, 200, { ok: true, ledger: publicLearningLedger(next) });
+    });
+  } catch (error) {
+    if (Object.hasOwn(error, 'currentRevision')) return replyLearningConflict(res, error);
+    return replyJson(res, 400, publicApiError('Learned preference could not be undone.'));
+  }
+};
 
 function publicEmployerRegistry(registry) {
   return {

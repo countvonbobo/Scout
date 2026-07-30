@@ -539,6 +539,36 @@ test('triage actions post the right status transitions', async () => {
   assert.deepEqual(normalized[2], ['/api/status', { id: 'b', status: 'new' }]);
 });
 
+test('explicit job feedback is separate from tracker status and carries the current ledger revision', async () => {
+  const { scout, context } = loadScout();
+  const answers = ['not-interested', 'location', 'The commute is too long.'];
+  context.window.prompt = () => answers.shift();
+  let alertText = '';
+  context.window.alert = (value) => { alertText = value; };
+  scout.feedbackLearning = { revision: 'a'.repeat(64) };
+  const calls = [];
+  scout.api = async (pathname, options) => {
+    calls.push([pathname, JSON.parse(options.body)]);
+    return { ok: true, ledger: { revision: 'b'.repeat(64) } };
+  };
+
+  const result = await scout.recordJobFeedback('job-1');
+
+  assert.equal(result.ok, true);
+  assert.deepEqual(calls, [[
+    '/api/feedback',
+    {
+      revision: 'a'.repeat(64),
+      opportunityId: 'job-1',
+      decision: 'not-interested',
+      reason: 'location',
+      explanation: 'The commute is too long.',
+    },
+  ]]);
+  assert.match(alertText, /Ranking did not change/);
+  assert.equal(scout.feedbackLearning.revision, 'b'.repeat(64));
+});
+
 test('No removes a job immediately and restores it when persistence fails', async () => {
   const { scout } = loadScout();
   scout.state.data = { opportunities: [{ id: 'b', status: 'new' }] };

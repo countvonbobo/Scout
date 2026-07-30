@@ -95,7 +95,12 @@ It appends one canonical schema-version-5 JSON object to `data/scan-runs.jsonl` 
 
 Ranked discovery retains employers from selected canonical adverts as
 normal-priority review evidence and can monitor explicitly reviewed public
-careers sources. It does not learn new rules from feedback; that capability
-remains deferred until Gate D.
+careers sources. Job feedback is a separate versioned event and cannot change
+ranking itself. Only an explicitly reviewed learned-preference proposal enters
+the deterministic rank compatibility fingerprint. Its bounded contribution is
+shown separately from base profile evidence; confirmed exact rule
+reconsideration retains the original exclusion evidence. Undo appends a new
+version restoring the prior published behavior, while historical decisions
+retain their original profile and learning versions.
 
 Multiple runs on the same date are combined into one report with separate provider/mode summaries; the later run never erases the earlier run's presence. Before reporting success, Scout reads back and validates the tracker, required report sections and the matching final run record. The lock is released after completed, healthy-empty, degraded or failed runs.

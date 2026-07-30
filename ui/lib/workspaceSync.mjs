@@ -23,6 +23,7 @@ const MARKER_FILTER_PATHS = Object.freeze([
   'data/opportunities.json',
   'data/search-lanes.json',
   'data/employers.json',
+  'data/feedback-learning.json',
   'data/scan-runs.jsonl',
   'reports/*.md',
 ]);
@@ -628,6 +629,7 @@ function markerFilterAttributes(root) {
     'data/opportunities.json filter=scout-marker',
     'data/search-lanes.json filter=scout-marker',
     'data/employers.json filter=scout-marker',
+    'data/feedback-learning.json filter=scout-marker',
     'data/scan-runs.jsonl filter=scout-marker',
     'reports/*.md filter=scout-marker',
     '# scout marker clean filter end',

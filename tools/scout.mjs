@@ -55,6 +55,9 @@ import {
   employerRegistryRevision, loadEmployerRegistry, migrateLegacyPortals,
   selectEmployersForMonitoring,
 } from '../ui/lib/employerRegistry.mjs';
+import {
+  activeLearningPolicy, createLearningLedger, loadLearningLedger,
+} from '../ui/lib/feedbackLearning.mjs';
 
 const APP_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const MAX_SCAN_FILE_CHARS = 100_000;
@@ -123,7 +126,7 @@ function readScanTracker(root) {
 }
 
 function scanCompatibility({
-  config, mode, model, profile, provider, root, tracker,
+  config, learningPolicy, mode, model, profile, provider, root, tracker,
   requester = 'manual', scheduleId = null, logicalWindowId = null,
 }) {
   const contextDigests = assessmentContextDigests(workspacePaths(root), config);
@@ -137,7 +140,10 @@ function scanCompatibility({
     artifactSchemaVersion: RUN_ARTIFACT_SCHEMA_VERSION,
     stageArtifactSchemaVersion: PIPELINE_STAGE_ARTIFACT_SCHEMA_VERSION,
     pipelineVersion: 'scan-pipeline-v4-reconciled-coverage',
-    rankingVersion: `ranked-discovery-v1-${scanDigest(tracker).slice(0, 32)}`,
+    rankingVersion: `ranked-discovery-v1-${scanDigest({
+      tracker,
+      learningVersionId: learningPolicy?.id || 'learning-baseline',
+    }).slice(0, 32)}`,
     promptVersion: `assessment-prompt-v2-${scanDigest(contextDigests).slice(0, 32)}`,
     assessmentSchemaVersion: 2,
     provider,
@@ -149,9 +155,12 @@ function scanCompatibility({
   };
 }
 
-function scanQueueCompatibility(compatibility, profile, config, tracker) {
+function scanQueueCompatibility(compatibility, profile, config, tracker, learningPolicy) {
   return Object.freeze({
-    profileFingerprint: scanDigest(profile || { id: compatibility.profileVersion }),
+    profileFingerprint: scanDigest({
+      profile: profile || { id: compatibility.profileVersion },
+      learningVersionId: learningPolicy?.id || 'learning-baseline',
+    }),
     configFingerprint: queueConfigFingerprint(config, tracker),
     schemaVersion: 1,
   });
@@ -161,8 +170,14 @@ function currentScanQueueCompatibility(root) {
   const config = loadWorkspaceConfig(root);
   const profile = loadPublishedSearchProfile(root);
   const tracker = readScanTracker(root);
+  const learningPolicy = activeLearningPolicy(
+    loadLearningLedger(root) || createLearningLedger({ now: () => '2000-01-01T00:00:00.000Z' }),
+  );
   return Object.freeze({
-    profileFingerprint: scanDigest(profile || { id: profile?.id || 'legacy-profile' }),
+    profileFingerprint: scanDigest({
+      profile: profile || { id: profile?.id || 'legacy-profile' },
+      learningVersionId: learningPolicy.id,
+    }),
     configFingerprint: queueConfigFingerprint(config, tracker),
     schemaVersion: 1,
   });
@@ -177,6 +192,9 @@ function verifyQueuedScanCompatibility(root, request, manifest = null) {
   const config = loadWorkspaceConfig(root);
   const profile = loadPublishedSearchProfile(root);
   const tracker = readScanTracker(root);
+  const learningPolicy = activeLearningPolicy(
+    loadLearningLedger(root) || createLearningLedger({ now: () => '2000-01-01T00:00:00.000Z' }),
+  );
   const currentQueue = {
     ...currentScanQueueCompatibility(root),
     purpose: request.purpose,
@@ -186,6 +204,7 @@ function verifyQueuedScanCompatibility(root, request, manifest = null) {
   }
   const currentRun = scanCompatibility({
     config,
+    learningPolicy,
     profile,
     root,
     tracker,
@@ -202,7 +221,7 @@ function verifyQueuedScanCompatibility(root, request, manifest = null) {
 
 function scanQueueRequest(compatibility, profile, {
   config, tracker, mode, model, provider, requestedAt, requester = 'manual',
-  windowAt = null, scheduleId = null, logicalWindowId = null,
+  windowAt = null, scheduleId = null, logicalWindowId = null, learningPolicy = null,
 }) {
   if (!['manual', 'scheduled'].includes(requester)) throw new TypeError('scan requester is invalid');
   if (requester === 'scheduled' && !windowAt) throw new TypeError('scheduled scan requires its next window');
@@ -214,10 +233,11 @@ function scanQueueRequest(compatibility, profile, {
     key: `scan-${scanDigest({
       mode, model: model || 'provider-default', profile: compatibility.profileVersion, provider,
       sourceConfigFingerprint: compatibility.sourceConfigFingerprint,
+      rankingVersion: compatibility.rankingVersion,
     }).slice(0, 40)}`,
     requester,
     purpose: compatibility.purpose,
-    compatibility: scanQueueCompatibility(compatibility, profile, config, tracker),
+    compatibility: scanQueueCompatibility(compatibility, profile, config, tracker, learningPolicy),
     execution: Object.freeze({
       schemaVersion: 2,
       provider,
@@ -735,15 +755,20 @@ export async function runScanWith(root, provider, mode, {
   let trustedProviderStatus = null;
   const publishedAtStart = loadPublishedSearchProfile(root);
   const trackerAtStart = readScanTracker(root);
+  const learningPolicyAtStart = activeLearningPolicy(
+    loadLearningLedger(root) || createLearningLedger({ now: () => '2000-01-01T00:00:00.000Z' }),
+  );
   const plannedQueryPlan = workspaceQueryPlan(root, { broadened: mode === 'broadened' });
   const compatibility = scanCompatibility({
-    config, mode, model, profile: publishedAtStart, provider, root, tracker: trackerAtStart,
+    config, learningPolicy: learningPolicyAtStart, mode, model,
+    profile: publishedAtStart, provider, root, tracker: trackerAtStart,
     requester, scheduleId, logicalWindowId,
   });
   const request = claimedLease === null
     ? scanQueueRequest(compatibility, publishedAtStart, {
       mode, model, provider, requestedAt: startedAt, requester, windowAt,
       scheduleId, logicalWindowId, config, tracker: trackerAtStart,
+      learningPolicy: learningPolicyAtStart,
     })
     : null;
   const collect = async () => {
@@ -758,6 +783,7 @@ export async function runScanWith(root, provider, mode, {
       collect,
       profile: publishedAtStart,
       tracker: trackerAtStart,
+      learningPolicy: learningPolicyAtStart,
       decisionHistory: readVacancyDecisionHistory(root),
       limit: DEFAULT_CANDIDATE_LIMIT,
       relevanceThreshold: config.search?.relevanceThreshold ?? config.triage?.checkScore,
@@ -881,6 +907,7 @@ export async function runScanWith(root, provider, mode, {
           discoveryEngine,
           exclusions: discovery?.exclusions || [],
           profileId: publishedProfile?.id || publishedAtStart?.id || null,
+          learningVersionId: learningPolicyAtStart.id,
           staleInboxEntries,
           inboxRechecked,
         }, { run, lease });
@@ -1041,6 +1068,7 @@ export async function runScanWith(root, provider, mode, {
             selectionDecision: discovery?.selection || null,
             runId: run.runId,
             discoveryEngine, profileId: publishedProfile?.id || null,
+            learningVersionId: learningPolicyAtStart.id,
             staleInboxEntries, inboxRechecked,
           }, { run, lease, hooks: mutationHooks });
           result = { ok: true, status: artifacts.run.degraded ? 'degraded' : candidates.length ? 'completed' : 'healthy-empty', scan: artifacts.run, usage };
