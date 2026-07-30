@@ -162,11 +162,24 @@ before(async () => {
 });
 
 after(async () => {
+  let drainError = null;
   if (child && child.exitCode === null) {
-    child.kill();
-    await new Promise((resolve) => child.once('exit', resolve));
+    try {
+      const drained = await request({
+        method: 'POST',
+        route: '/api/sync/backup',
+        body: { reason: 'setup test cleanup' },
+      });
+      assert.equal(drained.status, 200, drained.text);
+    } catch (error) {
+      drainError = error;
+    } finally {
+      child.kill();
+      await new Promise((resolve) => child.once('exit', resolve));
+    }
   }
   fs.rmSync(workspace, { recursive: true, force: true });
+  if (drainError) throw drainError;
 });
 
 test('fresh setup waits for an explicit local create or restore choice', async () => {
