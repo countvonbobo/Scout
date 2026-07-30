@@ -826,7 +826,7 @@ function withGuard(root, owner, options, action, behavior = {}) {
           process.platform === 'win32' ? 'junction' : 'dir',
         );
       } catch (error) {
-        if (!['EEXIST', 'ENOTEMPTY', 'EPERM', 'EACCES'].includes(error?.code)) throw error;
+        if (!['EEXIST', 'ENOTEMPTY', 'EBUSY', 'EPERM', 'EACCES'].includes(error?.code)) throw error;
         const metadata = readGuardMetadata(guard, fileSystem);
         if (staleAndRecoverable(guard, metadata, wallMilliseconds(options), options)) {
           options.hooks.afterGuardObservation?.();

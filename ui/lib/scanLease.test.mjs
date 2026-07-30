@@ -80,6 +80,42 @@ test('separate processes racing for one workspace produce exactly one winner', a
   assert.equal(results.find((result) => result.acquired).lease.generation, 1);
 });
 
+test('guard publication retries a transient Windows busy result within its existing budget', () => {
+  const root = temp();
+  let busyFailures = 1;
+  let publicationAttempts = 0;
+  const fileSystem = new Proxy(fs, {
+    get(target, property) {
+      if (property === 'symlinkSync') return (source, destination, type) => {
+        if (String(destination).endsWith('scan-lease.guard')) {
+          publicationAttempts += 1;
+          if (busyFailures > 0) {
+            busyFailures -= 1;
+            throw Object.assign(new Error('injected transient Windows guard contention'), {
+              code: 'EBUSY',
+            });
+          }
+        }
+        return target.symlinkSync(source, destination, type);
+      };
+      const value = target[property];
+      return typeof value === 'function' ? value.bind(target) : value;
+    },
+  });
+
+  const lease = acquireScanLease(
+    root,
+    currentLeaseOwner(),
+    operation('run-busy-publication-retry'),
+    { fileSystem, guardAcquireTimeoutMs: 100 },
+  );
+
+  assert.equal(busyFailures, 0);
+  assert.equal(publicationAttempts, 2);
+  assert.equal(lease.runId, 'run-busy-publication-retry');
+  releaseScanLease(lease);
+});
+
 test('an independent heartbeat prevents a competing process from taking over', async () => {
   const root = temp();
   const ready = path.join(root, 'heartbeat-ready');
