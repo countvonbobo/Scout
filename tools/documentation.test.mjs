@@ -156,3 +156,24 @@ test('beta.23 upgrade guidance explains the one-way fenced lease boundary', () =
   }
   assert.match(release, /no manual workspace-data conversion is normally needed/i);
 });
+
+test('configuration distinguishes field influence and published-profile authority', () => {
+  const configuration = fs.readFileSync(path.join(root, 'docs', 'CONFIGURATION.md'), 'utf8');
+
+  for (const heading of [
+    'Authoritative scan input',
+    'Workspace runtime configuration',
+    'Legacy compatibility inputs',
+    'Deployment-only configuration',
+    'Readiness and UI claims',
+  ]) {
+    assert.match(configuration, new RegExp(`^## ${heading}$`, 'm'), heading);
+  }
+  assert.match(configuration, /published search profile.*does not yet generate source queries/is);
+  assert.match(configuration, /published search profile.*filtering.*ranking.*assessment/is);
+  assert.match(configuration, /search\.roleFamilies.*legacy.*collection/is);
+  assert.match(configuration, /search\.salaryMinimum.*legacy.*collection/is);
+  assert.match(configuration, /profile\.displayName.*no scan-decision effect/is);
+  assert.match(configuration, /setup\.completedAt.*does not change\s+collection, filtering, ranking or assessment/is);
+  assert.match(configuration, /deployment-only.*not stored in `workspace\.json`/is);
+});
