@@ -1241,10 +1241,10 @@ not acceptance of `d5ebca2`.
   provenance. Parsed generic `output` and `payload` handling remains open
   under Minor 3.
 - Private-path classification now uses exact segments rather than prefix
-  exemptions. It detects `/root`, `/var/root` through the root segment,
-  `/Users`, `/home` and derived Unix home families, drive-letter Windows
-  profiles, and UNC `Users`, `home`, `homes` and `profiles` shares. Only exact
-  public or documented placeholder segments are exempt; adversarial
+  exemptions. It detects root-account homes, macOS and derived Unix home
+  families, drive-letter Windows profiles, and UNC `Users`, `home`, `homes`
+  and `profiles` shares. Only exact public or documented placeholder segments
+  are exempt; adversarial
   `yourname`, `yourself`, `YourAccount` and mixed-case equivalents fail. The
   findings continue to contain only file, line and rule metadata, never the
   matched private value.

@@ -683,6 +683,6 @@ test('ranked discovery production sources stay neutral and release bundles omit 
 test('default audit evaluates releasable sources without treating test lock tokens as credentials', () => {
   const result = auditRelease({ root: ROOT, buildDirs: [] });
 
-  assert.equal(result.ok, true);
+  assert.equal(result.ok, true, JSON.stringify(result.findings));
   assert.equal(result.findings.some(({ file }) => file.endsWith('.test.mjs')), false);
 });
