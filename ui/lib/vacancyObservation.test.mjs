@@ -20,6 +20,18 @@ test('normalisation preserves explicit values and unknowns with provenance', () 
   assert.equal(observation.fieldProvenance.location, 'unknown');
   assert.equal(observation.fetchedAt, NOW);
   assert.equal(observation.laneId, 'lane-1');
+  assert.deepEqual(observation.laneIds, ['lane-1']);
+});
+
+test('normalisation retains every bounded matching lane in stable order', () => {
+  const observation = normaliseObservation({
+    providerId: 'job-lanes', title: 'Researcher', company: 'Acme',
+    url: 'https://jobs.example/lanes',
+    laneIds: ['lane-b', 'lane-a', 'lane-b'],
+  }, { sourceName: 'fixture', fetchedAt: NOW, laneId: 'lane-c' });
+
+  assert.equal(observation.laneId, 'lane-a');
+  assert.deepEqual(observation.laneIds, ['lane-a', 'lane-b', 'lane-c']);
 });
 
 test('retains the configured collection source separately from the vacancy vendor', () => {
@@ -160,11 +172,21 @@ test('lane and explicit role-family provenance participate in observation identi
   const first = normaliseObservation(job, {
     sourceName: 'fixture', fetchedAt: NOW, laneId: 'lane-primary', roleFamily: 'engineering',
   });
-  const second = normaliseObservation(job, {
-    sourceName: 'fixture', fetchedAt: NOW, laneId: 'lane-adjacent', roleFamily: 'operations',
+  const second = normaliseObservation({
+    ...job,
+    laneIds: ['lane-adjacent'],
+    searchQueries: ['operations'],
+    roleFamily: 'operations',
+  }, {
+    sourceName: 'fixture', fetchedAt: NOW,
   });
 
   assert.notEqual(first.observationId, second.observationId);
+  assert.equal(
+    first.rawFingerprint,
+    second.rawFingerprint,
+    'discovery provenance must not masquerade as a source-content update',
+  );
   assert.deepEqual(
     [first, second].map(({ laneId, roleFamily }) => ({ laneId, roleFamily })),
     [

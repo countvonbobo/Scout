@@ -16,6 +16,8 @@ import {
   scanOutcomeSummary,
   shouldAutoRunFirstScan,
   shouldRequestRecoveryKey,
+  adaptiveQuestionnaireHtml,
+  searchLanePlanHtml,
   searchProfileReviewHtml,
   splitList,
   validateCvName,
@@ -49,6 +51,74 @@ test('profile review names every decision area and keeps unconfirmed inferences 
   assert.match(html, /unknown location facts: penalise/i);
   assert.match(html, /Unconfirmed inferences remain non-blocking/);
   assert.match(html, /Publish this reviewed profile/);
+});
+
+test('adaptive questionnaire renders universal questions before bounded specialist follow-ups safely', () => {
+  const html = adaptiveQuestionnaireHtml({
+    questionnaire: {
+      specialistLimit: 6,
+      questions: [
+        {
+          id: 'primary-work', phase: 'universal', field: 'target.primaryTitles',
+          label: 'Primary work', prompt: 'Which primary work?', current: [],
+          answer: { kind: 'rules', maxItems: 8, allowBlocking: false },
+        },
+        {
+          id: 'specialist-skills', phase: 'specialist', field: 'target.skills',
+          label: 'Skills', prompt: '<script>skills</script>', current: [],
+          answer: { kind: 'rules', maxItems: 12, allowBlocking: false },
+        },
+      ],
+    },
+  });
+  assert.ok(html.indexOf('Universal questions') < html.indexOf('Specialist follow-ups'));
+  assert.match(html, /data-adaptive-include="primary-work"/);
+  assert.match(html, /Save selected structured answers/);
+  assert.doesNotMatch(html, /<script>skills<\/script>/);
+  assert.match(html, /&lt;script&gt;skills&lt;\/script&gt;/);
+});
+
+test('search-lane review shows bounded evidence with explicit retirement and restoration controls', () => {
+  const lane = {
+    id: 'lane-aaaaaaaaaaaaaaaa',
+    query: '<script>Platform engineer</script>',
+    kind: 'title',
+    state: 'active',
+    runCount: 3,
+    consecutiveUnproductiveRuns: 3,
+    aggregate: { returned: 4, eligible: 0, promising: 0 },
+    profileFields: [{ path: 'target.primaryTitles' }],
+    history: [{
+      recordedAt: '2026-07-30T10:00:00.000Z',
+      returned: 1,
+      eligible: 0,
+      promising: 0,
+      failures: [{ source: 'adzuna', code: 'source-query-failed' }],
+    }],
+  };
+  const html = searchLanePlanHtml({
+    lanePlan: {
+      lanes: [
+        lane,
+        {
+          ...lane,
+          id: 'lane-bbbbbbbbbbbbbbbb',
+          query: 'Restorable lane',
+          state: 'retired',
+          retirement: { reversible: true },
+          consecutiveUnproductiveRuns: 0,
+        },
+      ],
+      archivedLanes: [],
+    },
+    laneRevision: 'revision',
+  });
+
+  assert.doesNotMatch(html, /<script>Platform/);
+  assert.match(html, /&lt;script&gt;Platform engineer&lt;\/script&gt;/);
+  assert.match(html, /source failure recorded/);
+  assert.match(html, /search-lanes-retire-confirm/);
+  assert.match(html, /data-search-lane-restore="lane-bbbbbbbbbbbbbbbb"/);
 });
 
 test('profile review renders safely before profile state loads', () => {

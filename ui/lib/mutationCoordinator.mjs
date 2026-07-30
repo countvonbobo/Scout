@@ -119,6 +119,7 @@ function resolveTarget(root, key, kind) {
   let file;
   if (key === 'tracker' && kind === 'tracker') file = paths.tracker;
   else if (key === 'scan-log' && kind === 'run-log') file = paths.scanRuns;
+  else if (key === 'search-lanes' && kind === 'json') file = paths.searchLanes;
   else {
     const report = typeof key === 'string' ? key.match(/^report:(\d{4}-\d{2}-\d{2})$/) : null;
     if (!report || kind !== 'report') throw new TypeError('mutation target key is not supported');
@@ -316,7 +317,7 @@ export function prepareMutation(run, target, recipes) {
   const paths = new Set();
   const intended = target.files.map((descriptor) => {
     if (!descriptor || Object.getPrototypeOf(descriptor) !== Object.prototype
-      || !['tracker', 'report', 'run-log'].includes(descriptor.kind)) {
+      || !['tracker', 'report', 'run-log', 'json'].includes(descriptor.kind)) {
       throw new TypeError('mutation target file is invalid');
     }
     const key = requireId(descriptor.key, 'mutation target key');

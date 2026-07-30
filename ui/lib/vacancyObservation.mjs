@@ -112,7 +112,7 @@ function diagnosticCode(warning) {
 }
 
 export function normaliseObservation(job, {
-  sourceName, collectionSource, fetchedAt, laneId, roleFamily,
+  sourceName, collectionSource, fetchedAt, laneId, laneIds, roleFamily,
 } = {}) {
   const source = text(sourceName) || text(job?.source);
   if (!job || !source) return null;
@@ -139,15 +139,34 @@ export function normaliseObservation(job, {
   ], warnings, 'seniority');
   const fullTime = extraction(description, [['full-time', /\bfull[ -]?time\b/i], ['part-time', /\bpart[ -]?time\b/i]]);
   if (fullTime.ambiguous) warnings.push('ambiguous working pattern was left unknown');
-  const observationLaneId = metadataText(laneId);
+  const observationLaneIds = [...new Set([
+    ...(Array.isArray(job.laneIds) ? job.laneIds : []),
+    ...(Array.isArray(laneIds) ? laneIds : []),
+    job.laneId,
+    laneId,
+  ].map(metadataText).filter(Boolean))].sort().slice(0, 32);
+  const observationLaneId = observationLaneIds[0] || null;
   const observationCollectionSource = metadataText(collectionSource || source);
   const observationRoleFamily = metadataText(
     job.roleFamilyId || job.roleFamily || job.targetRoleFamily || roleFamily,
   );
-  const fingerprintInput = { ...job, url: canonicalUrl || text(job.url), sourceUrl: canonicalUrl || text(job.sourceUrl) };
+  const {
+    laneId: _laneId,
+    laneIds: _laneIds,
+    searchQueries: _searchQueries,
+    roleFamily: _roleFamily,
+    roleFamilyId: _roleFamilyId,
+    targetRoleFamily: _targetRoleFamily,
+    ...sourceJob
+  } = job;
+  const fingerprintInput = {
+    ...sourceJob,
+    url: canonicalUrl || text(job.url),
+    sourceUrl: canonicalUrl || text(job.sourceUrl),
+  };
   const rawFingerprint = fingerprint(stableJson(fingerprintInput));
   const observationId = fingerprint(
-    `${source}\n${observationCollectionSource || ''}\n${recordId || canonicalUrl || ''}\n${observationLaneId || ''}\n${observationRoleFamily || ''}\n${rawFingerprint}`,
+    `${source}\n${observationCollectionSource || ''}\n${recordId || canonicalUrl || ''}\n${observationLaneIds.join(',')}\n${observationRoleFamily || ''}\n${rawFingerprint}`,
   );
   const result = {
     observationId,
@@ -178,6 +197,7 @@ export function normaliseObservation(job, {
     firstSeenAt: text(job.firstSeenAt) || text(fetchedAt),
     lastSeenAt: text(job.lastSeenAt) || text(fetchedAt),
     laneId: observationLaneId,
+    laneIds: observationLaneIds,
     roleFamily: observationRoleFamily,
     warnings,
     rawFingerprint,

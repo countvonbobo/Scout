@@ -4,8 +4,8 @@
 
 - Stack from exact Gate A candidate
   `22f8a5d78692c9d3cb94ad742f539ea31f4121cc`.
-- Keep PR #82 draft and unchanged.
-- Use a focused Gate B branch and draft PR.
+- Continue the existing PR #82 branch and keep the PR draft.
+- Do not create another branch or PR for Gate B.
 - Preserve the issue #77 cross-gate interfaces and private-workspace boundary.
 
 ## 1. Adaptive structured setup

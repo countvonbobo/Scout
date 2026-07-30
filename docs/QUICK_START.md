@@ -70,9 +70,23 @@ Complete the setup questions for your role families, sectors, locations, minimum
 
 Review the complete search-profile draft and explicitly publish it before ranked discovery starts. Scout stages the draft automatically once setup preferences and profile evidence exist. A published profile is immutable for a scan: it records the approved rules, their strength and how unknown source facts should be handled. A fresh workspace cannot scan until you publish. If you upgrade an established older workspace that already has tracked opportunities, Scout creates an unpublished review draft from its existing preferences and temporarily continues the explicitly marked legacy discovery path until you publish it. A migration preserves your tracker, reports, applications and profile prose; it does not turn inferred preferences into hard exclusions. Unconfirmed inferred mandatory values remain non-blocking, and multiple accepted mandatory values for one field mean “any of these”, not “all of these”.
 
+The structured review starts with universal questions, then offers no more
+than six specialist follow-ups based on fields that are still missing or need
+review. Check only the answers you want to change, inspect the complete draft,
+and publish explicitly. Publication creates traceable search lanes from the
+approved profile; it does not use a built-in occupation, employer, location or
+salary taxonomy.
+
 Setup, Settings, CV options and side drawers keep keyboard focus inside the active dialog and return it to the control that opened the dialog. Press **Escape** to close an optional dialog or drawer. Mandatory first-run setup remains open until its required action is complete.
 
 Scout uses these approved answers, the imported CV and generated search lanes to find and score jobs. It does not inspect unrelated Codex/Claude conversations or automatically infer a career from previous AI usage.
+
+After several scans, open **Settings → Search & profile → Search lanes and run
+history** to see what each query returned and what survived filtering,
+selection and assessment. Scout can offer a lane for retirement only after
+three completed non-failed runs produced no new, eligible, selected or
+promising result. You must confirm retirement, and you can restore the lane
+later without losing its history.
 
 ### Tailor a CV
 

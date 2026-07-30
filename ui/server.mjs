@@ -65,6 +65,13 @@ import {
   loadPublishedSearchProfile, migrateSearchProfile, profileFingerprint, publishSearchProfile, validateSearchProfile,
 } from './lib/searchProfile.mjs';
 import {
+  applyAdaptiveAnswers, buildAdaptiveQuestionnaire,
+} from './lib/adaptiveSetup.mjs';
+import {
+  loadSearchLanePlan, reconcileSearchLanePlan, restoreSearchLane,
+  retireUnproductiveSearchLanes, searchLanePlanRevision, writeSearchLanePlan,
+} from './lib/searchLanes.mjs';
+import {
   loadWorkspaceConfig, migrateWorkspace, resolveWorkspaceRoot, seedWorkspace, syncManagedInstructions,
   workspacePaths, writeWorkspaceConfig,
 } from './lib/workspace.mjs';
@@ -1276,6 +1283,125 @@ function replySearchProfileConflict(res, error) {
   });
 }
 
+routes['GET /api/search-profile/adaptive'] = (req, res) => {
+  try {
+    stageSearchProfileReview();
+    const draft = readDraftSearchProfile();
+    const lanePlan = loadSearchLanePlan(WORKSPACE_ROOT);
+    return replyJson(res, 200, {
+      questionnaire: draft ? buildAdaptiveQuestionnaire(draft) : null,
+      lanePlan,
+      laneRevision: lanePlan ? searchLanePlanRevision(lanePlan) : null,
+    });
+  } catch {
+    return replyJson(res, 400, publicApiError('Adaptive search-profile review could not be loaded.'));
+  }
+};
+
+function currentLanePlanForRevision(revision) {
+  const plan = loadSearchLanePlan(WORKSPACE_ROOT);
+  if (!plan) throw new Error('No published search-lane plan is available.');
+  const currentRevision = searchLanePlanRevision(plan);
+  if (revision !== currentRevision) {
+    const error = new Error('The search-lane plan changed while this page was open. Refresh and retry.');
+    error.currentRevision = currentRevision;
+    throw error;
+  }
+  return plan;
+}
+
+function replyLaneConflict(res, error) {
+  return replyJson(res, 409, {
+    conflict: true,
+    currentRevision: error.currentRevision,
+    ...publicApiError('Search-lane update conflict.'),
+  });
+}
+
+function withSearchPlanMutation(res, phase, action) {
+  let lease;
+  let heartbeat;
+  try {
+    lease = acquireScanLease(
+      WORKSPACE_ROOT,
+      currentLeaseOwner(),
+      {
+        kind: 'search-plan-mutation',
+        runId: `search-plan-${randomUUID()}`,
+        phase,
+      },
+    );
+    if (!lease) {
+      return replyJson(res, 409, {
+        error: 'A scan or workspace mutation is in progress. Refresh and retry.',
+      });
+    }
+    heartbeat = startLeaseHeartbeat(lease);
+    return action();
+  } finally {
+    heartbeat?.stop();
+    if (lease) {
+      try { releaseScanLease(lease); } catch {}
+    }
+  }
+}
+
+routes['POST /api/search-lanes/retire-unproductive'] = (req, res, body) => {
+  const value = parseBody(body);
+  if (!value || value.confirmed !== true || !Object.hasOwn(value, 'revision')) {
+    return replyJson(res, 400, {
+      error: 'explicit confirmation and current lane revision are required',
+    });
+  }
+  try {
+    return withSearchPlanMutation(res, 'retire', () => {
+      const current = currentLanePlanForRevision(value.revision);
+      const plan = retireUnproductiveSearchLanes(current, { minimumRuns: 3 });
+      if (searchLanePlanRevision(plan) === searchLanePlanRevision(current)) {
+        return replyJson(res, 409, {
+          error: 'No active lane has three completed unproductive runs.',
+        });
+      }
+      writeSearchLanePlan(WORKSPACE_ROOT, plan);
+      void queueCheckpoint('ui: retire unproductive search lanes');
+      return replyJson(res, 200, {
+        ok: true,
+        lanePlan: plan,
+        laneRevision: searchLanePlanRevision(plan),
+      });
+    });
+  } catch (error) {
+    if (Object.hasOwn(error, 'currentRevision')) return replyLaneConflict(res, error);
+    return replyJson(res, 400, publicApiError('Search lanes could not be retired.'));
+  }
+};
+
+routes['POST /api/search-lanes/restore'] = (req, res, body) => {
+  const value = parseBody(body);
+  if (!value || value.confirmed !== true
+    || !Object.hasOwn(value, 'revision') || !Object.hasOwn(value, 'laneId')) {
+    return replyJson(res, 400, {
+      error: 'lane ID, explicit confirmation and current lane revision are required',
+    });
+  }
+  try {
+    return withSearchPlanMutation(res, 'restore', () => {
+      const current = currentLanePlanForRevision(value.revision);
+      const plan = restoreSearchLane(current, value.laneId);
+      writeSearchLanePlan(WORKSPACE_ROOT, plan);
+      void queueCheckpoint('ui: restore search lane');
+      return replyJson(res, 200, {
+        ok: true,
+        lanePlan: plan,
+        laneRevision: searchLanePlanRevision(plan),
+      });
+    });
+  } catch (error) {
+    if (Object.hasOwn(error, 'currentRevision')) return replyLaneConflict(res, error);
+    return replyJson(res, 400, publicApiError('Search lane could not be restored.'));
+  }
+};
+
 routes['PUT /api/search-profile/draft'] = (req, res, body) => {
   const value = parseBody(body);
   if (!value || !Object.hasOwn(value, 'draft') || !Object.hasOwn(value, 'revision')) {
@@ -1295,32 +1421,94 @@ routes['PUT /api/search-profile/draft'] = (req, res, body) => {
   }
 };
 
+routes['PUT /api/search-profile/adaptive'] = (req, res, body) => {
+  const value = parseBody(body);
+  if (!value || !Object.hasOwn(value, 'answers') || !Object.hasOwn(value, 'revision')) {
+    return replyJson(res, 400, { error: 'adaptive answers and current revision are required' });
+  }
+  try {
+    const current = currentDraftForRevision(value.revision);
+    const draft = applyAdaptiveAnswers(current, value.answers);
+    atomicWriteFile(WORKSPACE.searchProfileDraft, `${JSON.stringify(draft, null, 2)}\n`);
+    const draftRevision = profileFingerprint(draft);
+    void queueCheckpoint('ui: save adaptive search profile answers');
+    return replyJson(res, 200, {
+      ok: true,
+      draft,
+      draftRevision,
+      questionnaire: buildAdaptiveQuestionnaire(draft),
+    });
+  } catch (e) {
+    if (Object.hasOwn(e, 'currentRevision')) return replySearchProfileConflict(res, e);
+    return replyJson(res, 400, publicApiError('Adaptive search-profile answers could not be saved.'));
+  }
+};
+
+function restorePublishedArtifact(file, previous) {
+  if (previous === null) fs.rmSync(file, { force: true });
+  else atomicWriteFile(file, previous);
+}
+
+function publishProfileAndLanePlan(published, lanePlan, config) {
+  const previous = new Map([
+    [WORKSPACE.searchProfilePublished, fs.existsSync(WORKSPACE.searchProfilePublished)
+      ? fs.readFileSync(WORKSPACE.searchProfilePublished)
+      : null],
+    [WORKSPACE.searchLanes, fs.existsSync(WORKSPACE.searchLanes)
+      ? fs.readFileSync(WORKSPACE.searchLanes)
+      : null],
+    [WORKSPACE.config, fs.existsSync(WORKSPACE.config)
+      ? fs.readFileSync(WORKSPACE.config)
+      : null],
+  ]);
+  try {
+    atomicWriteFile(WORKSPACE.searchProfilePublished, `${JSON.stringify(published, null, 2)}\n`);
+    writeSearchLanePlan(WORKSPACE_ROOT, lanePlan);
+    writeWorkspaceConfig(WORKSPACE_ROOT, config);
+  } catch (error) {
+    for (const [file, content] of previous) restorePublishedArtifact(file, content);
+    throw error;
+  }
+}
+
 routes['POST /api/search-profile/publish'] = (req, res, body) => {
   const value = parseBody(body);
   if (!value) return replyJson(res, 400, { error: 'bad json' });
   try {
-    const draft = currentDraftForRevision(value.revision);
-    if (value.confirmed !== true) {
-      const error = new Error('Explicit confirmation is required before publishing this search profile.');
-      error.currentRevision = profileFingerprint(draft);
-      throw error;
-    }
-    const published = publishSearchProfile(draft);
-    const historicalRerank = rerankHistoricalVacancies(WORKSPACE_ROOT, published);
-    atomicWriteFile(WORKSPACE.searchProfilePublished, `${JSON.stringify(published, null, 2)}\n`);
-    const config = loadWorkspaceConfig(WORKSPACE_ROOT);
-    writeWorkspaceConfig(WORKSPACE_ROOT, {
-      ...config,
-      searchProfile: { ...(config.searchProfile || {}), publishedId: published.id },
-    });
-    void queueCheckpoint('ui: publish search profile');
-    return replyJson(res, 200, {
-      ok: true,
-      published,
-      historicalRerank: {
-        created: historicalRerank.created,
-        totals: historicalRerank.totals,
-      },
+    return withSearchPlanMutation(res, 'publish', () => {
+      const draft = currentDraftForRevision(value.revision);
+      if (value.confirmed !== true) {
+        const error = new Error('Explicit confirmation is required before publishing this search profile.');
+        error.currentRevision = profileFingerprint(draft);
+        throw error;
+      }
+      const published = publishSearchProfile(draft);
+      const lanePlan = reconcileSearchLanePlan(loadSearchLanePlan(WORKSPACE_ROOT), published);
+      const historicalRerank = rerankHistoricalVacancies(WORKSPACE_ROOT, published);
+      const config = loadWorkspaceConfig(WORKSPACE_ROOT);
+      const nextConfig = {
+        ...config,
+        searchProfile: { ...(config.searchProfile || {}), publishedId: published.id },
+      };
+      publishProfileAndLanePlan(published, lanePlan, nextConfig);
+      void queueCheckpoint('ui: publish search profile');
+      return replyJson(res, 200, {
+        ok: true,
+        published,
+        lanePlan: {
+          schemaVersion: lanePlan.schemaVersion,
+          profileId: lanePlan.profileId,
+          generation: lanePlan.generation,
+          active: lanePlan.lanes.filter(({ state }) => state === 'active').length,
+          retired: lanePlan.lanes.filter(({ state }) => state === 'retired').length,
+          archived: lanePlan.archivedLanes.length,
+          omissions: lanePlan.omissions.length,
+        },
+        historicalRerank: {
+          created: historicalRerank.created,
+          totals: historicalRerank.totals,
+        },
+      });
     });
   } catch (e) {
     if (Object.hasOwn(e, 'currentRevision')) return replySearchProfileConflict(res, e);

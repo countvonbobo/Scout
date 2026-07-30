@@ -180,7 +180,8 @@ test('configuration distinguishes field influence and published-profile authorit
   ]) {
     assert.match(configuration, new RegExp(`^## ${heading}$`, 'm'), heading);
   }
-  assert.match(configuration, /published search profile.*does not yet generate source queries/is);
+  assert.match(configuration, /published search profile.*(?:creates|reconciles).*search-lanes\.json/is);
+  assert.match(configuration, /query sources use only its selected active\s+lanes.*Legacy categories are not silently added/is);
   assert.match(configuration, /published search profile.*filtering.*ranking.*assessment/is);
   assert.match(configuration, /search\.roleFamilies.*legacy.*collection/is);
   assert.match(configuration, /search\.salaryMinimum.*legacy.*collection/is);

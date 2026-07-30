@@ -100,7 +100,10 @@ function dateBound(observations, name, direction) {
 }
 
 function metadataValues(observations, name) {
-  return [...new Set(observations.map((observation) => String(observation?.[name] || '').trim().slice(0, 120))
+  return [...new Set(observations.flatMap((observation) => {
+    const value = observation?.[name];
+    return Array.isArray(value) ? value : [value];
+  }).map((value) => String(value || '').trim().slice(0, 120))
     .filter(Boolean))].sort(compareStable);
 }
 
@@ -120,7 +123,10 @@ function canonicalVacancy(observations) {
   const canonicalUrl = orderedObservations.map((observation) => observation?.canonicalUrl).find(Boolean) || null;
   const sourceReferences = mergeSourceReferences(...orderedObservations);
   const collectionSources = metadataValues(orderedObservations, 'collectionSource');
-  const laneIds = metadataValues(orderedObservations, 'laneId');
+  const laneIds = [...new Set([
+    ...metadataValues(orderedObservations, 'laneId'),
+    ...metadataValues(orderedObservations, 'laneIds'),
+  ])].sort(compareStable);
   const roleFamilies = metadataValues(orderedObservations, 'roleFamily');
   return {
     observations: orderedObservations,

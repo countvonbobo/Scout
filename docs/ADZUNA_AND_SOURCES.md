@@ -21,7 +21,12 @@ Without credentials this command reports Adzuna unavailable and Scout can contin
 
 ## ATS and public discovery
 
-ATS portal configuration lives in `data/ats-portals.json`; search categories and queries live in `data/search-categories.json`; source notes live in `data/sources.md`. Keep entries generic and validated. Commands for diagnostic fetches are:
+ATS portal configuration lives in `data/ats-portals.json`; source notes live
+in `data/sources.md`. `data/search-categories.json` remains a legacy query
+input only until a reviewed profile creates `data/search-lanes.json`. After
+that, Adzuna and hiring.cafe use the fairly selected active lanes and preserve
+every matching lane ID when queries overlap. Keep entries generic and
+validated. Commands for diagnostic fetches are:
 
 ```powershell
 scout source ats

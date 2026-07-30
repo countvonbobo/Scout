@@ -2,8 +2,9 @@
 
 ## Status and scope
 
-This design implements Gate B of issue #77 on a branch stacked on exact Gate A
-candidate head `22f8a5d78692c9d3cb94ad742f539ea31f4121cc`.
+This design implements Gate B of issue #77 on the existing draft-PR branch,
+stacked on exact Gate A candidate head
+`22f8a5d78692c9d3cb94ad742f539ea31f4121cc`.
 
 Gate B adds:
 

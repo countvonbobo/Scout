@@ -21,6 +21,7 @@ const RUNTIME_FENCE_FAILURE = Symbol('runtime-fence-failure');
 const MARKER_FILTER = 'scout-marker';
 const MARKER_FILTER_PATHS = Object.freeze([
   'data/opportunities.json',
+  'data/search-lanes.json',
   'data/scan-runs.jsonl',
   'reports/*.md',
 ]);
@@ -624,6 +625,7 @@ function markerFilterAttributes(root) {
   const managed = [
     '# scout marker clean filter begin',
     'data/opportunities.json filter=scout-marker',
+    'data/search-lanes.json filter=scout-marker',
     'data/scan-runs.jsonl filter=scout-marker',
     'reports/*.md filter=scout-marker',
     '# scout marker clean filter end',

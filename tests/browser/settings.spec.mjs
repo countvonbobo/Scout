@@ -260,6 +260,116 @@ test('scan settings offer only the selected provider until verification is reque
   await expect(dialog.getByText('Claude verification pass time')).toBeVisible();
 });
 
+test('search settings review lane evidence before reversible retirement', async ({ page }) => {
+  const baseLane = {
+    id: 'lane-aaaaaaaaaaaaaaaa',
+    definitionFingerprint: 'a'.repeat(64),
+    state: 'active',
+    kind: 'title',
+    source: 'query-sources',
+    query: 'Platform engineer',
+    canonicalQuery: 'platform engineer',
+    priority: 100,
+    priorityBand: 'core',
+    profileFields: [{
+      path: 'target.primaryTitles',
+      ruleId: 'rule-primary',
+      value: 'Platform engineer',
+      strength: 'strong-preference',
+      provenance: 'explicit',
+    }],
+    overlaps: [],
+    createdAt: '2026-07-20T10:00:00.000Z',
+    updatedAt: '2026-07-23T10:00:00.000Z',
+    aggregate: { returned: 0, parsed: 0, new: 0, eligible: 0, selected: 0, promising: 0 },
+    runCount: 3,
+    failureCount: 0,
+    consecutiveUnproductiveRuns: 3,
+    history: [{
+      runId: 'run-three',
+      recordedAt: '2026-07-23T10:00:00.000Z',
+      laneId: 'lane-aaaaaaaaaaaaaaaa',
+      returned: 0, parsed: 0, new: 0, eligible: 0, selected: 0, promising: 0,
+    }],
+    retirement: null,
+  };
+  const plan = {
+    schemaVersion: 1,
+    profileId: 'profile-aaaaaaaaaaaa',
+    generatedAt: '2026-07-20T10:00:00.000Z',
+    updatedAt: '2026-07-23T10:00:00.000Z',
+    generation: 1,
+    lanes: [baseLane],
+    archivedLanes: [],
+    omissions: [],
+  };
+  await page.route('**/api/search-profile', (route) => route.fulfill({
+    contentType: 'application/json',
+    body: JSON.stringify({
+      rawPresent: true,
+      draft: null,
+      published: { id: plan.profileId },
+      draftRevision: null,
+    }),
+  }));
+  await page.route('**/api/search-profile/adaptive', (route) => route.fulfill({
+    contentType: 'application/json',
+    body: JSON.stringify({ questionnaire: null, lanePlan: plan, laneRevision: 'revision-one' }),
+  }));
+  let retirementRequest;
+  await page.route('**/api/search-lanes/retire-unproductive', (route) => {
+    retirementRequest = route.request().postDataJSON();
+    const retired = {
+      ...plan,
+      lanes: [{
+        ...baseLane,
+        state: 'retired',
+        retirement: {
+          reason: 'consistently-unproductive',
+          retiredAt: '2026-07-24T10:00:00.000Z',
+          minimumRuns: 3,
+          reversible: true,
+        },
+      }],
+    };
+    return route.fulfill({
+      contentType: 'application/json',
+      body: JSON.stringify({ ok: true, lanePlan: retired, laneRevision: 'revision-two' }),
+    });
+  });
+  let restoreRequest;
+  await page.route('**/api/search-lanes/restore', (route) => {
+    restoreRequest = route.request().postDataJSON();
+    return route.fulfill({
+      contentType: 'application/json',
+      body: JSON.stringify({ ok: true, lanePlan: plan, laneRevision: 'revision-three' }),
+    });
+  });
+
+  await page.getByRole('button', { name: 'Settings' }).click();
+  const dialog = page.getByRole('dialog');
+  await dialog.getByRole('button', { name: 'Search & profile' }).click();
+  await dialog.getByText('Search lanes and run history', { exact: true }).click();
+  await expect(dialog.getByText('Platform engineer', { exact: true })).toBeVisible();
+  await expect(dialog.getByText(/3 run\(s\)/)).toBeVisible();
+  await dialog.getByRole('button', { name: 'Retire reviewed unproductive lanes' }).click();
+  await expect(page.locator('#setup-status')).toContainText('Confirm that you reviewed');
+  await dialog.locator('#search-lanes-retire-confirm').check();
+  await dialog.getByRole('button', { name: 'Retire reviewed unproductive lanes' }).click();
+  await expect.poll(() => retirementRequest).toEqual({
+    revision: 'revision-one',
+    confirmed: true,
+  });
+  await dialog.getByText('Search lanes and run history', { exact: true }).click();
+  await dialog.getByRole('button', { name: 'Restore this lane' }).click();
+  await expect.poll(() => restoreRequest).toEqual({
+    laneId: baseLane.id,
+    revision: 'revision-two',
+    confirmed: true,
+  });
+  await expect(dialog.getByRole('button', { name: 'Restore this lane' })).toHaveCount(0);
+});
+
 test('AI and scan settings save independent provider model choices', async ({ page }) => {
   let aiRequest;
   await page.route('**/api/setup/config', async (route) => {

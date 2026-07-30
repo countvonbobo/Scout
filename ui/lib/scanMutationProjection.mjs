@@ -127,6 +127,32 @@ function digest(value) {
   return createHash('sha256').update(String(value || '')).digest('hex');
 }
 
+function plainJson(value) {
+  if (value === null || ['boolean', 'string'].includes(typeof value)) return value;
+  if (typeof value === 'number') {
+    if (!Number.isFinite(value)) throw new TypeError('JSON replacement values must be finite');
+    return value;
+  }
+  if (Array.isArray(value)) return value.map(plainJson);
+  if (!value || typeof value !== 'object' || Object.getPrototypeOf(value) !== Object.prototype) {
+    throw new TypeError('JSON replacement values must be plain JSON');
+  }
+  return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, plainJson(item)]));
+}
+
+export function jsonReplaceRecipe(value) {
+  const replacement = plainJson(value);
+  if (!replacement || Array.isArray(replacement)) {
+    throw new TypeError('JSON replacement root must be an object');
+  }
+  delete replacement._scoutMutation;
+  return {
+    schemaVersion: RECIPE_VERSION,
+    operation: 'json-replace',
+    value: replacement,
+  };
+}
+
 function safeReferences(entry) {
   const values = Array.isArray(entry?.sourceReferences)
     ? entry.sourceReferences
@@ -439,6 +465,7 @@ export function canonicalMutationRecipe(kind, recipe) {
   if (kind === 'tracker' && recipe.operation === 'tracker-merge') return canonicalTrackerRecipe(recipe);
   if (kind === 'report' && recipe.operation === 'scan-report') return scanReportRecipe(recipe.model || {});
   if (kind === 'run-log' && recipe.operation === 'run-log-append') return runLogAppendRecipe(recipe.record || {});
+  if (kind === 'json' && recipe.operation === 'json-replace') return jsonReplaceRecipe(recipe.value);
   throw new TypeError(`mutation recipe does not match target kind: ${kind}`);
 }
 
@@ -544,5 +571,6 @@ export function renderMutationRecipe(kind, currentContent, recipe) {
   if (kind === 'tracker' && recipe.operation === 'tracker-merge') return renderTracker(currentContent, recipe);
   if (kind === 'report' && recipe.operation === 'scan-report') return renderReport(recipe);
   if (kind === 'run-log' && recipe.operation === 'run-log-append') return renderRunLog(currentContent, recipe);
+  if (kind === 'json' && recipe.operation === 'json-replace') return `${JSON.stringify(recipe.value, null, 2)}\n`;
   throw new TypeError(`mutation recipe does not match target kind: ${kind}`);
 }

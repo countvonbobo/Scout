@@ -54,6 +54,16 @@ test('fetchHiringCafe keeps distinct openings with the same company and title', 
   assert.equal(result.jobs.length, 2);
 });
 
+test('fetchHiringCafe retains every query that found a deduplicated opening', async () => {
+  let call = 0;
+  const result = await fetchHiringCafe(['designer', 'researcher'], async () => {
+    call += 1;
+    return call === 1 ? homepage('bld1') : dataResponse([hit]);
+  });
+  assert.equal(result.jobs.length, 1);
+  assert.deepEqual(result.jobs[0].searchQueries, ['designer', 'researcher']);
+});
+
 test('fetchHiringCafe fingerprints the canonical apply URL when the provider omits an identifier', async () => {
   let call = 0;
   const result = await fetchHiringCafe(['product designer'], async () => {

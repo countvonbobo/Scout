@@ -252,6 +252,89 @@ function profileRuleText(profile, section, field, strengths) {
   return values.length ? escapeProfileText(values.join(', ')) : 'None recorded';
 }
 
+function adaptiveQuestionEditor(question) {
+  const id = escapeProfileText(question?.id || '');
+  const prompt = escapeProfileText(question?.prompt || '');
+  const field = escapeProfileText(question?.field || '');
+  const suppliedCurrent = question?.current ?? (
+    question?.answer?.kind === 'rules' ? [] : null
+  );
+  const current = question?.answer?.kind === 'rules'
+    ? (Array.isArray(suppliedCurrent) ? suppliedCurrent : []).map(({ value, strength }) => ({
+      value, strength,
+    }))
+    : suppliedCurrent;
+  let editor;
+  if (question?.answer?.kind === 'enum') {
+    editor = `<select data-adaptive-value="${id}">${(question.answer.values || []).map((value) => (
+      `<option value="${escapeProfileText(value)}"${value === current ? ' selected' : ''}>${escapeProfileText(value)}</option>`
+    )).join('')}</select>`;
+  } else {
+    const rows = question?.answer?.kind === 'rules' ? 5 : 4;
+    editor = `<textarea data-adaptive-value="${id}" rows="${rows}">${escapeProfileText(JSON.stringify(current, null, 2))}</textarea>`;
+  }
+  return `<fieldset class="setup-field wide" data-adaptive-phase="${escapeProfileText(question?.phase || '')}">
+    <legend>${escapeProfileText(question?.label || question?.id || 'Question')}</legend>
+    <p>${prompt}</p><p class="meta">Draft field: ${field}</p>
+    <label><span><input type="checkbox" data-adaptive-include="${id}"> Update this structured answer</span></label>
+    ${editor}
+    ${question?.answer?.allowBlocking ? `<label><span><input type="checkbox" data-adaptive-confirm="${id}"> I explicitly confirm any hard exclusion in this answer</span></label>` : ''}
+  </fieldset>`;
+}
+
+export function adaptiveQuestionnaireHtml(adaptive = {}) {
+  const questionnaire = adaptive?.questionnaire;
+  if (!questionnaire?.questions?.length) {
+    return '<p class="meta">Adaptive structured questions are unavailable until a complete draft exists.</p>';
+  }
+  const universal = questionnaire.questions.filter(({ phase }) => phase === 'universal');
+  const specialist = questionnaire.questions.filter(({ phase }) => phase === 'specialist');
+  return `<details id="adaptive-search-questions"><summary>Answer structured search questions</summary>
+    <p>Universal questions come first. Scout then offers at most ${escapeProfileText(questionnaire.specialistLimit)} occupation-relevant follow-ups. Only checked answers are changed.</p>
+    <h4>Universal questions</h4>${universal.map(adaptiveQuestionEditor).join('')}
+    <h4>Specialist follow-ups</h4>${specialist.map(adaptiveQuestionEditor).join('')}
+    <p><button id="search-profile-adaptive-save" class="act" type="button">Save selected structured answers</button></p>
+  </details>`;
+}
+
+export function searchLanePlanHtml(adaptive = {}) {
+  const plan = adaptive?.lanePlan;
+  if (!plan?.lanes?.length) {
+    return '<p class="meta">Search lanes are created when a reviewed profile is published.</p>';
+  }
+  const active = plan.lanes.filter(({ state }) => state === 'active');
+  const retired = plan.lanes.filter(({ state }) => state === 'retired');
+  const eligible = active.filter(({ consecutiveUnproductiveRuns }) => (
+    Number(consecutiveUnproductiveRuns) >= 3
+  ));
+  const lane = (item) => {
+    const counts = item.aggregate || {};
+    const recent = (item.history || []).slice(-3).reverse().map((event) => (
+      `<li>${escapeProfileText(String(event.recordedAt || '').slice(0, 10) || 'unknown date')}: `
+      + `${escapeProfileText(event.returned || 0)} returned, ${escapeProfileText(event.eligible || 0)} eligible, `
+      + `${escapeProfileText(event.promising || 0)} promising${event.failures?.length ? ' (source failure recorded)' : ''}</li>`
+    )).join('') || '<li>No completed run yet.</li>';
+    return `<li data-search-lane="${escapeProfileText(item.id)}">
+      <strong>${escapeProfileText(item.query)}</strong>
+      <span class="meta"> — ${escapeProfileText(item.kind)}; ${escapeProfileText(item.state)};
+      ${escapeProfileText(item.runCount || 0)} run(s); totals: ${escapeProfileText(counts.returned || 0)} returned,
+      ${escapeProfileText(counts.eligible || 0)} eligible, ${escapeProfileText(counts.promising || 0)} promising.</span>
+      <details><summary>Recent lane history and provenance</summary><ul>${recent}</ul>
+      <p class="meta">Profile fields: ${escapeProfileText((item.profileFields || []).map(({ path }) => path).join(', '))}</p></details>
+      ${item.state === 'retired' && item.retirement?.reversible
+        ? `<button class="act" type="button" data-search-lane-restore="${escapeProfileText(item.id)}">Restore this lane</button>`
+        : ''}
+    </li>`;
+  };
+  return `<details id="search-lane-plan"><summary>Search lanes and run history</summary>
+    <p>${active.length} active, ${retired.length} retired, ${(plan.archivedLanes || []).length} archived after profile changes.</p>
+    <ul>${plan.lanes.map(lane).join('')}</ul>
+    ${eligible.length ? `<label><span><input id="search-lanes-retire-confirm" type="checkbox"> I reviewed the evidence and want to retire ${eligible.length} lane(s) with three unproductive runs</span></label>
+      <p><button id="search-lanes-retire" class="act" type="button">Retire reviewed unproductive lanes</button></p>`
+      : '<p class="meta">No active lane currently has three completed unproductive runs.</p>'}
+  </details>`;
+}
+
 export function searchProfileReviewHtml(state = {}) {
   state ||= {};
   const draft = state.draft || null;
@@ -267,7 +350,7 @@ export function searchProfileReviewHtml(state = {}) {
   return `<section class="setup-callout" id="search-profile-review"><h3>Review your published search profile</h3>
     ${noDraft}
     <section><h4>Primary work</h4><p>${profileRuleText(draft, 'target', 'primaryTitles', null)}</p></section>
-    <section><h4>Adjacent work</h4><p>${profileRuleText(draft, 'target', 'sectors', null)}</p></section>
+    <section><h4>Adjacent work</h4><p>${profileRuleText(draft, 'target', 'titles', null)}</p></section>
     <section><h4>Mandatory requirements</h4><p>${profileRuleText(draft, 'target', null, ['mandatory'])}</p></section>
     <section><h4>Preferences</h4><p>${profileRuleText(draft, 'target', null, ['strong-preference', 'nice-to-have', 'neutral'])}</p></section>
     <section><h4>Confirmed exclusions</h4><p>${confirmedExclusions.length ? escapeProfileText(confirmedExclusions.join(', ')) : 'None recorded'}</p></section>
@@ -276,7 +359,8 @@ export function searchProfileReviewHtml(state = {}) {
     <section><h4>Focused, balanced or exploratory breadth</h4><p>This draft does not make breadth a hard rule; review it as focused, balanced or exploratory before publishing.</p></section>
     <p class="meta">Unconfirmed inferences remain non-blocking until you explicitly confirm them.</p>
     ${published ? `<p>Published version: ${escapeProfileText(published.id)}</p>` : '<p>Not yet published.</p>'}
-    ${draft ? `<details><summary>Edit the complete validated draft</summary><label class="setup-field wide">Complete draft JSON<textarea id="search-profile-draft" rows="16">${draftJson}</textarea></label><p><button id="search-profile-save" class="act" type="button">Save complete draft</button></p></details><label class="setup-field"><span><input id="search-profile-confirm" type="checkbox"> I reviewed this complete profile and want to publish it</span></label><p><button id="search-profile-publish" class="act primary" type="button">Publish this reviewed profile</button></p>` : ''}
+    ${searchLanePlanHtml(state.adaptive)}
+    ${draft ? `${adaptiveQuestionnaireHtml(state.adaptive)}<details><summary>Edit the complete validated draft</summary><label class="setup-field wide">Complete draft JSON<textarea id="search-profile-draft" rows="16">${draftJson}</textarea></label><p><button id="search-profile-save" class="act" type="button">Save complete draft</button></p></details><label class="setup-field"><span><input id="search-profile-confirm" type="checkbox"> I reviewed this complete profile and want to publish it</span></label><p><button id="search-profile-publish" class="act primary" type="button">Publish this reviewed profile</button></p>` : ''}
   </section>`;
 }
 
@@ -781,15 +865,69 @@ const Setup = {
       this.enterRetune('search');
       this.focusDialogTitle();
     });
+    this.el('search-profile-adaptive-save')?.addEventListener('click', () => this.saveAdaptiveSearchAnswers());
     this.el('search-profile-save')?.addEventListener('click', () => this.saveSearchProfileDraft());
     this.el('search-profile-publish')?.addEventListener('click', () => this.publishSearchProfile());
+    this.el('search-lanes-retire')?.addEventListener('click', () => this.retireSearchLanes());
+    this.el('setup-body').querySelectorAll('[data-search-lane-restore]').forEach((button) => {
+      button.addEventListener('click', () => this.restoreSearchLane(button.dataset.searchLaneRestore));
+    });
     if (!this.searchProfile) void this.loadSearchProfileReview();
   },
 
   async loadSearchProfileReview() {
     try {
-      this.searchProfile = await requestJson('/api/search-profile');
+      const [profile, adaptive] = await Promise.all([
+        requestJson('/api/search-profile'),
+        requestJson('/api/search-profile/adaptive'),
+      ]);
+      this.searchProfile = { ...profile, adaptive };
       if (this.view === 'section' && this.settingsSection === 'search') this.renderSearchSettings();
+    } catch (error) {
+      this.setMessage(error.message, 'error');
+    }
+  },
+
+  async saveAdaptiveSearchAnswers() {
+    try {
+      const questions = this.searchProfile?.adaptive?.questionnaire?.questions || [];
+      const answers = questions.filter(({ id }) => (
+        this.el('setup-body').querySelector(`[data-adaptive-include="${id}"]`)?.checked
+      )).map((question) => {
+        const control = this.el('setup-body').querySelector(`[data-adaptive-value="${question.id}"]`);
+        const answer = {
+          questionId: question.id,
+          value: question.answer.kind === 'enum' ? control.value : JSON.parse(control.value),
+        };
+        if (question.answer.kind === 'rules') {
+          answer.values = answer.value;
+          delete answer.value;
+          if (question.answer.allowBlocking) {
+            answer.confirmed = Boolean(this.el('setup-body')
+              .querySelector(`[data-adaptive-confirm="${question.id}"]`)?.checked);
+          }
+        }
+        return answer;
+      });
+      if (!answers.length) throw new Error('Select at least one structured answer to update.');
+      const result = await requestJson('/api/search-profile/adaptive', {
+        method: 'PUT', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          answers,
+          revision: this.searchProfile?.draftRevision ?? null,
+        }),
+      });
+      this.searchProfile = {
+        ...this.searchProfile,
+        draft: result.draft,
+        draftRevision: result.draftRevision,
+        adaptive: {
+          ...this.searchProfile.adaptive,
+          questionnaire: result.questionnaire,
+        },
+      };
+      this.renderSearchSettings();
+      this.setMessage('Selected structured search answers saved for complete review.', 'good');
     } catch (error) {
       this.setMessage(error.message, 'error');
     }
@@ -803,7 +941,7 @@ const Setup = {
         body: JSON.stringify({ draft, revision: this.searchProfile?.draftRevision ?? null }),
       });
       this.searchProfile = { ...this.searchProfile, draft: result.draft, draftRevision: result.draftRevision };
-      this.renderSearchSettings();
+      await this.loadSearchProfileReview();
       this.setMessage('Complete search-profile draft saved for review.', 'good');
     } catch (error) {
       this.setMessage(error.message, 'error');
@@ -821,8 +959,55 @@ const Setup = {
         body: JSON.stringify({ revision: this.searchProfile?.draftRevision ?? null, confirmed: true }),
       });
       this.searchProfile = { ...this.searchProfile, published: result.published };
-      this.renderSearchSettings();
+      await this.loadSearchProfileReview();
       this.setMessage('Search profile published. New ranked discovery uses this version.', 'good');
+    } catch (error) {
+      this.setMessage(error.message, 'error');
+    }
+  },
+
+  async retireSearchLanes() {
+    if (!this.el('search-lanes-retire-confirm')?.checked) {
+      this.setMessage('Confirm that you reviewed the lane history before retiring lanes.', 'error');
+      return;
+    }
+    try {
+      const result = await requestJson('/api/search-lanes/retire-unproductive', {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          revision: this.searchProfile?.adaptive?.laneRevision ?? null,
+          confirmed: true,
+        }),
+      });
+      this.searchProfile.adaptive = {
+        ...this.searchProfile.adaptive,
+        lanePlan: result.lanePlan,
+        laneRevision: result.laneRevision,
+      };
+      this.renderSearchSettings();
+      this.setMessage('Reviewed unproductive search lanes retired. They remain restorable.', 'good');
+    } catch (error) {
+      this.setMessage(error.message, 'error');
+    }
+  },
+
+  async restoreSearchLane(laneId) {
+    try {
+      const result = await requestJson('/api/search-lanes/restore', {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          laneId,
+          revision: this.searchProfile?.adaptive?.laneRevision ?? null,
+          confirmed: true,
+        }),
+      });
+      this.searchProfile.adaptive = {
+        ...this.searchProfile.adaptive,
+        lanePlan: result.lanePlan,
+        laneRevision: result.laneRevision,
+      };
+      this.renderSearchSettings();
+      this.setMessage('Search lane restored with its full history.', 'good');
     } catch (error) {
       this.setMessage(error.message, 'error');
     }

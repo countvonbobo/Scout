@@ -1751,3 +1751,45 @@ record that exact reconciliation SHA and CI run without rewriting history.
   reviewer acceptance/merge, issue acceptance and the authorised live/private
   rehearsal are outside this branch's authority and remain open. No issue is
   closed, no epic completion checkbox is changed and PR #82 remains draft.
+
+## Gate B — adaptive setup and mature search lanes
+
+- Status: candidate implementation and local acceptance complete. Protected
+  review/merge remains outstanding; PR #82 stays draft and no epic checkbox is
+  changed.
+- The reviewed draft now exposes universal structured questions followed by at
+  most six occupation-relevant specialist questions. Answers are bounded,
+  selective and explicit; unchecked answers do not alter the draft, no answer
+  publishes it, and a hard exclusion still requires confirmation.
+- Publishing the immutable profile creates or selectively reconciles
+  `data/search-lanes.json`. Bounded lanes cover titles, locations, industries,
+  skills, remote policy, named employers and configured exploration. Every lane
+  retains its exact query, profile-rule provenance, priority, overlap evidence,
+  returned/parsed/new/eligible/selected/promising funnel, bounded failures and
+  run history.
+- Lane selection is independent of stored order, rotates lower-run lanes across
+  core/relevant/exploration bands and cannot grow as a profile-field
+  cross-product. Re-publication preserves unaffected lane history and archives
+  rules that were removed. Three completed non-failed unproductive runs make a
+  lane eligible for explicit retirement; restoration is reviewable and
+  reversible.
+- Query attribution survives cross-query deduplication and canonical
+  cross-source merging without changing the raw source-content fingerprint.
+  The selected lane contract is fixed at run start, persisted in the collect
+  artifact, and its metrics are committed in the same fenced final mutation as
+  tracker, report and run-log output. Failed runs retain bounded failure
+  evidence and do not count towards unproductive retirement.
+- Profile publication, retirement and restoration acquire the existing fenced
+  workspace lease, reject stale revisions and cannot race an active scan.
+  Marker-free private backup includes the lane plan, and interrupted
+  multi-target finalisation recovers without duplicate lane history.
+- The exact six Gate A domain fixtures produce six materially different,
+  domain-neutral plans. Focused unit/server/pipeline tests cover bounds,
+  provenance, overlap, rotation, selective reconciliation, idempotency,
+  failure accounting, retirement, restoration, contention and crash recovery.
+- Complete candidate verification passed: `npm test` reported 1,189 passes, 0
+  failures and 6 platform skips out of 1,195 tests; the formerly slow unique
+  ranking test completed in 25.75 seconds. Chromium and Firefox reported 159
+  passes, 0 failures and 11 intentional skips out of 170 browser scenarios.
+  The source audit passed, a fresh release stage was built, and its stage audit
+  scanned 1,587 files with no findings.

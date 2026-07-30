@@ -81,6 +81,7 @@ test('canonical vacancies preserve structured evidence and observed lifecycle bo
   const first = observation({
     source: 'adzuna',
     laneId: 'lane-primary',
+    laneIds: ['lane-primary', 'lane-location'],
     roleFamily: 'platform',
     employerReference: 'acme-careers',
     responsibilities: ['Operate services'],
@@ -122,7 +123,7 @@ test('canonical vacancies preserve structured evidence and observed lifecycle bo
   assert.equal(vacancy.closingAt, '2026-08-01T00:00:00.000Z');
   assert.equal(vacancy.firstSeenAt, '2026-07-01T00:00:00.000Z');
   assert.equal(vacancy.lastSeenAt, '2026-07-04T00:00:00.000Z');
-  assert.deepEqual(vacancy.laneIds, ['lane-adjacent', 'lane-primary']);
+  assert.deepEqual(vacancy.laneIds, ['lane-adjacent', 'lane-location', 'lane-primary']);
   assert.equal(vacancy.laneId, 'lane-adjacent');
   assert.deepEqual(vacancy.roleFamilies, ['platform', 'site-reliability']);
   assert.equal(vacancy.roleFamily, 'platform');

@@ -58,12 +58,18 @@ assessment. `workspace.json` stores only its `searchProfile.publishedId`
 reference. Draft and raw profile artifacts are review evidence and never drive
 a scan.
 
-The published search profile does not yet generate source queries. Collection
-still uses the legacy compatibility fields listed below until Gate B replaces
-them with traceable, profile-derived search lanes. This is a deliberate,
-visible boundary: publishing a profile can change filtering, ranking,
-selection and assessment provenance without silently changing the set of
-queries collected by the current release.
+Publishing a reviewed profile also creates or selectively reconciles
+`data/search-lanes.json`. Each bounded lane records its exact query, priority,
+contributing profile fields and run history. Unchanged fields retain their lane
+history; removed fields are archived instead of remaining as hidden search
+preferences. Once this plan exists, query sources use only its selected active
+lanes. Legacy categories are not silently added.
+
+Settings shows the universal structured questions before at most six
+specialist follow-ups. Only checked answers change the complete draft, and no
+answer publishes it. Hard exclusions still require explicit confirmation.
+Scout rotates bounded capacity fairly across core, relevant and exploration
+lanes rather than allowing stored order to starve a lane.
 
 | Published profile field | Current runtime effect |
 | --- | --- |
@@ -98,9 +104,10 @@ The following fields remain live only where stated, so an existing workspace
 keeps working while the published-profile and future lane contracts replace
 them:
 
-- `search.roleFamilies` and `search.sectors` are legacy collection query
-  inputs. They also seed the conservative migrated profile draft, but do not
-  override an already published profile.
+- `search.roleFamilies` and `search.sectors` are collection inputs only while
+  no published search-lane plan exists. They also seed the conservative
+  migrated profile draft, but do not override an already published profile or
+  add queries beside its lanes.
 - `search.locations` and `search.salaryMinimum` are legacy collection inputs
   for the configured Adzuna request. They seed migration evidence; unknown and
   non-comparable compensation in ranked discovery follows the published
@@ -113,8 +120,23 @@ them:
   historical values are not new scan preferences.
 - `profile/context.md`, `profile/calibration.md` and
   `data/search-categories.json` remain user-authored evidence and legacy
-  provider/search inputs. They do not silently mutate the immutable published
-  profile.
+  provider/search inputs. Search categories are ignored for collection after
+  a lane plan is published. None of these files silently mutates the immutable
+  published profile.
+
+## Search-lane history and retirement
+
+Every selected lane records returned, parsed, new, eligible, selected and
+promising counts in the same fenced final mutation as the tracker, report and
+run log. A failed run is recorded as failed and cannot count towards
+unproductive retirement. History is bounded and idempotent by run ID.
+
+Open **Settings → Search & profile → Search lanes and run history** to inspect
+the exact query, profile provenance and recent evidence. Scout offers
+retirement only after three completed, non-failed runs with no new, eligible,
+selected or promising result. Retirement requires a review checkbox and is
+reversible with **Restore this lane**. A lane archived because its profile rule
+was removed must instead be restored by editing and republishing the rule.
 
 ## Deployment-only configuration
 

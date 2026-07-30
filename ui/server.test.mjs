@@ -21,6 +21,9 @@ const {
 } = await import('./server.mjs');
 const { seedWorkspace, loadWorkspaceConfig, workspacePaths, writeWorkspaceConfig } = await import('./lib/workspace.mjs');
 const { profileFingerprint } = await import('./lib/searchProfile.mjs');
+const {
+  recordSearchLaneRun, searchLanePlanRevision, writeSearchLanePlan,
+} = await import('./lib/searchLanes.mjs');
 const { acquireScanLock, releaseScanLock } = await import('../tools/scan-lock.mjs');
 const { appendRunEvent, openRunJournal } = await import('./lib/runJournal.mjs');
 const { acquireScanLease, currentLeaseOwner, releaseScanLease } = await import('./lib/scanLease.mjs');
@@ -636,6 +639,12 @@ test('search-profile routes review a complete draft and publish only the current
   assert.deepEqual(JSON.parse(reviewed.text), {
     rawPresent: true, draft, published: null, draftRevision: revision,
   });
+  const adaptive = await request({ method: 'GET', path: '/api/search-profile/adaptive' });
+  assert.equal(adaptive.status, 200);
+  const adaptiveState = JSON.parse(adaptive.text);
+  assert.equal(adaptiveState.lanePlan, null);
+  assert.equal(adaptiveState.questionnaire.questions[0].phase, 'universal');
+  assert.ok(adaptiveState.questionnaire.questions.some(({ phase }) => phase === 'specialist'));
 
   const partial = await request({
     method: 'PUT', path: '/api/search-profile/draft', headers: JSON_HEADERS(),
@@ -650,9 +659,26 @@ test('search-profile routes review a complete draft and publish only the current
   assert.equal(saved.status, 200);
   assert.equal(JSON.parse(saved.text).draftRevision, revision);
 
+  const adapt = await request({
+    method: 'PUT', path: '/api/search-profile/adaptive', headers: JSON_HEADERS(),
+    body: JSON.stringify({
+      revision,
+      answers: [{
+        questionId: 'specialist-skills',
+        values: [{ value: 'Evidence synthesis', strength: 'strong-preference' }],
+      }],
+    }),
+  });
+  assert.equal(adapt.status, 200);
+  const adapted = JSON.parse(adapt.text);
+  assert.notEqual(adapted.draftRevision, revision);
+  assert.deepEqual(adapted.draft.target.skills, [{
+    value: 'Evidence synthesis', strength: 'strong-preference', provenance: 'explicit',
+  }]);
+
   const unconfirmed = await request({
     method: 'POST', path: '/api/search-profile/publish', headers: JSON_HEADERS(),
-    body: JSON.stringify({ revision, confirmed: false }),
+    body: JSON.stringify({ revision: adapted.draftRevision, confirmed: false }),
   });
   assert.equal(unconfirmed.status, 409);
 
@@ -664,7 +690,7 @@ test('search-profile routes review a complete draft and publish only the current
 
   const published = await request({
     method: 'POST', path: '/api/search-profile/publish', headers: JSON_HEADERS(),
-    body: JSON.stringify({ revision, confirmed: true }),
+    body: JSON.stringify({ revision: adapted.draftRevision, confirmed: true }),
   });
   assert.equal(published.status, 200);
   const result = JSON.parse(published.text);
@@ -676,7 +702,86 @@ test('search-profile routes review a complete draft and publish only the current
     true,
   );
   assert.deepEqual(JSON.parse(fs.readFileSync(paths.searchProfilePublished, 'utf8')), result.published);
+  const lanePlan = JSON.parse(fs.readFileSync(paths.searchLanes, 'utf8'));
+  assert.equal(lanePlan.profileId, result.published.id);
+  assert.ok(lanePlan.lanes.some(({ profileFields }) => (
+    profileFields.some(({ path: field }) => field === 'target.skills')
+  )));
+  assert.equal(result.lanePlan.profileId, result.published.id);
   assert.equal(loadWorkspaceConfig(WORKSPACE_ROOT).searchProfile.publishedId, result.published.id);
+
+  const retireLane = lanePlan.lanes[0];
+  let recordedPlan = lanePlan;
+  for (let index = 1; index <= 3; index += 1) {
+    recordedPlan = recordSearchLaneRun(recordedPlan, {
+      runId: `server-lane-run-${index}`,
+      recordedAt: `2026-07-${String(20 + index).padStart(2, '0')}T10:00:00.000Z`,
+      results: [{
+        laneId: retireLane.id,
+        returned: 0, parsed: 0, new: 0, eligible: 0, selected: 0, promising: 0,
+      }],
+    });
+  }
+  writeSearchLanePlan(WORKSPACE_ROOT, recordedPlan);
+  const laneRevision = searchLanePlanRevision(recordedPlan);
+
+  const unconfirmedRetirement = await request({
+    method: 'POST', path: '/api/search-lanes/retire-unproductive', headers: JSON_HEADERS(),
+    body: JSON.stringify({ revision: laneRevision, confirmed: false }),
+  });
+  assert.equal(unconfirmedRetirement.status, 400);
+  const staleRetirement = await request({
+    method: 'POST', path: '/api/search-lanes/retire-unproductive', headers: JSON_HEADERS(),
+    body: JSON.stringify({ revision: 'stale', confirmed: true }),
+  });
+  assert.equal(staleRetirement.status, 409);
+  const retiredResponse = await request({
+    method: 'POST', path: '/api/search-lanes/retire-unproductive', headers: JSON_HEADERS(),
+    body: JSON.stringify({ revision: laneRevision, confirmed: true }),
+  });
+  assert.equal(retiredResponse.status, 200);
+  const retiredState = JSON.parse(retiredResponse.text);
+  assert.equal(
+    retiredState.lanePlan.lanes.find(({ id }) => id === retireLane.id).state,
+    'retired',
+  );
+
+  const restoredResponse = await request({
+    method: 'POST', path: '/api/search-lanes/restore', headers: JSON_HEADERS(),
+    body: JSON.stringify({
+      revision: retiredState.laneRevision,
+      laneId: retireLane.id,
+      confirmed: true,
+    }),
+  });
+  assert.equal(restoredResponse.status, 200);
+  const restoredState = JSON.parse(restoredResponse.text);
+  const restoredLane = restoredState.lanePlan.lanes.find(({ id }) => id === retireLane.id);
+  assert.equal(restoredLane.state, 'active');
+  assert.equal(restoredLane.history.length, 3);
+
+  const blockingLease = acquireScanLease(WORKSPACE_ROOT, currentLeaseOwner(), {
+    kind: 'scan',
+    runId: 'server-lane-blocking-scan',
+  });
+  try {
+    const blockedRetirement = await request({
+      method: 'POST', path: '/api/search-lanes/retire-unproductive', headers: JSON_HEADERS(),
+      body: JSON.stringify({
+        revision: restoredState.laneRevision,
+        confirmed: true,
+      }),
+    });
+    assert.equal(blockedRetirement.status, 409);
+    assert.match(JSON.parse(blockedRetirement.text).error, /in progress/i);
+    assert.equal(
+      JSON.parse(fs.readFileSync(paths.searchLanes, 'utf8'))
+        .lanes.find(({ id }) => id === retireLane.id).state,
+      'active',
+    );
+  } finally {
+    releaseScanLease(blockingLease);
+  }
 });
 
 test('local server rejects a non-loopback Host header', async () => {

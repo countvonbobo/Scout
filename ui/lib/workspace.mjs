@@ -93,6 +93,7 @@ export function workspacePaths(root) {
     tracker: path.join(workspaceRoot, 'data', 'opportunities.json'),
     scanRuns: path.join(workspaceRoot, 'data', 'scan-runs.jsonl'),
     categories: path.join(workspaceRoot, 'data', 'search-categories.json'),
+    searchLanes: path.join(workspaceRoot, 'data', 'search-lanes.json'),
     portals: path.join(workspaceRoot, 'data', 'ats-portals.json'),
     employers: path.join(workspaceRoot, 'data', 'employers.json'),
     sources: path.join(workspaceRoot, 'data', 'sources.md'),

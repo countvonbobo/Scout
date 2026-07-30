@@ -47,10 +47,14 @@ import {
   createBeta22WorkspaceSnapshot,
   materializeBeta22Rollback,
 } from '../ui/lib/workspaceMigration.mjs';
+import {
+  loadSearchLanePlan, selectSearchLanes,
+} from '../ui/lib/searchLanes.mjs';
 
 const APP_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const MAX_SCAN_FILE_CHARS = 100_000;
 const MAX_SCAN_CONTEXT_CHARS = 280_000;
+export const DEFAULT_LANES_PER_SCAN = 12;
 
 function stableJson(value) {
   if (Array.isArray(value)) return `[${value.map(stableJson).join(',')}]`;
@@ -264,8 +268,29 @@ export function shouldAutoBroaden(scanResult, mode, enabled = false) {
   return !(scanResult.scan?.reviewed || []).some((item) => item.outcome === 'kept');
 }
 
-function workspaceQueries(root, { broadened = false } = {}) {
+export function workspaceQueryPlan(root, { broadened = false } = {}) {
   const config = loadWorkspaceConfig(root);
+  const lanePlan = loadSearchLanePlan(root);
+  if (lanePlan) {
+    const selected = selectSearchLanes(lanePlan, {
+      limit: broadened ? Math.min(24, lanePlan.lanes.length) : DEFAULT_LANES_PER_SCAN,
+    });
+    return {
+      source: 'published-search-lanes',
+      profileId: lanePlan.profileId,
+      lanes: selected.map((lane) => ({
+        id: lane.id,
+        query: lane.query,
+        source: lane.source,
+        priority: lane.priority,
+        priorityBand: lane.priorityBand,
+        roleFamily: lane.profileFields.find(({ path: field }) => (
+          field === 'target.primaryTitles' || field === 'target.titles'
+        ))?.value || null,
+      })),
+      queries: [...new Set(selected.map(({ query }) => query))],
+    };
+  }
   const queries = new Set((config.search?.roleFamilies || []).map((q) => String(q).trim()).filter(Boolean));
   const file = workspacePaths(root).categories;
   if (fs.existsSync(file)) {
@@ -274,7 +299,41 @@ function workspaceQueries(root, { broadened = false } = {}) {
       for (const category of parsed.categories || []) for (const query of category.queries || []) if (String(query).trim()) queries.add(String(query).trim());
     } catch { /* doctor reports malformed configuration separately */ }
   }
-  return broadened ? broadenSearchQueries(config, [...queries]) : [...queries];
+  return {
+    source: 'legacy-search-categories',
+    profileId: null,
+    lanes: [],
+    queries: broadened ? broadenSearchQueries(config, [...queries]) : [...queries],
+  };
+}
+
+function annotateLaneJobs(result, lanes, queries) {
+  const laneByQuery = new Map();
+  for (const lane of lanes) {
+    const key = String(lane.query || '').trim().toLocaleLowerCase('en');
+    const current = laneByQuery.get(key) || [];
+    current.push(lane);
+    laneByQuery.set(key, current);
+  }
+  return {
+    ...result,
+    jobs: (result?.jobs || []).map((job) => {
+      const searchQueries = Array.isArray(job.searchQueries) && job.searchQueries.length
+        ? job.searchQueries
+        : queries.length === 1 ? queries : [];
+      const matched = searchQueries.flatMap((query) => (
+        laneByQuery.get(String(query).trim().toLocaleLowerCase('en')) || []
+      ));
+      const laneIds = [...new Set(matched.map(({ id }) => id))].sort();
+      const roleFamilies = [...new Set(matched.map(({ roleFamily }) => roleFamily).filter(Boolean))].sort();
+      return laneIds.length ? {
+        ...job,
+        laneIds,
+        laneId: laneIds[0],
+        ...(roleFamilies.length ? { roleFamily: roleFamilies[0] } : {}),
+      } : job;
+    }),
+  };
 }
 
 function copyIfPresent(source, target) {
@@ -405,37 +464,68 @@ export async function runScan(root, provider, mode, {
   return result;
 }
 
-function compactSource(result, configured = true) {
+function compactSource(result, configured = true, queries = []) {
+  const queryCounts = Object.fromEntries(Object.entries(result?.sources || {})
+    .filter(([query, count]) => String(query).trim() && Number.isSafeInteger(Number(count)) && Number(count) >= 0)
+    .slice(0, 128)
+    .map(([query, count]) => [String(query).slice(0, 300), Number(count)]));
+  const errors = Array.isArray(result?.errors) ? result.errors.slice(0, 20) : [];
+  const unavailable = configured && (
+    result?.status === 'unavailable' || result?.available === false
+  );
+  const queryFailures = Object.fromEntries(queries
+    .filter((query) => unavailable || errors.some((error) => String(error).includes(`"${query}"`)))
+    .slice(0, 128)
+    .map((query) => [query, unavailable ? 'source-unavailable' : 'source-query-failed']));
   return {
     configured, status: result?.status || (result?.available === false ? 'unavailable' : 'healthy'),
     count: Number.isFinite(Number(result?.count)) ? Number(result.count) : (Array.isArray(result?.jobs) ? result.jobs.length : 0),
-    reason: result?.reason || null, errors: Array.isArray(result?.errors) ? result.errors.slice(0, 20) : [],
+    reason: result?.reason || null, errors,
+    queryCounts,
+    queryFailures,
     recovery: result?.recovery || null, jobs: Array.isArray(result?.jobs) ? result.jobs : [],
   };
 }
 
 export async function collectScanSources(root, config, {
-  fetchAts = fetchConfiguredPortals, fetchCafe = fetchHiringCafe, fetchAdzunaFn = fetchAdzuna, broadened = false,
+  fetchAts = fetchConfiguredPortals, fetchCafe = fetchHiringCafe, fetchAdzunaFn = fetchAdzuna,
+  broadened = false, queryPlan: suppliedQueryPlan = null,
 } = {}) {
-  const queries = workspaceQueries(root, { broadened });
+  const queryPlan = suppliedQueryPlan || workspaceQueryPlan(root, { broadened });
+  const { queries } = queryPlan;
   const env = { ...loadEnv(root), ...process.env };
   const credentials = resolveAdzunaCredentials(env);
   const adzuna = config.sources?.adzuna || {};
-  const capture = async (action, configured) => {
-    if (!configured) return compactSource({ status: 'unavailable', count: 0, reason: 'not configured', jobs: [] }, false);
-    try { return compactSource(await action(), true); }
-    catch (error) { return compactSource({ status: 'unavailable', count: 0, reason: error.message, errors: [error.message], jobs: [] }, true); }
+  const capture = async (action, configured, sourceQueries = []) => {
+    if (!configured) return compactSource({
+      status: 'unavailable', count: 0, reason: 'not configured', jobs: [],
+    }, false, sourceQueries);
+    try { return compactSource(await action(), true, sourceQueries); }
+    catch (error) {
+      return compactSource({
+        status: 'unavailable', count: 0, reason: error.message, errors: [error.message], jobs: [],
+      }, true, sourceQueries);
+    }
   };
   const atsResult = await capture(() => fetchAts(root), true);
   if (/^no .*portals? (?:configured|enabled)$/i.test(String(atsResult.reason || ''))) atsResult.configured = false;
   const [hiringCafe, adzunaResult] = await Promise.all([
-    capture(() => fetchCafe(queries, globalThis.fetch, { ...config.sources?.hiringCafe, locale: config.locale }), queries.length > 0),
+    capture(() => fetchCafe(queries, globalThis.fetch, { ...config.sources?.hiringCafe, locale: config.locale }), queries.length > 0, queries),
     capture(() => fetchAdzunaFn({
       ...(credentials || {}), ...adzuna, queries, where: broadened ? '' : (adzuna.where || config.search?.locations?.[0] || ''),
       salaryMin: config.search?.salaryMinimum, locale: config.locale, currency: config.currency,
-    }), Boolean(credentials)),
+    }), Boolean(credentials), queries),
   ]);
-  return { generatedAt: new Date().toISOString(), queries, sources: { ats: atsResult, hiring_cafe: hiringCafe, adzuna: adzunaResult } };
+  return {
+    generatedAt: new Date().toISOString(),
+    queries,
+    lanes: queryPlan.lanes,
+    sources: {
+      ats: atsResult,
+      hiring_cafe: annotateLaneJobs(hiringCafe, queryPlan.lanes, queries),
+      adzuna: annotateLaneJobs(adzunaResult, queryPlan.lanes, queries),
+    },
+  };
 }
 
 function readBounded(file, label, maximum = MAX_SCAN_FILE_CHARS) {
@@ -578,6 +668,7 @@ export async function runScanWith(root, provider, mode, {
   let trustedProviderStatus = null;
   const publishedAtStart = loadPublishedSearchProfile(root);
   const trackerAtStart = readScanTracker(root);
+  const plannedQueryPlan = workspaceQueryPlan(root, { broadened: mode === 'broadened' });
   const compatibility = scanCompatibility({
     config, mode, model, profile: publishedAtStart, provider, root, tracker: trackerAtStart,
     requester, scheduleId, logicalWindowId,
@@ -590,7 +681,10 @@ export async function runScanWith(root, provider, mode, {
     : null;
   const collect = async () => {
     onProgress({ phase: 'Collecting current opportunities', current: 2, total: 5 });
-    return collectSourcesFn(root, config, { broadened: mode === 'broadened' });
+    return collectSourcesFn(root, config, {
+      broadened: mode === 'broadened',
+      queryPlan: plannedQueryPlan,
+    });
   };
   const stages = publishedAtStart
     ? createRankedDiscoveryStages({
@@ -699,7 +793,8 @@ export async function runScanWith(root, provider, mode, {
           provider,
           mode,
           sources: collected?.sources || {},
-          queries: collected?.queries || [],
+          queries: collected?.queries || plannedQueryPlan.queries,
+          lanes: collected?.lanes || plannedQueryPlan.lanes,
           candidates,
           assessmentResult: null,
           policy: config.triage,
@@ -866,7 +961,8 @@ export async function runScanWith(root, provider, mode, {
           }
           onProgress({ phase: 'Writing tracker and report', current: 4, total: 5 });
           const artifacts = coordinateScanArtifacts(root, {
-            provider, mode, sources: collected.sources, queries: collected.queries, candidates, assessmentResult,
+            provider, mode, sources: collected.sources, queries: collected.queries,
+            lanes: collected.lanes, candidates, assessmentResult,
             policy: config.triage, startedAt,
             assessmentFailures,
             dropped, hardExcluded, closedAdverts, exclusions: discovery?.exclusions || [],

@@ -57,6 +57,7 @@ test('fetchAdzuna dedupes and fails soft per query', async () => {
   assert.equal(result.errors.length, 1);
   assert.equal(result.status, 'degraded');
   assert.match(result.errors[0], /bad/);
+  assert.deepEqual(result.jobs[0].searchQueries, ['good', 'again']);
 });
 
 test('fetchAdzuna keeps distinct provider openings with the same title', async () => {

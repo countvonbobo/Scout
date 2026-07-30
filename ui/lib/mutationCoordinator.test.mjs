@@ -18,6 +18,9 @@ import {
 } from './scanLease.mjs';
 import { appendRunEvent, openRunJournal, replayRunJournal } from './runJournal.mjs';
 import { runLogAppendRecipe, scanReportRecipe, trackerMergeRecipe } from './scanMutationProjection.mjs';
+import {
+  generateSearchLanePlan, loadSearchLanePlan, writeSearchLanePlan,
+} from './searchLanes.mjs';
 
 const roots = [];
 
@@ -402,6 +405,87 @@ test('partial assessment success produces one deterministic tracker/report plan 
     validationFailures: ['missing-required-field'],
   }]);
   assert.equal(replayRunJournal(handle.file).filter((event) => event.type === 'mutation.prepared').length, 1);
+  assert.equal(replayRunJournal(handle.file).filter((event) => event.type === 'mutation.receipted').length, 1);
+});
+
+test('lane history is one recoverable target in the fenced final scan mutation', () => {
+  const { root, lease, handle } = fixture();
+  const profile = {
+    id: 'profile-aaaaaaaaaaaa',
+    version: 1,
+    status: 'published',
+    target: {
+      primaryTitles: [{
+        value: 'Platform engineer', strength: 'strong-preference', provenance: 'explicit',
+      }],
+    },
+    negative: {},
+    compensation: {
+      currency: null, period: 'year', minimum: null,
+      minimumStrength: 'neutral', unknownPolicy: 'include',
+    },
+    selection: { breadth: 'balanced', relevanceThreshold: 45, exploration: 0 },
+  };
+  const plan = generateSearchLanePlan(profile, {
+    now: () => '2026-07-28T08:00:00.000Z',
+  });
+  const lane = plan.lanes[0];
+  writeSearchLanePlan(root, plan);
+  const input = {
+    provider: 'codex',
+    mode: 'primary',
+    profileId: profile.id,
+    lanes: [lane],
+    sources: {
+      hiring_cafe: {
+        configured: true,
+        status: 'healthy',
+        count: 1,
+        queryCounts: { [lane.query]: 1 },
+        observations: [{
+          observationId: 'observation-lane',
+          laneIds: [lane.id],
+        }],
+      },
+    },
+    ranked: [{
+      vacancyId: 'vacancy-lane',
+      laneIds: [lane.id],
+      dimensions: [{ name: 'novelty', evidence: [{ comparison: 'unseen' }] }],
+    }],
+    candidates: [],
+    assessmentResult: { assessments: [] },
+    policy: {},
+    startedAt: '2026-07-28T09:00:00.000Z',
+  };
+
+  assert.throws(() => coordinateScanArtifacts(root, input, {
+    run: handle,
+    lease,
+    hooks: {
+      afterReplacement(target) {
+        if (target.key === 'search-lanes') throw new Error('synthetic crash after lane replacement');
+      },
+    },
+  }), /synthetic crash after lane replacement/);
+  assert.equal(loadSearchLanePlan(root).lanes[0].history.length, 1);
+  assert.equal(replayRunJournal(handle.file).some((event) => event.type === 'mutation.receipted'), false);
+
+  coordinateScanArtifacts(root, input, { run: handle, lease });
+  const restored = loadSearchLanePlan(root).lanes[0];
+  assert.equal(restored.history.length, 1);
+  assert.deepEqual(restored.history[0], {
+    runId: handle.runId,
+    recordedAt: handle.events.find((event) => event.type === 'run.started')?.recordedAt
+      || input.startedAt,
+    laneId: lane.id,
+    returned: 1,
+    parsed: 1,
+    new: 1,
+    eligible: 1,
+    selected: 0,
+    promising: 0,
+  });
   assert.equal(replayRunJournal(handle.file).filter((event) => event.type === 'mutation.receipted').length, 1);
 });
 

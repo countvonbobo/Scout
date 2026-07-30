@@ -44,8 +44,11 @@ import {
   applyPreparedMutation, loadPreparedMutation, markerFreeMutationContent, prepareMutation,
 } from './mutationCoordinator.mjs';
 import {
-  renderMutationRecipe, runLogAppendRecipe, scanReportRecipe, trackerMergeRecipe,
+  jsonReplaceRecipe, renderMutationRecipe, runLogAppendRecipe, scanReportRecipe, trackerMergeRecipe,
 } from './scanMutationProjection.mjs';
+import {
+  deriveSearchLaneResults, loadSearchLanePlan, recordSearchLaneRun,
+} from './searchLanes.mjs';
 export { filterVacancies } from './vacancyFilter.mjs';
 
 const EMPTY_DISCARDED = Object.freeze({ hard_exclusion: 0, mandatory_unmet: 0, below_threshold: 0, provider_discarded: 0 });
@@ -1221,6 +1224,7 @@ function observationInputs(sources) {
       collectionSource: sourceName,
       fetchedAt: source?.fetchedAt || source?.generatedAt || null,
       laneId: job?.laneId || job?.source || source?.laneId || sourceName,
+      laneIds: job?.laneIds || source?.laneIds || null,
       roleFamily: job?.roleFamilyId || job?.roleFamily
         || source?.roleFamilyId || source?.roleFamily || null,
     })).filter(Boolean);
@@ -1293,7 +1297,7 @@ export function prepareRankedDiscovery({
 }
 
 const RANKED_STAGE_ARTIFACT_FIELDS = Object.freeze({
-  collect: Object.freeze(['generatedAt', 'queries', 'sources']),
+  collect: Object.freeze(['generatedAt', 'lanes', 'queries', 'sources']),
   normalise: Object.freeze(['generatedAt', 'initialFunnel', 'observations', 'queries']),
   deduplicate: Object.freeze(['duplicateObservations', 'initialFunnel', 'normalisedCount', 'vacancies']),
   filter: Object.freeze(['duplicateObservations', 'eligible', 'exclusions', 'initialFunnel', 'normalisedCount', 'uniqueVacancies']),
@@ -1399,6 +1403,7 @@ function semanticObservation(job, sourceName, source, profile, { durableUrls = t
     sourceName: job?.source || sourceName,
     fetchedAt: source?.fetchedAt || source?.generatedAt || null,
     laneId: job?.laneId || job?.source || source?.laneId || sourceName,
+    laneIds: job?.laneIds || source?.laneIds || null,
     roleFamily: job?.roleFamilyId || job?.roleFamily
       || source?.roleFamilyId || source?.roleFamily || null,
   });
@@ -1458,6 +1463,18 @@ function semanticCollectedSource(source, sourceName, profile, options = {}) {
     configured: Boolean(source?.configured),
     status,
     count: Number.isFinite(Number(source?.count)) ? Math.max(0, Number(source.count)) : jobs.length,
+    queryCounts: Object.fromEntries(Object.entries(source?.queryCounts || {})
+      .slice(0, 128)
+      .map(([query, count]) => [
+        String(query).slice(0, 300),
+        Number.isSafeInteger(Number(count)) && Number(count) >= 0 ? Number(count) : 0,
+      ])),
+    queryFailures: Object.fromEntries(Object.entries(source?.queryFailures || {})
+      .slice(0, 128)
+      .map(([query, code]) => [
+        String(query).slice(0, 300),
+        String(code).toLowerCase().replace(/[^a-z0-9-]+/g, '-').slice(0, 100),
+      ])),
     failedRecords: Math.max(0, Number(source?.failedRecords || 0) + jobs.length - observations.length),
     sourceErrorCount: Array.isArray(source?.errors) ? source.errors.length : 0,
     observations,
@@ -1507,6 +1524,18 @@ function legacySemanticCollectedSource(source, sourceName, options = {}) {
     configured: Boolean(source?.configured),
     status: ['healthy', 'degraded', 'unavailable'].includes(source?.status) ? source.status : 'unavailable',
     count: Number.isFinite(Number(source?.count)) ? Math.max(0, Number(source.count)) : jobs.length,
+    queryCounts: Object.fromEntries(Object.entries(source?.queryCounts || {})
+      .slice(0, 128)
+      .map(([query, count]) => [
+        String(query).slice(0, 300),
+        Number.isSafeInteger(Number(count)) && Number(count) >= 0 ? Number(count) : 0,
+      ])),
+    queryFailures: Object.fromEntries(Object.entries(source?.queryFailures || {})
+      .slice(0, 128)
+      .map(([query, code]) => [
+        String(query).slice(0, 300),
+        String(code).toLowerCase().replace(/[^a-z0-9-]+/g, '-').slice(0, 100),
+      ])),
     failedRecords: Math.max(0, Number(source?.failedRecords || 0) + jobs.length - semanticJobs.length),
     sourceErrorCount: Array.isArray(source?.errors) ? source.errors.length : 0,
     jobs: semanticJobs,
@@ -1517,6 +1546,14 @@ function encodePipelineStageValue(stageId, value, profile = null, { durableUrls 
   if (stageId !== 'collect') return encodeRankedStageValue(value);
   return {
     generatedAt: String(value?.generatedAt || '').slice(0, 80) || null,
+    lanes: (Array.isArray(value?.lanes) ? value.lanes : []).slice(0, 32).map((lane) => ({
+      id: String(lane?.id || '').slice(0, 80),
+      query: String(lane?.query || '').slice(0, 300),
+      source: String(lane?.source || '').slice(0, 80),
+      priority: Number.isFinite(Number(lane?.priority)) ? Number(lane.priority) : 0,
+      priorityBand: String(lane?.priorityBand || '').slice(0, 40),
+      roleFamily: String(lane?.roleFamily || '').slice(0, 160) || null,
+    })),
     queries: (Array.isArray(value?.queries) ? value.queries : [])
       .slice(0, 128)
       .map((query) => String(query || '').slice(0, 300)),
@@ -1580,8 +1617,15 @@ export function createRankedDiscoveryStages({
 } = {}) {
   if (typeof collect !== 'function') throw new TypeError('ranked discovery collection stage is required');
   if (!profile || profile.status !== 'published') throw new Error('ranked discovery requires a published search profile');
+  const collectWithLanes = async (...args) => {
+    const value = await collect(...args);
+    return {
+      ...value,
+      lanes: Array.isArray(value?.lanes) ? value.lanes : [],
+    };
+  };
   return {
-    collect: withRankedArtifactCodec('collect', collect, profile),
+    collect: withRankedArtifactCodec('collect', collectWithLanes, profile),
     normalise: withRankedArtifactCodec('normalise', function normaliseStage({ priorArtifact }) {
       const input = observationInputs(priorArtifact?.sources);
       return {
@@ -2262,13 +2306,33 @@ export function coordinateScanArtifacts(root, input, { run, lease, hooks = {} })
     const artifacts = buildScanArtifacts(root, { ...input, timestamp });
     const date = artifacts.run.timestamp.slice(0, 10);
     const hasTracker = artifacts.contents.tracker !== undefined;
+    const selectedLanes = Array.isArray(input.lanes) ? input.lanes : [];
+    const currentLanePlan = selectedLanes.length ? loadSearchLanePlan(root) : null;
+    if (currentLanePlan && input.profileId && currentLanePlan.profileId !== input.profileId) {
+      throw new Error('selected search lanes do not match the scan profile');
+    }
+    const updatedLanePlan = currentLanePlan ? recordSearchLaneRun(currentLanePlan, {
+      runId: run.runId,
+      recordedAt: timestamp,
+      results: deriveSearchLaneResults({
+        lanes: selectedLanes,
+        sources: input.sources,
+        ranked: input.ranked,
+        candidates: input.candidates,
+        reviewed: artifacts.run.reviewed,
+        scanFailureCode: input.error ? 'scan-failed' : null,
+      }),
+    }) : null;
     const target = {
-      id: hasTracker ? 'scan-tracker-report' : 'scan-failure-report',
+      id: updatedLanePlan
+        ? hasTracker ? 'scan-tracker-report-lanes' : 'scan-failure-report-lanes'
+        : hasTracker ? 'scan-tracker-report' : 'scan-failure-report',
       schemaVersion: 1,
       files: [
         ...(hasTracker ? [{ kind: 'tracker', key: 'tracker' }] : []),
         { kind: 'report', key: `report:${date}` },
         { kind: 'run-log', key: 'scan-log' },
+        ...(updatedLanePlan ? [{ kind: 'json', key: 'search-lanes' }] : []),
       ],
     };
     plan = prepareMutation({ handle: run, lease }, target, {
@@ -2280,6 +2344,7 @@ export function coordinateScanArtifacts(root, input, { run, lease, hooks = {} })
       } : {}),
       [`report:${date}`]: artifacts.recipes.report,
       'scan-log': artifacts.recipes.runLog,
+      ...(updatedLanePlan ? { 'search-lanes': jsonReplaceRecipe(updatedLanePlan) } : {}),
     });
   }
   const mutationReceipt = applyPreparedMutation(plan, lease, hooks);

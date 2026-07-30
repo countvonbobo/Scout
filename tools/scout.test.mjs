@@ -5,6 +5,7 @@ import path from 'node:path';
 import test from 'node:test';
 import {
   assertScanReady, broadenSearchQueries, collectScanSources, migrateLegacyWorkspace, runScan, runScanWith, shouldAutoBroaden,
+  workspaceQueryPlan,
 } from './scout.mjs';
 import { DEFAULT_WORKSPACE_CONFIG, loadWorkspaceConfig, writeWorkspaceConfig } from '../ui/lib/workspace.mjs';
 import { publishSearchProfile } from '../ui/lib/searchProfile.mjs';
@@ -13,6 +14,9 @@ import { projectScanQueue } from '../ui/lib/scanQueue.mjs';
 import { acquireScanLease, currentLeaseOwner, readScanLease, releaseScanLease } from '../ui/lib/scanLease.mjs';
 import { ProviderLifecycleUnclosedError } from '../ui/lib/structuredTurn.mjs';
 import { loadPreparedMutation, reconcileMutation } from '../ui/lib/mutationCoordinator.mjs';
+import {
+  generateSearchLanePlan, loadSearchLanePlan, writeSearchLanePlan,
+} from '../ui/lib/searchLanes.mjs';
 
 function scanRoot() {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'scout-runtime-scan-'));
@@ -149,6 +153,71 @@ test('an absent ATS configuration does not degrade a healthy configured source',
   assert.equal(collected.sources.hiring_cafe.configured, true);
   assert.equal(collected.sources.hiring_cafe.status, 'healthy');
   assert.equal(collected.sources.adzuna.configured, false);
+});
+
+test('published search lanes replace legacy categories and annotate collected jobs', async () => {
+  const root = scanRoot();
+  const config = {
+    ...structuredClone(DEFAULT_WORKSPACE_CONFIG),
+    search: {
+      ...DEFAULT_WORKSPACE_CONFIG.search,
+      roleFamilies: ['Legacy query must not run'],
+    },
+  };
+  writeWorkspaceConfig(root, config);
+  fs.writeFileSync(path.join(root, 'data', 'search-categories.json'), JSON.stringify({
+    categories: [{ queries: ['Legacy category must not run'] }],
+  }));
+  const published = publishSearchProfile({
+    version: 1,
+    status: 'draft',
+    target: {
+      primaryTitles: [{ value: 'Research coordinator', strength: 'strong-preference', provenance: 'explicit' }],
+      skills: [{ value: 'Evidence synthesis', strength: 'nice-to-have', provenance: 'explicit' }],
+    },
+    negative: {},
+    compensation: {
+      currency: null, period: 'year', minimum: null,
+      minimumStrength: 'neutral', unknownPolicy: 'include',
+    },
+    selection: { breadth: 'balanced', relevanceThreshold: 45, exploration: 0 },
+  }, { publishedAt: '2026-07-30T16:00:00.000Z' });
+  writeSearchLanePlan(root, generateSearchLanePlan(published));
+
+  const queryPlan = workspaceQueryPlan(root);
+  assert.equal(queryPlan.source, 'published-search-lanes');
+  assert.ok(queryPlan.queries.includes('Research coordinator'));
+  assert.equal(queryPlan.queries.includes('Legacy query must not run'), false);
+  assert.equal(queryPlan.queries.includes('Legacy category must not run'), false);
+
+  let seenQueries;
+  const collected = await collectScanSources(root, config, {
+    fetchAts: async () => ({
+      status: 'unavailable', count: 0, reason: 'no supported ATS portals enabled', jobs: [],
+    }),
+    fetchCafe: async (queries) => {
+      seenQueries = queries;
+      return {
+        status: 'healthy',
+        count: 1,
+        sources: { [queries[0]]: 1 },
+        jobs: [{
+          providerId: 'lane-job-1',
+          title: 'Research coordinator',
+          company: 'Example',
+          url: 'https://example.test/lane-job',
+          searchQueries: [queries[0]],
+        }],
+      };
+    },
+    fetchAdzunaFn: async () => ({
+      status: 'unavailable', count: 0, reason: 'not configured', jobs: [],
+    }),
+  });
+  assert.deepEqual(seenQueries, queryPlan.queries);
+  assert.deepEqual(collected.lanes.map(({ id }) => id), queryPlan.lanes.map(({ id }) => id));
+  assert.deepEqual(collected.sources.hiring_cafe.jobs[0].laneIds, [queryPlan.lanes[0].id]);
+  assert.deepEqual(collected.sources.hiring_cafe.queryCounts, { [queryPlan.queries[0]]: 1 });
 });
 
 test('legacy migration overwrites generic seed placeholders and preserves user trees', () => {
@@ -906,6 +975,13 @@ test('runtime scan records provider failure truthfully and always releases its l
 test('runtime records a canonical failure when collection fails before finalization', async () => {
   const root = scanRoot();
   try {
+    const profile = publishedRankingProfile();
+    fs.mkdirSync(path.join(root, 'profile', 'search'), { recursive: true });
+    fs.writeFileSync(
+      path.join(root, 'profile', 'search', 'published.json'),
+      `${JSON.stringify(profile)}\n`,
+    );
+    writeSearchLanePlan(root, generateSearchLanePlan(profile));
     const result = await runScanWith(root, 'codex', 'primary', {
       providerStatusFn: authenticated,
       collectSourcesFn: async () => {
@@ -921,6 +997,14 @@ test('runtime records a canonical failure when collection fails before finalizat
     assert.equal(events.at(-1).type, 'run.completed');
     assert.equal(events.at(-1).payload.outcome, 'failed');
     assert.equal(fs.existsSync(path.join(root, '.scout', 'scan-lease.json')), false);
+    const lane = loadSearchLanePlan(root).lanes[0];
+    assert.equal(lane.runCount, 1);
+    assert.equal(lane.failureCount, 1);
+    assert.equal(lane.consecutiveUnproductiveRuns, 0);
+    assert.deepEqual(lane.history[0].failures, [{
+      source: 'scan',
+      code: 'scan-failed',
+    }]);
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }

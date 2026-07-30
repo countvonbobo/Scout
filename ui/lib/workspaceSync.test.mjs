@@ -189,6 +189,15 @@ test('multi-record scan-run backup and fresh clone are marker-free while live re
     `${JSON.stringify({ schemaVersion: 4, timestamp: '2026-07-28T09:00:00.000Z' })}\n`
       + `${JSON.stringify({ schemaVersion: 4, timestamp: '2026-07-28T10:00:00.000Z', _scoutMutation: marker })}\n`,
   );
+  fs.writeFileSync(
+    path.join(f.root, 'data', 'search-lanes.json'),
+    `${JSON.stringify({
+      schemaVersion: 1,
+      profileId: 'profile-aaaaaaaaaaaa',
+      lanes: [],
+      _scoutMutation: marker,
+    }, null, 2)}\n`,
+  );
   git(f.root, 'init');
 
   const status = await runWorkspaceSync(f.root, 'marker-free recovery projection');
@@ -196,6 +205,7 @@ test('multi-record scan-run backup and fresh clone are marker-free while live re
   assert.equal(status.state, 'disabled');
   for (const relative of [
     'data/opportunities.json',
+    'data/search-lanes.json',
     'data/scan-runs.jsonl',
     'reports/2026-07-28.md',
   ]) {
@@ -203,9 +213,12 @@ test('multi-record scan-run backup and fresh clone are marker-free while live re
     assert.match(fs.readFileSync(path.join(f.root, ...relative.split('/')), 'utf8'), /scout-mutation|_scoutMutation/);
   }
   const restoredTracker = JSON.parse(git(f.root, 'show', 'HEAD:data/opportunities.json'));
+  const restoredLanes = JSON.parse(git(f.root, 'show', 'HEAD:data/search-lanes.json'));
   const committedRuns = git(f.root, 'show', 'HEAD:data/scan-runs.jsonl')
     .split(/\r?\n/).filter(Boolean).map((line) => JSON.parse(line));
   assert.equal(restoredTracker.opportunities[0].id, 'kept');
+  assert.equal(restoredLanes.profileId, 'profile-aaaaaaaaaaaa');
+  assert.equal(Object.hasOwn(restoredLanes, '_scoutMutation'), false);
   assert.deepEqual(
     committedRuns.map((record) => record.timestamp),
     ['2026-07-28T09:00:00.000Z', '2026-07-28T10:00:00.000Z'],
