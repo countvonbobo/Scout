@@ -143,6 +143,26 @@ function normaliseSerializedKey(key) {
   return String(key).normalize('NFKC').replace(/[^a-z0-9]/gi, '').toLocaleLowerCase('en-US');
 }
 
+const PRIVATE_OUTPUT_CONTEXT_KEYS = [
+  /^auth(?:entication|orization|state|code|output|response)?$/,
+  /^credentials?$/,
+  /^device(?:auth|login|session)?$/,
+  /^login(?:state|session|output|response)?$/,
+  /^provider(?:state|session|output|response|turn|run)?$/,
+  /^session(?:state|id|output|result)?$/,
+  /^run(?:state|id|output|result|events?)?$/,
+  /^scan(?:state|id|run|journal|output|result)?$/,
+  /^execution(?:state|id|output|result)?$/,
+  /^journal(?:state|id|output|events?)?$/,
+  /^transcript$/,
+];
+
+function privateOutputContext(owner, ancestors) {
+  const contextKey = (part) => PRIVATE_OUTPUT_CONTEXT_KEYS.some((pattern) => pattern.test(part));
+  return ancestors.some(contextKey)
+    || Object.keys(owner || {}).some((key) => contextKey(normaliseSerializedKey(key)));
+}
+
 function privacyRuleForKey(key, value, owner = {}, ancestors = []) {
   const normal = normaliseSerializedKey(key);
   const inAuthContext = ancestors.some((part) =>
@@ -163,8 +183,9 @@ function privacyRuleForKey(key, value, owner = {}, ancestors = []) {
     || (normal.includes('raw') && /(?:run|scan|execution|journal|state|event)/.test(normal))) {
     return 'raw-run-state';
   }
-  if (['output', 'payload', 'stdout', 'stderr'].includes(normal)
-    || (normal.includes('raw') && /(?:auth|login|provider|output|response|transcript)/.test(normal))) {
+  if (['stdout', 'stderr'].includes(normal)
+    || (['output', 'payload'].includes(normal) && privateOutputContext(owner, ancestors))
+    || (normal.includes('raw') && /(?:auth|login|provider|output|payload|response|transcript)/.test(normal))) {
     return 'raw-auth-output';
   }
   if (normal === 'usercode'

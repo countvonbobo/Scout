@@ -88,7 +88,17 @@ test('rejects raw run, auth, prompt, CV, advert, transcript and tracking payload
     ['nested-run.json', { run: { state: 'assessing', owner: { host: 'synthetic-private-host', pid: 1234 } } }, 'raw-run-state'],
     ['raw-auth.json', { rawAuthOutput: 'synthetic-auth-output' }, 'raw-auth-output'],
     ['raw-stdout.json', { stdout: 'synthetic-auth-output' }, 'raw-auth-output'],
-    ['generic-output.json', { output: 'synthetic-auth-output' }, 'raw-auth-output'],
+    ['raw-payload.json', { rawPayload: 'synthetic-provider-output' }, 'raw-auth-output'],
+    ['provider-output.json', { provider: 'codex', output: 'synthetic-auth-output' }, 'raw-auth-output'],
+    ['nested-provider-payload.json', {
+      provider: { payload: 'Synthetic provider output whose provenance is explicit.' },
+    }, 'raw-auth-output'],
+    ['nested-auth-output.json', {
+      authentication: { output: 'Synthetic authentication output.' },
+    }, 'raw-auth-output'],
+    ['nested-run-payload.json', {
+      run: { payload: 'Synthetic private run payload.' },
+    }, 'raw-auth-output'],
     ['auth-code.json', { authorizationCode: 'SYNTHETIC-CODE-1234' }, 'auth-code'],
     ['auth-code-snake.json', { auth_code: 'SYNTHETIC-CODE-1234' }, 'auth-code'],
     ['provider-code.json', { provider: 'claude', code: 'SYNTHETIC-CODE-1234' }, 'auth-code'],
@@ -112,7 +122,6 @@ test('rejects raw run, auth, prompt, CV, advert, transcript and tracking payload
     ['transcript.json', { providerTranscript: 'Synthetic provider transcript.' }, 'provider-transcript'],
     ['plain-transcript.json', { transcript: 'Synthetic provider transcript.' }, 'provider-transcript'],
     ['transcript.log', 'provider_transcript: synthetic-private-provider-output', 'provider-transcript'],
-    ['opaque-payload.json', { payload: 'Synthetic provider output whose provenance cannot be audited.' }, 'raw-auth-output'],
     ['tracking.json', { trackingValue: 'utm_source=synthetic-private' }, 'tracking-value'],
     ['tracking-key.json', { utm_source: 'synthetic-private' }, 'tracking-value'],
     ['private-path.json', { path: macHome('synthetic-private', 'Scout Workspace') }, 'private-path'],
@@ -136,6 +145,37 @@ test('rejects raw run, auth, prompt, CV, advert, transcript and tracking payload
       .sort(([left], [right]) => left.localeCompare(right, 'en')),
   );
   assert.equal(JSON.stringify(result).includes('synthetic-private'), false);
+});
+
+test('allows generic serialized output and payload without private provenance', () => {
+  const root = fixture();
+  const cases = [
+    ['build-result.json', {
+      output: { directory: 'dist', format: 'esm' },
+    }],
+    ['package-envelope.json', {
+      payload: { name: 'selected-package', version: '1.2.3' },
+    }],
+    ['public-build-record.json', {
+      source: 'build',
+      type: 'module',
+      output: 'dist/index.js',
+      payload: { files: 3 },
+    }],
+  ];
+  for (const [relative, value] of cases) {
+    fs.writeFileSync(path.join(root, relative), `${JSON.stringify(value)}\n`);
+  }
+
+  const result = auditRelease({
+    root,
+    trackedFiles: cases.map(([relative]) => relative),
+    buildDirs: [],
+  });
+
+  assert.equal(result.ok, true);
+  assert.equal(result.filesScanned, cases.length);
+  assert.deepEqual(result.findings, []);
 });
 
 test('rejects ordinary credential, auth-state, prompt and advert representations', () => {
@@ -629,6 +669,13 @@ test('stage mode audits installed dependency JSON, YAML, TOML, text, log and run
     'rawRunState = "synthetic-private-run-state"\n',
   );
   fs.writeFileSync(
+    path.join(root, 'app', 'node_modules', 'selected-package', 'package-metadata.json'),
+    JSON.stringify({
+      output: 'dist/index.js',
+      payload: { name: 'selected-package', version: '1.2.3' },
+    }),
+  );
+  fs.writeFileSync(
     path.join(root, 'app', 'node_modules', 'selected-package', '.scout', 'run-state.jsonl'),
     `${JSON.stringify({ events: [{ stage: 'synthetic-private-stage' }] })}\n`,
   );
@@ -651,7 +698,7 @@ test('stage mode audits installed dependency JSON, YAML, TOML, text, log and run
       SCOUT_RELEASE_MARKERS: marker,
     });
     assert.equal(stagedAudit.ok, false);
-    assert.equal(stagedAudit.filesScanned, 7);
+    assert.equal(stagedAudit.filesScanned, 8);
     assert.deepEqual(
       stagedAudit.findings.map(({ file, rule }) => [file, rule]),
       [
