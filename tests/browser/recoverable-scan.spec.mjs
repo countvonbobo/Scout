@@ -44,8 +44,8 @@ const ACCEPTANCE_COMPATIBILITY = Object.freeze({
   artifactSchemaVersion: 1,
   pipelineVersion: 'pipeline-v1',
   rankingVersion: 'ranking-v1',
-  promptVersion: 'prompt-v1',
-  assessmentSchemaVersion: 1,
+  promptVersion: 'prompt-v2',
+  assessmentSchemaVersion: 2,
   provider: 'codex',
   model: 'provider-default',
   mutationSchemaVersion: 1,
@@ -218,9 +218,13 @@ function acceptanceCandidates() {
 function acceptanceAssessment(candidateId, overrides = {}) {
   return {
     candidateId,
-    categoryId: null,
     summary: 'Evidence-led synthetic match.',
-    hardExclusionMatches: [],
+    responsibilityFit: {
+      rating: 'strong',
+      advertEvidence: 'The advert requires synthetic engineering delivery.',
+      profileEvidence: 'The synthetic profile records engineering delivery.',
+      explanation: 'The responsibility and profile evidence align.',
+    },
     mandatoryRequirements: [{
       requirement: 'Synthetic evidence',
       advertEvidence: 'The advert marks synthetic evidence as mandatory.',
@@ -228,11 +232,22 @@ function acceptanceAssessment(candidateId, overrides = {}) {
       status: 'met',
       profileEvidence: 'The synthetic profile supplies matching evidence.',
     }],
-    dimensions: [{
-      name: 'fit',
-      score: 80,
-      maximum: 100,
-      evidence: 'Bounded synthetic evidence.',
+    transferableExperience: [{
+      advertNeed: 'Deliver reliable synthetic systems.',
+      profileEvidence: 'Delivered a related synthetic system.',
+      relevance: 'strong',
+      explanation: 'The operating constraints transfer directly.',
+    }],
+    uncertainties: ['The advert does not state the delivery team size.'],
+    strengths: [{
+      point: 'Direct synthetic systems evidence.',
+      advertEvidence: 'The advert requires synthetic engineering delivery.',
+      profileEvidence: 'The synthetic profile records engineering delivery.',
+    }],
+    concerns: [{
+      point: 'Delivery team size remains unknown.',
+      advertEvidence: 'The advert does not state the delivery team size.',
+      profileEvidence: null,
     }],
     recommendation: 'keep',
     ...overrides,
@@ -360,7 +375,7 @@ test('production assessment repair, retry and completed-work reuse survive final
       return { assessments: [acceptanceAssessment(ids[0])] };
     }
     return {
-      assessments: [acceptanceAssessment(ids[0], { dimensions: [] })],
+      assessments: [acceptanceAssessment(ids[0], { responsibilityFit: {} })],
     };
   };
   const finalize = async ({ run, lease }) => {
@@ -423,7 +438,7 @@ test('production assessment repair, retry and completed-work reuse survive final
       jobId: 'acceptance-candidate-3',
       code: 'assessment-validation-exhausted',
       attempts: 3,
-      validationFailures: ['dimensions-required'],
+      validationFailures: ['responsibility-fit-shape-invalid'],
     }]);
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
