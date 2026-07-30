@@ -1872,6 +1872,10 @@ test('semantic recovery preserves a hard exclusion found after the old advert pr
     leaseDurationMs: 1_000,
     takeoverMarginMs: 0,
   };
+  const heartbeatOptions = {
+    wallNow: () => now,
+    monotonicNow: () => now,
+  };
   const stages = createRankedDiscoveryStages({
     collect: async () => ({
       generatedAt: '2026-07-27T10:00:00.000Z',
@@ -1907,6 +1911,7 @@ test('semantic recovery preserves a hard exclusion found after the old advert pr
         compatibility: RECOVERY_COMPATIBILITY,
         stages,
         leaseOptions,
+        heartbeatOptions,
         onStageCommitted({ stageId, run }) {
           runId = run.runId;
           if (stageId === 'collect') {
@@ -1922,6 +1927,7 @@ test('semantic recovery preserves a hard exclusion found after the old advert pr
       compatibility: RECOVERY_COMPATIBILITY,
       stages,
       leaseOptions,
+      heartbeatOptions,
     });
     assert.equal(recovered.outcome, 'complete', JSON.stringify(recovered.failures));
     assert.equal(recovered.stageOutputs.select.selection.selected.length, 0);
