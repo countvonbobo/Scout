@@ -34,6 +34,7 @@ import {
   ASSESSMENT_RESPONSE_SCHEMA,
   planAssessmentBatches,
   resumeAssessments,
+  validateAssessmentJob,
 } from './assessmentBatches.mjs';
 import { ProviderLifecycleUnclosedError } from './structuredTurn.mjs';
 import {
@@ -499,6 +500,13 @@ export async function runScanPipeline({
   if (typeof waitForTransientLease !== 'function') {
     throw new TypeError('scan pipeline transient lease waiter must be a function');
   }
+  const effectiveHeartbeatOptions = {
+    ...(typeof leaseOptions.wallNow === 'function' ? { wallNow: leaseOptions.wallNow } : {}),
+    ...(typeof leaseOptions.monotonicNow === 'function'
+      ? { monotonicNow: leaseOptions.monotonicNow }
+      : {}),
+    ...heartbeatOptions,
+  };
   const functions = stageFunctions(stages);
   const ownsLease = claimedLease === null;
   const provisionalRunId = claimedLease?.runId || requestedRunId || randomUUID();
@@ -613,7 +621,7 @@ export async function runScanPipeline({
   let receiptIssue = 'mutation-receipt-missing';
   try {
     if (healthPreflight !== null) {
-      heartbeat = startLeaseHeartbeat(lease, heartbeatOptions);
+      heartbeat = startLeaseHeartbeat(lease, effectiveHeartbeatOptions);
       let health;
       try {
         health = await healthPreflight({
@@ -695,7 +703,7 @@ export async function runScanPipeline({
         }, lease);
         manifest = validateManifestAgreement(run, lease).manifest;
       }
-      heartbeat = startLeaseHeartbeat(lease, heartbeatOptions);
+      heartbeat = startLeaseHeartbeat(lease, effectiveHeartbeatOptions);
       if (prepare !== null) await prepare({ run, lease });
 
       const reusable = new Map((recovery?.reusableStages || []).map((stage) => [stage.stageId, stage]));
@@ -1750,6 +1758,27 @@ export function promptCandidate(candidate) {
     .map((field) => [field, candidate[field]]));
 }
 
+export function buildAssessmentPrompt(context, {
+  kind = 'batch',
+  validationFailures = {},
+} = {}) {
+  const retryInstruction = kind === 'repair'
+    ? `Repair only the supplied invalid jobs against these bounded validation codes: ${JSON.stringify(validationFailures)}`
+    : kind === 'retry'
+      ? 'This is one clean per-job retry. Produce a fresh assessment without relying on any previous provider response.'
+      : 'This is the initial assessment batch.';
+  return [
+    'Assess only the supplied Scout candidates and return one result per candidate using only the required JSON schema.',
+    'Scout has already normalised, deduplicated, filtered, ranked and selected these vacancies. Do not assign numeric scores, categories or deterministic exclusions; do not reorder candidates, repair source coverage or invent user preferences.',
+    'Judge nuanced responsibility fit from advert and profile evidence. Record transferable experience, explicit uncertainty, evidence-backed strengths and concerns, and a keep, check or discard recommendation.',
+    'Cover every supplied mandatorySignals item and copy its id into advertEvidenceId. For an additional mandatory requirement you identify, use a concise provider-<slug> advertEvidenceId.',
+    'Every met mandatory requirement needs explicit profile evidence. Use unknown when evidence is absent or ambiguous.',
+    'Never access files, run commands, browse, write artifacts, apply, or send outreach.',
+    retryInstruction,
+    JSON.stringify(context),
+  ].join('\n\n');
+}
+
 function normaliseJob(job) {
   const company = String(job?.company || '').trim();
   const role = String(job?.title || job?.role || '').trim();
@@ -1863,41 +1892,38 @@ export function validateAssessments(value, candidates) {
   for (const item of value.assessments) {
     if (!known.has(item.candidateId) || seen.has(item.candidateId)) throw new Error(`invalid or duplicate candidate assessment: ${item.candidateId}`);
     seen.add(item.candidateId);
-    if (!Array.isArray(item.dimensions) || !item.dimensions.length) throw new Error(`assessment lacks score dimensions: ${item.candidateId}`);
-    const maximum = item.dimensions.reduce((sum, dimension) => sum + Number(dimension.maximum), 0);
-    if (Math.abs(maximum - 100) > 0.001) throw new Error(`assessment dimensions must total 100: ${item.candidateId}`);
-    for (const dimension of item.dimensions) {
-      if (!Number.isFinite(dimension.score) || !Number.isFinite(dimension.maximum)
-          || dimension.score < 0 || dimension.score > dimension.maximum) throw new Error(`invalid score dimension: ${item.candidateId}`);
-    }
     const candidate = candidates.find((entry) => entry.candidateId === item.candidateId);
-    const knownSignals = new Set((candidate?.mandatorySignals || []).map((signal) => signal.id));
-    for (const requirement of item.mandatoryRequirements || []) {
-      if (!requirement.requirement || !requirement.advertEvidence || !requirement.advertEvidenceId) throw new Error(`mandatory requirement lacks advert evidence: ${item.candidateId}`);
-      if (!knownSignals.has(requirement.advertEvidenceId) && !/^provider-[a-z0-9-]+$/i.test(requirement.advertEvidenceId)) {
-        throw new Error(`mandatory requirement cites unknown advert evidence: ${item.candidateId}`);
-      }
-      if (requirement.status === 'met' && !String(requirement.profileEvidence || '').trim()) throw new Error(`met requirement lacks profile evidence: ${item.candidateId}`);
+    const failures = validateAssessmentJob(item, candidate);
+    if (failures.includes('mandatory-advert-evidence-omitted')) {
+      throw new Error(`assessment omitted mandatory advert evidence: ${item.candidateId}`);
     }
-    const coveredSignals = new Set((item.mandatoryRequirements || []).map((requirement) => requirement.advertEvidenceId));
-    const missingSignals = [...knownSignals].filter((id) => !coveredSignals.has(id));
-    if (missingSignals.length) throw new Error(`assessment omitted mandatory advert evidence ${missingSignals.join(', ')}: ${item.candidateId}`);
+    if (failures.length) {
+      throw new Error(`assessment validation failed for ${item.candidateId}: ${failures.join(', ')}`);
+    }
   }
   if (seen.size !== candidates.length) throw new Error(`scan assessment covered ${seen.size} of ${candidates.length} candidates`);
   return value;
 }
 
-export function gateAssessment(assessment, policy) {
+export function gateAssessment(assessment, policy, candidate = {}) {
   const actionScore = Number(policy?.actionScore ?? 70);
   const checkScore = Number(policy?.checkScore ?? 55);
-  const total = Math.round(assessment.dimensions.reduce((sum, item) => sum + Number(item.score), 0) * 100) / 100;
+  const rankedScore = Number(candidate?.preRankScore);
+  const total = Number.isFinite(rankedScore)
+    ? Math.round(rankedScore * 100) / 100
+    : assessment.recommendation === 'keep' ? actionScore
+      : assessment.recommendation === 'check' ? checkScore : 0;
   const unmet = (assessment.mandatoryRequirements || []).filter((item) => item.status === 'unmet');
   const unknown = (assessment.mandatoryRequirements || []).filter((item) => item.status === 'unknown');
-  const excluded = (assessment.hardExclusionMatches || []).length > 0;
-  if (assessment.recommendation === 'discard' || excluded || unmet.length) {
-    return { eligibility: 'ineligible', score: Math.min(total, checkScore - 1), keep: false, reasons: [...assessment.hardExclusionMatches, ...unmet.map((item) => item.requirement)] };
+  if (assessment.recommendation === 'discard' || unmet.length) {
+    return {
+      eligibility: 'ineligible',
+      score: Math.min(total, checkScore - 1),
+      keep: false,
+      reasons: unmet.map((item) => item.requirement),
+    };
   }
-  if (unknown.length) {
+  if (unknown.length || assessment.recommendation === 'check') {
     return { eligibility: 'check', score: Math.min(total, actionScore - 1), keep: total >= checkScore, reasons: unknown.map((item) => item.requirement) };
   }
   return { eligibility: total >= actionScore ? 'eligible' : total >= checkScore ? 'check' : 'below-threshold', score: total, keep: total >= checkScore, reasons: [] };
@@ -1919,11 +1945,10 @@ function mergeTracker(existing, candidates, assessments, policy, date, profileId
   for (const assessment of assessments) {
     const candidate = candidates.find((item) => item.candidateId === assessment.candidateId);
     if (!candidate) continue;
-    const gate = gateAssessment(assessment, policy);
+    const gate = gateAssessment(assessment, policy, candidate);
     let outcome = 'kept';
     if (!gate.keep) {
-      if ((assessment.hardExclusionMatches || []).length) outcome = 'hard_exclusion';
-      else if ((assessment.mandatoryRequirements || []).some((item) => item.status === 'unmet')) outcome = 'mandatory_unmet';
+      if ((assessment.mandatoryRequirements || []).some((item) => item.status === 'unmet')) outcome = 'mandatory_unmet';
       else if (assessment.recommendation === 'discard') outcome = 'provider_discarded';
       else outcome = 'below_threshold';
       discarded[outcome] += 1;
@@ -1940,7 +1965,7 @@ function mergeTracker(existing, candidates, assessments, policy, date, profileId
         ? candidate.contentFingerprint
         : vacancyContentFingerprint(candidate),
       profileId: boundedText(profileId, 80),
-      categoryId: boundedText(assessment.categoryId, 80) || null,
+      categoryId: null,
       outcome, score: gate.score,
       reasons: reasons.map((reason) => boundedText(reason)).filter(Boolean).slice(0, REVIEW_REASON_LIMIT),
     });
@@ -1954,12 +1979,15 @@ function mergeTracker(existing, candidates, assessments, policy, date, profileId
     const changedAdvert = Boolean(previous && advertMateriallyChanged(previous, candidate));
     const references = mergeSourceReferences(previous || {}, candidate);
     const urls = references.map((reference) => reference.url).filter(Boolean);
+    const deterministicDimensions = Array.isArray(candidate.dimensions) ? candidate.dimensions : [];
     const generated = {
       id, company: candidate.company, role: candidate.role, location: candidate.location || previous?.location || '', score: gate.score,
-      scoreBreakdown: Object.fromEntries(assessment.dimensions.map((item) => [item.name, item.score])),
+      scoreBreakdown: Object.fromEntries(deterministicDimensions
+        .filter((item) => item?.name && Number.isFinite(Number(item.score)))
+        .map((item) => [item.name, Number(item.score)])),
       eligibility: { status: gate.eligibility, reasons: gate.reasons },
       mandatoryRequirements: assessment.mandatoryRequirements,
-      status: previous?.status || 'new', category: assessment.categoryId || previous?.category || null,
+      status: previous?.status || 'new', category: previous?.category || null,
       tags: [...new Set([...(previous?.tags || []), ...(candidate.tags || []), ...(gate.eligibility === 'check' ? ['Check mandatory requirement'] : []), ...(changedAdvert ? ['Updated advert — review'] : [])])],
       sources: [...new Set([...(previous?.sources || []), ...urls])], sourceReferences: references,
       jobIdentity: jobIdentity(candidate),

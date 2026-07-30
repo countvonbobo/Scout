@@ -24,13 +24,19 @@ const CONTEXT_DIGEST_KEYS = Object.freeze([
   'scoringConfigDigest', 'profileDigest', 'calibrationDigest', 'masterCvDigest',
 ]);
 const ASSESSMENT_KEYS = Object.freeze([
-  'candidateId', 'categoryId', 'summary', 'hardExclusionMatches',
-  'mandatoryRequirements', 'dimensions', 'recommendation',
+  'candidateId', 'summary', 'responsibilityFit', 'mandatoryRequirements',
+  'transferableExperience', 'uncertainties', 'strengths', 'concerns', 'recommendation',
 ]);
 const REQUIREMENT_KEYS = Object.freeze([
   'requirement', 'advertEvidence', 'advertEvidenceId', 'status', 'profileEvidence',
 ]);
-const DIMENSION_KEYS = Object.freeze(['name', 'score', 'maximum', 'evidence']);
+const RESPONSIBILITY_FIT_KEYS = Object.freeze([
+  'rating', 'advertEvidence', 'profileEvidence', 'explanation',
+]);
+const TRANSFERABLE_EXPERIENCE_KEYS = Object.freeze([
+  'advertNeed', 'profileEvidence', 'relevance', 'explanation',
+]);
+const EVIDENCE_POINT_KEYS = Object.freeze(['point', 'advertEvidence', 'profileEvidence']);
 
 export const ASSESSMENT_RESPONSE_SCHEMA = Object.freeze({
   type: 'object',
@@ -38,15 +44,24 @@ export const ASSESSMENT_RESPONSE_SCHEMA = Object.freeze({
   properties: {
     assessments: {
       type: 'array',
+      minItems: 1,
+      maxItems: MAX_BATCH_JOBS,
       items: {
         type: 'object',
         additionalProperties: false,
         properties: {
           candidateId: { type: 'string', maxLength: 128 },
-          categoryId: { type: ['string', 'null'], maxLength: 80 },
           summary: { type: 'string', maxLength: 600 },
-          hardExclusionMatches: {
-            type: 'array', maxItems: 20, items: { type: 'string', maxLength: 300 },
+          responsibilityFit: {
+            type: 'object',
+            additionalProperties: false,
+            properties: {
+              rating: { type: 'string', enum: ['strong', 'mixed', 'weak', 'unknown'] },
+              advertEvidence: { type: 'string', maxLength: 600 },
+              profileEvidence: { type: ['string', 'null'], maxLength: 600 },
+              explanation: { type: 'string', maxLength: 600 },
+            },
+            required: RESPONSIBILITY_FIT_KEYS,
           },
           mandatoryRequirements: {
             type: 'array',
@@ -64,23 +79,53 @@ export const ASSESSMENT_RESPONSE_SCHEMA = Object.freeze({
               required: REQUIREMENT_KEYS,
             },
           },
-          dimensions: {
+          transferableExperience: {
             type: 'array',
-            minItems: 1,
-            maxItems: 20,
+            maxItems: 12,
             items: {
               type: 'object',
               additionalProperties: false,
               properties: {
-                name: { type: 'string', maxLength: 100 },
-                score: { type: 'number' },
-                maximum: { type: 'number' },
-                evidence: { type: 'string', maxLength: 600 },
+                advertNeed: { type: 'string', maxLength: 600 },
+                profileEvidence: { type: ['string', 'null'], maxLength: 600 },
+                relevance: { type: 'string', enum: ['strong', 'partial', 'unknown'] },
+                explanation: { type: 'string', maxLength: 600 },
               },
-              required: DIMENSION_KEYS,
+              required: TRANSFERABLE_EXPERIENCE_KEYS,
             },
           },
-          recommendation: { type: 'string', enum: ['keep', 'discard'] },
+          uncertainties: {
+            type: 'array', maxItems: 12, items: { type: 'string', maxLength: 600 },
+          },
+          strengths: {
+            type: 'array',
+            maxItems: 12,
+            items: {
+              type: 'object',
+              additionalProperties: false,
+              properties: {
+                point: { type: 'string', maxLength: 600 },
+                advertEvidence: { type: 'string', maxLength: 600 },
+                profileEvidence: { type: ['string', 'null'], maxLength: 600 },
+              },
+              required: EVIDENCE_POINT_KEYS,
+            },
+          },
+          concerns: {
+            type: 'array',
+            maxItems: 12,
+            items: {
+              type: 'object',
+              additionalProperties: false,
+              properties: {
+                point: { type: 'string', maxLength: 600 },
+                advertEvidence: { type: 'string', maxLength: 600 },
+                profileEvidence: { type: ['string', 'null'], maxLength: 600 },
+              },
+              required: EVIDENCE_POINT_KEYS,
+            },
+          },
+          recommendation: { type: 'string', enum: ['keep', 'check', 'discard'] },
         },
         required: ASSESSMENT_KEYS,
       },
@@ -336,12 +381,25 @@ export function validateAssessmentJob(value, job) {
   if (value.candidateId !== expectedId) return validationFailure('candidate-id-mismatch');
   try {
     boundedString(value.candidateId, 'assessment candidate ID', 128);
-    boundedString(value.categoryId, 'assessment category ID', 80, { nullable: true });
     boundedString(value.summary, 'assessment summary', 600);
-    if (!Array.isArray(value.hardExclusionMatches) || value.hardExclusionMatches.length > 20) {
-      return validationFailure('hard-exclusions-invalid');
+    if (!exactKeys(value.responsibilityFit, RESPONSIBILITY_FIT_KEYS)) {
+      return validationFailure('responsibility-fit-shape-invalid');
     }
-    for (const match of value.hardExclusionMatches) boundedString(match, 'hard exclusion match', 300);
+    boundedString(value.responsibilityFit.advertEvidence, 'responsibility advert evidence', 600);
+    boundedString(
+      value.responsibilityFit.profileEvidence,
+      'responsibility profile evidence',
+      600,
+      { nullable: true },
+    );
+    boundedString(value.responsibilityFit.explanation, 'responsibility fit explanation', 600);
+    if (!['strong', 'mixed', 'weak', 'unknown'].includes(value.responsibilityFit.rating)) {
+      return validationFailure('responsibility-fit-rating-invalid');
+    }
+    if (value.responsibilityFit.rating === 'strong'
+      && !String(value.responsibilityFit.profileEvidence || '').trim()) {
+      return validationFailure('responsibility-profile-evidence-required');
+    }
     if (!Array.isArray(value.mandatoryRequirements) || value.mandatoryRequirements.length > 24) {
       return validationFailure('mandatory-requirements-invalid');
     }
@@ -361,25 +419,53 @@ export function validateAssessmentJob(value, job) {
       if (requirement.status === 'met' && !String(requirement.profileEvidence || '').trim()) {
         return validationFailure('profile-evidence-required');
       }
+      if (covered.has(requirement.advertEvidenceId)) {
+        return validationFailure('advert-evidence-duplicate');
+      }
       covered.add(requirement.advertEvidenceId);
     }
     if ([...knownSignals].some((id) => !covered.has(id))) return validationFailure('mandatory-advert-evidence-omitted');
-    if (!Array.isArray(value.dimensions) || !value.dimensions.length || value.dimensions.length > 20) {
-      return validationFailure('dimensions-required');
+    if (!Array.isArray(value.transferableExperience) || value.transferableExperience.length > 12) {
+      return validationFailure('transferable-experience-invalid');
     }
-    let maximum = 0;
-    for (const dimension of value.dimensions) {
-      if (!exactKeys(dimension, DIMENSION_KEYS)) return validationFailure('dimension-shape-invalid');
-      boundedString(dimension.name, 'assessment dimension name', 100);
-      boundedString(dimension.evidence, 'assessment dimension evidence', 600);
-      if (!Number.isFinite(dimension.score) || !Number.isFinite(dimension.maximum)
-        || dimension.maximum <= 0 || dimension.score < 0 || dimension.score > dimension.maximum) {
-        return validationFailure('dimension-score-invalid');
+    for (const experience of value.transferableExperience) {
+      if (!exactKeys(experience, TRANSFERABLE_EXPERIENCE_KEYS)) {
+        return validationFailure('transferable-experience-shape-invalid');
       }
-      maximum += dimension.maximum;
+      boundedString(experience.advertNeed, 'transferable advert need', 600);
+      boundedString(experience.profileEvidence, 'transferable profile evidence', 600, { nullable: true });
+      boundedString(experience.explanation, 'transferable experience explanation', 600);
+      if (!['strong', 'partial', 'unknown'].includes(experience.relevance)) {
+        return validationFailure('transferable-relevance-invalid');
+      }
+      if (experience.relevance !== 'unknown' && !String(experience.profileEvidence || '').trim()) {
+        return validationFailure('transferable-profile-evidence-required');
+      }
     }
-    if (Math.abs(maximum - 100) > 0.001) return validationFailure('dimension-maximum-invalid');
-    if (!['keep', 'discard'].includes(value.recommendation)) return validationFailure('recommendation-invalid');
+    if (!Array.isArray(value.uncertainties) || value.uncertainties.length > 12) {
+      return validationFailure('uncertainties-invalid');
+    }
+    for (const uncertainty of value.uncertainties) {
+      boundedString(uncertainty, 'assessment uncertainty', 600);
+    }
+    for (const [name, points, requireProfile] of [
+      ['strength', value.strengths, true],
+      ['concern', value.concerns, false],
+    ]) {
+      if (!Array.isArray(points) || points.length > 12) return validationFailure(`${name}s-invalid`);
+      for (const point of points) {
+        if (!exactKeys(point, EVIDENCE_POINT_KEYS)) return validationFailure(`${name}-shape-invalid`);
+        boundedString(point.point, `${name} point`, 600);
+        boundedString(point.advertEvidence, `${name} advert evidence`, 600);
+        boundedString(point.profileEvidence, `${name} profile evidence`, 600, { nullable: true });
+        if (requireProfile && !String(point.profileEvidence || '').trim()) {
+          return validationFailure(`${name}-profile-evidence-required`);
+        }
+      }
+    }
+    if (!['keep', 'check', 'discard'].includes(value.recommendation)) {
+      return validationFailure('recommendation-invalid');
+    }
   } catch {
     return validationFailure('assessment-value-invalid');
   }
@@ -541,6 +627,8 @@ function commitAssessment(batch, job, value, context) {
     model: batch.request.provenance.model,
     promptVersion: batch.request.provenance.promptVersion,
     assessmentSchemaVersion: batch.request.provenance.assessmentSchemaVersion,
+    profileVersion: batch.request.provenance.profileVersion,
+    pipelineVersion: batch.request.provenance.pipelineVersion,
   };
   const ref = artifact(
     context.run,

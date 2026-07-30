@@ -361,11 +361,18 @@ test('partial assessment success produces one deterministic tracker/report plan 
     assessmentResult: {
       assessments: [{
         candidateId: 'candidate-001',
-        categoryId: 'software',
         summary: 'Synthetic fit',
-        hardExclusionMatches: [],
+        responsibilityFit: {
+          rating: 'strong',
+          advertEvidence: 'The advert requires engineering delivery.',
+          profileEvidence: 'The profile records engineering delivery.',
+          explanation: 'The evidence aligns.',
+        },
         mandatoryRequirements: [],
-        dimensions: [{ name: 'Fit', score: 90, maximum: 100, evidence: 'Bounded evidence' }],
+        transferableExperience: [],
+        uncertainties: [],
+        strengths: [],
+        concerns: [],
         recommendation: 'keep',
       }],
     },
@@ -472,9 +479,13 @@ test('real prepared recipe excludes unlabelled private bodies while preserving t
     assessmentResult: {
       assessments: [{
         candidateId: 'candidate-001',
-        categoryId: 'software',
         summary: privateBodies.provider,
-        hardExclusionMatches: [],
+        responsibilityFit: {
+          rating: 'strong',
+          advertEvidence: privateBodies.advert,
+          profileEvidence: privateBodies.cv,
+          explanation: privateBodies.provider,
+        },
         mandatoryRequirements: [{
           requirement: privateBodies.prompt,
           advertEvidence: privateBodies.advert,
@@ -482,7 +493,10 @@ test('real prepared recipe excludes unlabelled private bodies while preserving t
           status: 'met',
           profileEvidence: privateBodies.cv,
         }],
-        dimensions: [{ name: 'Fit', score: 90, maximum: 100, evidence: privateBodies.provider }],
+        transferableExperience: [],
+        uncertainties: [],
+        strengths: [],
+        concerns: [],
         recommendation: 'keep',
       }],
     },

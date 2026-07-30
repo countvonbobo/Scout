@@ -28,7 +28,7 @@ Provider checks run asynchronously, share an in-progress probe and keep a short-
 
 Scout uses the provider CLI, not a desktop application's embedded session. If Codex is installed but shown as signed out, run `codex`, complete sign-in, and confirm `codex login status` in the same host account before refreshing Scout.
 
-Scout separately reports installation, authentication and bounded structured-output compatibility. An authenticated CLI that is too old for schema-constrained output remains disabled until it is upgraded from the provider's official installer. Bounded setup, scans and fit assessments use one non-resumable turn with no provider file-writing tools; Scout's trusted runtime validates and writes the workspace artifacts.
+Scout separately reports installation, authentication and bounded structured-output compatibility. An authenticated CLI that is too old for schema-constrained output remains disabled until it is upgraded from the provider's official installer. Bounded setup, scans and fit assessments use one non-resumable turn with no provider file-writing tools; Scout's trusted runtime validates and writes the workspace artifacts. Claude and Codex use the same strict assessment schema: providers supply nuanced fit and evidence, while Scout retains numeric scoring, category, deterministic-exclusion, ordering and source-coverage authority.
 
 On Windows, Codex runs under its documented `unelevated` sandbox. Scout never uses Codex's unrestricted filesystem mode.
 

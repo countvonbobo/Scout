@@ -41,7 +41,10 @@ After a process exit or machine restart, start Scout normally. It validates the
 append-only run journal, the rebuildable manifest, the persisted lease expiry
 and the previous process-start identity. It then resumes the newest
 stage-compatible run; it may reuse deterministic stages while restarting
-assessment when provider/model/prompt/schema provenance changed. Newer
+assessment when provider/model/prompt/schema/profile/pipeline provenance
+changed. A provider-neutral assessment-schema upgrade therefore restarts
+incompatible assessment work without recollecting or reranking compatible
+deterministic stages. Newer
 incompatible candidates are left as bounded `partial` or `abandoned` evidence,
 not rewritten.
 

@@ -4,10 +4,12 @@ import os from 'node:os';
 import path from 'node:path';
 import { test } from 'node:test';
 import {
+  ASSESSMENT_RESPONSE_SCHEMA,
   assertMinimalAssessmentRequest,
   executeAssessmentBatch,
   planAssessmentBatches,
   resumeAssessments,
+  validateAssessmentJob,
 } from './assessmentBatches.mjs';
 import { readRunArtifact } from './runArtifacts.mjs';
 import { acquireScanLease, currentLeaseOwner, releaseScanLease } from './scanLease.mjs';
@@ -19,8 +21,8 @@ import {
 
 const provenance = Object.freeze({
   profileVersion: 'profile-v1',
-  promptVersion: 'prompt-v1',
-  assessmentSchemaVersion: 1,
+  promptVersion: 'prompt-v2',
+  assessmentSchemaVersion: 2,
   pipelineVersion: 'pipeline-v1',
   provider: 'codex',
   model: 'provider-default',
@@ -32,6 +34,18 @@ const contextDigests = Object.freeze({
   calibrationDigest: '3'.repeat(64),
   masterCvDigest: '4'.repeat(64),
 });
+
+const ASSESSMENT_KEYS_FOR_TEST = Object.freeze([
+  'candidateId',
+  'concerns',
+  'mandatoryRequirements',
+  'recommendation',
+  'responsibilityFit',
+  'strengths',
+  'summary',
+  'transferableExperience',
+  'uncertainties',
+]);
 
 function jobs(count) {
   return Array.from({ length: count }, (_, index) => ({
@@ -46,11 +60,19 @@ function jobs(count) {
 }
 
 function assessment(candidateId, overrides = {}) {
+  return nuancedAssessment(candidateId, overrides);
+}
+
+function nuancedAssessment(candidateId, overrides = {}) {
   return {
     candidateId,
-    categoryId: null,
     summary: 'Evidence-led synthetic match.',
-    hardExclusionMatches: [],
+    responsibilityFit: {
+      rating: 'strong',
+      advertEvidence: 'The advert requires delivery of reliable systems.',
+      profileEvidence: 'The synthetic profile records reliable systems delivery.',
+      explanation: 'The responsibility and prior evidence align directly.',
+    },
     mandatoryRequirements: [{
       requirement: 'Synthetic evidence',
       advertEvidence: 'The advert marks synthetic evidence as mandatory.',
@@ -58,7 +80,23 @@ function assessment(candidateId, overrides = {}) {
       status: 'met',
       profileEvidence: 'The synthetic profile supplies matching evidence.',
     }],
-    dimensions: [{ name: 'fit', score: 80, maximum: 100, evidence: 'Bounded evidence.' }],
+    transferableExperience: [{
+      advertNeed: 'Operate reliable systems.',
+      profileEvidence: 'Operated a related synthetic service.',
+      relevance: 'strong',
+      explanation: 'The operating constraints are directly transferable.',
+    }],
+    uncertainties: ['The scale of the team is not stated.'],
+    strengths: [{
+      point: 'Direct systems evidence.',
+      advertEvidence: 'The advert requires reliable systems.',
+      profileEvidence: 'The profile records reliable systems delivery.',
+    }],
+    concerns: [{
+      point: 'Team scale remains unknown.',
+      advertEvidence: 'The advert does not state team size.',
+      profileEvidence: null,
+    }],
     recommendation: 'keep',
     ...overrides,
   };
@@ -173,7 +211,7 @@ test('batch identity covers ordered input digests, execution parameters and prov
   const [changedParameters] = planAssessmentBatches({ ...base, timeoutMs: 12_000 });
   const [changedProvenance] = planAssessmentBatches({
     ...base,
-    provenance: { ...provenance, promptVersion: 'prompt-v2' },
+    provenance: { ...provenance, promptVersion: 'prompt-v3' },
   });
   const [changedContext] = planAssessmentBatches({
     ...base,
@@ -184,6 +222,28 @@ test('batch identity covers ordered input digests, execution parameters and prov
   assert.notEqual(changedParameters.id, original.id);
   assert.notEqual(changedProvenance.id, original.id);
   assert.notEqual(changedContext.id, original.id);
+});
+
+test('provider-neutral schema accepts only nuanced fit and evidence fields', () => {
+  const assessments = ASSESSMENT_RESPONSE_SCHEMA.properties.assessments;
+  assert.equal(assessments.minItems, 1);
+  assert.equal(assessments.maxItems, 10);
+  const item = assessments.items;
+  assert.deepEqual(Object.keys(item.properties).sort(), [
+    'candidateId',
+    'concerns',
+    'mandatoryRequirements',
+    'recommendation',
+    'responsibilityFit',
+    'strengths',
+    'summary',
+    'transferableExperience',
+    'uncertainties',
+  ]);
+  for (const forbidden of ['categoryId', 'dimensions', 'hardExclusionMatches']) {
+    assert.equal(Object.hasOwn(item.properties, forbidden), false);
+  }
+  assert.deepEqual(validateAssessmentJob(nuancedAssessment('candidate-001'), jobs(1)[0]), []);
 });
 
 test('valid siblings persist while only invalid jobs receive one focused repair', async () => {
@@ -299,7 +359,7 @@ test('failed repair gets one clean per-job retry and exhausted failures stay aud
           assessments: requested.map((job) => assessment(job.candidateId, { mandatoryRequirements: [] })),
         };
         if (requested[0].candidateId === 'candidate-002') return { assessments: [assessment('candidate-002')] };
-        return { assessments: [assessment('candidate-003', { dimensions: [] })] };
+        return { assessments: [assessment('candidate-003', { responsibilityFit: {} })] };
       },
     });
     assert.deepEqual(result.assessments.map((item) => item.candidateId), ['candidate-001', 'candidate-002']);
@@ -307,7 +367,7 @@ test('failed repair gets one clean per-job retry and exhausted failures stay aud
       jobId: 'candidate-003',
       code: 'assessment-validation-exhausted',
       attempts: 3,
-      validationFailures: ['dimensions-required'],
+      validationFailures: ['responsibility-fit-shape-invalid'],
     }]);
     assert.deepEqual(calls, [
       { kind: 'batch', ids: ['candidate-001', 'candidate-002', 'candidate-003'] },
@@ -441,7 +501,7 @@ test('an assessment-stage recovery restart invalidates otherwise identical compl
         schemaVersion: 2,
         compatibility: {
           ...fixture.run.events[0].payload.compatibility,
-          promptVersion: 'prompt-v2',
+          promptVersion: 'prompt-v3',
         },
         requestFingerprint: 'b'.repeat(64),
         selectionFingerprint: 'c'.repeat(64),
@@ -708,10 +768,51 @@ test('provider substitution is rejected unless explicit and records new provenan
     assert.deepEqual(result.provenanceByJob['candidate-001'], {
       provider: 'claude',
       model: 'sonnet',
-      promptVersion: 'prompt-v1',
-      assessmentSchemaVersion: 1,
+      promptVersion: 'prompt-v2',
+      assessmentSchemaVersion: 2,
+      profileVersion: 'profile-v1',
+      pipelineVersion: 'pipeline-v1',
     });
   } finally {
     fixture.cleanup();
+  }
+});
+
+test('Claude and Codex preserve equivalent schema-valid assessment artifacts', async () => {
+  const results = {};
+  for (const provider of ['claude', 'codex']) {
+    const fixture = runFixture();
+    try {
+      const providerProvenance = {
+        ...provenance,
+        provider,
+        model: provider === 'claude' ? 'sonnet' : 'gpt',
+      };
+      const [batch] = planAssessmentBatches({
+        runId: fixture.run.runId,
+        jobs: jobs(1),
+        provenance: providerProvenance,
+        contextBudgetCharacters: 5_000,
+        contextOverheadCharacters: 100,
+      });
+      results[provider] = await executeAssessmentBatch(batch, {
+        run: fixture.run,
+        lease: fixture.lease,
+        invokeProvider: async () => ({
+          assessments: [nuancedAssessment('candidate-001')],
+        }),
+      });
+    } finally {
+      fixture.cleanup();
+    }
+  }
+
+  assert.deepEqual(results.claude.assessments, results.codex.assessments);
+  assert.deepEqual(Object.keys(results.claude.assessments[0]).sort(), ASSESSMENT_KEYS_FOR_TEST);
+  for (const provider of ['claude', 'codex']) {
+    assert.equal(results[provider].failures.length, 0);
+    assert.equal(results[provider].provenanceByJob['candidate-001'].provider, provider);
+    assert.equal(results[provider].provenanceByJob['candidate-001'].profileVersion, 'profile-v1');
+    assert.equal(results[provider].provenanceByJob['candidate-001'].assessmentSchemaVersion, 2);
   }
 });

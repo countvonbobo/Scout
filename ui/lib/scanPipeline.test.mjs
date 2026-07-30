@@ -4,7 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { test } from 'node:test';
 import {
-  assessScanCandidates, assessmentCandidatesForSelection, compactCandidates, createRankedDiscoveryStages, DEFAULT_CANDIDATE_LIMIT, gateAssessment, inboxRecheckCandidates, prepareRankedDiscovery, promptCandidate,
+  assessScanCandidates, assessmentCandidatesForSelection, buildAssessmentPrompt, compactCandidates, createRankedDiscoveryStages, DEFAULT_CANDIDATE_LIMIT, gateAssessment, inboxRecheckCandidates, prepareRankedDiscovery, promptCandidate,
   filterVacancies, PipelineInterruptedError, readVacancyDecisionHistory, runScanPipeline, validateAssessments, validateWrittenScanArtifacts,
   verificationCandidates, writeScanArtifacts,
 } from './scanPipeline.mjs';
@@ -19,9 +19,46 @@ import { scanReportRecipe } from './scanMutationProjection.mjs';
 
 const dimensions = [{ name: 'Fit', score: 90, maximum: 100, evidence: 'Advert and profile' }];
 const assessment = (status = 'met') => ({
-  candidateId: 'candidate-001', categoryId: 'software', summary: 'Synthetic fit', hardExclusionMatches: [],
+  candidateId: 'candidate-001',
+  summary: 'Synthetic fit',
+  responsibilityFit: {
+    rating: 'strong',
+    advertEvidence: 'The advert requires systems delivery.',
+    profileEvidence: 'Built production systems.',
+    explanation: 'The responsibility evidence aligns.',
+  },
   mandatoryRequirements: [{ requirement: 'AWS', advertEvidence: 'AWS is required', advertEvidenceId: 'provider-aws', status, profileEvidence: status === 'met' ? 'Built systems on AWS' : null }],
-  dimensions, recommendation: 'keep',
+  transferableExperience: [{
+    advertNeed: 'Deliver reliable services.',
+    profileEvidence: 'Delivered a related service.',
+    relevance: 'strong',
+    explanation: 'The operating constraints transfer directly.',
+  }],
+  uncertainties: ['Team scale is not stated.'],
+  strengths: [{
+    point: 'Direct systems evidence.',
+    advertEvidence: 'The advert requires systems delivery.',
+    profileEvidence: 'Built production systems.',
+  }],
+  concerns: [{
+    point: 'Team scale remains unknown.',
+    advertEvidence: 'The advert does not state team size.',
+    profileEvidence: null,
+  }],
+  recommendation: 'keep',
+});
+
+test('assessment prompt confines providers to nuanced evidence and recommendations', () => {
+  const context = { candidates: [{ candidateId: 'candidate-001' }] };
+  const prompt = buildAssessmentPrompt(context);
+  assert.match(prompt, /already normalised, deduplicated, filtered, ranked and selected/);
+  assert.match(prompt, /responsibility fit/);
+  assert.match(prompt, /transferable experience/);
+  assert.match(prompt, /uncertainty/);
+  assert.match(prompt, /strengths and concerns/);
+  assert.doesNotMatch(prompt, /Use a 100-point evidence-led breakdown/);
+  assert.doesNotMatch(prompt, /Apply hard exclusions before scoring/);
+  assert.deepEqual(JSON.parse(prompt.split('\n\n').at(-1)), context);
 });
 
 test('candidate input is deduplicated, capped and descriptions are bounded', () => {
@@ -358,21 +395,28 @@ test('normalized source requirement summaries are mandatory without keyword heur
     ],
   };
   assert.equal(validateAssessments({ assessments: [missingRust] }, candidates).assessments.length, 1);
-  assert.equal(gateAssessment(missingRust, { actionScore: 70, checkScore: 55 }).score, 69);
-  assert.equal(gateAssessment(missingRust, { actionScore: 70, checkScore: 55 }).eligibility, 'check');
+  assert.equal(gateAssessment(missingRust, { actionScore: 70, checkScore: 55 }, { preRankScore: 90 }).score, 69);
+  assert.equal(gateAssessment(missingRust, { actionScore: 70, checkScore: 55 }, { preRankScore: 90 }).eligibility, 'check');
 });
 
-test('mandatory and exclusion gates recompute trusted scores and bands', () => {
-  assert.deepEqual(gateAssessment(assessment('unmet'), { actionScore: 70, checkScore: 55 }), {
+test('mandatory and recommendation gates use Scout deterministic scores and bands', () => {
+  const candidate = { candidateId: 'candidate-001', preRankScore: 90 };
+  assert.deepEqual(gateAssessment(assessment('unmet'), { actionScore: 70, checkScore: 55 }, candidate), {
     eligibility: 'ineligible', score: 54, keep: false, reasons: ['AWS'],
   });
-  assert.deepEqual(gateAssessment(assessment('unknown'), { actionScore: 70, checkScore: 55 }), {
+  assert.deepEqual(gateAssessment(assessment('unknown'), { actionScore: 70, checkScore: 55 }, candidate), {
     eligibility: 'check', score: 69, keep: true, reasons: ['AWS'],
   });
-  const excluded = assessment('met');
-  excluded.hardExclusionMatches = ['gambling'];
-  assert.equal(gateAssessment(excluded, { actionScore: 70, checkScore: 55 }).keep, false);
-  assert.throws(() => validateAssessments({ assessments: [{ ...assessment('met'), dimensions: [{ ...dimensions[0], score: 101 }] }] }, [{ candidateId: 'candidate-001' }]), /invalid score/);
+  const discarded = { ...assessment('met'), recommendation: 'discard' };
+  assert.equal(gateAssessment(discarded, { actionScore: 70, checkScore: 55 }, candidate).keep, false);
+  assert.equal(gateAssessment(assessment('met'), { actionScore: 70, checkScore: 55 }, { preRankScore: 82 }).score, 82);
+  assert.throws(
+    () => validateAssessments(
+      { assessments: [{ ...assessment('met'), dimensions }] },
+      [{ candidateId: 'candidate-001' }],
+    ),
+    /assessment validation failed/,
+  );
   assert.throws(() => validateAssessments({ assessments: [] }, [{ candidateId: 'candidate-001' }]), /covered 0 of 1/);
 });
 
@@ -722,8 +766,8 @@ const RECOVERY_COMPATIBILITY = Object.freeze({
   artifactSchemaVersion: 1,
   pipelineVersion: 'pipeline-v1',
   rankingVersion: 'ranking-v1',
-  promptVersion: 'prompt-v1',
-  assessmentSchemaVersion: 1,
+  promptVersion: 'prompt-v2',
+  assessmentSchemaVersion: 2,
   provider: 'codex',
   model: 'provider-default',
   mutationSchemaVersion: 1,
@@ -779,6 +823,53 @@ test('committed durable stage boundaries let the existing heartbeat run between 
   }
 });
 
+test('pipeline heartbeat inherits the injected lease clock unless explicitly overridden', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'scout-pipeline-shared-clock-'));
+  let now = Date.parse('2026-07-30T08:00:00.000Z');
+  let heartbeatTick = null;
+  const calls = new Map();
+  const baseStages = durableStageHarness(calls);
+  const stages = {
+    ...baseStages,
+    collect: async (context) => {
+      await new Promise((resolve) => setTimeout(resolve, 15));
+      now += 20;
+      heartbeatTick();
+      assert.equal(
+        readScanLease(root).expiresAt,
+        new Date(now + 100).toISOString(),
+      );
+      return baseStages.collect(context);
+    },
+  };
+  try {
+    const result = await runScanPipeline({
+      root,
+      compatibility: RECOVERY_COMPATIBILITY,
+      stages,
+      leaseOptions: {
+        wallNow: () => now,
+        monotonicNow: () => now,
+        leaseDurationMs: 100,
+        takeoverMarginMs: 0,
+      },
+      heartbeatOptions: {
+        intervalMs: 10,
+        setTimeoutFn(callback) {
+          heartbeatTick = callback;
+          return { unref() {} };
+        },
+        clearTimeoutFn() {},
+      },
+    });
+
+    assert.equal(result.outcome, 'complete', JSON.stringify(result.failures));
+    assert.deepEqual([...calls.keys()], DURABLE_STAGES);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test('durable scan finalisation assesses real candidates in recoverable batches with partial repair', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'scout-real-assessment-batches-'));
   const candidates = Array.from({ length: 12 }, (_, index) => ({
@@ -791,9 +882,13 @@ test('durable scan finalisation assesses real candidates in recoverable batches 
   }));
   const makeAssessment = (candidateId, valid = true) => ({
     candidateId,
-    categoryId: null,
     summary: 'Evidence-led fit.',
-    hardExclusionMatches: [],
+    responsibilityFit: {
+      rating: 'strong',
+      advertEvidence: 'The advert requires systems delivery.',
+      profileEvidence: 'The profile supplies systems evidence.',
+      explanation: 'The responsibility evidence aligns.',
+    },
     mandatoryRequirements: valid ? [{
       requirement: 'Systems evidence',
       advertEvidence: 'The advert requires systems evidence.',
@@ -801,7 +896,14 @@ test('durable scan finalisation assesses real candidates in recoverable batches 
       status: 'met',
       profileEvidence: 'The profile supplies systems evidence.',
     }] : [],
-    dimensions: [{ name: 'fit', score: 80, maximum: 100, evidence: 'Bounded evidence.' }],
+    transferableExperience: [],
+    uncertainties: [],
+    strengths: [{
+      point: 'Direct systems evidence.',
+      advertEvidence: 'The advert requires systems delivery.',
+      profileEvidence: 'The profile supplies systems evidence.',
+    }],
+    concerns: [],
     recommendation: 'keep',
   });
   const calls = [];

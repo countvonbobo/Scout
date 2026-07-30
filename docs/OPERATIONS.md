@@ -75,6 +75,12 @@ The maintained beta deployment uses one private, single-owner Ubuntu VPS:
   a fact for every non-empty description clause.
 - Assessment work is split into stable provider batches of at most ten jobs,
   with smaller deterministic batches when the context budget requires them.
+  The strict provider-neutral schema accepts nuanced responsibility fit,
+  mandatory advert/profile evidence, transferable experience, uncertainties,
+  strengths, concerns and a recommendation. Numeric scores, categories and
+  deterministic exclusions remain trusted-runtime decisions. Each committed
+  assessment binds provider, model, prompt, assessment-schema, profile and
+  pipeline provenance.
   Valid job results are committed independently; invalid jobs receive one
   focused schema repair and one clean per-job retry. Recovery never resubmits
   completed jobs or batches. Durable request records contain only stable job

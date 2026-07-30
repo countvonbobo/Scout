@@ -113,8 +113,8 @@ test('assessment artifacts enforce their kind-specific privacy envelope', () => 
     parameters: { maxJobs: 10, maxInputTokens: 75_000, timeoutMs: 60_000, contextBudgetCharacters: 280_000 },
     provenance: {
       profileVersion: 'profile-v1',
-      promptVersion: 'prompt-v1',
-      assessmentSchemaVersion: 1,
+      promptVersion: 'prompt-v2',
+      assessmentSchemaVersion: 2,
       pipelineVersion: 'pipeline-v1',
       provider: 'codex',
       model: 'provider-default',
@@ -153,11 +153,18 @@ test('assessment result artifacts reject URL-bearing and secret-shaped evidence 
   ];
   const baseAssessment = {
     candidateId: 'candidate-001',
-    categoryId: null,
     summary: 'Safe bounded summary.',
-    hardExclusionMatches: [],
+    responsibilityFit: {
+      rating: 'strong',
+      advertEvidence: 'Safe advert evidence.',
+      profileEvidence: 'Safe profile evidence.',
+      explanation: 'Safe bounded explanation.',
+    },
     mandatoryRequirements: [],
-    dimensions: [{ name: 'fit', score: 80, maximum: 100, evidence: 'Safe bounded evidence.' }],
+    transferableExperience: [],
+    uncertainties: [],
+    strengths: [],
+    concerns: [],
     recommendation: 'keep',
   };
 
@@ -177,13 +184,18 @@ test('assessment result artifacts reject URL-bearing and secret-shaped evidence 
           fencingGeneration: 1,
           assessment: {
             ...baseAssessment,
-            dimensions: [{ ...baseAssessment.dimensions[0], evidence: unsafe }],
+            responsibilityFit: {
+              ...baseAssessment.responsibilityFit,
+              advertEvidence: unsafe,
+            },
           },
           provenance: {
             provider: 'codex',
             model: 'provider-default',
-            promptVersion: 'prompt-v1',
-            assessmentSchemaVersion: 1,
+            promptVersion: 'prompt-v2',
+            assessmentSchemaVersion: 2,
+            profileVersion: 'profile-v1',
+            pipelineVersion: 'pipeline-v1',
           },
         },
       }, lease),

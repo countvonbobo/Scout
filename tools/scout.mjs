@@ -19,7 +19,7 @@ import {
 import { setupReadiness } from '../ui/lib/setupReadiness.mjs';
 import { runStructuredTurn } from '../ui/lib/structuredTurn.mjs';
 import {
-  assessScanCandidates, assessmentCandidatesForSelection, compactCandidates, createRankedDiscoveryStages, DEFAULT_CANDIDATE_LIMIT,
+  assessScanCandidates, assessmentCandidatesForSelection, buildAssessmentPrompt, compactCandidates, createRankedDiscoveryStages, DEFAULT_CANDIDATE_LIMIT,
   coordinateScanArtifacts, durableScanProjection, inboxRecheckCandidates, promptCandidate, runScanPipeline, SCAN_ASSESSMENT_SCHEMA,
   readVacancyDecisionHistory, verificationCandidates,
 } from '../ui/lib/scanPipeline.mjs';
@@ -125,8 +125,8 @@ function scanCompatibility({
     stageArtifactSchemaVersion: PIPELINE_STAGE_ARTIFACT_SCHEMA_VERSION,
     pipelineVersion: 'scan-pipeline-v3-semantic-stage-artifacts',
     rankingVersion: `ranked-discovery-v1-${scanDigest(tracker).slice(0, 32)}`,
-    promptVersion: `assessment-prompt-v1-${scanDigest(contextDigests).slice(0, 32)}`,
-    assessmentSchemaVersion: 1,
+    promptVersion: `assessment-prompt-v2-${scanDigest(contextDigests).slice(0, 32)}`,
+    assessmentSchemaVersion: 2,
     provider,
     model: model || 'provider-default',
     mutationSchemaVersion: 1,
@@ -819,20 +819,7 @@ export async function runScanWith(root, provider, mode, {
               contextDigests,
               invokeProvider({ kind, jobs, validationFailures, timeoutMs, maxInputTokens }) {
                 const context = buildScanContext(paths, config, jobs.map(promptCandidate));
-                const repairInstruction = kind === 'repair'
-                  ? `Repair only the supplied invalid jobs against these bounded validation codes: ${JSON.stringify(validationFailures)}`
-                  : kind === 'retry'
-                    ? 'This is one clean per-job retry. Produce a fresh assessment without relying on any previous provider response.'
-                    : 'This is the initial assessment batch.';
-                const prompt = [
-                  'Assess only the supplied Scout candidates. Return one assessment per candidate and only the required JSON schema.',
-                  'Use a 100-point evidence-led breakdown. Treat every supplied normalized requirement signal, plus advert words such as required, essential, must and non-negotiable, as mandatory requirements.',
-                  'Cover every supplied mandatorySignals item and copy its id into advertEvidenceId. For an additional mandatory requirement you identify, use a concise provider-<slug> advertEvidenceId.',
-                  'Every met mandatory requirement needs explicit profile evidence. Use unknown when evidence is absent or ambiguous.',
-                  'Apply hard exclusions before scoring. Never access files, run commands, browse, write artifacts, apply, or send outreach.',
-                  repairInstruction,
-                  JSON.stringify(context),
-                ].join('\n\n');
+                const prompt = buildAssessmentPrompt(context, { kind, validationFailures });
                 const invocation = runStructuredTurnFn({
                   provider, status: trustedProviderStatus, schema: SCAN_ASSESSMENT_SCHEMA, prompt,
                   model, validate: (value) => value, timeoutMs, maxInputTokens,

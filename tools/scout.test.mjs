@@ -64,12 +64,33 @@ function enableRankedDiscovery(root) {
   fs.writeFileSync(path.join(root, 'profile', 'search', 'published.json'), `${JSON.stringify(profile)}\n`);
 }
 
+function nuancedAssessment(candidateId, overrides = {}) {
+  return {
+    candidateId,
+    summary: 'Synthetic assessment',
+    responsibilityFit: {
+      rating: 'strong',
+      advertEvidence: 'The advert requires delivery of reliable systems.',
+      profileEvidence: 'The profile records reliable systems delivery.',
+      explanation: 'The responsibility and profile evidence align.',
+    },
+    mandatoryRequirements: [],
+    transferableExperience: [],
+    uncertainties: [],
+    strengths: [{
+      point: 'Direct delivery evidence.',
+      advertEvidence: 'The advert requires reliable systems.',
+      profileEvidence: 'The profile records reliable systems delivery.',
+    }],
+    concerns: [],
+    recommendation: 'keep',
+    ...overrides,
+  };
+}
+
 function assessmentFor(candidates) {
   return {
-    assessments: candidates.map((candidate) => ({
-      candidateId: candidate.candidateId, categoryId: null, summary: 'Synthetic assessment', hardExclusionMatches: [],
-      mandatoryRequirements: [], dimensions: [{ name: 'fit', score: 80, maximum: 100, evidence: 'Synthetic evidence' }], recommendation: 'keep',
-    })),
+    assessments: candidates.map((candidate) => nuancedAssessment(candidate.candidateId)),
   };
 }
 
@@ -780,7 +801,7 @@ test('real scan execution keeps valid siblings and reports exhausted jobs precis
         const batch = JSON.parse(prompt.split('\n\n').at(-1)).candidates;
         const value = assessmentFor(batch);
         for (const item of value.assessments) {
-          if (item.candidateId === 'candidate-002') item.dimensions = [];
+          if (item.candidateId === 'candidate-002') item.responsibilityFit = {};
         }
         validate(value);
         return { value, usage: {} };
@@ -796,7 +817,7 @@ test('real scan execution keeps valid siblings and reports exhausted jobs precis
       jobId: 'candidate-002',
       code: 'assessment-validation-exhausted',
       attempts: 3,
-      validationFailures: ['dimensions-required'],
+      validationFailures: ['responsibility-fit-shape-invalid'],
     }]);
     const tracker = JSON.parse(fs.readFileSync(path.join(root, 'data', 'opportunities.json'), 'utf8'));
     assert.equal(tracker.opportunities.length, 1);
@@ -822,10 +843,10 @@ test('runtime scan model is independent from the job-work model', async () => {
     }),
     runStructuredTurnFn: async ({ model: selected }) => {
       seen.push(selected);
-      return { value: { assessments: [{
-        candidateId: 'candidate-001', categoryId: null, summary: 'Match', hardExclusionMatches: [], mandatoryRequirements: [],
-        dimensions: [{ name: 'fit', score: 80, maximum: 100, evidence: 'Evidence' }], recommendation: 'keep',
-      }] }, usage: {} };
+      return {
+        value: { assessments: [nuancedAssessment('candidate-001', { summary: 'Match' })] },
+        usage: {},
+      };
     },
     acquireLockFn: () => ({ ok: true, lock: { token: `lock-${seen.length}` } }),
     releaseLockFn: () => ({ ok: true }),
@@ -1781,11 +1802,9 @@ test('runtime scan preserves an evidence-rich profile larger than the former per
       const context = JSON.parse(prompt.split('\n\n').at(-1));
       profileLength = context.profile.length;
       return {
-        value: { assessments: [{
-          candidateId: 'candidate-001', categoryId: null, summary: 'Evidence-backed match',
-          hardExclusionMatches: [], mandatoryRequirements: [],
-          dimensions: [{ name: 'fit', score: 80, maximum: 100, evidence: 'Profile evidence' }], recommendation: 'keep',
-        }] },
+        value: {
+          assessments: [nuancedAssessment('candidate-001', { summary: 'Evidence-backed match' })],
+        },
         usage: { input_tokens: 12_000 },
       };
     },
