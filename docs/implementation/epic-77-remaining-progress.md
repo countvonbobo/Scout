@@ -869,3 +869,46 @@ not acceptance of `d5ebca2`.
   #82 with these exact commits and evidence, then implement Important 5 by
   routing chat, bounded fit assessment and onboarding provider results through
   the durable health hook without resending provider work.
+
+## 2026-07-30 PR #82 CI repair and review checkpoint 2
+
+- Resumed from exact pushed head
+  `3b130c69f0bc807057be33c9f2a59e1f6d3c47a0`.
+- Repaired failed CI run `30493547303` without weakening production contracts:
+  `221de5a` replaced a stale service-worker spelling assertion with an executed
+  cache-behaviour contract and yielded between already-durable scan stages so
+  the existing heartbeat can renew its genuine fence. `35a94df` made the
+  heartbeat takeover integration test wait for durable renewal evidence rather
+  than a fixed sleep. `93da518` aligned the semantic-recovery test's heartbeat
+  with its injected wall and monotonic clocks.
+- Replacement CI run `30528186616` passed all seven jobs at exact head
+  `93da5189e9872b05f4384df335d5eeb719511911`: Node/test/release-audit on
+  Ubuntu, macOS ARM, Intel macOS and Windows, plus browser acceptance on Ubuntu
+  Firefox, Ubuntu Chromium and Windows Chromium.
+- Fixed Important 5 in
+  `5988b4cb8cec707ad3262fa06e8c474e761bf911`. RED proved that remote
+  authentication failures from ordinary chat, bounded fit assessment and
+  onboarding left durable provider health at `checking`. GREEN routes those
+  boundaries, both handoff turns and scan assessments through one
+  settled-result hook. The hook reduces raw results to the allowlisted health
+  vocabulary, retries only the health transition under bounded authority,
+  preserves remote-auth barriers until a real remote success and cannot resend
+  provider work because it receives no invocation callback.
+- The failed ordinary-chat message remains in its private transcript. The
+  regression observes one provider invocation after failure and a second only
+  after a separate explicit user request; that real remote success clears the
+  barrier. Fit assessment and onboarding each prove one invocation and no
+  automatic retry.
+- Verification for Important 5:
+  - focused provider/chat/onboarding/structured-turn/scan group: 100 passed;
+  - complete `npm test`: 1,121 discovered, 1,116 passed, 0 failed and 5
+    documented platform skips;
+  - release/build audit tests: 35 passed;
+  - fresh staged release audit: 519 files, passed;
+  - `git diff --check`: passed.
+- Still open from the exact-head review: Important 6–12 and Minor 3. Important
+  12 remains a rolling ledger repair and requires a final exact-head update.
+- Exact next action: commit and normally push this ledger checkpoint, update
+  draft PR #82 with the Important 5 SHA and evidence, require all seven CI jobs
+  to pass, then implement Important 6 by re-detecting provider state inside the
+  fenced direct-run preflight after queued work drains.
