@@ -64,8 +64,15 @@ if (command === 'race-acquire') {
   const heartbeat = startLeaseHeartbeat(lease, { intervalMs: Number(interval) });
   fs.writeFileSync(ready, JSON.stringify(lease), 'utf8');
   await new Promise((resolve) => {
-    process.stdin.once('data', resolve);
-    process.stdin.once('end', resolve);
+    const stop = () => {
+      process.stdin.off('data', stop);
+      process.stdin.off('end', stop);
+      process.stdin.pause();
+      process.stdin.destroy();
+      resolve();
+    };
+    process.stdin.once('data', stop);
+    process.stdin.once('end', stop);
     process.stdin.resume();
   });
   heartbeat.stop();
