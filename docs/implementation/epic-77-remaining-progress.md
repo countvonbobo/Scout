@@ -922,3 +922,41 @@ not acceptance of `d5ebca2`.
   draft PR #82 with the Important 5 SHA and evidence, require all seven CI jobs
   to pass, then implement Important 6 by re-detecting provider state inside the
   fenced direct-run preflight after queued work drains.
+
+## 2026-07-30 PR #82 review checkpoint 3
+
+- The final Important 5 replacement run
+  [30529978300](https://github.com/oliver-hitchings/Scout/actions/runs/30529978300)
+  passed all seven required jobs at exact head
+  `8fbc2e23adf4adbb9f83e3076509fad1076f9591`.
+- Fixed Important 6 in
+  `393eedee6aafc078adb8f4280c4aed1fa0f5ebd2`. RED drained three
+  distinct older Claude requests before the unqueued Codex run. A Codex
+  sign-out during that drain was ignored by the entry-time authenticated
+  snapshot, while a sign-in during the same drain was hidden by the
+  entry-time signed-out snapshot.
+- GREEN removes the entry-time provider observation and re-detects the
+  selected provider inside the current fenced health preflight after startup
+  queue drain. The exact freshly trusted status object, including its
+  executable and environment, is retained for every bounded assessment call
+  in that run.
+- The signed-out scheduled regression drains all three older requests,
+  durably abandons the direct run as `sign-in-required`, performs no direct
+  collection or provider call and creates no replacement queue request. The
+  signed-in regression drains the same three requests and proves the provider
+  receives the exact new trusted status object once direct assessment begins.
+- Verification for Important 6:
+  - focused multi-item queue-drain regressions: 2 passed;
+  - complete scan runtime suite: 44 passed;
+  - complete `npm test`: 1,123 discovered, 1,118 passed, 0 failed and 5
+    documented platform skips;
+  - release/build audit tests: 35 passed;
+  - source release audit: 519 files, passed;
+  - fresh stage construction and staged release audit: 182 files, passed;
+  - `git diff --check`: passed.
+- Still open from review `4812913188`: Important 7–12 and Minor 3. Important
+  12 remains a rolling ledger repair and requires another update at the final
+  exact pushed head.
+- Exact next action: normally push this checkpoint, update draft PR #82, then
+  implement Important 7 by reproducing the Windows reused-PID guard-budget
+  exhaustion with deterministic observations before changing recovery.
