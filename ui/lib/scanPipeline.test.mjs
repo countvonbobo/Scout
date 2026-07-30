@@ -10,7 +10,9 @@ import {
 } from './scanPipeline.mjs';
 import { claimNextScanRequest, enqueueScanRequest, projectScanQueue } from './scanQueue.mjs';
 import { acquireScanLease, currentLeaseOwner, readScanLease, releaseScanLease } from './scanLease.mjs';
-import { appendRunEvent, openRunJournal, replayRunJournal } from './runJournal.mjs';
+import {
+  appendRunEvent, openRunJournal, replayRunJournal, validateRunJournal,
+} from './runJournal.mjs';
 import { ProviderLifecycleUnclosedError } from './structuredTurn.mjs';
 import { applyPreparedMutation, prepareMutation } from './mutationCoordinator.mjs';
 import { scanReportRecipe } from './scanMutationProjection.mjs';
@@ -789,6 +791,54 @@ for (const interruptedAfter of DURABLE_STAGES) {
     }
   });
 }
+
+test('pipeline selection admits a valid journal prefix so fenced recovery can quarantine its torn tail', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'scout-torn-pipeline-journal-'));
+  let now = Date.parse('2026-07-27T10:00:00.000Z');
+  let interruptedRun;
+  const leaseOptions = {
+    wallNow: () => now,
+    monotonicNow: () => now,
+    leaseDurationMs: 1_000,
+    takeoverMarginMs: 0,
+  };
+  try {
+    await assert.rejects(
+      runScanPipeline({
+        root,
+        compatibility: RECOVERY_COMPATIBILITY,
+        stages: durableStageHarness(new Map()),
+        leaseOptions,
+        onStageCommitted({ stageId, run }) {
+          if (stageId !== 'collect') return;
+          interruptedRun = run;
+          now += 1_001;
+          throw new PipelineInterruptedError('stopped before torn append');
+        },
+      }),
+      PipelineInterruptedError,
+    );
+    fs.appendFileSync(interruptedRun.file, '{"schemaVersion":');
+
+    const recovered = await runScanPipeline({
+      root,
+      compatibility: RECOVERY_COMPATIBILITY,
+      stages: durableStageHarness(new Map()),
+      leaseOptions,
+    });
+
+    assert.equal(recovered.runId, interruptedRun.runId);
+    assert.equal(recovered.outcome, 'complete');
+    assert.equal(validateRunJournal(interruptedRun.file).truncatedTail, false);
+    assert.equal(
+      fs.readdirSync(interruptedRun.directory)
+        .filter((name) => name.startsWith('journal.truncated.')).length,
+      1,
+    );
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
 
 test('a corrupt recovery candidate is durably skipped outside its damaged run', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'scout-corrupt-recovery-candidate-'));

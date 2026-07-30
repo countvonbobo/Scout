@@ -130,7 +130,9 @@ function pipelineRunCandidates(root, requestedRunId) {
       stat = fs.statSync(path.join(directory, runId));
       if (!stat.isDirectory()) continue;
       const journalState = validateRunJournal(path.join(directory, runId, 'journal.jsonl'));
-      if (journalState.truncatedTail) throw new Error('recovery candidate has a truncated journal');
+      if (journalState.truncatedTail && journalState.events.length === 0) {
+        throw new Error('recovery candidate has no valid journal prefix');
+      }
       const run = openRunJournal(root, runId);
       if (!run.events.length) continue;
       const manifest = projectRunManifest(run.events);
