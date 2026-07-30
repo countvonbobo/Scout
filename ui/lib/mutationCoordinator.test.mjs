@@ -550,6 +550,19 @@ test('run-log recipes project funnel counters without copying nested source pros
     profile_id: privateBody,
     assessment_failures: [{ jobId: privateBody, code: 'assessment-failed' }],
     explanations: [{ vacancy_id: privateBody, assessment_status: 'failed' }],
+    reviewed: [{
+      vacancyId: 'vacancy-safe-1',
+      company: 'Safe Company',
+      role: 'Safe Role',
+      source: 'ats',
+      sourceUrl: 'https://example.test/jobs/1?token=private#fragment',
+      contentFingerprint: 'a'.repeat(64),
+      profileId: 'profile-safe',
+      categoryId: 'general',
+      outcome: 'below_threshold',
+      score: 42,
+      rawDiagnostic: privateBody,
+    }],
   });
   const durable = JSON.stringify(recipe);
 
@@ -573,6 +586,19 @@ test('run-log recipes project funnel counters without copying nested source pros
     provider_discarded: 4,
     advert_closed: 5,
   });
+  assert.deepEqual(recipe.record.reviewed, [{
+    vacancyId: 'vacancy-safe-1',
+    company: 'Safe Company',
+    role: 'Safe Role',
+    source: 'ats',
+    sourceUrl: 'https://example.test/jobs/1',
+    contentFingerprint: 'a'.repeat(64),
+    profileId: 'profile-safe',
+    categoryId: 'general',
+    outcome: 'below_threshold',
+    score: 42,
+    reasonCodes: ['below-threshold'],
+  }]);
   assert.deepEqual(scanReportRecipe({
     date: '2026-07-28',
     discarded: {

@@ -76,3 +76,46 @@ test('a live vacancy returning from a closed state is reopened', () => {
   const oldJob = { ...observation(), status: 'closed' };
   assert.equal(classifyVacancyChange(oldJob, { ...oldJob, status: 'open' }), 'reopened');
 });
+
+test('canonical vacancies preserve structured evidence and observed lifecycle bounds', () => {
+  const first = observation({
+    source: 'adzuna',
+    employerReference: 'acme-careers',
+    responsibilities: ['Operate services'],
+    skills: ['Incident response'],
+    qualifications: ['Cloud certification'],
+    eligibility: ['Right to work'],
+    industry: 'Technology',
+    postedAt: '2026-07-01T00:00:00.000Z',
+    closingAt: '2026-08-10T00:00:00.000Z',
+    firstSeenAt: '2026-07-02T00:00:00.000Z',
+    lastSeenAt: '2026-07-03T00:00:00.000Z',
+  });
+  const second = observation({
+    source: 'greenhouse',
+    providerId: 'greenhouse-1',
+    responsibilities: ['Operate services', 'Mentor engineers'],
+    skills: ['Incident response', 'Observability'],
+    qualifications: ['Cloud certification'],
+    eligibility: ['Right to work'],
+    industry: 'Technology',
+    postedAt: '2026-06-30T00:00:00.000Z',
+    closingAt: '2026-08-01T00:00:00.000Z',
+    firstSeenAt: '2026-07-01T00:00:00.000Z',
+    lastSeenAt: '2026-07-04T00:00:00.000Z',
+  });
+
+  const vacancy = canonicaliseObservations([first, second]).vacancies[0];
+
+  assert.equal(vacancy.canonicalUrl, DIRECT_URL);
+  assert.equal(vacancy.employerReference.value, 'acme-careers');
+  assert.deepEqual(vacancy.responsibilities.value, ['Mentor engineers', 'Operate services']);
+  assert.deepEqual(vacancy.skills.value, ['Incident response', 'Observability']);
+  assert.deepEqual(vacancy.qualifications.value, ['Cloud certification']);
+  assert.deepEqual(vacancy.eligibility.value, ['Right to work']);
+  assert.equal(vacancy.industry.value, 'Technology');
+  assert.equal(vacancy.postedAt, '2026-06-30T00:00:00.000Z');
+  assert.equal(vacancy.closingAt, '2026-08-01T00:00:00.000Z');
+  assert.equal(vacancy.firstSeenAt, '2026-07-01T00:00:00.000Z');
+  assert.equal(vacancy.lastSeenAt, '2026-07-04T00:00:00.000Z');
+});

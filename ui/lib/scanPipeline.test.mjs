@@ -5,7 +5,7 @@ import path from 'node:path';
 import { test } from 'node:test';
 import {
   assessScanCandidates, assessmentCandidatesForSelection, compactCandidates, createRankedDiscoveryStages, DEFAULT_CANDIDATE_LIMIT, gateAssessment, inboxRecheckCandidates, prepareRankedDiscovery, promptCandidate,
-  filterVacancies, PipelineInterruptedError, runScanPipeline, validateAssessments, validateWrittenScanArtifacts,
+  filterVacancies, PipelineInterruptedError, readVacancyDecisionHistory, runScanPipeline, validateAssessments, validateWrittenScanArtifacts,
   verificationCandidates, writeScanArtifacts,
 } from './scanPipeline.mjs';
 import { claimNextScanRequest, enqueueScanRequest, projectScanQueue } from './scanQueue.mjs';
@@ -114,6 +114,63 @@ test('ranked discovery excludes zero-score unrelated vacancies below the configu
   assert.deepEqual(result.selection.selected.map((item) => item.role), ['Ideal Role']);
   assert.equal(result.funnel.ranked, 2);
   assert.equal(result.funnel.aboveThreshold, 1);
+  assert.equal(result.funnel.selected, 1);
+});
+
+test('ranked discovery backfills assessment capacity instead of re-assessing an unchanged rejection', () => {
+  const profile = {
+    version: 1, status: 'published', id: 'profile-current',
+    target: { primaryTitles: [{ value: 'Ideal Role', strength: 'strong-preference', provenance: 'explicit' }] },
+    negative: {},
+    compensation: {
+      currency: null, period: 'year', minimum: null, minimumStrength: 'neutral', unknownPolicy: 'include',
+    },
+  };
+  const sources = { ats: { count: 2, jobs: [
+    {
+      company: 'Already Reviewed',
+      title: 'Ideal Role',
+      url: 'https://example.test/rejected',
+      providerId: 'rejected',
+      description: 'Deliver the ideal role responsibilities.',
+    },
+    {
+      company: 'Fresh Candidate',
+      title: 'Ideal Role',
+      url: 'https://example.test/fresh',
+      providerId: 'fresh',
+      description: 'Deliver the ideal role responsibilities.',
+    },
+  ] } };
+  const initial = prepareRankedDiscovery({
+    sources, profile, tracker: { opportunities: [] }, runId: 'initial', limit: 2,
+  });
+  const rejected = initial.ranked.find((item) => item.company === 'Already Reviewed');
+  const result = prepareRankedDiscovery({
+    sources,
+    profile,
+    tracker: { opportunities: [] },
+    decisionHistory: [{
+      company: rejected.company,
+      role: rejected.role,
+      url: rejected.url,
+      source: rejected.source,
+      outcome: 'below_threshold',
+      profileId: profile.id,
+      contentFingerprint: rejected.contentFingerprint,
+    }],
+    runId: 'repeat',
+    limit: 1,
+  });
+
+  assert.equal(result.ranked.length, 2);
+  assert.equal(Object.hasOwn(result.ranked[0], 'observations'), false);
+  assert.deepEqual(result.selection.selected.map((item) => item.company), ['Fresh Candidate']);
+  assert.deepEqual(result.selection.assessmentSkipped.map((item) => ({
+    company: item.company,
+    reason: item.lifecycle.reason,
+  })), [{ company: 'Already Reviewed', reason: 'unchanged-rejection' }]);
+  assert.equal(result.candidates.length, 1);
   assert.equal(result.funnel.selected, 1);
 });
 
@@ -400,8 +457,20 @@ test('forty zero-keeper candidates produce a bounded sanitised audit without tra
   assert.equal(artifacts.tracker.opportunities.length, 0);
   assert.deepEqual(artifacts.run.discarded, { hard_exclusion: 0, mandatory_unmet: 16, below_threshold: 0, provider_discarded: 24, advert_closed: 0 });
   assert.equal(artifacts.run.reviewed.length, 40);
-  assert.deepEqual(Object.keys(artifacts.run.reviewed[0]).sort(), ['categoryId', 'company', 'outcome', 'reasons', 'role', 'score', 'source', 'sourceUrl'].sort());
+  assert.deepEqual(Object.keys(artifacts.run.reviewed[0]).sort(), [
+    'categoryId', 'company', 'contentFingerprint', 'outcome', 'profileId', 'reasons',
+    'role', 'score', 'source', 'sourceUrl', 'vacancyId',
+  ].sort());
   assert.doesNotMatch(JSON.stringify(artifacts.run.reviewed), /full advert|profileEvidence|Built systems/);
+
+  const history = readVacancyDecisionHistory(root, { limit: 1 });
+  assert.equal(history.length, 1);
+  assert.equal(history[0].outcome, 'provider_discarded');
+  assert.match(history[0].contentFingerprint, /^[a-f0-9]{64}$/);
+  assert.deepEqual(Object.keys(history[0]).sort(), [
+    'assessedAt', 'company', 'contentFingerprint', 'outcome', 'profileId',
+    'role', 'source', 'url', 'vacancyId',
+  ].sort());
 });
 
 test('two same-day providers remain visible in one combined report', () => {

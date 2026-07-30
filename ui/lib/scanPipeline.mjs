@@ -8,12 +8,13 @@ import {
   advertMateriallyChanged, invalidateJobIdentity, jobIdentity, mergeSourceReferences, sameUnderlyingJob, sourceReferencesOf,
 } from './jobIdentity.mjs';
 import { isVerifiable } from './statusGroups.mjs';
-import { canonicaliseObservations } from './vacancyCanonical.mjs';
+import { canonicaliseObservations, vacancyContentFingerprint } from './vacancyCanonical.mjs';
 import { createDiscoveryFunnel, advanceDiscoveryFunnel, assertDiscoveryFunnel } from './discoveryFunnel.mjs';
 import { filterVacancies } from './vacancyFilter.mjs';
 import { normaliseObservation } from './vacancyObservation.mjs';
 import { rankVacancies } from './vacancyRank.mjs';
 import { selectVacancies } from './vacancySelect.mjs';
+import { partitionVacanciesForAssessment } from './vacancyLifecycle.mjs';
 import {
   PIPELINE_STAGE_ARTIFACT_SCHEMA_VERSION, commitRunArtifact, projectRunManifest,
   readRunArtifact, validateManifestAgreement,
@@ -1111,11 +1112,14 @@ function sourceReferences(vacancy) {
 }
 
 function assessmentVacancy(vacancy) {
-  const observation = vacancy?.observations?.[0] || {};
+  const observations = vacancy?.observations || [];
+  const observation = observations[0] || {};
+  const { observations: omittedObservations, ...canonicalVacancy } = vacancy || {};
+  void omittedObservations;
   const references = sourceReferences(vacancy);
   const url = vacancy?.canonicalUrl || observation.sourceUrl || references[0]?.url || '';
   return {
-    ...vacancy,
+    ...canonicalVacancy,
     company: valueOf(vacancy?.employer) || '',
     role: valueOf(vacancy?.title) || '',
     url,
@@ -1127,7 +1131,8 @@ function assessmentVacancy(vacancy) {
     providerId: observation.sourceRecordId || references[0]?.providerId || '',
     sourceReferences: references,
     sources: [...new Set([url, ...references.map((reference) => reference.url)].filter(Boolean))],
-    duplicateCount: Math.max(1, Number(vacancy?.observations?.length || 1)),
+    duplicateCount: Math.max(1, Number(observations.length || 1)),
+    contentFingerprint: vacancyContentFingerprint(vacancy),
     tags: [],
     requirements: '',
   };
@@ -1162,6 +1167,43 @@ function candidateFromSelected(vacancy, index) {
 
 export function assessmentCandidatesForSelection(selected) {
   return (selected || []).map(candidateFromSelected);
+}
+
+const VACANCY_DECISION_HISTORY_LIMIT = 512;
+
+export function readVacancyDecisionHistory(root, { limit = VACANCY_DECISION_HISTORY_LIMIT } = {}) {
+  const file = workspacePaths(root).scanRuns;
+  if (!fs.existsSync(file)) return [];
+  const boundedLimit = Math.max(0, Math.min(VACANCY_DECISION_HISTORY_LIMIT, Math.floor(Number(limit) || 0)));
+  if (!boundedLimit) return [];
+  const records = [];
+  const lines = fs.readFileSync(file, 'utf8').split(/\r?\n/).filter(Boolean).reverse();
+  for (const line of lines) {
+    let run;
+    try {
+      run = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    for (const item of [...(Array.isArray(run?.reviewed) ? run.reviewed : [])].reverse()) {
+      if (!item?.company || !item?.role || !item?.outcome) continue;
+      records.push({
+        vacancyId: boundedText(item.vacancyId, 160) || null,
+        company: boundedText(item.company, 120),
+        role: boundedText(item.role, 160),
+        source: boundedText(item.source, 80),
+        url: safeSourceUrl(item.sourceUrl),
+        outcome: boundedText(item.outcome, 80),
+        contentFingerprint: /^[a-f0-9]{64}$/.test(String(item.contentFingerprint || ''))
+          ? item.contentFingerprint
+          : null,
+        profileId: boundedText(item.profileId || run.profile_id, 80),
+        assessedAt: boundedText(run.timestamp, 80),
+      });
+      if (records.length >= boundedLimit) return records;
+    }
+  }
+  return records;
 }
 
 function observationInputs(sources) {
@@ -1199,7 +1241,7 @@ function observationInputs(sources) {
 // response order cannot leak into provider-facing identities.
 export function prepareRankedDiscovery({
   sources, profile, tracker = { opportunities: [] }, runId = '', limit = DEFAULT_CANDIDATE_LIMIT,
-  relevanceThreshold,
+  relevanceThreshold, decisionHistory = [],
 } = {}) {
   if (!profile || profile.status !== 'published') throw new Error('ranked discovery requires a published search profile');
   const input = observationInputs(sources);
@@ -1209,14 +1251,16 @@ export function prepareRankedDiscovery({
   const vacancies = canonical.vacancies.map(assessmentVacancy);
   const filtered = filterVacancies(vacancies, profile);
   const ranked = rankVacancies(filtered.eligible, profile, tracker?.opportunities || []);
+  const lifecycle = partitionVacanciesForAssessment(ranked, decisionHistory, { profileId: profile.id });
   const configuredThreshold = Number(relevanceThreshold ?? profile?.selection?.relevanceThreshold ?? 1);
   const threshold = Number.isFinite(configuredThreshold) ? Math.max(Number.EPSILON, configuredThreshold) : 1;
-  const selection = selectVacancies(ranked, {
+  const selection = selectVacancies(lifecycle.eligible, {
     limit,
     threshold,
     exploration: Number(profile?.selection?.exploration || 0),
     seed: runId,
   });
+  selection.assessmentSkipped = lifecycle.skipped;
   const funnel = assertDiscoveryFunnel(advanceDiscoveryFunnel(initialFunnel, 'selection', {
     parsed: initialFunnel.sourceRecords,
     normalised: observations.length,
@@ -1225,7 +1269,7 @@ export function prepareRankedDiscovery({
     deterministicallyExcluded: new Set(filtered.excluded.map((item) => String(item.vacancyId))).size,
     eligible: filtered.eligible.length,
     ranked: ranked.length,
-    aboveThreshold: ranked.length - selection.belowCutoff.length,
+    aboveThreshold: ranked.filter((vacancy) => Number(vacancy.preRankScore || 0) >= threshold).length,
     selected: selection.selected.length,
   }));
   const vacancyById = new Map(vacancies.map((vacancy) => [String(vacancy.vacancyId || vacancy.canonicalUrl), vacancy]));
@@ -1524,6 +1568,7 @@ export function createRankedDiscoveryStages({
   collect,
   profile,
   tracker = { opportunities: [] },
+  decisionHistory = [],
   limit = DEFAULT_CANDIDATE_LIMIT,
   relevanceThreshold,
 } = {}) {
@@ -1580,12 +1625,18 @@ export function createRankedDiscoveryStages({
     select: withRankedArtifactCodec('select', function selectStage({ run, priorArtifact }) {
       const configuredThreshold = Number(relevanceThreshold ?? profile?.selection?.relevanceThreshold ?? 1);
       const threshold = Number.isFinite(configuredThreshold) ? Math.max(Number.EPSILON, configuredThreshold) : 1;
-      const selection = selectVacancies(priorArtifact.ranked, {
+      const lifecycle = partitionVacanciesForAssessment(
+        priorArtifact.ranked,
+        decisionHistory,
+        { profileId: profile.id },
+      );
+      const selection = selectVacancies(lifecycle.eligible, {
         limit,
         threshold,
         exploration: Number(profile?.selection?.exploration || 0),
         seed: run.runId,
       });
+      selection.assessmentSkipped = lifecycle.skipped;
       const funnel = assertDiscoveryFunnel(advanceDiscoveryFunnel(priorArtifact.initialFunnel, 'selection', {
         parsed: priorArtifact.initialFunnel.sourceRecords,
         normalised: priorArtifact.normalisedCount,
@@ -1594,7 +1645,8 @@ export function createRankedDiscoveryStages({
         deterministicallyExcluded: new Set(priorArtifact.exclusions.map((item) => String(item.vacancyId))).size,
         eligible: priorArtifact.ranked.length,
         ranked: priorArtifact.ranked.length,
-        aboveThreshold: priorArtifact.ranked.length - selection.belowCutoff.length,
+        aboveThreshold: priorArtifact.ranked
+          .filter((vacancy) => Number(vacancy.preRankScore || 0) >= threshold).length,
         selected: selection.selected.length,
       }));
       return {
@@ -1854,7 +1906,7 @@ function sourceHealth(sources) {
   }]));
 }
 
-function mergeTracker(existing, candidates, assessments, policy, date) {
+function mergeTracker(existing, candidates, assessments, policy, date, profileId = null) {
   const byId = new Map(existing.opportunities.map((entry) => [entry.id, entry]));
   const discarded = { ...EMPTY_DISCARDED };
   const reviewed = [];
@@ -1877,8 +1929,13 @@ function mergeTracker(existing, candidates, assessments, policy, date) {
       : outcome === 'provider_discarded' ? [assessment.summary]
         : outcome === 'below_threshold' ? ['Below the configured check threshold'] : [];
     reviewed.push({
+      vacancyId: boundedText(candidate.vacancyId, 160),
       company: boundedText(candidate.company, 120), role: boundedText(candidate.role, 160),
       source: boundedText(candidate.source, 80), sourceUrl: safeSourceUrl(candidate.url),
+      contentFingerprint: /^[a-f0-9]{64}$/.test(String(candidate.contentFingerprint || ''))
+        ? candidate.contentFingerprint
+        : vacancyContentFingerprint(candidate),
+      profileId: boundedText(profileId, 80),
       categoryId: boundedText(assessment.categoryId, 80) || null,
       outcome, score: gate.score,
       reasons: reasons.map((reason) => boundedText(reason)).filter(Boolean).slice(0, REVIEW_REASON_LIMIT),
@@ -1973,7 +2030,7 @@ function buildScanArtifacts(root, {
   const degraded = configuredFailures.length > 0 || errors.length > 0;
   const existing = JSON.parse(fs.readFileSync(paths.tracker, 'utf8'));
   const merged = assessmentResult
-    ? mergeTracker(existing, candidates, assessmentResult.assessments, policy, date)
+    ? mergeTracker(existing, candidates, assessmentResult.assessments, policy, date, profileId)
     : { tracker: existing, keepersAdded: 0, keepersUpdated: 0, discarded: { ...EMPTY_DISCARDED }, reviewed: [] };
   const inboxArchived = archiveStaleInboxEntries(merged.tracker, staleInboxEntries, date);
   const reconciledFunnel = funnel && error ? { ...funnel, assessed: Number(assessmentResult?.assessments?.length || 0), assessmentFailed: Math.max(0, Number(funnel.selected || candidates.length) - Number(assessmentResult?.assessments?.length || 0)) } : funnel;

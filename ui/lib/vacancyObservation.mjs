@@ -23,6 +23,21 @@ function field(value, provenance) {
   return { value: value ?? null, provenance: value == null ? 'unknown' : provenance };
 }
 
+function list(value) {
+  const values = Array.isArray(value) ? value : value == null ? [] : [value];
+  const seen = new Set();
+  return values.map((item) => text(item)?.slice(0, 300) || null).filter((item) => {
+    if (!item || seen.has(item)) return false;
+    seen.add(item);
+    return true;
+  }).slice(0, 32);
+}
+
+function listField(value) {
+  const values = list(value);
+  return field(values.length ? values : null, 'explicit-source');
+}
+
 export function canonicaliseUrl(value) {
   const url = text(value);
   if (!url) return null;
@@ -58,6 +73,8 @@ function compensation(job, warnings) {
   const currency = text(job.salaryCurrency);
   const period = text(job.salaryPeriod);
   const rateType = text(job.salaryRateType || job.compensationRateType || job.rateType);
+  const amountType = text(job.compensationAmountType || job.salaryAmountType)?.toLowerCase() || null;
+  const certainty = text(job.compensationCertainty || job.salaryCertainty)?.toLowerCase() || null;
   if (minimum !== null || maximum !== null) {
     return field({
       minimum,
@@ -65,6 +82,8 @@ function compensation(job, warnings) {
       currency,
       period: period?.toLowerCase() || null,
       rateType: rateType?.toLowerCase() || null,
+      ...(amountType ? { amountType } : {}),
+      ...(certainty ? { certainty } : {}),
     }, 'explicit-source');
   }
   if (text(job.salary)) {
@@ -78,6 +97,14 @@ function compensation(job, warnings) {
 function sourceRecordId(job, canonicalUrl) {
   const providerId = text(job.sourceRecordId) || text(job.providerId);
   return providerId || (canonicalUrl ? `url-${fingerprint(canonicalUrl).slice(0, 16)}` : null);
+}
+
+function diagnosticCode(warning) {
+  if (/working pattern/i.test(warning)) return 'ambiguous-working-pattern';
+  if (/employment type/i.test(warning)) return 'ambiguous-employment-type';
+  if (/seniority/i.test(warning)) return 'ambiguous-seniority';
+  if (/compensation/i.test(warning)) return 'ambiguous-compensation';
+  return 'normalisation-warning';
 }
 
 export function normaliseObservation(job, { sourceName, fetchedAt, laneId } = {}) {
@@ -116,8 +143,14 @@ export function normaliseObservation(job, { sourceName, fetchedAt, laneId } = {}
     sourceUrl: text(job.url || job.sourceUrl),
     canonicalUrl,
     employer: field(text(job.company || job.employer), 'explicit-source'),
+    employerReference: field(text(job.employerReference || job.companyReference || job.employerId), 'explicit-source'),
     title: field(title, 'explicit-source'),
     description,
+    responsibilities: listField(job.responsibilities),
+    skills: listField(job.skills),
+    qualifications: listField(job.qualifications),
+    eligibility: listField(job.eligibility),
+    industry: field(text(job.industry || job.sector || job.category), 'explicit-source'),
     location,
     workingPattern: workingPattern.value || workingPatternAmbiguous
       ? workingPattern
@@ -126,13 +159,23 @@ export function normaliseObservation(job, { sourceName, fetchedAt, laneId } = {}
     seniority,
     compensation: compensation(job, warnings),
     postedAt: text(job.postedDate || job.postedAt),
+    closingAt: text(job.closingDate || job.closingAt || job.expiresAt),
     fetchedAt: text(fetchedAt),
+    firstSeenAt: text(job.firstSeenAt) || text(fetchedAt),
+    lastSeenAt: text(job.lastSeenAt) || text(fetchedAt),
     laneId: text(laneId),
     warnings,
     rawFingerprint,
+    diagnostics: {
+      codes: [...new Set(warnings.map(diagnosticCode))].slice(0, 16),
+      rawPayloadRetained: false,
+      retention: 'fingerprint-only',
+    },
   };
   result.fieldProvenance = Object.fromEntries([
-    'employer', 'title', 'location', 'workingPattern', 'employmentType', 'seniority', 'compensation',
+    'employer', 'employerReference', 'title', 'responsibilities', 'skills', 'qualifications',
+    'eligibility', 'industry', 'location', 'workingPattern', 'employmentType', 'seniority',
+    'compensation',
   ].map((name) => [name, result[name].provenance]));
   return deepFreeze(result);
 }

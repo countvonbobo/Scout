@@ -21,7 +21,7 @@ import { runStructuredTurn } from '../ui/lib/structuredTurn.mjs';
 import {
   assessScanCandidates, assessmentCandidatesForSelection, compactCandidates, createRankedDiscoveryStages, DEFAULT_CANDIDATE_LIMIT,
   coordinateScanArtifacts, durableScanProjection, inboxRecheckCandidates, promptCandidate, runScanPipeline, SCAN_ASSESSMENT_SCHEMA,
-  verificationCandidates,
+  readVacancyDecisionHistory, verificationCandidates,
 } from '../ui/lib/scanPipeline.mjs';
 import { loadPublishedSearchProfile, migrateSearchProfile } from '../ui/lib/searchProfile.mjs';
 import { partitionLiveCandidates } from '../ui/lib/advertLiveness.mjs';
@@ -593,6 +593,7 @@ export async function runScanWith(root, provider, mode, {
       collect,
       profile: publishedAtStart,
       tracker: trackerAtStart,
+      decisionHistory: readVacancyDecisionHistory(root),
       limit: DEFAULT_CANDIDATE_LIMIT,
       relevanceThreshold: config.search?.relevanceThreshold ?? config.triage?.checkScore,
     })

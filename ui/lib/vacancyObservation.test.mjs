@@ -82,3 +82,80 @@ test('normalisation records warnings when bounded extraction is ambiguous and fr
   assert.throws(() => { observation.compensation.value.minimum = 1; }, TypeError);
   assert.throws(() => { observation.warnings.push('mutated'); }, TypeError);
 });
+
+test('normalisation preserves complete structured source evidence and lifecycle dates', () => {
+  const observation = normaliseObservation({
+    providerId: 'job-5',
+    employerReference: 'employer-42',
+    title: 'Clinical Operations Lead',
+    company: 'Health Co',
+    url: 'https://jobs.example/5',
+    description: 'Lead a regulated service.',
+    responsibilities: ['Service improvement', ' Service improvement ', 'Team leadership'],
+    skills: ['Stakeholder facilitation', 'Risk management'],
+    qualifications: ['Professional registration'],
+    eligibility: ['Right to work'],
+    industry: 'Healthcare',
+    salaryMin: 5000,
+    salaryMax: 5500,
+    salaryCurrency: 'EUR',
+    salaryPeriod: 'month',
+    salaryRateType: 'salary',
+    compensationAmountType: 'base',
+    compensationCertainty: 'range',
+    postedAt: '2026-07-01T00:00:00.000Z',
+    closingAt: '2026-08-01T23:59:59.000Z',
+    firstSeenAt: '2026-07-02T10:00:00.000Z',
+    lastSeenAt: '2026-07-03T10:00:00.000Z',
+  }, { sourceName: 'fixture', fetchedAt: NOW, laneId: 'lane-clinical' });
+
+  assert.equal(observation.employerReference.value, 'employer-42');
+  assert.deepEqual(observation.responsibilities.value, ['Service improvement', 'Team leadership']);
+  assert.deepEqual(observation.skills.value, ['Stakeholder facilitation', 'Risk management']);
+  assert.deepEqual(observation.qualifications.value, ['Professional registration']);
+  assert.deepEqual(observation.eligibility.value, ['Right to work']);
+  assert.equal(observation.industry.value, 'Healthcare');
+  assert.deepEqual(observation.compensation.value, {
+    minimum: 5000,
+    maximum: 5500,
+    currency: 'EUR',
+    period: 'month',
+    rateType: 'salary',
+    amountType: 'base',
+    certainty: 'range',
+  });
+  assert.equal(observation.postedAt, '2026-07-01T00:00:00.000Z');
+  assert.equal(observation.closingAt, '2026-08-01T23:59:59.000Z');
+  assert.equal(observation.firstSeenAt, '2026-07-02T10:00:00.000Z');
+  assert.equal(observation.lastSeenAt, '2026-07-03T10:00:00.000Z');
+  for (const field of [
+    'employerReference', 'responsibilities', 'skills', 'qualifications', 'eligibility', 'industry',
+  ]) {
+    assert.equal(observation.fieldProvenance[field], 'explicit-source');
+  }
+});
+
+test('normalisation retains only bounded redacted diagnostics and a raw fingerprint', () => {
+  const observation = normaliseObservation({
+    providerId: 'job-6',
+    title: 'Engineer',
+    company: 'Acme',
+    url: 'https://jobs.example/6',
+    description: 'Flexible arrangement and competitive salary.',
+    diagnostic: 'Authorization Bearer PRIVATE_SOURCE_TOKEN',
+    rawPayload: { value: 'PRIVATE_RAW_VALUE' },
+    skills: Array.from({ length: 40 }, (_, index) => `Skill ${index} ${'x'.repeat(400)}`),
+  }, { sourceName: 'fixture', fetchedAt: NOW, laneId: 'lane-1' });
+  const stored = JSON.stringify(observation);
+
+  assert.deepEqual(Object.keys(observation.diagnostics).sort(), [
+    'codes', 'rawPayloadRetained', 'retention',
+  ]);
+  assert.equal(observation.diagnostics.rawPayloadRetained, false);
+  assert.equal(observation.diagnostics.retention, 'fingerprint-only');
+  assert.ok(observation.diagnostics.codes.length <= 16);
+  assert.equal(observation.skills.value.length, 32);
+  assert.ok(observation.skills.value.every((value) => value.length <= 300));
+  assert.match(observation.rawFingerprint, /^[a-f0-9]{64}$/);
+  assert.doesNotMatch(stored, /PRIVATE_SOURCE_TOKEN|PRIVATE_RAW_VALUE|Authorization Bearer/);
+});

@@ -1,7 +1,11 @@
 import crypto from 'node:crypto';
 import { mergeSourceReferences, sameUnderlyingJob } from './jobIdentity.mjs';
 
-const DISPLAY_FIELDS = ['employer', 'title', 'location', 'workingPattern', 'employmentType', 'seniority', 'compensation'];
+const DISPLAY_FIELDS = [
+  'employer', 'employerReference', 'title', 'location', 'workingPattern',
+  'employmentType', 'seniority', 'compensation', 'industry',
+];
+const LIST_FIELDS = ['responsibilities', 'skills', 'qualifications', 'eligibility'];
 const PROVENANCE_RANK = { 'explicit-source': 2, 'deterministic-extraction': 1, unknown: 0 };
 const APPLICATION_BOILERPLATE = /(?:\bapply now\.?|\bclick here to apply\.?|\bsubmit your application\.?)/gi;
 
@@ -48,6 +52,12 @@ function fingerprintShape(vacancy, { includeBoilerplate = false } = {}) {
     location: normaliseText(valueOf(vacancy?.location)),
     workingPattern: normaliseText(valueOf(vacancy?.workingPattern)),
     employmentType: normaliseText(valueOf(vacancy?.employmentType)),
+    employerReference: normaliseText(valueOf(vacancy?.employerReference)),
+    responsibilities: valueOf(vacancy?.responsibilities) || null,
+    skills: valueOf(vacancy?.skills) || null,
+    qualifications: valueOf(vacancy?.qualifications) || null,
+    eligibility: valueOf(vacancy?.eligibility) || null,
+    industry: normaliseText(valueOf(vacancy?.industry)),
     compensation: valueOf(vacancy?.compensation) || null,
     description: vacancy?.semanticEvidence?.descriptionDigest
       || (includeBoilerplate ? normaliseText(vacancy?.description) : responsibilityDescription(vacancy)),
@@ -72,6 +82,23 @@ function displayField(observations, name) {
     || { value: null, provenance: 'unknown' };
 }
 
+function listDisplayField(observations, name) {
+  const candidates = observations.map((observation) => observation?.[name]).filter(Boolean);
+  const values = [...new Set(candidates.flatMap((candidate) => (
+    Array.isArray(valueOf(candidate)) ? valueOf(candidate) : []
+  )))].sort(compareStable);
+  const provenance = candidates.some((candidate) => candidate.provenance === 'explicit-source')
+    ? 'explicit-source'
+    : values.length ? 'deterministic-extraction' : 'unknown';
+  return { value: values.length ? values : null, provenance };
+}
+
+function dateBound(observations, name, direction) {
+  const values = observations.map((observation) => observation?.[name]).filter(Boolean);
+  if (!values.length) return null;
+  return [...values].sort((left, right) => direction * compareStable(left, right))[0];
+}
+
 function canonicalVacancy(observations) {
   const orderedObservations = sortObservations(observations);
   const semanticObservation = [...orderedObservations]
@@ -84,13 +111,21 @@ function canonicalVacancy(observations) {
     ? ''
     : orderedObservations.map((observation) => String(observation?.description || '').trim())
       .sort((left, right) => right.length - left.length || compareStable(left, right))[0] || '';
+  const fields = Object.fromEntries(DISPLAY_FIELDS.map((name) => [name, displayField(orderedObservations, name)]));
+  const canonicalUrl = orderedObservations.map((observation) => observation?.canonicalUrl).find(Boolean) || null;
+  const sourceReferences = mergeSourceReferences(...orderedObservations);
   return {
     observations: orderedObservations,
-    canonicalUrl: orderedObservations.map((observation) => observation?.canonicalUrl).find(Boolean) || null,
-    sourceReferences: mergeSourceReferences(...orderedObservations),
+    canonicalUrl,
+    sourceReferences,
     description,
+    postedAt: dateBound(orderedObservations, 'postedAt', 1),
+    closingAt: dateBound(orderedObservations, 'closingAt', 1),
+    firstSeenAt: dateBound(orderedObservations, 'firstSeenAt', 1),
+    lastSeenAt: dateBound(orderedObservations, 'lastSeenAt', -1),
     ...(semanticObservation ? { semanticEvidence: semanticObservation.semanticEvidence } : {}),
-    ...Object.fromEntries(DISPLAY_FIELDS.map((name) => [name, displayField(orderedObservations, name)])),
+    ...fields,
+    ...Object.fromEntries(LIST_FIELDS.map((name) => [name, listDisplayField(orderedObservations, name)])),
   };
 }
 
@@ -114,7 +149,11 @@ export function vacancyContentFingerprint(vacancy) {
 
 export function classifyVacancyChange(previous, current) {
   if (isClosed(previous) && !isClosed(current)) return 'reopened';
-  if (vacancyContentFingerprint(previous) !== vacancyContentFingerprint(current)) return 'material';
+  const currentFingerprint = vacancyContentFingerprint(current);
+  if (previous?.contentFingerprint) {
+    return previous.contentFingerprint === currentFingerprint ? 'unchanged' : 'material';
+  }
+  if (vacancyContentFingerprint(previous) !== currentFingerprint) return 'material';
   return stableJson(fingerprintShape(previous, { includeBoilerplate: true })) === stableJson(fingerprintShape(current, { includeBoilerplate: true }))
     ? 'unchanged'
     : 'minor';

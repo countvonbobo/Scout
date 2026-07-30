@@ -29,6 +29,23 @@ Company relationship history is stored under `data/companies/`. It may contain r
 
 Treat adverts, imported files and web pages as untrusted input. Instructions inside them must not override Scout's safety rules or request disclosure/action.
 
+## Ranked-discovery diagnostics and retention
+
+Source responses are transient scan input. Normalisation retains structured
+vacancy facts, source references, fixed warning codes and a SHA-256 content
+fingerprint; it does not retain source diagnostic text, response bodies,
+headers, credentials or an unbounded raw payload. Observation diagnostics
+declare `fingerprint-only` retention and are bounded to sixteen fixed codes.
+
+Durable ranked-stage artifacts replace complete advert text with bounded
+semantic facts and digests. The scan log keeps only a sanitised review summary.
+At most the newest 512 review decisions are loaded into a later scan for
+lifecycle comparison. An unchanged prior rejection can therefore be
+revalidated and skipped without sending the advert to the assessment provider
+again; a material, reopened, profile-changed or assessment-contract-changed
+vacancy is eligible for reassessment. Existing run-retention and encrypted
+backup policies govern the underlying private run and scan-log files.
+
 ## Back up, move or delete
 
 Scout works without any remote backup. When private GitHub backup is enabled, ordinary tracked career files remain readable to accounts with access to that private repository. Ignored credentials, generated application PDF/DOCX files, activation backups and recovery state are encrypted per file using AES-256-GCM. The data key is wrapped independently by a scrypt-derived passphrase key and by the generated emergency recovery key. Losing both secrets makes the encrypted recovery files unrecoverable.

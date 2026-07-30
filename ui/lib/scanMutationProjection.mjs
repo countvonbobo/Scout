@@ -255,10 +255,15 @@ function safeRunRecord(record) {
       sourceUrl: canonicalUrl(item?.sourceUrl),
     })).slice(0, 180),
     reviewed: (record?.reviewed || []).map((item) => ({
+      vacancyId: identifier(item?.vacancyId),
       company: boundedLabel(item?.company, 120),
       role: boundedLabel(item?.role, 160),
       source: code(item?.source),
       sourceUrl: canonicalUrl(item?.sourceUrl),
+      contentFingerprint: /^[a-f0-9]{64}$/.test(String(item?.contentFingerprint || ''))
+        ? item.contentFingerprint
+        : null,
+      profileId: identifier(item?.profileId),
       categoryId: code(item?.categoryId),
       outcome: SAFE_OUTCOME.has(item?.outcome) ? item.outcome : 'below_threshold',
       score: number(item?.score),
