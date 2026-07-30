@@ -90,11 +90,11 @@ test('an independent heartbeat prevents a competing process from taking over', a
     'heartbeat-owner', root, ready, 'run-heartbeat',
     String(leaseDurationMs), String(heartbeatIntervalMs), String(takeoverMarginMs),
   ]);
-  await waitUntil(() => fs.existsSync(ready), 'heartbeat owner did not acquire');
-  const initial = JSON.parse(fs.readFileSync(ready, 'utf8'));
   let contender;
   let ownerResult;
   try {
+    await waitUntil(() => fs.existsSync(ready), 'heartbeat owner did not acquire');
+    const initial = JSON.parse(fs.readFileSync(ready, 'utf8'));
     await waitUntil(() => {
       const current = readScanLease(root);
       return current?.leaseId === initial.leaseId

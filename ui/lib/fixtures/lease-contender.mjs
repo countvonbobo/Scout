@@ -62,7 +62,9 @@ if (command === 'race-acquire') {
   const lease = acquireScanLease(root, currentLeaseOwner(), operation(runId), options);
   if (!lease) throw new Error('heartbeat owner could not acquire the lease');
   const heartbeat = startLeaseHeartbeat(lease, { intervalMs: Number(interval) });
-  fs.writeFileSync(ready, JSON.stringify(lease), 'utf8');
+  const unpublishedReady = `${ready}.${process.pid}.unpublished`;
+  fs.writeFileSync(unpublishedReady, JSON.stringify(lease), 'utf8');
+  fs.renameSync(unpublishedReady, ready);
   await new Promise((resolve) => {
     const stop = () => {
       process.stdin.off('data', stop);
