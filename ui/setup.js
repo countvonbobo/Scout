@@ -45,6 +45,7 @@ export const RETUNE_ENTRY_STEPS = Object.freeze({
 });
 const SETTINGS_SECTIONS = [
   ['search', 'Search & profile', 'Roles, locations, compensation, commute and exclusions'],
+  ['employers', 'Employers', 'Named-employer priority, careers monitoring and health'],
   ['providers', 'AI providers', 'Choose the signed-in provider Scout uses'],
   ['sources', 'Sources', 'Public sources and optional Adzuna credentials'],
   ['scans', 'Scans & schedule', 'Run a supervised scan and manage daily jobs'],
@@ -364,6 +365,75 @@ export function searchProfileReviewHtml(state = {}) {
   </section>`;
 }
 
+export function employerRegistryHtml(registry = null) {
+  if (!registry) return '<p class="meta">Loading the private employer registry…</p>';
+  const priorities = ['priority', 'relevant', 'normal', 'inactive', 'irrelevant'];
+  const policyOptions = (values, selected) => values.map((value) => (
+    `<option value="${escapeProfileText(value)}"${value === selected ? ' selected' : ''}>${escapeProfileText(value)}</option>`
+  )).join('');
+  const employerCard = (employer) => {
+    const id = escapeProfileText(employer.id);
+    const recent = (employer.history || []).slice(-5).reverse().map((event) => (
+      `<li>${escapeProfileText(String(event.recordedAt || '').slice(0, 10))}: `
+      + `${escapeProfileText(event.status)} via ${escapeProfileText(event.adapter)}; `
+      + `${escapeProfileText(event.parsed)} parsed${event.failureCode ? `; ${escapeProfileText(event.failureCode)}` : ''}</li>`
+    )).join('') || '<li>No completed monitoring check yet.</li>';
+    return `<section class="setup-callout" data-employer="${id}">
+      <h3>${escapeProfileText(employer.canonicalName)}</h3>
+      <p class="meta">Health: ${escapeProfileText(employer.health?.status || 'unknown')}
+      ${employer.health?.reasonCode ? `(${escapeProfileText(employer.health.reasonCode)})` : ''}.
+      Last checked: ${escapeProfileText(employer.monitoring?.lastCheckedAt || 'not yet')}.
+      Next eligible: ${escapeProfileText(employer.monitoring?.nextEligibleAt || 'now')}.</p>
+      <div class="setup-grid">
+        <label class="setup-field">Priority
+          <select data-employer-priority="${id}">${policyOptions(priorities, employer.userPriority)}</select>
+        </label>
+        <label class="setup-field">Decision reason
+          <input data-employer-reason="${id}" maxlength="160" value="${escapeProfileText(employer.decision?.reason || '')}">
+        </label>
+        <label class="setup-field wide">Careers URL
+          <input data-employer-url="${id}" type="url" value="${escapeProfileText(employer.careersUrl || '')}">
+        </label>
+        <label class="setup-field">ATS adapter
+          <select data-employer-adapter="${id}">${policyOptions(['', 'greenhouse', 'lever', 'ashby'], employer.board?.adapter || '')}</select>
+        </label>
+        <label class="setup-field">ATS board ID
+          <input data-employer-board="${id}" maxlength="160" value="${escapeProfileText(employer.board?.boardId || '')}">
+        </label>
+        <label class="setup-field">Terms review
+          <select data-employer-terms="${id}">${policyOptions(['unreviewed', 'allowed', 'disallowed'], employer.access.terms)}</select>
+        </label>
+        <label class="setup-field">Robots review
+          <select data-employer-robots="${id}">${policyOptions(['unknown', 'allowed', 'disallowed'], employer.access.robots)}</select>
+        </label>
+        <label class="setup-field">Minimum interval (minutes)
+          <input data-employer-interval="${id}" type="number" min="15" max="43200" value="${escapeProfileText(employer.access.minIntervalMinutes)}">
+        </label>
+        <label class="setup-field"><span><input data-employer-generic="${id}" type="checkbox"${employer.access.genericEnabled ? ' checked' : ''}> Allow conservative generic-page parsing</span></label>
+      </div>
+      <details><summary>Discovery evidence and recent checks</summary>
+        <p class="meta">Origins: ${escapeProfileText((employer.origins || []).map(({ kind }) => kind).join(', '))}</p>
+        <ul>${recent}</ul>
+      </details>
+      <label><span><input data-employer-confirm="${id}" type="checkbox"> I reviewed this employer and monitoring policy</span></label>
+      <p><button class="act" type="button" data-employer-save="${id}">Save employer</button></p>
+    </section>`;
+  };
+  return `<section id="employer-registry-review">
+    <p>${registry.employers.length} registered employer(s). Priority employers are considered every eligible scan; inactive employers are checked at most every 30 days; irrelevant employers are excluded.</p>
+    ${registry.employers.map(employerCard).join('') || '<p class="meta">No employers registered yet.</p>'}
+    <section class="setup-callout">
+      <h3>Add an employer for review</h3>
+      <div class="setup-grid">
+        <label class="setup-field">Canonical employer name<input id="employer-add-name" maxlength="160"></label>
+        <label class="setup-field">Careers URL<input id="employer-add-url" type="url"></label>
+      </div>
+      <label><span><input id="employer-add-confirm" type="checkbox"> I want to add this employer to my private registry</span></label>
+      <p><button id="employer-add" class="act" type="button">Add employer</button></p>
+    </section>
+  </section>`;
+}
+
 async function requestJson(pathname, options) {
   const response = await fetch(pathname, options);
   const body = await response.json().catch(() => ({}));
@@ -392,6 +462,7 @@ const Setup = {
   refreshSequence: 0,
   statusRetry: null,
   searchProfile: null,
+  employerRegistry: null,
   operations: { proposal: null, scan: null },
   operationTimers: {},
   providerLoginState: { codex: null, claude: null },
@@ -841,6 +912,7 @@ const Setup = {
     const definition = SETTINGS_SECTIONS.find(([id]) => id === section) || SETTINGS_SECTIONS[0];
     this.prepareDismissibleView({ title: definition[1], subtitle: definition[2], back: true });
     if (section === 'search') return this.renderSearchSettings();
+    if (section === 'employers') return this.renderEmployerSettings();
     if (section === 'providers') return this.renderProviderSettings();
     if (section === 'sources') return this.renderSourceSettings();
     if (section === 'scans') return this.renderScanSettings();
@@ -1010,6 +1082,71 @@ const Setup = {
       this.setMessage('Search lane restored with its full history.', 'good');
     } catch (error) {
       this.setMessage(error.message, 'error');
+    }
+  },
+
+  renderEmployerSettings() {
+    this.el('setup-body').innerHTML = employerRegistryHtml(this.employerRegistry);
+    this.el('setup-body').querySelectorAll('[data-employer-save]').forEach((button) => {
+      button.addEventListener('click', () => this.saveEmployer(button.dataset.employerSave));
+    });
+    this.el('employer-add')?.addEventListener('click', () => this.saveEmployer(null));
+    if (!this.employerRegistry) void this.loadEmployerRegistry();
+  },
+
+  async loadEmployerRegistry() {
+    try {
+      this.employerRegistry = await requestJson('/api/employers');
+      if (this.view === 'section' && this.settingsSection === 'employers') {
+        this.renderEmployerSettings();
+      }
+    } catch (error) {
+      this.setMessage(error.message, 'error');
+    }
+  },
+
+  async saveEmployer(id) {
+    const read = (name) => this.el('setup-body').querySelector(`[data-employer-${name}="${id}"]`);
+    const confirmed = id
+      ? read('confirm')?.checked
+      : this.el('employer-add-confirm')?.checked;
+    if (!confirmed) {
+      this.setMessage('Confirm that you reviewed this employer update.', 'error');
+      return;
+    }
+    const employer = id ? {
+      id,
+      userPriority: read('priority').value,
+      reason: read('reason').value.trim() || null,
+      careersUrl: read('url').value.trim() || null,
+      board: read('adapter').value && read('board').value.trim()
+        ? { adapter: read('adapter').value, boardId: read('board').value.trim() }
+        : null,
+      access: {
+        terms: read('terms').value,
+        robots: read('robots').value,
+        genericEnabled: read('generic').checked,
+        minIntervalMinutes: Number(read('interval').value),
+      },
+    } : {
+      canonicalName: this.el('employer-add-name').value.trim(),
+      careersUrl: this.el('employer-add-url').value.trim() || null,
+    };
+    try {
+      const result = await requestJson('/api/employers', {
+        method: 'PUT', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          revision: this.employerRegistry?.revision,
+          confirmed: true,
+          employer,
+        }),
+      });
+      this.employerRegistry = result.registry;
+      this.renderEmployerSettings();
+      this.setMessage(id ? 'Employer monitoring policy saved.' : 'Employer added for review.', 'good');
+    } catch (error) {
+      this.setMessage(error.message, 'error');
+      await this.loadEmployerRegistry();
     }
   },
 

@@ -88,6 +88,14 @@ three completed non-failed runs produced no new, eligible, selected or
 promising result. You must confirm retirement, and you can restore the lane
 later without losing its history.
 
+Open **Settings → Employers** to review named and advert-discovered employers.
+You can set explicit priority, pause or exclude an employer reversibly, review
+terms and robots permission, configure a public ATS board or careers URL, set
+the minimum check interval, and inspect health and recent outcomes. Generic
+careers-page parsing is off until you enable it. Scout never bypasses sign-in,
+anti-bot or JavaScript-only pages and never treats an empty check as a negative
+preference.
+
 ### Tailor a CV
 
 Choose **Create custom CV** on an opportunity. Scout recommends Google XYZ for genuine achievement bullets and a separate natural-voice review, but both options can be switched off for each CV.

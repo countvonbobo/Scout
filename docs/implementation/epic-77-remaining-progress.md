@@ -1793,3 +1793,44 @@ record that exact reconciliation SHA and CI run without rewriting history.
   passes, 0 failures and 11 intentional skips out of 170 browser scenarios.
   The source audit passed, a fresh release stage was built, and its stage audit
   scanned 1,587 files with no findings.
+
+## Gate C — employer registry and careers monitoring
+
+- Status: candidate implementation and local staged-package acceptance
+  complete; protected CI/review remains to be recorded. PR #82 stays draft
+  and no issue checkbox is changed.
+- The private schema-v1 registry retains stable normalized-name identity,
+  bounded named-profile/advert/research/manual origins, aliases, public
+  careers/board facts, explicit priority/decision, reviewed access policy,
+  fair cadence, health and idempotent bounded history.
+- Profile publication reconciles named employers atomically with the immutable
+  profile, search lanes and workspace config. Existing explicit user state is
+  preserved; the exact legacy note-only placeholder and ATS portal list
+  migrate conservatively.
+- Every scan freezes a revision-bound employer snapshot and fairly selected
+  target set at collection. Legacy ATS collection yields to the registry so a
+  migrated board cannot be fetched twice.
+- Public Greenhouse, Lever and Ashby adapters, validated `JobPosting` JSON-LD
+  and opt-in same-site generic pages return one bounded contract. Terms,
+  robots, authentication, cross-origin redirects, anti-bot responses, rate
+  limits and JavaScript-only shells fail safely without browser evasion.
+- Per-employer checks and selected-advert employer discoveries from every
+  configured source enter `data/employers.json` only through the same prepared
+  fenced final mutation as tracker/report/run-log/lane state. Private backup
+  removes mutation markers from the registry projection.
+- Settings exposes bounded identity, origins, priority, careers/board
+  configuration, access safeguards, health and recent checks. Narrow updates
+  require the current revision and explicit confirmation; inactive and
+  irrelevant decisions are reversible.
+- Complete local candidate verification passed:
+  - focused registry and runtime regression bundle: 57 passed, 0 failed;
+  - `npm test`: 1,210 passed, 0 failed and 6 platform skips out of 1,216;
+  - the unique-ranking regression completed in 40.46 seconds;
+  - affected Chromium/Firefox acceptance: 64 passed, 0 failed;
+  - complete browser matrix: 159 passed, 0 failed and 11 intentional skips
+    out of 170;
+  - the previously isolated Firefox focus scenario passed 10 of 10 repeated
+    runs without a timeout change;
+  - generated public-source privacy audit: passed for 538 files;
+  - fresh release-stage audit: passed for 1,589 files;
+  - source and full-range diff checks: passed.

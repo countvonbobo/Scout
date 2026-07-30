@@ -120,6 +120,7 @@ function resolveTarget(root, key, kind) {
   if (key === 'tracker' && kind === 'tracker') file = paths.tracker;
   else if (key === 'scan-log' && kind === 'run-log') file = paths.scanRuns;
   else if (key === 'search-lanes' && kind === 'json') file = paths.searchLanes;
+  else if (key === 'employers' && kind === 'json') file = paths.employers;
   else {
     const report = typeof key === 'string' ? key.match(/^report:(\d{4}-\d{2}-\d{2})$/) : null;
     if (!report || kind !== 'report') throw new TypeError('mutation target key is not supported');

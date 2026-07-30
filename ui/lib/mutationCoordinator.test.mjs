@@ -21,6 +21,10 @@ import { runLogAppendRecipe, scanReportRecipe, trackerMergeRecipe } from './scan
 import {
   generateSearchLanePlan, loadSearchLanePlan, writeSearchLanePlan,
 } from './searchLanes.mjs';
+import {
+  createEmployerRegistry, employerRegistryRevision, loadEmployerRegistry,
+  writeEmployerRegistry,
+} from './employerRegistry.mjs';
 
 const roots = [];
 
@@ -406,6 +410,65 @@ test('partial assessment success produces one deterministic tracker/report plan 
   }]);
   assert.equal(replayRunJournal(handle.file).filter((event) => event.type === 'mutation.prepared').length, 1);
   assert.equal(replayRunJournal(handle.file).filter((event) => event.type === 'mutation.receipted').length, 1);
+});
+
+test('scan finalisation commits employer health and advert discoveries in the same prepared mutation', () => {
+  const { root, lease, handle } = fixture();
+  const registry = createEmployerRegistry([{
+    canonicalName: 'Monitored Example',
+    careersUrl: 'https://careers.example.test/jobs',
+    origin: {
+      kind: 'manual', recordedAt: '2026-07-28T08:00:00.000Z', reference: 'settings',
+    },
+  }], { now: () => '2026-07-28T08:00:00.000Z' });
+  writeEmployerRegistry(root, registry);
+  const input = {
+    provider: 'codex',
+    mode: 'primary',
+    sources: {
+      employer_registry: {
+        configured: true,
+        status: 'healthy',
+        count: 1,
+        jobs: [],
+        registrySnapshot: registry,
+        registryRevision: employerRegistryRevision(registry),
+        checks: [{
+          employerId: registry.employers[0].id,
+          adapter: 'structured-data',
+          status: 'healthy',
+          returned: 1,
+          parsed: 1,
+        }],
+      },
+    },
+    candidates: [{
+      candidateId: 'candidate-001',
+      vacancyId: 'vacancy-advert-001',
+      company: 'Advert Discovery Example',
+      role: 'Research lead',
+      url: 'https://jobs.example.test/research-lead',
+      source: 'careers-structured',
+    }],
+    assessmentResult: { assessments: [] },
+    policy: {},
+    startedAt: '2026-07-28T09:00:00.000Z',
+  };
+
+  const artifacts = coordinateScanArtifacts(root, input, { run: handle, lease });
+  const updated = loadEmployerRegistry(root);
+  assert.match(artifacts.mutationReceipt.id, /^mutation-[a-f0-9]{40}$/);
+  assert.match(artifacts.mutationReceipt.digest, /^[a-f0-9]{64}$/);
+  assert.equal(updated.employers.find(
+    ({ canonicalName }) => canonicalName === 'Monitored Example',
+  ).history[0].runId, handle.runId);
+  assert.equal(updated.employers.find(
+    ({ canonicalName }) => canonicalName === 'Advert Discovery Example',
+  ).origins[0].kind, 'advert-discovered');
+  const prepared = replayRunJournal(handle.file).find(({ type }) => type === 'mutation.prepared');
+  assert.equal(loadPreparedMutation(handle, prepared.payload.reference.id).files.some(
+    ({ key }) => key === 'employers',
+  ), true);
 });
 
 test('lane history is one recoverable target in the fenced final scan mutation', () => {

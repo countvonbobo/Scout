@@ -49,6 +49,10 @@ import {
 import {
   deriveSearchLaneResults, loadSearchLanePlan, recordSearchLaneRun,
 } from './searchLanes.mjs';
+import {
+  canonicalEmployerId, employerRegistryRevision, loadEmployerRegistry,
+  reconcileEmployerDiscoveries, recordEmployerChecks, validateEmployerRegistry,
+} from './employerRegistry.mjs';
 export { filterVacancies } from './vacancyFilter.mjs';
 
 const EMPTY_DISCARDED = Object.freeze({ hard_exclusion: 0, mandatory_unmet: 0, below_threshold: 0, provider_discarded: 0 });
@@ -2323,16 +2327,65 @@ export function coordinateScanArtifacts(root, input, { run, lease, hooks = {} })
         scanFailureCode: input.error ? 'scan-failed' : null,
       }),
     }) : null;
+    const employerSource = input.sources?.employer_registry;
+    const employerDiscoveries = [];
+    let updatedEmployerRegistry = null;
+    if (employerSource?.registrySnapshot) {
+      const snapshot = validateEmployerRegistry(structuredClone(employerSource.registrySnapshot));
+      if (employerRegistryRevision(snapshot) !== employerSource.registryRevision) {
+        throw new Error('collected employer registry snapshot does not match its revision');
+      }
+      const stored = loadEmployerRegistry(root);
+      const currentEmployerRegistry = stored || snapshot;
+      if (stored && employerRegistryRevision(stored) !== employerSource.registryRevision) {
+        throw new Error('employer registry changed after scan collection');
+      }
+      const knownIds = new Set([
+        ...currentEmployerRegistry.employers,
+        ...currentEmployerRegistry.archivedEmployers,
+      ].map(({ id }) => id));
+      const discoveredIds = new Set();
+      let remainingCapacity = Math.max(0, 256 - currentEmployerRegistry.employers.length);
+      for (const candidate of input.candidates || []) {
+        const canonicalName = String(candidate?.company || candidate?.employer || '').trim();
+        if (!canonicalName) continue;
+        const id = canonicalEmployerId(canonicalName);
+        if (discoveredIds.has(id) || (!knownIds.has(id) && remainingCapacity <= 0)) continue;
+        discoveredIds.add(id);
+        if (!knownIds.has(id)) remainingCapacity -= 1;
+        employerDiscoveries.push({
+          canonicalName,
+          origin: {
+            kind: 'advert-discovered',
+            recordedAt: timestamp,
+            reference: String(candidate.vacancyId || candidate.url || `scan:${run.runId}`).slice(0, 160),
+          },
+        });
+      }
+      const checked = recordEmployerChecks(currentEmployerRegistry, {
+        runId: run.runId,
+        recordedAt: timestamp,
+        checks: Array.isArray(employerSource.checks) ? employerSource.checks : [],
+      });
+      updatedEmployerRegistry = reconcileEmployerDiscoveries(checked, employerDiscoveries, {
+        now: () => timestamp,
+      });
+    }
     const target = {
-      id: updatedLanePlan
-        ? hasTracker ? 'scan-tracker-report-lanes' : 'scan-failure-report-lanes'
-        : hasTracker ? 'scan-tracker-report' : 'scan-failure-report',
+      id: [
+        'scan',
+        hasTracker ? 'tracker' : 'failure',
+        'report',
+        ...(updatedLanePlan ? ['lanes'] : []),
+        ...(updatedEmployerRegistry ? ['employers'] : []),
+      ].join('-'),
       schemaVersion: 1,
       files: [
         ...(hasTracker ? [{ kind: 'tracker', key: 'tracker' }] : []),
         { kind: 'report', key: `report:${date}` },
         { kind: 'run-log', key: 'scan-log' },
         ...(updatedLanePlan ? [{ kind: 'json', key: 'search-lanes' }] : []),
+        ...(updatedEmployerRegistry ? [{ kind: 'json', key: 'employers' }] : []),
       ],
     };
     plan = prepareMutation({ handle: run, lease }, target, {
@@ -2345,6 +2398,7 @@ export function coordinateScanArtifacts(root, input, { run, lease, hooks = {} })
       [`report:${date}`]: artifacts.recipes.report,
       'scan-log': artifacts.recipes.runLog,
       ...(updatedLanePlan ? { 'search-lanes': jsonReplaceRecipe(updatedLanePlan) } : {}),
+      ...(updatedEmployerRegistry ? { employers: jsonReplaceRecipe(updatedEmployerRegistry) } : {}),
     });
   }
   const mutationReceipt = applyPreparedMutation(plan, lease, hooks);

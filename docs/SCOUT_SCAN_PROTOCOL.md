@@ -93,8 +93,9 @@ Scout writes `reports/YYYY-MM-DD.md` with:
 
 It appends one canonical schema-version-5 JSON object to `data/scan-runs.jsonl` containing timestamp/start time, agent, mode, `degraded`, `sources_checked`, `queries_checked`, candidate/keeper counts, discarded reasons, errors, `source_health` and a bounded `reviewed` audit. Ranked runs also record the profile ID, discovery engine, mathematically reconciled total/per-source funnel, selection summary, complete bounded per-vacancy explanations and coverage rollups. Scan-health presents these as **Source records returned**, **Unique vacancies after deduplication**, **Excluded by confirmed rules**, **Eligible and ranked**, **Selected for detailed assessment**, **Successfully assessed**, and **Assessment failed**. It never implies that every discovered vacancy received a detailed provider assessment. Audit entries contain only bounded company, role, dimensions, canonical source link, stage flags, deterministic score contributions, reason codes and assessment outcomes; they never contain prompts, profile evidence, provider transcripts, raw observation caches, URL query/fragment data or full advert descriptions. A run fails closed rather than silently truncating an audit above the 10,000-vacancy artifact capacity. Readers remain compatible with older records and beta.9 aliases including nested `degradation`, `checked_sources`, `candidate_count`, `keeper_count` and `discarded_reasons`.
 
-Ranked discovery does not yet add employers outside configured sources and
-does not learn new rules from feedback. Those capabilities remain deferred
-until Gates C and D.
+Ranked discovery retains employers from selected canonical adverts as
+normal-priority review evidence and can monitor explicitly reviewed public
+careers sources. It does not learn new rules from feedback; that capability
+remains deferred until Gate D.
 
 Multiple runs on the same date are combined into one report with separate provider/mode summaries; the later run never erases the earlier run's presence. Before reporting success, Scout reads back and validates the tracker, required report sections and the matching final run record. The lock is released after completed, healthy-empty, degraded or failed runs.

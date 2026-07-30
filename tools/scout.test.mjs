@@ -17,6 +17,9 @@ import { loadPreparedMutation, reconcileMutation } from '../ui/lib/mutationCoord
 import {
   generateSearchLanePlan, loadSearchLanePlan, writeSearchLanePlan,
 } from '../ui/lib/searchLanes.mjs';
+import {
+  createEmployerRegistry, writeEmployerRegistry,
+} from '../ui/lib/employerRegistry.mjs';
 
 function scanRoot() {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'scout-runtime-scan-'));
@@ -218,6 +221,51 @@ test('published search lanes replace legacy categories and annotate collected jo
   assert.deepEqual(collected.lanes.map(({ id }) => id), queryPlan.lanes.map(({ id }) => id));
   assert.deepEqual(collected.sources.hiring_cafe.jobs[0].laneIds, [queryPlan.lanes[0].id]);
   assert.deepEqual(collected.sources.hiring_cafe.queryCounts, { [queryPlan.queries[0]]: 1 });
+});
+
+test('employer monitoring is selected fairly at collection but remains a durable write intent', async () => {
+  const root = scanRoot();
+  const registry = createEmployerRegistry([{
+    canonicalName: 'Priority Example',
+    userPriority: 'priority',
+    careersUrl: 'https://careers.example.test/jobs',
+    access: {
+      terms: 'allowed', robots: 'allowed', genericEnabled: false, minIntervalMinutes: 60,
+    },
+    origin: {
+      kind: 'manual', recordedAt: '2026-07-30T10:00:00.000Z', reference: 'settings',
+    },
+  }], { now: () => '2026-07-30T10:00:00.000Z' });
+  writeEmployerRegistry(root, registry);
+  let atsCalls = 0;
+  const collected = await collectScanSources(root, DEFAULT_WORKSPACE_CONFIG, {
+    fetchAts: async () => { atsCalls += 1; return { jobs: [] }; },
+    collectEmployersFn: async (employers) => ({
+      jobs: [{
+        title: 'Research lead', company: 'Priority Example',
+        url: 'https://careers.example.test/jobs/research-lead',
+        employerId: employers[0].id,
+      }],
+      checks: [{
+        employerId: employers[0].id, adapter: 'structured-data',
+        status: 'healthy', returned: 1, parsed: 1,
+      }],
+      results: [],
+    }),
+    fetchCafe: async () => ({ status: 'unavailable', jobs: [] }),
+    fetchAdzunaFn: async () => ({ status: 'unavailable', jobs: [] }),
+  });
+
+  assert.equal(atsCalls, 0, 'legacy ATS collection must not duplicate registry collection');
+  assert.equal(collected.sources.employer_registry.status, 'healthy');
+  assert.equal(collected.sources.employer_registry.jobs.length, 1);
+  assert.deepEqual(collected.sources.employer_registry.selectedEmployerIds, [registry.employers[0].id]);
+  assert.equal(
+    JSON.parse(fs.readFileSync(path.join(root, 'data', 'employers.json'), 'utf8'))
+      .employers[0].history.length,
+    0,
+    'collection must not mutate the private registry',
+  );
 });
 
 test('legacy migration overwrites generic seed placeholders and preserves user trees', () => {
@@ -1758,6 +1806,7 @@ test('a queued keeper run completes against its claim-time tracker input instead
             configured: true,
             status: 'healthy',
             count: 1,
+            registrySnapshot: { privateRegistrySentinel: 'PRIVATE_REGISTRY_SNAPSHOT' },
             jobs: [{
               company: 'Keeper Co',
               title: 'Ideal Role',
@@ -1797,7 +1846,7 @@ test('a queued keeper run completes against its claim-time tracker input instead
     assert.match(scanInput, /https:\/\/example\.test\/jobs\/keeper/);
     assert.doesNotMatch(
       scanInput,
-      /PRIVATE_USER|PRIVATE_PASSWORD|PRIVATE_SESSION|PRIVATE_FRAGMENT|nested-user|nested-pass|[?#]session=/,
+      /PRIVATE_USER|PRIVATE_PASSWORD|PRIVATE_SESSION|PRIVATE_FRAGMENT|PRIVATE_REGISTRY_SNAPSHOT|nested-user|nested-pass|[?#]session=/,
     );
   } finally {
     fs.rmSync(root, { recursive: true, force: true });

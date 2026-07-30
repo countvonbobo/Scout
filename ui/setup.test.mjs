@@ -17,11 +17,46 @@ import {
   shouldAutoRunFirstScan,
   shouldRequestRecoveryKey,
   adaptiveQuestionnaireHtml,
+  employerRegistryHtml,
   searchLanePlanHtml,
   searchProfileReviewHtml,
   splitList,
   validateCvName,
 } from './setup.js';
+
+test('employer settings expose bounded health, policy and reversible priority controls safely', () => {
+  const html = employerRegistryHtml({
+    revision: 'a'.repeat(64),
+    employers: [{
+      id: 'employer-0123456789abcdef',
+      canonicalName: '<script>Example</script>',
+      origins: [{ kind: 'named-profile', recordedAt: '2026-07-30T10:00:00.000Z' }],
+      careersUrl: 'https://example.test/careers',
+      board: null,
+      userPriority: 'priority',
+      decision: { state: 'active', reason: null },
+      access: {
+        terms: 'unreviewed', robots: 'unknown', genericEnabled: false, minIntervalMinutes: 60,
+      },
+      health: { status: 'blocked', reasonCode: 'terms-unreviewed' },
+      monitoring: { lastCheckedAt: null, nextEligibleAt: null },
+      history: [{
+        recordedAt: '2026-07-30T10:00:00.000Z',
+        status: 'blocked', adapter: 'structured-data', parsed: 0,
+        failureCode: 'terms-unreviewed',
+      }],
+    }],
+  });
+  assert.doesNotMatch(html, /<script>Example/);
+  assert.match(html, /&lt;script&gt;Example&lt;\/script&gt;/);
+  assert.match(html, /priority/);
+  assert.match(html, /inactive/);
+  assert.match(html, /irrelevant/);
+  assert.match(html, /Terms review/);
+  assert.match(html, /Robots review/);
+  assert.match(html, /data-employer-confirm/);
+  assert.match(html, /Add an employer for review/);
+});
 
 test('profile review names every decision area and keeps unconfirmed inferences non-blocking', () => {
   const html = searchProfileReviewHtml({

@@ -1,1 +1,8 @@
-{ "_note": "Optional employer rotation configured during onboarding.", "employers": [] }
+{
+  "schemaVersion": 1,
+  "generatedAt": "2026-07-30T00:00:00.000Z",
+  "updatedAt": "2026-07-30T00:00:00.000Z",
+  "generation": 1,
+  "employers": [],
+  "archivedEmployers": []
+}

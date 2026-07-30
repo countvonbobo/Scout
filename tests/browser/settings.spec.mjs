@@ -510,8 +510,13 @@ test('settings opens a hub and retuning is explicit and dismissible', async ({ p
 
   const dialog = page.getByRole('dialog');
   await expect(dialog.getByRole('heading', { name: 'Scout settings' })).toBeVisible();
-  await expect(dialog.locator('.settings-card')).toHaveCount(7);
+  await expect(dialog.locator('.settings-card')).toHaveCount(8);
   await expect(dialog.getByText('Review settings')).toHaveCount(0);
+
+  await dialog.getByRole('button', { name: 'Employers' }).click();
+  await expect(dialog.getByRole('heading', { name: 'Employers' })).toBeVisible();
+  await expect(dialog.getByRole('heading', { name: 'Add an employer for review' })).toBeVisible();
+  await dialog.getByRole('button', { name: 'Back to settings' }).click();
 
   await dialog.getByRole('button', { name: 'Search & profile' }).click();
   await expect(dialog.getByRole('heading', { name: 'Search & profile' })).toBeVisible();
@@ -531,7 +536,7 @@ test('settings traps focus, makes the dashboard inert, and restores its opener',
   const settings = page.getByRole('button', { name: 'Settings' });
   await settings.click();
   const dialog = page.getByRole('dialog');
-  await expect(dialog.locator('.settings-card')).toHaveCount(7);
+  await expect(dialog.locator('.settings-card')).toHaveCount(8);
   await expect(dialog.getByRole('heading', { name: 'Scout settings' })).toBeFocused();
   await expect.poll(() => page.locator('main').evaluate((element) => element.inert)).toBe(true);
 
@@ -593,12 +598,12 @@ test('a slow initial setup response cannot replace an explicit Settings view', a
   await expect.poll(() => Boolean(releaseInitial)).toBe(true);
   await page.getByRole('button', { name: 'Settings' }).click();
   const dialog = page.getByRole('dialog');
-  await expect(dialog.locator('.settings-card')).toHaveCount(7);
+  await expect(dialog.locator('.settings-card')).toHaveCount(8);
 
   releaseInitial();
   await expect.poll(() => statusRequests).toBe(2);
   await page.waitForTimeout(100);
-  await expect(dialog.locator('.settings-card')).toHaveCount(7);
+  await expect(dialog.locator('.settings-card')).toHaveCount(8);
   await expect(dialog.getByRole('heading', { name: 'Scout setup update' })).toHaveCount(0);
 });
 

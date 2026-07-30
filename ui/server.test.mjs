@@ -591,6 +591,7 @@ function profileDraft() {
       primaryTitles: [{ value: 'Researcher', strength: 'mandatory', provenance: 'explicit' }],
       locations: [{ value: 'Remote', strength: 'strong-preference', provenance: 'explicit' }],
       sectors: [{ value: 'Public interest', strength: 'nice-to-have', provenance: 'unconfirmed-inference' }],
+      employers: [{ value: 'Example Research', strength: 'strong-preference', provenance: 'explicit' }],
     },
     negative: {
       excludedTitles: [{ value: 'Commission-only', strength: 'hard-exclusion', provenance: 'explicit' }],
@@ -708,7 +709,50 @@ test('search-profile routes review a complete draft and publish only the current
     profileFields.some(({ path: field }) => field === 'target.skills')
   )));
   assert.equal(result.lanePlan.profileId, result.published.id);
+  const employerRegistry = JSON.parse(fs.readFileSync(paths.employers, 'utf8'));
+  assert.equal(employerRegistry.schemaVersion, 1);
+  const namedEmployer = employerRegistry.employers.find(
+    ({ canonicalName }) => canonicalName === 'Example Research',
+  );
+  assert.equal(namedEmployer.userPriority, 'priority');
+  assert.equal(namedEmployer.origins[0].kind, 'named-profile');
+  assert.equal(result.employerRegistry.active, 1);
+  assert.match(result.employerRegistry.revision, /^[a-f0-9]{64}$/);
   assert.equal(loadWorkspaceConfig(WORKSPACE_ROOT).searchProfile.publishedId, result.published.id);
+
+  const employerReviewResponse = await request({ method: 'GET', path: '/api/employers' });
+  assert.equal(employerReviewResponse.status, 200);
+  const employerReview = JSON.parse(employerReviewResponse.text);
+  assert.equal(employerReview.employers[0].canonicalName, 'Example Research');
+  assert.match(employerReview.revision, /^[a-f0-9]{64}$/);
+  const retiredEmployerResponse = await request({
+    method: 'PUT', path: '/api/employers', headers: JSON_HEADERS(),
+    body: JSON.stringify({
+      revision: employerReview.revision,
+      confirmed: true,
+      employer: {
+        id: employerReview.employers[0].id,
+        userPriority: 'inactive',
+        reason: 'Reviewed pause',
+      },
+    }),
+  });
+  assert.equal(retiredEmployerResponse.status, 200);
+  const retiredEmployerRegistry = JSON.parse(retiredEmployerResponse.text).registry;
+  assert.equal(retiredEmployerRegistry.employers[0].decision.state, 'inactive');
+  assert.equal(retiredEmployerRegistry.employers[0].decision.reason, 'Reviewed pause');
+  const staleEmployerResponse = await request({
+    method: 'PUT', path: '/api/employers', headers: JSON_HEADERS(),
+    body: JSON.stringify({
+      revision: employerReview.revision,
+      confirmed: true,
+      employer: {
+        id: employerReview.employers[0].id,
+        userPriority: 'relevant',
+      },
+    }),
+  });
+  assert.equal(staleEmployerResponse.status, 409);
 
   const retireLane = lanePlan.lanes[0];
   let recordedPlan = lanePlan;

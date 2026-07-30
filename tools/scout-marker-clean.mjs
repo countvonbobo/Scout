@@ -5,7 +5,8 @@ import { markerFreeMutationContent } from '../ui/lib/mutationCoordinator.mjs';
 const relative = String(process.argv[2] || '').replaceAll('\\', '/');
 const content = fs.readFileSync(0, 'utf8');
 let kind = relative.endsWith('/data/opportunities.json') || relative === 'data/opportunities.json' ? 'tracker'
-  : relative.endsWith('/data/search-lanes.json') || relative === 'data/search-lanes.json' ? 'json'
+  : relative.endsWith('/data/search-lanes.json') || relative === 'data/search-lanes.json'
+    || relative.endsWith('/data/employers.json') || relative === 'data/employers.json' ? 'json'
   : relative.endsWith('/data/scan-runs.jsonl') || relative === 'data/scan-runs.jsonl' ? 'run-log'
     : /(?:^|\/)reports\/\d{4}-\d{2}-\d{2}\.md$/.test(relative) ? 'report'
       : null;

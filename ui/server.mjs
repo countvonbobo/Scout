@@ -72,6 +72,10 @@ import {
   retireUnproductiveSearchLanes, searchLanePlanRevision, writeSearchLanePlan,
 } from './lib/searchLanes.mjs';
 import {
+  employerRegistryRevision, loadEmployerRegistry, migrateLegacyPortals,
+  reconcileEmployerDiscoveries, updateEmployerRegistryEntry, writeEmployerRegistry,
+} from './lib/employerRegistry.mjs';
+import {
   loadWorkspaceConfig, migrateWorkspace, resolveWorkspaceRoot, seedWorkspace, syncManagedInstructions,
   workspacePaths, writeWorkspaceConfig,
 } from './lib/workspace.mjs';
@@ -929,6 +933,10 @@ async function handleRead(req, res, url) {
   if (req.method === 'GET' && url.pathname === '/api/ats-portals') {
     return sendJson(res, 200, { portals: portalSummary(loadPortals(WORKSPACE_ROOT)) });
   }
+  if (req.method === 'GET' && url.pathname === '/api/employers') {
+    try { return sendJson(res, 200, publicEmployerRegistry(currentEmployerRegistry())); }
+    catch { return sendJson(res, 400, publicApiError('Employer registry could not be loaded.')); }
+  }
   if (req.method === 'GET' && url.pathname === '/api/reports') {
     return sendJson(res, 200, { reports: reportDates() });
   }
@@ -1283,6 +1291,47 @@ function replySearchProfileConflict(res, error) {
   });
 }
 
+function currentEmployerRegistry() {
+  const evidenceFile = fs.existsSync(WORKSPACE.employers)
+    ? WORKSPACE.employers
+    : WORKSPACE.portals;
+  const recordedAt = fs.existsSync(evidenceFile)
+    ? fs.statSync(evidenceFile).mtime.toISOString()
+    : '2000-01-01T00:00:00.000Z';
+  return migrateLegacyPortals(
+    loadEmployerRegistry(WORKSPACE_ROOT),
+    loadPortals(WORKSPACE_ROOT),
+    { now: () => recordedAt },
+  );
+}
+
+function publicEmployerRegistry(registry) {
+  return {
+    schemaVersion: registry.schemaVersion,
+    revision: employerRegistryRevision(registry),
+    generation: registry.generation,
+    updatedAt: registry.updatedAt,
+    employers: registry.employers.map((employer) => ({
+      id: employer.id,
+      canonicalName: employer.canonicalName,
+      aliases: employer.aliases,
+      origins: employer.origins,
+      careersUrl: employer.careersUrl,
+      board: employer.board,
+      industries: employer.industries,
+      locations: employer.locations,
+      userPriority: employer.userPriority,
+      decision: employer.decision,
+      access: employer.access,
+      health: employer.health,
+      monitoring: employer.monitoring,
+      history: employer.history.slice(-10),
+      createdAt: employer.createdAt,
+      updatedAt: employer.updatedAt,
+    })),
+  };
+}
+
 routes['GET /api/search-profile/adaptive'] = (req, res) => {
   try {
     stageSearchProfileReview();
@@ -1402,6 +1451,39 @@ routes['POST /api/search-lanes/restore'] = (req, res, body) => {
   }
 };
 
+routes['PUT /api/employers'] = (req, res, body) => {
+  const value = parseBody(body);
+  if (!value || value.confirmed !== true
+    || typeof value.revision !== 'string'
+    || !value.employer || typeof value.employer !== 'object') {
+    return replyJson(res, 400, {
+      error: 'employer update, explicit confirmation and current revision are required',
+    });
+  }
+  try {
+    return withSearchPlanMutation(res, 'employer-registry', () => {
+      const current = currentEmployerRegistry();
+      const currentRevision = employerRegistryRevision(current);
+      if (value.revision !== currentRevision) {
+        return replyJson(res, 409, {
+          conflict: true,
+          currentRevision,
+          ...publicApiError('Employer registry update conflict.'),
+        });
+      }
+      const registry = updateEmployerRegistryEntry(current, value.employer);
+      writeEmployerRegistry(WORKSPACE_ROOT, registry);
+      void queueCheckpoint('ui: update employer registry');
+      return replyJson(res, 200, {
+        ok: true,
+        registry: publicEmployerRegistry(registry),
+      });
+    });
+  } catch {
+    return replyJson(res, 400, publicApiError('Employer registry could not be updated.'));
+  }
+};
+
 routes['PUT /api/search-profile/draft'] = (req, res, body) => {
   const value = parseBody(body);
   if (!value || !Object.hasOwn(value, 'draft') || !Object.hasOwn(value, 'revision')) {
@@ -1449,13 +1531,38 @@ function restorePublishedArtifact(file, previous) {
   else atomicWriteFile(file, previous);
 }
 
-function publishProfileAndLanePlan(published, lanePlan, config) {
+function employerRegistryForPublishedProfile(published) {
+  const migrated = migrateLegacyPortals(
+    loadEmployerRegistry(WORKSPACE_ROOT),
+    loadPortals(WORKSPACE_ROOT),
+    { now: () => published.publishedAt },
+  );
+  const discoveries = (published.target.employers || []).map((rule, index) => ({
+    canonicalName: rule.value,
+    userPriority: ['mandatory', 'strong-preference'].includes(rule.strength)
+      ? 'priority'
+      : 'relevant',
+    origin: {
+      kind: 'named-profile',
+      recordedAt: published.publishedAt,
+      reference: `${published.id}:target.employers:${index}`,
+    },
+  }));
+  return reconcileEmployerDiscoveries(migrated, discoveries, {
+    now: () => published.publishedAt,
+  });
+}
+
+function publishProfileAndLanePlan(published, lanePlan, employerRegistry, config) {
   const previous = new Map([
     [WORKSPACE.searchProfilePublished, fs.existsSync(WORKSPACE.searchProfilePublished)
       ? fs.readFileSync(WORKSPACE.searchProfilePublished)
       : null],
     [WORKSPACE.searchLanes, fs.existsSync(WORKSPACE.searchLanes)
       ? fs.readFileSync(WORKSPACE.searchLanes)
+      : null],
+    [WORKSPACE.employers, fs.existsSync(WORKSPACE.employers)
+      ? fs.readFileSync(WORKSPACE.employers)
       : null],
     [WORKSPACE.config, fs.existsSync(WORKSPACE.config)
       ? fs.readFileSync(WORKSPACE.config)
@@ -1464,6 +1571,7 @@ function publishProfileAndLanePlan(published, lanePlan, config) {
   try {
     atomicWriteFile(WORKSPACE.searchProfilePublished, `${JSON.stringify(published, null, 2)}\n`);
     writeSearchLanePlan(WORKSPACE_ROOT, lanePlan);
+    writeEmployerRegistry(WORKSPACE_ROOT, employerRegistry);
     writeWorkspaceConfig(WORKSPACE_ROOT, config);
   } catch (error) {
     for (const [file, content] of previous) restorePublishedArtifact(file, content);
@@ -1484,13 +1592,14 @@ routes['POST /api/search-profile/publish'] = (req, res, body) => {
       }
       const published = publishSearchProfile(draft);
       const lanePlan = reconcileSearchLanePlan(loadSearchLanePlan(WORKSPACE_ROOT), published);
+      const employerRegistry = employerRegistryForPublishedProfile(published);
       const historicalRerank = rerankHistoricalVacancies(WORKSPACE_ROOT, published);
       const config = loadWorkspaceConfig(WORKSPACE_ROOT);
       const nextConfig = {
         ...config,
         searchProfile: { ...(config.searchProfile || {}), publishedId: published.id },
       };
-      publishProfileAndLanePlan(published, lanePlan, nextConfig);
+      publishProfileAndLanePlan(published, lanePlan, employerRegistry, nextConfig);
       void queueCheckpoint('ui: publish search profile');
       return replyJson(res, 200, {
         ok: true,
@@ -1503,6 +1612,13 @@ routes['POST /api/search-profile/publish'] = (req, res, body) => {
           retired: lanePlan.lanes.filter(({ state }) => state === 'retired').length,
           archived: lanePlan.archivedLanes.length,
           omissions: lanePlan.omissions.length,
+        },
+        employerRegistry: {
+          revision: employerRegistryRevision(employerRegistry),
+          generation: employerRegistry.generation,
+          active: employerRegistry.employers.filter(({ decision }) => decision.state === 'active').length,
+          inactive: employerRegistry.employers.filter(({ decision }) => decision.state === 'inactive').length,
+          irrelevant: employerRegistry.employers.filter(({ decision }) => decision.state === 'irrelevant').length,
         },
         historicalRerank: {
           created: historicalRerank.created,

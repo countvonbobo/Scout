@@ -21,8 +21,10 @@ Without credentials this command reports Adzuna unavailable and Scout can contin
 
 ## ATS and public discovery
 
-ATS portal configuration lives in `data/ats-portals.json`; source notes live
-in `data/sources.md`. `data/search-categories.json` remains a legacy query
+Employer monitoring lives in `data/employers.json`; legacy ATS portal
+configuration in `data/ats-portals.json` is migrated into that reviewable
+registry and is not collected a second time. Source notes live in
+`data/sources.md`. `data/search-categories.json` remains a legacy query
 input only until a reviewed profile creates `data/search-lanes.json`. After
 that, Adzuna and hiring.cafe use the fairly selected active lanes and preserve
 every matching lane ID when queries overlap. Keep entries generic and
@@ -43,6 +45,28 @@ Freshness and novelty are configured by published search breadth, not by occupat
 
 Assessment selection remains score-first and never admits a below-threshold vacancy merely to improve variety. When the above-threshold pool has enough distinct values, soft limits allow at most 30% from one employer (four or more employers), 60% from one source (two or more sources), and 50% from one lane, explicit role family or canonical location (three or more values for that dimension). Role families come only from explicit lane/source metadata and are never inferred from a title. If the limits cannot fill the assessment budget, Scout relaxes lane, source, role family, location and then employer in that stable order, recording every relaxation. Seeded exploration must still satisfy every limit that was not relaxed.
 
-Configured sources are discovery inputs, not a promise to discover every employer or opening. Scout does not yet learn new search rules from feedback; review and publish profile changes yourself before a later scan uses them.
+Configured sources and reviewed employer pages are discovery inputs, not a
+promise to discover every employer or opening. Scout retains employers from
+selected canonical adverts as normal-priority review evidence; it does not
+learn new search rules from feedback. Review and publish profile changes
+yourself before a later scan uses them.
 
 Respect site terms, robots/rate limits and personal-data rules. Do not work around access controls.
+
+Open **Settings → Employers** to review named and advert-discovered employers,
+priority, careers URL or public ATS board, access policy, rate interval, health
+and recent bounded check outcomes. Greenhouse, Lever and Ashby public boards
+share one monitoring result contract. A careers page is fetched only after
+terms and robots state are explicitly allowed; validated `JobPosting` JSON-LD
+is preferred, and conservative same-site generic links are opt-in. Redirects
+to another origin, authentication, anti-bot challenges, rate limits and
+JavaScript-only shells are recorded honestly rather than bypassed. Priority
+employers are selected whenever eligible, relevant/normal employers rotate
+fairly, inactive employers receive only a 30-day validation check, and
+irrelevant employers remain excluded until restored.
+
+Monitoring never sends a page to the detailed-assessment model and never
+treats an empty or blocked page as evidence that an employer is irrelevant.
+The exact selected registry revision and bounded check outcomes are persisted
+at collection, then committed with advert-discovery evidence in the same
+recoverable final mutation as the tracker, report, scan log and search lanes.

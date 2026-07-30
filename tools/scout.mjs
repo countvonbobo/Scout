@@ -7,7 +7,8 @@ import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
 import { doctor } from '../ui/lib/doctor.mjs';
 import { fetchAdzuna, resolveAdzunaCredentials } from '../ui/lib/adzuna.mjs';
-import { fetchConfiguredPortals } from '../ui/lib/ats.mjs';
+import { fetchConfiguredPortals, loadPortals } from '../ui/lib/ats.mjs';
+import { collectEmployers } from '../ui/lib/careersAdapters.mjs';
 import { fetchHiringCafe } from '../ui/lib/hiringCafe.mjs';
 import { loadEnv } from '../ui/lib/env.mjs';
 import {
@@ -50,6 +51,10 @@ import {
 import {
   loadSearchLanePlan, selectSearchLanes,
 } from '../ui/lib/searchLanes.mjs';
+import {
+  employerRegistryRevision, loadEmployerRegistry, migrateLegacyPortals,
+  selectEmployersForMonitoring,
+} from '../ui/lib/employerRegistry.mjs';
 
 const APP_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const MAX_SCAN_FILE_CHARS = 100_000;
@@ -489,8 +494,10 @@ function compactSource(result, configured = true, queries = []) {
 
 export async function collectScanSources(root, config, {
   fetchAts = fetchConfiguredPortals, fetchCafe = fetchHiringCafe, fetchAdzunaFn = fetchAdzuna,
+  collectEmployersFn = collectEmployers,
   broadened = false, queryPlan: suppliedQueryPlan = null,
 } = {}) {
+  const generatedAt = new Date().toISOString();
   const queryPlan = suppliedQueryPlan || workspaceQueryPlan(root, { broadened });
   const { queries } = queryPlan;
   const env = { ...loadEnv(root), ...process.env };
@@ -507,7 +514,66 @@ export async function collectScanSources(root, config, {
       }, true, sourceQueries);
     }
   };
-  const atsResult = await capture(() => fetchAts(root), true);
+  const legacyPortals = loadPortals(root);
+  const storedRegistry = loadEmployerRegistry(root);
+  const employerRegistry = storedRegistry || migrateLegacyPortals(null, legacyPortals, {
+    now: () => generatedAt,
+  });
+  const monitoredEmployers = selectEmployersForMonitoring(employerRegistry, {
+    now: () => generatedAt,
+  });
+  let employerCollection = { jobs: [], checks: [], results: [] };
+  if (monitoredEmployers.length) {
+    try {
+      employerCollection = await collectEmployersFn(monitoredEmployers, {
+        now: () => generatedAt,
+      });
+    } catch {
+      employerCollection = {
+        jobs: [],
+        checks: monitoredEmployers.map((employer) => ({
+          employerId: employer.id,
+          adapter: employer.board?.adapter || 'structured-data',
+          status: 'degraded',
+          returned: 0,
+          parsed: 0,
+          failureCode: 'collection-failed',
+        })),
+        results: [],
+      };
+    }
+  }
+  const employerFailures = employerCollection.checks.filter(({ status }) => status !== 'healthy');
+  const employerSource = {
+    ...compactSource({
+      status: !employerRegistry.employers.length
+        ? 'unavailable'
+        : employerFailures.length ? 'degraded' : 'healthy',
+      available: employerRegistry.employers.length > 0,
+      count: employerCollection.jobs.length,
+      reason: !employerRegistry.employers.length
+        ? 'no employers registered'
+        : !monitoredEmployers.length
+          ? 'all registered employers are within their monitoring interval'
+          : employerFailures.length
+            ? 'one or more employer checks did not complete'
+            : null,
+      errors: [],
+      jobs: employerCollection.jobs,
+    }, employerRegistry.employers.length > 0),
+    checkedAt: generatedAt,
+    checks: employerCollection.checks,
+    registryRevision: employerRegistryRevision(employerRegistry),
+    registrySnapshot: employerRegistry,
+    selectedEmployerIds: monitoredEmployers.map(({ id }) => id),
+  };
+  const registryOwnsLegacyPortals = employerRegistry.employers.length > 0 || legacyPortals.length > 0;
+  const atsResult = registryOwnsLegacyPortals
+    ? compactSource({
+      status: 'unavailable', count: 0,
+      reason: 'legacy ATS portals are managed by the employer registry', jobs: [],
+    }, false)
+    : await capture(() => fetchAts(root), true);
   if (/^no .*portals? (?:configured|enabled)$/i.test(String(atsResult.reason || ''))) atsResult.configured = false;
   const [hiringCafe, adzunaResult] = await Promise.all([
     capture(() => fetchCafe(queries, globalThis.fetch, { ...config.sources?.hiringCafe, locale: config.locale }), queries.length > 0, queries),
@@ -517,11 +583,12 @@ export async function collectScanSources(root, config, {
     }), Boolean(credentials), queries),
   ]);
   return {
-    generatedAt: new Date().toISOString(),
+    generatedAt,
     queries,
     lanes: queryPlan.lanes,
     sources: {
       ats: atsResult,
+      employer_registry: employerSource,
       hiring_cafe: annotateLaneJobs(hiringCafe, queryPlan.lanes, queries),
       adzuna: annotateLaneJobs(adzunaResult, queryPlan.lanes, queries),
     },
@@ -895,7 +962,10 @@ export async function runScanWith(root, provider, mode, {
             fs.writeFileSync(bundleFile, `${JSON.stringify(durableScanProjection({
               generatedAt: collected.generatedAt,
               queries: collected.queries,
-              sources: Object.fromEntries(Object.entries(collected.sources).map(([name, value]) => [name, { ...value, jobs: undefined }])),
+              sources: Object.fromEntries(Object.entries(collected.sources).map(([name, value]) => [
+                name,
+                { ...value, jobs: undefined, registrySnapshot: undefined },
+              ])),
               discoveryEngine,
               dropped,
               livenessSummary,
