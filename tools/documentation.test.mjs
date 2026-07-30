@@ -157,6 +157,17 @@ test('beta.23 upgrade guidance explains the one-way fenced lease boundary', () =
   assert.match(release, /no manual workspace-data conversion is normally needed/i);
 });
 
+test('beta.23 notes reconcile beta.22 through the candidate and readiness work 70 to 76', () => {
+  const release = fs.readFileSync(path.join(root, 'docs', 'releases', '0.1.0-beta.23.md'), 'utf8');
+
+  assert.match(release, /beta\.22.*candidate|candidate.*beta\.22/is);
+  for (let issue = 70; issue <= 76; issue += 1) {
+    assert.match(release, new RegExp(`#${issue}\\b`), `missing #${issue}`);
+  }
+  assert.match(release, /unknown location facts.*include.*penalise.*exclude/is);
+  assert.match(release, /live.*(?:pending|not yet recorded)|(?:pending|not yet recorded).*live/is);
+});
+
 test('configuration distinguishes field influence and published-profile authority', () => {
   const configuration = fs.readFileSync(path.join(root, 'docs', 'CONFIGURATION.md'), 'utf8');
 

@@ -1664,3 +1664,90 @@ record that exact reconciliation SHA and CI run without rewriting history.
 - PR #82 remains draft. PR #71 remains draft/open. Issues #72–#76 remain open.
   No protected merge, issue closure or epic completion checkbox is performed
   by this reconciliation.
+
+## Gate A11 — faults, privacy, packaging and candidate release evidence
+
+- Status: candidate implementation and local acceptance complete. Protected
+  review/merge and the authorised live/private acceptance step remain
+  deliberately outstanding.
+- This work is additive to exact green Gate A10 head
+  `ed49a10db768d8597cec0af3eef63932842c75d3`.
+
+### Unknown-value policy contract
+
+- Compensation already exposed published `include`, `penalise` and `exclude`
+  behavior. Location had only implicit include-with-zero-confidence behavior,
+  so presenting it as a selectable policy would have been false.
+- Six RED assertions proved the missing location schema, migration default,
+  filter, rank, review and release-note behavior before the repair.
+- A published optional `unknownPolicies.location` now accepts only `include`,
+  `penalise` or `exclude`. Omission remains beta.22-compatible and behaves as
+  `include`; legacy profile migration writes that conservative default.
+- `include` keeps an otherwise eligible unknown-location vacancy at zero
+  location confidence and never awards a match. `penalise` adds a bounded
+  negative contribution tied to `policy-location-unknown`. `exclude` emits an
+  overrideable `location-unknown` reason only when a blocking location rule
+  exists. The review surface and configuration guide name the selected
+  behavior before publication.
+- Focused schema, filter, rank, review and documentation verification passed
+  67/67.
+
+### Required fault and migration matrix
+
+- Ranked discovery, canonical identity, lifecycle, assessment batches,
+  interrupted-run recovery, leases, profile migration, filtering, ranking and
+  observation verification discovered 166 tests: 165 passed, 0 failed and 1
+  genuine Windows-only process-observation test skipped on macOS.
+- That matrix covers unknown compensation, unknown location, duplicate
+  observations, material changes, unchanged rejected vacancies, malformed
+  assessment artifacts, partial/resumed runs, stale leases, bounded
+  diagnostic retention, production-shaped profile migration and the
+  beta.22-compatible snapshot/rollback boundary.
+- Real source-adapter and complete scan-pipeline verification passed 97/97,
+  including fail-soft Adzuna, ATS and hiring.cafe failures, partial-source
+  degradation, retry/recovery and preservation of valid completed work.
+
+### Privacy, authentication and release audit
+
+- The provider-authentication, provider-health, guided-login, server,
+  observation, release-builder and release-audit matrix passed 187/187.
+  Coverage includes same-provider mutation authority, raw-output and
+  one-time-code exclusion, bounded diagnostic retention, origin/owner/CSRF
+  enforcement, private API cache prevention, safe browser projections,
+  provider isolation, staged-runtime filtering and content-based rejection of
+  renamed private payloads.
+- The live npm advisory audit reported zero vulnerabilities at the
+  moderate-or-higher threshold.
+- A fresh real release stage was built from the candidate. Its stage-mode
+  privacy audit scanned 1,585 files with no configured personal markers and
+  passed.
+
+### Candidate notes and live/private boundary
+
+- The beta.23 notes now describe the beta.22-to-candidate ranked-discovery,
+  recovery, migration and rollback contract; the #70–#76 readiness inventory;
+  the integrated portion of #71 and its deliberately excluded unrelated tab
+  reorder; and the unknown compensation/location decisions.
+- No authorised operator supplied live VPS access or explicitly requested a
+  migration, deployment, rollback or owner-acceptance rehearsal. Those
+  private/live steps are therefore **blocked and not recorded as passing**.
+  Local, CI and staged-package checks are not substitutes for that evidence.
+- The private operator-context record is unavailable in this checkout. No
+  hosting detail is inferred or copied into this public evidence.
+
+### Gate A definition-of-done reconciliation
+
+- Candidate evidence proves canonical dedupe/filter/rank precedes detailed
+  assessment; global ordering prevents earlier sources and lanes from
+  starving stronger work; interruption resumes or remains an auditable
+  partial; profile, rule, score, selection and assessment provenance remain
+  traceable; and reconciled metrics/UI language distinguish returned,
+  duplicate, excluded, eligible, selected, assessed, failed and outcome
+  counts.
+- Production-shaped migration, immutable historical reranking, explicit
+  legacy provenance and beta.22-compatible snapshot/rollback evidence pass.
+  Fault, package, privacy and release-stage verification also pass.
+- Gate A remains a draft candidate, not an accepted release: protected
+  reviewer acceptance/merge, issue acceptance and the authorised live/private
+  rehearsal are outside this branch's authority and remain open. No issue is
+  closed, no epic completion checkbox is changed and PR #82 remains draft.

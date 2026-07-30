@@ -10,7 +10,7 @@ function profile({
   primaryTitles = [], locations = [], workingPatterns = [], employmentTypes = [],
   responsibilities = [], skills = [], qualifications = [], industries = [], sectors = [],
   seniority = [], employers = [], excludedResponsibilities = [], compensation = {},
-  selection,
+  unknownPolicies, selection,
 } = {}) {
   return {
     id: 'profile-ranked-fixture', version: 1,
@@ -23,6 +23,7 @@ function profile({
       currency: null, period: 'year', minimum: null, minimumStrength: 'neutral', unknownPolicy: 'include',
       ...compensation,
     },
+    ...(unknownPolicies ? { unknownPolicies } : {}),
     ...(selection ? { selection } : {}),
   };
 }
@@ -195,6 +196,26 @@ test('unknown evidence lowers confidence and never receives a positive match sco
   assert.equal(location.confidence, 0);
   assert.ok(result.preRankConfidence < 100);
   assert.ok(result.preRankScore < 100);
+});
+
+test('unknown location include and penalise policies remain distinct and traceable', () => {
+  const job = vacancy({ vacancyId: 'unknown-location-policy', title: 'Data Analyst', location: null });
+  const rules = {
+    primaryTitles: [rule('Data Analyst', 'strong-preference')],
+    locations: [rule('Manchester', 'strong-preference')],
+  };
+  const included = rankVacancies([job], profile({
+    ...rules, unknownPolicies: { location: 'include' },
+  }))[0];
+  const penalised = rankVacancies([job], profile({
+    ...rules, unknownPolicies: { location: 'penalise' },
+  }))[0];
+  const dimension = penalised.dimensions.find(({ name }) => name === 'location');
+
+  assert.equal(included.dimensions.find(({ name }) => name === 'location').score, 0);
+  assert.ok(dimension.score < 0);
+  assert.equal(dimension.evidence[0].comparison, 'unknown');
+  assert.ok(penalised.preRankScore < included.preRankScore);
 });
 
 test('compensation only matches comparable currency, period and rate types', () => {

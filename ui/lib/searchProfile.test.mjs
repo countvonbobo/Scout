@@ -55,11 +55,13 @@ test('published profile preserves strengths, provenance and unknown policies', (
     primaryTitles: [{ value: 'Commercial solicitor', strength: 'mandatory', provenance: 'explicit' }],
     compensation: { currency: 'EUR', period: 'day', minimum: 450, minimumStrength: 'strong-preference', unknownPolicy: 'include' },
   });
+  draft.unknownPolicies = { location: 'penalise' };
   const profile = publishSearchProfile(draft, { publishedAt: NOW });
   assert.equal(profile.version, 1);
   assert.equal(profile.target.primaryTitles[0].provenance, 'explicit');
   assert.equal(profile.compensation.period, 'day');
   assert.equal(profile.compensation.unknownPolicy, 'include');
+  assert.equal(profile.unknownPolicies.location, 'penalise');
   assert.match(profile.id, /^profile-[a-f0-9]{12}$/);
 });
 
@@ -132,6 +134,20 @@ test('profile publication rejects invalid compensation and unbounded search beha
     () => publishSearchProfile(invalidSelection, { publishedAt: NOW }),
     /search profile\.selection/i,
   );
+
+  const invalidUnknownPolicy = genericProfileDraft();
+  invalidUnknownPolicy.unknownPolicies = { location: 'guess' };
+  assert.throws(
+    () => publishSearchProfile(invalidUnknownPolicy, { publishedAt: NOW }),
+    /unknownPolicies\.location/i,
+  );
+
+  const unsupportedUnknownPolicy = genericProfileDraft();
+  unsupportedUnknownPolicy.unknownPolicies = { privateField: 'exclude' };
+  assert.throws(
+    () => publishSearchProfile(unsupportedUnknownPolicy, { publishedAt: NOW }),
+    /unsupported field/i,
+  );
 });
 
 test('unconfirmed inference cannot publish as a hard exclusion', () => {
@@ -164,6 +180,7 @@ test('legacy preferences become a conservative, reviewable draft', () => {
   assert.notEqual(draft.negative.excludedResponsibilities[0].strength, 'hard-exclusion');
   assert.equal(draft.compensation.minimumStrength, 'strong-preference');
   assert.equal(draft.compensation.unknownPolicy, 'include');
+  assert.equal(draft.unknownPolicies.location, 'include');
 });
 
 test('compensation cannot publish as a hard exclusion without confirmation provenance', () => {

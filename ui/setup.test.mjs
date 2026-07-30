@@ -37,6 +37,7 @@ test('profile review names every decision area and keeps unconfirmed inferences 
         excludedResponsibilities: [],
       },
       compensation: { currency: 'GBP', period: 'year', minimum: 60000, minimumStrength: 'strong-preference', unknownPolicy: 'include' },
+      unknownPolicies: { location: 'penalise' },
     },
   });
 
@@ -45,6 +46,7 @@ test('profile review names every decision area and keeps unconfirmed inferences 
     'Confirmed exclusions', 'Accepted locations and working patterns',
     'Compensation and unknown handling', 'Focused, balanced or exploratory breadth',
   ]) assert.match(html, new RegExp(label));
+  assert.match(html, /unknown location facts: penalise/i);
   assert.match(html, /Unconfirmed inferences remain non-blocking/);
   assert.match(html, /Publish this reviewed profile/);
 });

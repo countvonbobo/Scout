@@ -21,6 +21,7 @@ const softwareJob = {
   description: 'Build software systems and perform coding for customers.',
 };
 const unknownSalaryJob = { ...softwareJob, vacancyId: 'vacancy-unknown-salary', compensation: { value: null, provenance: 'unknown' } };
+const unknownLocationJob = { ...softwareJob, vacancyId: 'vacancy-unknown-location', location: { value: null, provenance: 'unknown' } };
 
 test('only confirmed hard rules deterministically exclude', () => {
   const result = filterVacancies([softwareJob], profile({
@@ -38,6 +39,32 @@ test('only confirmed hard rules deterministically exclude', () => {
 test('unknown salary follows the published policy', () => {
   assert.equal(filterVacancies([unknownSalaryJob], profile({ salaryUnknownPolicy: 'include' })).eligible.length, 1);
   assert.equal(filterVacancies([unknownSalaryJob], profile({ salaryUnknownPolicy: 'exclude' })).excluded[0].code, 'compensation-unknown');
+});
+
+test('unknown location follows the published policy without pretending it matches', () => {
+  const include = {
+    ...profile({ locations: [rule('London', 'mandatory')] }),
+    unknownPolicies: { location: 'include' },
+  };
+  const exclude = {
+    ...include,
+    unknownPolicies: { location: 'exclude' },
+  };
+
+  assert.equal(filterVacancies([unknownLocationJob], include).eligible.length, 1);
+  assert.deepEqual(filterVacancies([unknownLocationJob], exclude).excluded[0], {
+    vacancyId: 'vacancy-unknown-location',
+    code: 'location-unknown',
+    profileRuleId: 'policy-location-unknown',
+    profileVersion: 'profile-test000001',
+    evidence: {
+      vacancy: null,
+      rule: 'unknown location policy: exclude',
+      comparison: 'unknown',
+    },
+    confidence: 'unknown',
+    overrideable: true,
+  });
 });
 
 test('mandatory structured title mismatch is overrideable and preserves source evidence', () => {

@@ -257,6 +257,7 @@ export function searchProfileReviewHtml(state = {}) {
   const draft = state.draft || null;
   const published = state.published || null;
   const compensation = draft?.compensation || {};
+  const locationUnknownPolicy = draft?.unknownPolicies?.location || 'include';
   const confirmedExclusions = profileRules(draft, 'negative', null, ['hard-exclusion']);
   const draftJson = draft ? escapeProfileText(JSON.stringify(draft, null, 2)) : '';
   const noDraft = draft ? '' : '<p>No complete draft is available yet. Migrate or save a complete draft before publishing.</p>';
@@ -270,7 +271,7 @@ export function searchProfileReviewHtml(state = {}) {
     <section><h4>Mandatory requirements</h4><p>${profileRuleText(draft, 'target', null, ['mandatory'])}</p></section>
     <section><h4>Preferences</h4><p>${profileRuleText(draft, 'target', null, ['strong-preference', 'nice-to-have', 'neutral'])}</p></section>
     <section><h4>Confirmed exclusions</h4><p>${confirmedExclusions.length ? escapeProfileText(confirmedExclusions.join(', ')) : 'None recorded'}</p></section>
-    <section><h4>Accepted locations and working patterns</h4><p>${profileRuleText(draft, 'target', 'locations', null)}</p></section>
+    <section><h4>Accepted locations and working patterns</h4><p>${profileRuleText(draft, 'target', 'locations', null)}. Unknown location facts: ${escapeProfileText(locationUnknownPolicy)}.</p></section>
     <section><h4>Compensation and unknown handling</h4><p>${compensationText}</p></section>
     <section><h4>Focused, balanced or exploratory breadth</h4><p>This draft does not make breadth a hard rule; review it as focused, balanced or exploratory before publishing.</p></section>
     <p class="meta">Unconfirmed inferences remain non-blocking until you explicitly confirm them.</p>

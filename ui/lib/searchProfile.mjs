@@ -15,6 +15,7 @@ export const PROVENANCE = Object.freeze([
 ]);
 
 export const UNKNOWN_POLICIES = Object.freeze(['include', 'penalise', 'exclude']);
+export const UNKNOWN_POLICY_FIELDS = Object.freeze(['location']);
 export const COMPENSATION_AMOUNT_TYPES = Object.freeze(['base', 'total', 'rate', 'unknown']);
 export const COMPENSATION_CERTAINTIES = Object.freeze(['exact', 'range', 'estimated', 'unknown']);
 export const SEARCH_BREADTHS = Object.freeze(['focused', 'balanced', 'broad']);
@@ -104,6 +105,22 @@ export function validateSearchProfile(profile) {
   if (minimumStrength === 'hard-exclusion') throw new Error('search profile.compensation hard exclusion requires a rule provenance');
   requireEnum(unknownPolicy, UNKNOWN_POLICIES, 'search profile.compensation.unknownPolicy');
 
+  if (profile.unknownPolicies !== undefined) {
+    requirePlainObject(profile.unknownPolicies, 'search profile.unknownPolicies');
+    const unsupported = Object.keys(profile.unknownPolicies)
+      .find((field) => !UNKNOWN_POLICY_FIELDS.includes(field));
+    if (unsupported) throw new Error(`search profile.unknownPolicies contains unsupported field: ${unsupported}`);
+    for (const field of UNKNOWN_POLICY_FIELDS) {
+      if (profile.unknownPolicies[field] !== undefined) {
+        requireEnum(
+          profile.unknownPolicies[field],
+          UNKNOWN_POLICIES,
+          `search profile.unknownPolicies.${field}`,
+        );
+      }
+    }
+  }
+
   if (profile.selection !== undefined) {
     requirePlainObject(profile.selection, 'search profile.selection');
     const fields = Object.keys(profile.selection);
@@ -164,6 +181,9 @@ export function draftProfileFromLegacy(config = {}, context = '') {
       minimum,
       minimumStrength: minimum === null ? 'neutral' : 'strong-preference',
       unknownPolicy: 'include',
+    },
+    unknownPolicies: {
+      location: 'include',
     },
   };
   void context;

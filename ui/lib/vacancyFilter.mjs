@@ -54,7 +54,7 @@ function exclusion(vacancy, profile, code, rule, evidence, sourceConfidence, ove
 }
 
 const POSITIVE_FIELDS = Object.freeze({
-  primaryTitles: ['title', 'title'], titles: ['title', 'title'], locations: ['location', 'location'],
+  primaryTitles: ['title', 'title'], titles: ['title', 'title'], locations: ['location', 'location', 'location'],
   employmentTypes: ['employmentType', 'employment-type'], employers: ['employer', 'employer'],
 });
 
@@ -73,12 +73,29 @@ function fieldValue(vacancy, field) {
 
 function structuredExclusions(vacancy, profile) {
   const found = [];
-  for (const [listName, [field, name]] of Object.entries(POSITIVE_FIELDS)) {
+  for (const [listName, [field, name, unknownPolicyField]] of Object.entries(POSITIVE_FIELDS)) {
     const rules = (profile?.target?.[listName] || []).filter(blockingStructuredRule);
     if (!rules.length) continue;
     const source = fieldValue(vacancy, field);
     const actual = valueOf(source);
-    if (actual === null || actual === undefined || actual === '') continue;
+    if (actual === null || actual === undefined || actual === '') {
+      if (unknownPolicyField && profile?.unknownPolicies?.[unknownPolicyField] === 'exclude') {
+        found.push({
+          vacancyId: vacancy?.vacancyId || vacancy?.candidateId || vacancy?.canonicalUrl || 'unknown-vacancy',
+          code: `${unknownPolicyField}-unknown`,
+          profileRuleId: `policy-${unknownPolicyField}-unknown`,
+          profileVersion: profileVersion(profile),
+          evidence: {
+            vacancy: null,
+            rule: `unknown ${unknownPolicyField} policy: exclude`,
+            comparison: 'unknown',
+          },
+          confidence: confidence(source),
+          overrideable: true,
+        });
+      }
+      continue;
+    }
     if (rules.some((rule) => exactMatches(actual, rule.value))) continue;
     for (const rule of rules) {
       found.push(exclusion(vacancy, profile, `mandatory-${name}-unmet`, rule,

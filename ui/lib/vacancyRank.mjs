@@ -149,7 +149,7 @@ function sourceMatches(source, expected, mode) {
   return values.some((value) => match(value, expected, mode));
 }
 
-function scoreRules(vacancy, dimension, rules) {
+function scoreRules(vacancy, dimension, rules, unknownPolicy = 'include') {
   const { source, descriptionFallback } = sourceFor(vacancy, dimension);
   const actual = valueOf(source);
   const suppliedSemanticEvidence = descriptionFallback ? vacancy?.semanticEvidence : null;
@@ -172,7 +172,9 @@ function scoreRules(vacancy, dimension, rules) {
       ? semanticMatches.has(ruleId(rule))
       : !unknown && sourceMatches(source, rule.value, dimension.mode)
   ));
-  const score = matched.reduce((total, rule) => total + STRENGTH_WEIGHT[rule.strength], 0);
+  const unknownPenalty = unknown && unknownPolicy === 'penalise' ? maximum * 0.25 : 0;
+  const score = matched.reduce((total, rule) => total + STRENGTH_WEIGHT[rule.strength], 0)
+    - unknownPenalty;
   return {
     name: dimension.name,
     score,
@@ -190,12 +192,24 @@ function scoreRules(vacancy, dimension, rules) {
       }
       : evidenceFor(source, rule, matched.includes(rule), unknown, dimension.mode)),
     profileRuleIds: rules.map(ruleId),
-    contributions: matched.map((rule) => ({
-      name: dimension.name, profileRuleId: ruleId(rule), score: STRENGTH_WEIGHT[rule.strength],
-      evidence: semanticMatches
-        ? { vacancy: { digest: semanticEvidence.descriptionDigest, matchedRule: ruleId(rule) }, rule: rule.value, matched: true }
-        : evidenceFor(source, rule, true, false, dimension.mode),
-    })),
+    contributions: [
+      ...matched.map((rule) => ({
+        name: dimension.name, profileRuleId: ruleId(rule), score: STRENGTH_WEIGHT[rule.strength],
+        evidence: semanticMatches
+          ? { vacancy: { digest: semanticEvidence.descriptionDigest, matchedRule: ruleId(rule) }, rule: rule.value, matched: true }
+          : evidenceFor(source, rule, true, false, dimension.mode),
+      })),
+      ...(unknownPenalty ? [{
+        name: dimension.name,
+        profileRuleId: `policy-${dimension.name}-unknown`,
+        score: -unknownPenalty,
+        evidence: {
+          vacancy: null,
+          rule: `unknown ${dimension.name} policy: penalise`,
+          comparison: 'unknown',
+        },
+      }] : []),
+    ],
   };
 }
 
@@ -385,7 +399,12 @@ function dimensionsFor(vacancy, profile, { referenceTimestamp, historyIndex }) {
   const dimensions = [];
   for (const dimension of REQUIRED_DIMENSIONS) {
     if (dimension.name === 'seniority') dimensions.push(compensationDimension(vacancy, profile));
-    dimensions.push(scoreRules(vacancy, dimension, dimensionRules(profile, dimension)));
+    dimensions.push(scoreRules(
+      vacancy,
+      dimension,
+      dimensionRules(profile, dimension),
+      profile?.unknownPolicies?.[dimension.name] || 'include',
+    ));
   }
   dimensions.push(
     freshnessDimension(vacancy, profile, referenceTimestamp),
@@ -393,7 +412,14 @@ function dimensionsFor(vacancy, profile, { referenceTimestamp, historyIndex }) {
   );
   for (const dimension of OPTIONAL_DIMENSIONS) {
     const rules = dimensionRules(profile, dimension);
-    if (rules.length) dimensions.push(scoreRules(vacancy, dimension, rules));
+    if (rules.length) {
+      dimensions.push(scoreRules(
+        vacancy,
+        dimension,
+        rules,
+        profile?.unknownPolicies?.[dimension.name] || 'include',
+      ));
+    }
   }
   return dimensions;
 }
