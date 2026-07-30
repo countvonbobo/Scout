@@ -25,6 +25,8 @@ const FIXTURE_TITLES = [
 const unixHome = (user, suffix = '') => ['', 'home', user, suffix].filter((part, index) => index === 0 || part).join('/');
 const macHome = (user, suffix = '') => ['', 'Users', user, suffix].filter((part, index) => index === 0 || part).join('/');
 const windowsHome = (user, suffix = '') => ['C:', 'Users', user, suffix].filter(Boolean).join('\\');
+const uncHome = (share, user, suffix = '') =>
+  ['', '', 'synthetic-fileserver', share, user, suffix].filter((part, index) => index < 2 || part).join('\\');
 
 test('passes clean tracked files and build output', () => {
   const root = fixture();
@@ -169,6 +171,32 @@ test('rejects ordinary credential, auth-state, prompt and advert representations
   }
   assert.equal(JSON.stringify(result).includes('SYNTHETIC-SECRET'), false);
   assert.equal(JSON.stringify(result).includes('Synthetic private'), false);
+});
+
+test('rejects high-signal private fields across YAML and TOML syntax', () => {
+  const root = fixture();
+  const cases = [
+    ['raw-run.yaml', 'rawRunState: synthetic-private-run-state\n', 'raw-run-state'],
+    ['raw-run.yml', 'raw_run_state: synthetic-private-run-state\n', 'raw-run-state'],
+    ['prompt.yaml', 'prompt: synthetic-private-prompt-body\n', 'full-prompt'],
+    ['raw-run.toml', 'rawRunState = "synthetic-private-run-state"\n', 'raw-run-state'],
+    ['prompt.toml', 'prompt = "synthetic-private-prompt-body"\n', 'full-prompt'],
+  ];
+  for (const [relative, content] of cases) fs.writeFileSync(path.join(root, relative), content);
+
+  const result = auditRelease({
+    root,
+    trackedFiles: cases.map(([relative]) => relative),
+    buildDirs: [],
+  });
+
+  assert.equal(result.ok, false);
+  assert.deepEqual(
+    result.findings.map(({ file, rule }) => [file, rule]),
+    cases.map(([file, _content, rule]) => [file, rule])
+      .sort(([left], [right]) => left.localeCompare(right, 'en')),
+  );
+  assert.equal(JSON.stringify(result).includes('synthetic-private'), false);
 });
 
 test('detects a serialized private payload by content after a harmless rename', () => {
@@ -438,6 +466,63 @@ test('rejects plausible private home paths without username exemptions', () => {
   })).sort((a, b) => a.file.localeCompare(b.file, 'en')));
 });
 
+test('rejects root, alternate Unix and UNC profiles plus usernames that only start like placeholders', () => {
+  const root = fixture();
+  const alternateUnix = (prefix, user, suffix) =>
+    ['', ...prefix.split('/'), user, suffix].filter((part, index) => index === 0 || part).join('/');
+  const cases = [
+    ['root.txt', ['', 'root', '.scout'].join('/')],
+    ['var-root.txt', ['', 'var', 'root', '.scout'].join('/')],
+    ['mac-yourname.txt', macHome('yourname', 'Scout Workspace')],
+    ['linux-yourself.txt', unixHome('yourself', 'Scout Workspace')],
+    ['unix-youraccount.txt', alternateUnix('usr/home', 'YourAccount', 'Scout Workspace')],
+    ['unix-mixed-case.txt', alternateUnix('export/home', 'yOuRnAmE', 'Scout Workspace')],
+    ['windows-youraccount.txt', windowsHome('YourAccount', 'Scout Workspace')],
+    ['unc-users.txt', uncHome('Users', 'yourname', 'Scout Workspace')],
+    ['unc-users.json', JSON.stringify({ path: uncHome('Users', 'YourAccount', 'Scout Workspace') })],
+    ['unc-homes.txt', uncHome('homes', 'yourself', 'Scout Workspace')],
+    ['unc-profiles.txt', uncHome('profiles', 'YourAccount', 'Scout Workspace')],
+  ];
+  for (const [relative, content] of cases) fs.writeFileSync(path.join(root, relative), `${content}\n`);
+
+  const result = auditRelease({
+    root,
+    trackedFiles: cases.map(([relative]) => relative),
+    buildDirs: [],
+  });
+
+  assert.equal(result.ok, false);
+  assert.deepEqual(result.findings.map(({ file, rule }) => ({ file, rule })), cases.map(([file]) => ({
+    file,
+    rule: 'private-path',
+  })).sort((a, b) => a.file.localeCompare(b.file, 'en')));
+  for (const [_relative, content] of cases) assert.equal(JSON.stringify(result).includes(content), false);
+});
+
+test('allows only exact segment-bounded public and placeholder profile names', () => {
+  const root = fixture();
+  const angleUser = ['<', 'user', '>'].join('');
+  const cases = [
+    ['mac-shared.txt', macHome('Shared', 'Scout')],
+    ['mac-public.txt', macHome('Public', 'Scout')],
+    ['mac-placeholder.txt', macHome('YOUR', 'Scout')],
+    ['linux-placeholder.txt', unixHome('your', 'Scout')],
+    ['linux-angle-placeholder.txt', unixHome(angleUser, 'Scout')],
+    ['windows-public.txt', windowsHome('Public', 'Scout')],
+    ['windows-placeholder.txt', windowsHome('Your', 'Scout')],
+    ['unc-placeholder.txt', uncHome('profiles', 'YOUR', 'Scout')],
+  ];
+  for (const [relative, content] of cases) fs.writeFileSync(path.join(root, relative), `${content}\n`);
+
+  const result = auditRelease({
+    root,
+    trackedFiles: cases.map(([relative]) => relative),
+    buildDirs: [],
+  });
+
+  assert.equal(result.ok, true);
+});
+
 test('ignores credential variable expressions and exact allowlisted binary assets', () => {
   const root = fixture();
   fs.writeFileSync(path.join(root, 'source.mjs'), "const apiKey = String(env.ADZUNA_API_KEY || '').trim();\nconst token = crypto.randomUUID();\n");
@@ -516,7 +601,7 @@ test('stage mode scans an exported tree without requiring Git metadata', () => {
   assert.match(writes.join(''), /Release audit passed/);
 });
 
-test('stage mode audits installed dependency JSON, text, log and runtime payloads', () => {
+test('stage mode audits installed dependency JSON, YAML, TOML, text, log and runtime payloads', () => {
   const root = fixture();
   const marker = 'Synthetic Dependency Private Marker';
   fs.mkdirSync(path.join(root, 'app', 'node_modules', 'selected-package', '.scout'), {
@@ -534,6 +619,14 @@ test('stage mode audits installed dependency JSON, text, log and runtime payload
   fs.writeFileSync(
     path.join(root, 'app', 'node_modules', 'selected-package', 'provider.log'),
     'provider_transcript: synthetic-private-provider-output\n',
+  );
+  fs.writeFileSync(
+    path.join(root, 'app', 'node_modules', 'selected-package', 'private.yaml'),
+    'prompt: synthetic-private-provider-prompt\n',
+  );
+  fs.writeFileSync(
+    path.join(root, 'app', 'node_modules', 'selected-package', 'run-state.toml'),
+    'rawRunState = "synthetic-private-run-state"\n',
   );
   fs.writeFileSync(
     path.join(root, 'app', 'node_modules', 'selected-package', '.scout', 'run-state.jsonl'),
@@ -558,21 +651,23 @@ test('stage mode audits installed dependency JSON, text, log and runtime payload
       SCOUT_RELEASE_MARKERS: marker,
     });
     assert.equal(stagedAudit.ok, false);
-    assert.equal(stagedAudit.filesScanned, 5);
+    assert.equal(stagedAudit.filesScanned, 7);
     assert.deepEqual(
       stagedAudit.findings.map(({ file, rule }) => [file, rule]),
       [
         ['app/node_modules/selected-package/.scout/run-state.jsonl', 'raw-run-state'],
         ['app/node_modules/selected-package/private.json', 'full-prompt'],
         ['app/node_modules/selected-package/private.txt', 'personal-marker-1'],
+        ['app/node_modules/selected-package/private.yaml', 'full-prompt'],
         ['app/node_modules/selected-package/provider.log', 'provider-transcript'],
+        ['app/node_modules/selected-package/run-state.toml', 'raw-run-state'],
       ],
     );
   } finally {
     process.stdout.write = originalWrite;
     process.exitCode = originalExitCode;
   }
-  assert.match(writes.join(''), /Release audit failed with 4 finding/);
+  assert.match(writes.join(''), /Release audit failed with 6 finding/);
 });
 
 test('ranked discovery production sources stay neutral and release bundles omit raw observation caches', () => {

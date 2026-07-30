@@ -24,8 +24,15 @@ const SECRET_RULES = Object.freeze([
 const PRIVATE_RUNTIME_ROOTS = new Set([
   '.scout', 'applications', 'chats', 'cv', 'data', 'profile', 'reports',
 ]);
-const SERIALIZED_EXTENSIONS = /\.(?:json|jsonl|ndjson|log|out|txt)$/i;
-const PRIVATE_PATH = /\/Users\/(?!(?:Shared|Public)(?:\/|["'\s])|YOUR|<)[^/"'\s]+|\/home\/(?!YOUR|<)[^/"'\s]+|[A-Za-z]:[\\/]Users[\\/](?!Public(?:[\\/]|["'\s])|YOUR|<)[^\\/"'\s]+/gi;
+const STATE_SHAPED_TEXT_EXTENSIONS = /\.(?:json|jsonl|ndjson|log|out|toml|txt|yaml|yml)$/i;
+const CROSS_FORMAT_CONFIG_EXTENSIONS = /\.(?:toml|yaml|yml)$/i;
+const EXACT_PROFILE_PLACEHOLDERS = new Set([
+  'your', '<user>', '<username>', '<your-user>', '<your-username>',
+]);
+const UNIX_HOME_PROFILE_PATH = /\/(Users|home)\/([A-Za-z0-9._-]+|<[^/>\s]+>)/gi;
+const WINDOWS_HOME_PROFILE_PATH = /[A-Za-z]:[\\/]+(Users)[\\/]+([A-Za-z0-9._-]+|<[^\\/>\s]+>)/gi;
+const UNC_PROFILE_PATH = /(?:\\{2,}|\/{2,})[A-Za-z0-9._-]+[\\/]+(Users|home|profiles|homes)[\\/]+([A-Za-z0-9._-]+|<[^\\/>\s]+>)/gi;
+const ROOT_PROFILE_PATH = /\/root(?=\/|["'`\s]|$)/g;
 const DOCUMENTED_PUBLIC_PATH_FILES = new Set([
   'docs/INSTALL_VPS.md',
   'docs/diagnostics/beta15-vps-workspace-incident.md',
@@ -164,6 +171,7 @@ function privacyRuleForKey(key, value, owner = {}, ancestors = []) {
     || /(?:auth|authentication|authorization|device|login).*code/.test(normal)
     || (normal === 'code' && /^(?:claude|codex)$/i.test(String(owner.provider || '')))
     || (normal === 'code' && ancestors.some((part) => /(?:auth|device|login|provider|session)/.test(part)))) return 'auth-code';
+  if (normal === 'defaultprompt') return null;
   if (normal.includes('prompt')) return 'full-prompt';
   if (normal === 'content'
     && /^(?:system|user)$/i.test(String(owner.role || ''))
@@ -208,31 +216,43 @@ function serializedPrivacyFindings(text) {
     }
   };
   const records = [];
+  const nonemptyLines = text.split(/\r?\n/).filter((entry) => entry.trim());
+  let parsedComplete = false;
   try {
     records.push(JSON.parse(text));
+    parsedComplete = true;
   } catch {
-    for (const line of text.split(/\r?\n/).filter((entry) => entry.trim())) {
+    for (const line of nonemptyLines) {
       try { records.push(JSON.parse(line)); } catch { /* handled by fallback key scan below */ }
     }
+    parsedComplete = nonemptyLines.length > 0 && records.length === nonemptyLines.length;
   }
   for (const record of records) inspect(record);
 
   // Text exports and damaged JSON still fail closed on high-signal field names.
-  const key = /["']?([A-Za-z][A-Za-z0-9_-]{1,80})["']?\s*:/g;
-  let match;
-  while ((match = key.exec(text)) !== null) {
-    const rule = privacyRuleForKey(match[1], null, {});
-    const finding = `${rule}:${match.index}`;
-    if (rule && !seen.has(finding)) {
-      seen.add(finding);
-      findings.push({ line: lineAt(text, match.index), rule });
+  if (!parsedComplete) {
+    const key = /["']?([A-Za-z][A-Za-z0-9_-]{1,80})["']?\s*[:=]/g;
+    let match;
+    while ((match = key.exec(text)) !== null) {
+      const normal = normaliseSerializedKey(match[1]);
+      // Generic process-output words have no privacy provenance in an
+      // unparsed config record. Explicit raw/auth-qualified keys remain
+      // high-signal; parsed object ancestry is handled above.
+      const rule = ['output', 'payload', 'stdout', 'stderr'].includes(normal)
+        ? null
+        : privacyRuleForKey(match[1], null, {});
+      const finding = `${rule}:${match.index}`;
+      if (rule && !seen.has(finding)) {
+        seen.add(finding);
+        findings.push({ line: lineAt(text, match.index), rule });
+      }
     }
   }
   return findings;
 }
 
 function serializedByContent(text, relative) {
-  if (SERIALIZED_EXTENSIONS.test(relative)) return true;
+  if (STATE_SHAPED_TEXT_EXTENSIONS.test(relative)) return true;
   const lines = String(text).split(/\r?\n/).filter((line) => line.trim());
   if (!lines.length) return false;
   try {
@@ -262,7 +282,34 @@ function dependencyDataArtifact(relative) {
   // field names and paths. Every dependency file still receives marker and
   // concrete-token checks; state-shaped heuristics apply to data payloads,
   // excluding the package metadata selected by the reviewed lockfile.
-  return base !== 'package.json' && SERIALIZED_EXTENSIONS.test(base);
+  return base !== 'package.json' && STATE_SHAPED_TEXT_EXTENSIONS.test(base);
+}
+
+function publicProfileSegment(family, segment) {
+  const normalFamily = String(family).toLocaleLowerCase('en-US');
+  const normalSegment = String(segment).toLocaleLowerCase('en-US');
+  if (EXACT_PROFILE_PLACEHOLDERS.has(normalSegment)) return true;
+  return normalFamily === 'users' && (normalSegment === 'public' || normalSegment === 'shared');
+}
+
+function privatePathFindings(text) {
+  const value = String(text);
+  const findings = [];
+  for (const regex of [UNIX_HOME_PROFILE_PATH, WINDOWS_HOME_PROFILE_PATH, UNC_PROFILE_PATH]) {
+    regex.lastIndex = 0;
+    let match;
+    while ((match = regex.exec(value)) !== null) {
+      if (!publicProfileSegment(match[1], match[2])) {
+        findings.push({ line: lineAt(value, match.index), rule: 'private-path' });
+      }
+    }
+  }
+  ROOT_PROFILE_PATH.lastIndex = 0;
+  let rootMatch;
+  while ((rootMatch = ROOT_PROFILE_PATH.exec(value)) !== null) {
+    findings.push({ line: lineAt(value, rootMatch.index), rule: 'private-path' });
+  }
+  return findings;
 }
 
 function scanText(text, markers, relative = '', { dependency = false } = {}) {
@@ -286,18 +333,23 @@ function scanText(text, markers, relative = '', { dependency = false } = {}) {
   }
   if (dependency && !dependencyDataArtifact(relative)) return findings;
   findings.push(...secretAssignmentFindings(text));
-  if (serializedByContent(text, relative)) findings.push(...serializedPrivacyFindings(text));
-  let pathText = text.replaceAll('\\\\', '\\');
+  if (serializedByContent(text, relative)) {
+    let privacyFindings = serializedPrivacyFindings(text);
+    // Config credentials are already value-checked above with exact
+    // placeholder handling. The format-independent state scan adds the
+    // structural rules that cannot be decided from credential values.
+    if (CROSS_FORMAT_CONFIG_EXTENSIONS.test(relative)) {
+      privacyFindings = privacyFindings.filter(({ rule }) => rule !== 'credential');
+    }
+    findings.push(...privacyFindings);
+  }
+  let pathText = text;
   const documentedPublicPath = [...DOCUMENTED_PUBLIC_PATH_FILES].some((documented) =>
     relative === documented || relative === `app/${documented}` || relative.endsWith(`/app/${documented}`));
   if (documentedPublicPath) {
     pathText = pathText.replaceAll(/\/home\/(?:scout-deploy|ubuntu)/g, '/home/YOUR');
   }
-  PRIVATE_PATH.lastIndex = 0;
-  let pathMatch;
-  while ((pathMatch = PRIVATE_PATH.exec(pathText)) !== null) {
-    findings.push({ line: lineAt(pathText, pathMatch.index), rule: 'private-path' });
-  }
+  findings.push(...privatePathFindings(pathText));
   return findings;
 }
 
