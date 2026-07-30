@@ -12,6 +12,28 @@ import {
 } from './build-release.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+const PRIVATE_COPY_FIXTURES = Object.freeze([
+  ['nested/.ENV', 'Synthetic Nested Private Marker'],
+  ['nested/config/Workspace.JSON', 'Synthetic Nested Private Marker'],
+  ['nested/logs/provider.LOG', 'Synthetic Nested Private Marker'],
+  ['nested/cache/session.TMP', 'Synthetic Nested Private Marker'],
+  ['nested/backups/report.BAK', 'Synthetic Nested Private Marker'],
+  ['nested/backups/report.json~', 'Synthetic Nested Private Marker'],
+]);
+
+function writePrivateCopyFixtures(root) {
+  for (const [relative, content] of PRIVATE_COPY_FIXTURES) {
+    const target = path.join(root, relative);
+    fs.mkdirSync(path.dirname(target), { recursive: true });
+    fs.writeFileSync(target, content);
+  }
+}
+
+function assertPrivateCopyFixturesAbsent(root) {
+  for (const [relative] of PRIVATE_COPY_FIXTURES) {
+    assert.equal(fs.existsSync(path.join(root, relative)), false, relative);
+  }
+}
 
 test('release manifest is allowlisted and excludes private workspace roots', () => {
   const sources = RELEASE_FILES.map((entry) => entry.source);
@@ -68,6 +90,13 @@ test('release tree filter omits tests and snapshots', () => {
     'app/Profile/context.md',
     'ui/Tests/private.mjs',
     'ui/Fixtures/private.json',
+    'ui/nested/.ENV',
+    'ui/nested/config/Workspace.JSON',
+    'ui/nested/logs/provider.LOG',
+    'ui/nested/cache/session.TMP',
+    'ui/nested/backups/report.BAK',
+    'ui/nested/backups/report.json~',
+    'node_modules/runtime/nested/.env.local',
   ]) {
     assert.equal(includeReleasePath(bypass), false);
   }
@@ -136,6 +165,7 @@ test('public source staging contains contributor inputs without private workspac
         fs.mkdirSync(path.join(target, 'output'), { recursive: true });
         fs.writeFileSync(path.join(target, 'output', 'Scout.exe'), 'built');
       }
+      if (entry.source === 'ui') writePrivateCopyFixtures(target);
     } else {
       fs.mkdirSync(path.dirname(target), { recursive: true });
       const content = entry.source === 'package.json'
@@ -153,6 +183,7 @@ test('public source staging contains contributor inputs without private workspac
   assert.equal(fs.existsSync(path.join(staged.stageDir, '.github', 'source.txt')), true);
   assert.equal(fs.existsSync(path.join(staged.stageDir, 'installer', 'output')), false);
   assert.equal(fs.existsSync(path.join(staged.stageDir, 'profile')), false);
+  assertPrivateCopyFixturesAbsent(path.join(staged.stageDir, 'ui'));
 });
 
 test('the generated public source tree passes the real privacy audit', () => {
@@ -190,6 +221,7 @@ test('staging copies only manifest content and bundled runtime', () => {
       fs.mkdirSync(target, { recursive: true });
       fs.writeFileSync(path.join(target, 'runtime.mjs'), 'ok');
       fs.writeFileSync(path.join(target, 'runtime.test.mjs'), 'private fixture');
+      if (entry.source === 'ui') writePrivateCopyFixtures(target);
     } else {
       fs.mkdirSync(path.dirname(target), { recursive: true });
       const content = entry.source === 'package.json'
@@ -206,6 +238,7 @@ test('staging copies only manifest content and bundled runtime', () => {
   const staged = stageRelease({ root, stageDir, nodeExecutable, typstExecutable, includeDependencies: false, platform: 'win32' });
   assert.equal(fs.existsSync(path.join(staged.appDir, 'ui', 'runtime.mjs')), true);
   assert.equal(fs.existsSync(path.join(staged.appDir, 'ui', 'runtime.test.mjs')), false);
+  assertPrivateCopyFixturesAbsent(path.join(staged.appDir, 'ui'));
   assert.equal(fs.existsSync(path.join(staged.appDir, 'profile')), false);
   assert.equal(fs.existsSync(path.join(staged.appDir, 'README.md')), true);
   assert.equal(fs.existsSync(path.join(staged.appDir, 'docs', 'QUICK_START.md')), true);
@@ -216,6 +249,12 @@ test('staging copies only manifest content and bundled runtime', () => {
   assert.doesNotMatch(fs.readFileSync(path.join(staged.appDir, 'package-lock.json'), 'utf8'), /playwright/i);
   assert.equal(fs.readFileSync(path.join(stageDir, 'runtime', 'ScoutRuntime.exe'), 'utf8'), 'runtime');
   assert.equal(fs.readFileSync(path.join(stageDir, 'runtime', 'typst.exe'), 'utf8'), 'typst-runtime');
+  const audit = auditPublicSourceStage({
+    root: ROOT,
+    stageDir,
+    markers: ['Synthetic', 'Nested', 'Private', 'Marker'].join(' '),
+  });
+  assert.equal(audit.status, 0);
 });
 
 test('checksums use SHA-256 and do not hash the manifest into itself', () => {

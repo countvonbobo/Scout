@@ -84,8 +84,18 @@ function normalise(relative) {
   return String(relative).replaceAll('\\', '/').replace(/^\.\/+/, '');
 }
 
+export function includeCopiedTreePath(relative) {
+  const value = normalise(relative);
+  const base = path.posix.basename(value).toLocaleLowerCase('en-US');
+  if (base === 'workspace.json' || base === '.env' || base.startsWith('.env.')) return false;
+  if (/\.(?:bak|backup|log(?:\.\d+)?|swp|swo|temp|tmp)$/i.test(base)) return false;
+  if (base.endsWith('~') || base.startsWith('.#')) return false;
+  return true;
+}
+
 export function includeReleasePath(relative) {
   const value = normalise(relative);
+  if (!includeCopiedTreePath(value)) return false;
   const lower = value.toLocaleLowerCase('en-US');
   const base = path.posix.basename(lower);
   const parts = lower.split('/').filter(Boolean);
@@ -100,7 +110,7 @@ export function includeReleasePath(relative) {
 
 export function includePublicSourcePath(relative) {
   const value = normalise(relative);
-  if (!includeReleasePath(value) && !/\.test\.mjs$/i.test(path.posix.basename(value))) return false;
+  if (!includeCopiedTreePath(value)) return false;
   if (value === 'output' || value.startsWith('output/')) return false;
   return true;
 }
@@ -177,7 +187,7 @@ export function stagePublicSource({
   for (const entry of PUBLIC_SOURCE_FILES) {
     const source = required(resolvedRoot, entry.source);
     const target = path.join(resolvedStage, entry.target);
-    if (entry.tree) copyTree(source, target, '', entry.publicFilter ? includePublicSourcePath : () => true);
+    if (entry.tree) copyTree(source, target, '', includePublicSourcePath);
     else {
       fs.mkdirSync(path.dirname(target), { recursive: true });
       fs.copyFileSync(source, target);
