@@ -1534,3 +1534,20 @@ record that exact reconciliation SHA and CI run without rewriting history.
   normally publish that attestation and require all seven jobs to pass again.
   Then begin the Gate A requirement-by-requirement evidence reconciliation;
   keep PR #82 draft and leave every protected issue and epic checkbox open.
+
+### Additive reconciliation attestation
+
+- The reconciliation above was committed and fast-forward published as exact
+  SHA `f258c4e87d63f2864175240f5e9e9b659fa75f8d`.
+- [CI run 30546232396](https://github.com/oliver-hitchings/Scout/actions/runs/30546232396)
+  passed all seven required jobs at that exact SHA, including complete Node,
+  release-stage and staged-dependency audit gates on all four platforms.
+- This attestation is the only change after that green reconciliation. The
+  commit containing this subsection is necessarily identified by Git rather
+  than self-referential file content; its exact published SHA and seven-job
+  result must be recorded in draft PR #82 before Gate A work starts.
+- Important 12 is complete as a candidate once that final attestation run is
+  green. The durable record then contains the rewrite bridge, resolvable
+  review, complete post-review behavior bridge, real publication state and
+  exact green reconciliation state without claiming a descendant was reviewed
+  by the historical Changes requested decision.
