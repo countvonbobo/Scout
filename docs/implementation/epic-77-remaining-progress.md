@@ -1300,6 +1300,44 @@ not acceptance of `d5ebca2`.
 - Exact next action: normally push this repair checkpoint, update draft PR
   #82, require all seven replacement CI jobs to pass, then implement Minor 3.
 
+## 2026-07-30 PR #82 review checkpoint 12
+
+- Important 11 replacement CI run
+  [30543397168](https://github.com/oliver-hitchings/Scout/actions/runs/30543397168)
+  passed all seven required jobs at exact pushed head
+  `872b06f5d5519cdf05261fd1bd91bbec46dbae82`: four Node, release-stage
+  and audit jobs plus three browser jobs. Windows Node/audit passed in 4m57s,
+  and the Intel macOS ranking regression also passed.
+- Minor 3 is implemented in
+  `136e4a10d834e8f4aa2ae9c7b16fe014613979c7`. The RED matrix proved that
+  otherwise benign parsed build and package records were rejected solely
+  because they used generic `output` or `payload` keys. The same false
+  positives appeared inside a selected staged dependency.
+- Bare `output` and `payload` are now private only when their owner or
+  ancestry establishes auth, provider, session, run, scan, execution,
+  journal or transcript provenance. Explicit raw payload keys and
+  `stdout`/`stderr` remain fail-closed, as do every independent credential,
+  prompt, transcript, run-state, advert, CV, marker and private-path rule.
+  Benign generic package metadata now remains auditable at the complete
+  staged-dependency boundary.
+- Verification for Minor 3:
+  - focused RED boundary: 3 failed;
+  - focused release build and audit suite: 41 passed;
+  - complete `npm test`: 1,135 discovered, 1,129 passed, 0 failed and 6
+    platform skips;
+  - complete cross-browser acceptance: 168 discovered, 157 passed, 0 failed
+    and 11 intentional Chromium-only skips;
+  - source release audit: 519 files scanned, passed;
+  - fresh marker-required release-stage audit: 1,582 files scanned, passed;
+  - `git diff --check`: passed.
+- Still open from review `4812913188`: Important 12 only. It remains a
+  rolling ledger repair and requires final old-to-rewritten history,
+  publication, CI and exact-head reconciliation after this checkpoint is
+  pushed and its seven jobs pass.
+- Exact next action: normally push this Minor 3 checkpoint, update draft PR
+  #82, require all seven CI jobs to pass, then perform Important 12's final
+  durable-ledger and exact-head reconciliation.
+
 ## 2026-07-30 PR #82 review checkpoint 11
 
 - Important 11 replacement CI run
