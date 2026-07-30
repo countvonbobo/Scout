@@ -42,6 +42,6 @@
 - [x] Run the complete focused domain, pipeline, server and browser matrix.
 - [x] Run complete Node and browser suites.
 - [x] Build and audit a fresh release stage.
-- [ ] Commit and fast-forward push normally.
+- [x] Commit and fast-forward push normally.
 - [ ] Require all seven CI jobs to pass.
 - [ ] Post exact-SHA evidence without changing draft or issue state.

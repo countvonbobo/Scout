@@ -1840,6 +1840,10 @@ record that exact reconciliation SHA and CI run without rewriting history.
 - Status: implementation and local verification complete on exact green Gate C
   base `95c8437039f622cee59e8627faf424584f94af13`; commit, push and protected CI
   remain required.
+- Gate D behavior commit:
+  `cb23a7de8fec267458cc472261d08528a9c29590`. The following documentation-only
+  evidence commit and protected CI head are recorded separately so this
+  immutable behavior SHA remains exact.
 - A strict private schema-v1 ledger keeps bounded job-only feedback separate
   from tracker status, pending proposals separate from active policy and
   immutable published versions separate from their reversible active pointer.
