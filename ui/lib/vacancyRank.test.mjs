@@ -8,16 +8,22 @@ function rule(value, strength = 'strong-preference') {
 
 function profile({
   primaryTitles = [], locations = [], workingPatterns = [], employmentTypes = [],
-  sectors = [], excludedResponsibilities = [], compensation = {},
+  responsibilities = [], skills = [], qualifications = [], industries = [], sectors = [],
+  seniority = [], employers = [], excludedResponsibilities = [], compensation = {},
+  selection,
 } = {}) {
   return {
     id: 'profile-ranked-fixture', version: 1,
-    target: { primaryTitles, locations, workingPatterns, employmentTypes, sectors },
+    target: {
+      primaryTitles, locations, workingPatterns, employmentTypes, responsibilities,
+      skills, qualifications, industries, sectors, seniority, employers,
+    },
     negative: { excludedTitles: [], excludedResponsibilities },
     compensation: {
       currency: null, period: 'year', minimum: null, minimumStrength: 'neutral', unknownPolicy: 'include',
       ...compensation,
     },
+    ...(selection ? { selection } : {}),
   };
 }
 
@@ -28,16 +34,111 @@ function field(value, provenance = 'explicit-source') {
 function vacancy({
   vacancyId, title, employer = 'Example Ltd', location = 'London', workingPattern = 'hybrid',
   employmentType = 'permanent', description = '', compensation = null, postedAt = '2026-07-20T00:00:00.000Z',
+  responsibilities = null, skills = null, qualifications = null, industry = null, seniority = null,
+  firstSeenAt = '2026-07-20T00:00:00.000Z', lastSeenAt = '2026-07-20T00:00:00.000Z',
   semanticEvidence = null,
 } = {}) {
   return {
-    vacancyId, canonicalUrl: `https://jobs.example/${vacancyId}`, description, postedAt,
+    vacancyId, canonicalUrl: `https://jobs.example/${vacancyId}`, description, postedAt, firstSeenAt, lastSeenAt,
     employer: field(employer), title: field(title), location: field(location),
     workingPattern: field(workingPattern), employmentType: field(employmentType),
+    responsibilities: field(responsibilities), skills: field(skills),
+    qualifications: field(qualifications), industry: field(industry), seniority: field(seniority),
     compensation: compensation === null ? field(null, 'unknown') : field(compensation),
     ...(semanticEvidence ? { semanticEvidence } : {}),
   };
 }
+
+test('ranking exposes and scores every required semantic dimension', () => {
+  const result = rankVacancies([vacancy({
+    vacancyId: 'complete',
+    title: 'Platform Engineer',
+    employer: 'Preferred Co',
+    location: 'Manchester',
+    workingPattern: 'hybrid',
+    responsibilities: ['Operate reliable services'],
+    skills: ['TypeScript'],
+    qualifications: ['Cloud certification'],
+    industry: 'Healthcare',
+    seniority: 'lead',
+    compensation: {
+      minimum: 70000, maximum: 80000, currency: 'GBP', period: 'year', rateType: 'salary',
+    },
+    postedAt: '2026-07-28T00:00:00.000Z',
+    lastSeenAt: '2026-07-30T00:00:00.000Z',
+  })], profile({
+    primaryTitles: [rule('Platform Engineer', 'mandatory')],
+    responsibilities: [rule('reliable services')],
+    skills: [rule('TypeScript')],
+    qualifications: [rule('Cloud certification')],
+    industries: [rule('Healthcare')],
+    locations: [rule('Manchester')],
+    workingPatterns: [rule('hybrid')],
+    seniority: [rule('lead')],
+    employers: [rule('Preferred Co')],
+    compensation: {
+      currency: 'GBP', period: 'year', rateType: 'salary', minimum: 65000,
+      minimumStrength: 'strong-preference', unknownPolicy: 'include',
+    },
+    selection: { breadth: 'balanced', relevanceThreshold: 45, exploration: 0.1 },
+  }))[0];
+
+  const required = [
+    'title', 'responsibilities', 'skills', 'qualifications', 'industry', 'location',
+    'workingPattern', 'compensation', 'seniority', 'employerPreference', 'freshness', 'novelty',
+  ];
+  assert.deepEqual(result.dimensions.filter(({ name }) => required.includes(name)).map(({ name }) => name), required);
+  for (const name of required) {
+    const dimension = result.dimensions.find((item) => item.name === name);
+    assert.ok(dimension.score > 0, name);
+    assert.equal(dimension.confidence, 1, name);
+    assert.ok(Array.isArray(dimension.evidence) && dimension.evidence.length > 0, name);
+  }
+  assert.deepEqual(
+    result.dimensions.find(({ name }) => name === 'responsibilities').evidence[0].vacancy,
+    { itemCount: 1, matchedValue: 'Operate reliable services' },
+  );
+});
+
+test('freshness uses persisted observation time and novelty uses only an exact history identity', () => {
+  const rankedProfile = profile({
+    primaryTitles: [rule('Engineer', 'mandatory')],
+    selection: { breadth: 'focused', relevanceThreshold: 45, exploration: 0 },
+  });
+  const ranked = rankVacancies([
+    vacancy({
+      vacancyId: 'seen-fresh',
+      title: 'Engineer',
+      postedAt: '2026-07-29T00:00:00.000Z',
+      lastSeenAt: '2026-07-30T00:00:00.000Z',
+    }),
+    vacancy({
+      vacancyId: 'unseen-stale',
+      title: 'Engineer',
+      postedAt: '2026-05-01T00:00:00.000Z',
+      lastSeenAt: '2026-07-30T00:00:00.000Z',
+    }),
+  ], rankedProfile, [{
+    vacancyId: 'seen-fresh',
+    status: 'rejected',
+    sourceUrl: 'https://jobs.example/seen-fresh',
+  }]);
+
+  const seen = ranked.find(({ vacancyId }) => vacancyId === 'seen-fresh');
+  const unseen = ranked.find(({ vacancyId }) => vacancyId === 'unseen-stale');
+  const seenNovelty = seen.dimensions.find(({ name }) => name === 'novelty');
+  const unseenNovelty = unseen.dimensions.find(({ name }) => name === 'novelty');
+  const seenFreshness = seen.dimensions.find(({ name }) => name === 'freshness');
+  const staleFreshness = unseen.dimensions.find(({ name }) => name === 'freshness');
+
+  assert.equal(seenNovelty.score, 0);
+  assert.equal(seenNovelty.evidence[0].comparison, 'seen-exact');
+  assert.ok(unseenNovelty.score > 0);
+  assert.equal(unseenNovelty.evidence[0].comparison, 'unseen');
+  assert.ok(seenFreshness.score > staleFreshness.score);
+  assert.equal(seenFreshness.evidence[0].referenceDate, '2026-07-30T00:00:00.000Z');
+  assert.equal(staleFreshness.evidence[0].referenceDate, '2026-07-30T00:00:00.000Z');
+});
 
 test('ranking is independent of source response order', () => {
   const rankedProfile = profile({ primaryTitles: [rule('Platform Engineer', 'mandatory')] });
@@ -88,7 +189,7 @@ test('unknown evidence lowers confidence and never receives a positive match sco
   const result = rankVacancies([vacancy({ vacancyId: 'unknown', title: 'Data Analyst', location: null })], profile({
     primaryTitles: [rule('Data Analyst', 'strong-preference')], locations: [rule('Manchester', 'strong-preference')],
   }))[0];
-  const location = result.dimensions.find((dimension) => dimension.name === 'locations');
+  const location = result.dimensions.find((dimension) => dimension.name === 'location');
 
   assert.equal(location.score, 0);
   assert.equal(location.confidence, 0);
@@ -99,12 +200,17 @@ test('unknown evidence lowers confidence and never receives a positive match sco
 test('compensation only matches comparable currency, period and rate types', () => {
   const rankedProfile = profile({ compensation: {
     currency: 'GBP', period: 'year', rateType: 'salary', minimum: 60000,
+    amountType: 'base', certainty: 'exact',
     minimumStrength: 'strong-preference', unknownPolicy: 'include',
   } });
   const jobs = [
     vacancy({ vacancyId: 'match', title: 'Engineer', compensation: { minimum: 65000, maximum: 70000, currency: 'GBP', period: 'year', rateType: 'salary' } }),
     vacancy({ vacancyId: 'foreign', title: 'Engineer', compensation: { minimum: 80000, maximum: 90000, currency: 'USD', period: 'year', rateType: 'salary' } }),
     vacancy({ vacancyId: 'hourly', title: 'Engineer', compensation: { minimum: 40, maximum: 45, currency: 'GBP', period: 'hour', rateType: 'salary' } }),
+    vacancy({ vacancyId: 'total', title: 'Engineer', compensation: {
+      minimum: 90000, maximum: 100000, currency: 'GBP', period: 'year', rateType: 'salary',
+      amountType: 'total', certainty: 'exact',
+    } }),
   ];
   const ranked = rankVacancies(jobs, rankedProfile);
 
@@ -147,7 +253,7 @@ test('unknown negative-rule evidence lowers confidence without receiving a penal
   const result = rankVacancies([vacancy({ vacancyId: 'unknown-negative', title: null })], profile({
     excludedResponsibilities: [rule('coding', 'strong-negative')],
   }))[0];
-  const negative = result.dimensions.find((dimension) => dimension.name === 'excludedResponsibilities');
+  const negative = result.dimensions.find((dimension) => dimension.name === 'responsibilities');
 
   assert.equal(negative.score, 0);
   assert.equal(negative.confidence, 0);
@@ -169,7 +275,7 @@ test('a semantic artifact with no description preserves unknown ranking evidence
   })], profile({
     sectors: [rule('public health', 'strong-preference')],
   }))[0];
-  const sector = result.dimensions.find((dimension) => dimension.name === 'sectors');
+  const sector = result.dimensions.find((dimension) => dimension.name === 'industry');
 
   assert.equal(sector.score, 0);
   assert.equal(sector.confidence, 0);

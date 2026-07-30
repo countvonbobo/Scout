@@ -12,7 +12,7 @@ import {
   softwareDeveloperProfile,
 } from './fixtures/searchProfiles.mjs';
 import { prepareRankedDiscovery } from './scanPipeline.mjs';
-import { migrateSearchProfile } from './searchProfile.mjs';
+import { migrateSearchProfile, publishSearchProfile } from './searchProfile.mjs';
 import { workspacePaths } from './workspace.mjs';
 
 const roots = [];
@@ -72,23 +72,65 @@ function profileCases() {
   });
 }
 
-function discover(jobs, profile) {
+function discover(jobs, profile, tracker = { opportunities: [] }) {
   return prepareRankedDiscovery({
     sources: { acceptance: { count: jobs.length, jobs } },
     profile,
-    tracker: { opportunities: [] },
+    tracker,
     runId: 'acceptance-run',
     limit: 60,
   });
 }
 
 test('one generic engine produces different justified rankings for six profiles', () => {
+  const requiredDimensions = [
+    'title', 'responsibilities', 'skills', 'qualifications', 'industry', 'location',
+    'workingPattern', 'compensation', 'seniority', 'employerPreference', 'freshness', 'novelty',
+  ];
   for (const fixture of profileCases()) {
     const result = discover(fixture.jobs, fixture.profile);
     assert.equal(result.ranked[0].vacancyId, fixture.expectedFirst);
     assert.ok(result.ranked.every((item) => item.dimensions.length > 0));
+    assert.deepEqual(
+      result.ranked[0].dimensions.filter(({ name }) => requiredDimensions.includes(name)).map(({ name }) => name),
+      requiredDimensions,
+    );
     assert.equal(result.funnel.ranked, result.funnel.eligible);
   }
+});
+
+test('ranked discovery applies novelty only to an exact prior vacancy identity', () => {
+  const base = softwareDeveloperProfile();
+  const profile = publishSearchProfile({
+    version: 1,
+    status: 'draft',
+    target: structuredClone(base.target),
+    negative: structuredClone(base.negative),
+    compensation: structuredClone(base.compensation),
+    selection: { breadth: 'broad', relevanceThreshold: 0, exploration: 0.1 },
+  }, { publishedAt: '2026-07-30T00:00:00.000Z' });
+  const result = discover([
+    sourceJob({ vacancyId: 'seen-role', title: 'Software Developer', arrangement: 'remote' }),
+    sourceJob({ vacancyId: 'unseen-role', title: 'Software Developer', arrangement: 'remote' }),
+  ], profile, {
+    opportunities: [{
+      id: 'unrelated-human-tracker-slug',
+      vacancyId: 'https://jobs.example.test/seen-role',
+      status: 'rejected',
+    }],
+  });
+
+  assert.equal(result.ranked[0].vacancyId, 'https://jobs.example.test/unseen-role');
+  assert.equal(
+    result.ranked.find(({ vacancyId }) => vacancyId.endsWith('/seen-role'))
+      .dimensions.find(({ name }) => name === 'novelty').evidence[0].comparison,
+    'seen-exact',
+  );
+  assert.equal(
+    result.ranked.find(({ vacancyId }) => vacancyId.endsWith('/unseen-role'))
+      .dimensions.find(({ name }) => name === 'novelty').evidence[0].comparison,
+    'unseen',
+  );
 });
 
 test('published unknown-compensation policies change end-to-end discovery decisions', () => {
