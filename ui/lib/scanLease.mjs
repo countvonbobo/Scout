@@ -507,13 +507,25 @@ function guardAge(guard, metadata, now, fileSystem = fs) {
   }
 }
 
-function staleAndRecoverable(guard, metadata, now, fileSystem = fs) {
+function sameGuardMetadata(left, right) {
+  return Boolean(left && right)
+    && left.schemaVersion === right.schemaVersion
+    && left.guardId === right.guardId
+    && left.acquiredAt === right.acquiredAt
+    && sameOwner(left.owner, right.owner);
+}
+
+function staleAndRecoverable(guard, metadata, now, options) {
+  if (!metadata) return false;
+  const fileSystem = options.fileSystem;
+  if (guardAge(guard, metadata, now, fileSystem) < GUARD_STALE_AFTER_MS) return false;
+  const live = typeof options.hooks.ownerIsLive === 'function'
+    ? options.hooks.ownerIsLive(metadata.owner)
+    : ownerIsLive(metadata.owner);
   // Missing or malformed metadata cannot prove who owns the path. Preserve it
   // rather than allowing a delayed previous-version initializer to be moved
   // and later write through a successor's canonical guard.
-  return Boolean(metadata)
-    && guardAge(guard, metadata, now, fileSystem) >= GUARD_STALE_AFTER_MS
-    && !ownerIsLive(metadata.owner);
+  return !live;
 }
 
 function quarantinePath(guard, now) {
@@ -621,7 +633,7 @@ function recoveryArbitrationState(root, options) {
   const claim = recoveryClaimDirectory(root);
   if (!fileSystem.existsSync(claim)) return 'none';
   const metadata = readGuardMetadata(claim, fileSystem);
-  if (!staleAndRecoverable(claim, metadata, wallMilliseconds(options), fileSystem)) return 'wait';
+  if (!staleAndRecoverable(claim, metadata, wallMilliseconds(options), options)) return 'wait';
   if (metadata) {
     if (cleanupRecoveryArbitration(root, metadata.guardId, options)) return 'retry';
     return 'wait';
@@ -710,7 +722,7 @@ function withRecoveryArbitration(root, owner, options, action) {
   return { acquired: true, result };
 }
 
-function recoverClaims(root, options) {
+function recoverClaims(root, options, revalidatedMetadata = null) {
   const fileSystem = options.fileSystem;
   const guard = guardDirectory(root);
   const recovery = recoveryDirectory(root);
@@ -718,28 +730,38 @@ function recoverClaims(root, options) {
 
   if (!fileSystem.existsSync(recovery)) return 'none';
   const metadata = readGuardMetadata(recovery, fileSystem);
+  const revalidated = sameGuardMetadata(metadata, revalidatedMetadata);
   if (fileSystem.existsSync(guard)) {
     // A canonical guard may have been created in the instant after a stale
     // observer moved a live successor here. Never discard that moved guard:
     // the new canonical creator must notice the recovery claim and withdraw.
-    if (staleAndRecoverable(recovery, metadata, now, fileSystem)) {
-      try { fileSystem.renameSync(recovery, quarantinePath(guard, now)); } catch {}
-      return 'retry';
+    if (revalidated || staleAndRecoverable(recovery, metadata, now, options)) {
+      try {
+        fileSystem.renameSync(recovery, quarantinePath(guard, now));
+        return 'retry';
+      } catch (error) {
+        if (error?.code === 'ENOENT') return 'retry';
+        if (!['EEXIST', 'EPERM', 'EACCES'].includes(error?.code)) throw error;
+      }
+      return 'wait';
     }
     return 'wait';
   }
-  if (staleAndRecoverable(recovery, metadata, now, fileSystem)) {
+  if (revalidated || staleAndRecoverable(recovery, metadata, now, options)) {
     try {
       fileSystem.renameSync(recovery, quarantinePath(guard, now));
+      return 'retry';
     } catch (error) {
-      if (!['ENOENT', 'EEXIST', 'EPERM', 'EACCES'].includes(error?.code)) throw error;
+      if (error?.code === 'ENOENT') return 'retry';
+      if (!['EEXIST', 'EPERM', 'EACCES'].includes(error?.code)) throw error;
     }
-    return 'retry';
+    return 'wait';
   }
   try {
     fileSystem.renameSync(recovery, guard);
   } catch (error) {
-    if (['EEXIST', 'ENOENT', 'EPERM', 'EACCES'].includes(error?.code)) return 'retry';
+    if (error?.code === 'ENOENT') return 'retry';
+    if (['EEXIST', 'EPERM', 'EACCES'].includes(error?.code)) return 'wait';
     throw error;
   }
   return 'wait';
@@ -755,12 +777,13 @@ function withGuard(root, owner, options, action, behavior = {}) {
     cleanupOwnedGuard(root, options.cleanupPending.guardId, options);
     delete options.cleanupPending;
   }
-  const deadline = performance.now() + options.guardAcquireTimeoutMs;
+  const deadline = options.monotonicNow() + options.guardAcquireTimeoutMs;
   const guardId = randomUUID();
   const acquiredAt = new Date(wallMilliseconds(options)).toISOString();
   const candidate = guardCandidateDirectory(root, guardId);
   let candidateReady = false;
   let guardAcquired = false;
+  let revalidatedRecoveryMetadata = null;
   const prepareCandidate = () => {
     if (candidateReady) return;
     fileSystem.mkdirSync(candidate);
@@ -778,15 +801,18 @@ function withGuard(root, owner, options, action, behavior = {}) {
   try {
     while (true) {
       const arbitration = recoveryArbitrationState(root, options);
-      if (arbitration !== 'none') {
-        const remaining = deadline - performance.now();
+      if (arbitration === 'retry') continue;
+      if (arbitration === 'wait') {
+        const remaining = deadline - options.monotonicNow();
         if (remaining <= 0) throw new GuardBusyError();
         Atomics.wait(sleepArray, 0, 0, Math.min(10, remaining));
         continue;
       }
-      const claim = recoverClaims(root, options);
-      if (claim === 'wait' || claim === 'retry') {
-        const remaining = deadline - performance.now();
+      const claim = recoverClaims(root, options, revalidatedRecoveryMetadata);
+      if (!fileSystem.existsSync(recovery)) revalidatedRecoveryMetadata = null;
+      if (claim === 'retry') continue;
+      if (claim === 'wait') {
+        const remaining = deadline - options.monotonicNow();
         if (remaining <= 0) throw new GuardBusyError();
         Atomics.wait(sleepArray, 0, 0, Math.min(10, remaining));
         continue;
@@ -802,12 +828,12 @@ function withGuard(root, owner, options, action, behavior = {}) {
       } catch (error) {
         if (!['EEXIST', 'ENOTEMPTY', 'EPERM', 'EACCES'].includes(error?.code)) throw error;
         const metadata = readGuardMetadata(guard, fileSystem);
-        if (staleAndRecoverable(guard, metadata, wallMilliseconds(options), fileSystem)) {
+        if (staleAndRecoverable(guard, metadata, wallMilliseconds(options), options)) {
           options.hooks.afterGuardObservation?.();
           const recoveryAttempt = withRecoveryArbitration(root, owner, options, () => {
             const currentMetadata = readGuardMetadata(guard, fileSystem);
             if (!staleAndRecoverable(
-              guard, currentMetadata, wallMilliseconds(options), fileSystem,
+              guard, currentMetadata, wallMilliseconds(options), options,
             )) return false;
             try {
               fileSystem.renameSync(guard, recovery);
@@ -816,13 +842,14 @@ function withGuard(root, owner, options, action, behavior = {}) {
               throw renameError;
             }
             options.hooks.afterGuardRecoveryRename?.();
+            revalidatedRecoveryMetadata = currentMetadata;
             return true;
           });
           if (recoveryAttempt.acquired && recoveryAttempt.result) {
             continue;
           }
         }
-        const remaining = deadline - performance.now();
+        const remaining = deadline - options.monotonicNow();
         if (remaining <= 0) throw new GuardBusyError();
         Atomics.wait(sleepArray, 0, 0, Math.min(10, remaining));
         continue;
@@ -841,7 +868,7 @@ function withGuard(root, owner, options, action, behavior = {}) {
           scheduleBackgroundCleanup(root, guardId, options, 'guard');
           throw error;
         }
-        const remaining = deadline - performance.now();
+        const remaining = deadline - options.monotonicNow();
         if (remaining <= 0) throw new GuardBusyError();
         Atomics.wait(sleepArray, 0, 0, Math.min(10, remaining));
         continue;

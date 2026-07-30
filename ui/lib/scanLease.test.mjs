@@ -170,6 +170,159 @@ test('a reused PID with a different process-start identity cannot preserve a dea
   assert.equal(quarantines.length, 1);
 });
 
+test('reused-PID cleanup gets one acquisition pass after observations exhaust the original guard budget', () => {
+  const root = temp();
+  const guard = path.join(root, '.scout', 'scan-lease.guard');
+  const wall = Date.parse('2026-07-30T09:00:00.000Z');
+  const actual = currentLeaseOwner();
+  fs.mkdirSync(guard, { recursive: true });
+  fs.writeFileSync(path.join(guard, 'guard-observation-budget.json'), `${JSON.stringify({
+    schemaVersion: 1,
+    guardId: 'guard-observation-budget',
+    owner: { ...actual, processStart: 'windows-638895000000000001' },
+    acquiredAt: new Date(wall - 31_000).toISOString(),
+  })}\n`, 'utf8');
+
+  let monotonic = 0;
+  let observations = 0;
+  const lease = acquireScanLease(root, actual, operation('run-after-observation-budget'), {
+    wallNow: () => wall,
+    monotonicNow: () => monotonic,
+    guardAcquireTimeoutMs: 2_000,
+    _testHooks: {
+      ownerIsLive() {
+        observations += 1;
+        monotonic += 1_100;
+        return false;
+      },
+    },
+  });
+
+  assert.equal(lease?.runId, 'run-after-observation-budget');
+  assert.equal(observations, 2);
+  assert.equal(
+    fs.readdirSync(path.join(root, '.scout'))
+      .filter((name) => name.startsWith('scan-lease.guard.quarantine.')).length,
+    1,
+  );
+  releaseScanLease(lease);
+});
+
+test('expired guard budget still waits when stale recovery cleanup makes no progress', () => {
+  const root = temp();
+  const guard = path.join(root, '.scout', 'scan-lease.guard');
+  const recovery = `${guard}.recovery`;
+  const wall = Date.parse('2026-07-30T09:00:00.000Z');
+  const actual = currentLeaseOwner();
+  fs.mkdirSync(guard, { recursive: true });
+  fs.writeFileSync(path.join(guard, 'guard-no-cleanup-progress.json'), `${JSON.stringify({
+    schemaVersion: 1,
+    guardId: 'guard-no-cleanup-progress',
+    owner: { ...actual, processStart: 'windows-638895000000000002' },
+    acquiredAt: new Date(wall - 31_000).toISOString(),
+  })}\n`, 'utf8');
+  const fileSystem = new Proxy(fs, {
+    get(target, property) {
+      if (property === 'renameSync') return (source, destination) => {
+        if (path.resolve(String(source)) === path.resolve(recovery)
+          && String(destination).includes('.quarantine.')) {
+          throw Object.assign(new Error('injected recovery quarantine contention'), { code: 'EPERM' });
+        }
+        return target.renameSync(source, destination);
+      };
+      const value = target[property];
+      return typeof value === 'function' ? value.bind(target) : value;
+    },
+  });
+  let monotonic = 0;
+  let observations = 0;
+
+  const lease = acquireScanLease(root, actual, operation('run-without-cleanup-progress'), {
+    wallNow: () => wall,
+    monotonicNow: () => monotonic,
+    guardAcquireTimeoutMs: 2_000,
+    fileSystem,
+    _testHooks: {
+      ownerIsLive() {
+        observations += 1;
+        monotonic += 1_100;
+        return false;
+      },
+    },
+  });
+
+  assert.equal(lease, null);
+  assert.equal(observations, 2);
+  assert.equal(fs.existsSync(recovery), true);
+  assert.equal(fs.existsSync(path.join(root, '.scout', 'scan-lease.json')), false);
+});
+
+test('unverifiable live owner remains fail-closed after the guard budget expires', () => {
+  const root = temp();
+  const guard = path.join(root, '.scout', 'scan-lease.guard');
+  const wall = Date.parse('2026-07-30T09:00:00.000Z');
+  const actual = currentLeaseOwner();
+  fs.mkdirSync(guard, { recursive: true });
+  fs.writeFileSync(path.join(guard, 'guard-unverifiable-owner.json'), `${JSON.stringify({
+    schemaVersion: 1,
+    guardId: 'guard-unverifiable-owner',
+    owner: { ...actual, processStart: 'windows-638895000000000003' },
+    acquiredAt: new Date(wall - 31_000).toISOString(),
+  })}\n`, 'utf8');
+  let monotonic = 0;
+  let observations = 0;
+
+  const lease = acquireScanLease(root, actual, operation('run-unverifiable-owner'), {
+    wallNow: () => wall,
+    monotonicNow: () => monotonic,
+    guardAcquireTimeoutMs: 2_000,
+    _testHooks: {
+      ownerIsLive() {
+        observations += 1;
+        monotonic += 2_100;
+        return true;
+      },
+    },
+  });
+
+  assert.equal(lease, null);
+  assert.equal(observations, 1);
+  assert.equal(fs.existsSync(guard), true);
+  assert.equal(
+    fs.readdirSync(path.join(root, '.scout'))
+      .some((name) => name.startsWith('scan-lease.guard.quarantine.')),
+    false,
+  );
+});
+
+test('Windows integration recovers a stale guard after real reused-PID observation', {
+  skip: process.platform !== 'win32' ? 'Windows-only process observation' : false,
+}, () => {
+  const root = temp();
+  const guard = path.join(root, '.scout', 'scan-lease.guard');
+  const actual = currentLeaseOwner();
+  const changedStart = actual.processStart.startsWith('windows-fallback-')
+    ? `${actual.processStart.slice(0, -1)}${actual.processStart.endsWith('0') ? '1' : '0'}`
+    : `${actual.processStart}1`;
+  fs.mkdirSync(guard, { recursive: true });
+  fs.writeFileSync(path.join(guard, 'guard-windows-reused-pid.json'), `${JSON.stringify({
+    schemaVersion: 1,
+    guardId: 'guard-windows-reused-pid',
+    owner: { ...actual, processStart: changedStart },
+    acquiredAt: new Date(Date.now() - 31_000).toISOString(),
+  })}\n`, 'utf8');
+
+  const lease = acquireScanLease(root, actual, operation('run-windows-reused-pid'));
+
+  assert.equal(lease?.runId, 'run-windows-reused-pid');
+  assert.equal(
+    fs.readdirSync(path.join(root, '.scout'))
+      .filter((name) => name.startsWith('scan-lease.guard.quarantine.')).length,
+    1,
+  );
+  releaseScanLease(lease);
+});
+
 test('a dead guard older than 30 seconds is atomically quarantined', async () => {
   const root = temp();
   const guard = path.join(root, '.scout', 'scan-lease.guard');
