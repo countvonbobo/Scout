@@ -198,15 +198,31 @@ export function selectVacancies(ranked, {
   const belowCutoff = ordered.filter((vacancy) => scoreOf(vacancy) < Number(threshold));
   const deterministic = chooseDeterministic(eligible, boundedLimit);
   const selected = explore(deterministic.selected, eligible, exploration, seed, deterministic.constraints);
-  const selectedIds = new Set(deterministic.selected.map(vacancyId));
+  const deterministicIds = new Set(deterministic.selected.map(vacancyId));
+  const selectedIds = new Set(selected.map(vacancyId));
+  const topBudgetIds = new Set(eligible.slice(0, boundedLimit).map(vacancyId));
+  const notSelected = ordered.filter((vacancy) => !selectedIds.has(vacancyId(vacancy)))
+    .map((vacancy) => {
+      const id = vacancyId(vacancy);
+      const reason = scoreOf(vacancy) < Number(threshold)
+        ? 'below-relevance-threshold'
+        : deterministicIds.has(id)
+          ? 'exploration-replacement'
+          : topBudgetIds.has(id)
+            ? 'diversity-limit'
+            : 'assessment-capacity';
+      return { vacancyId: id, score: scoreOf(vacancy), reason };
+    });
   return {
     selected,
     belowCutoff,
     reasons: selected.map((vacancy) => ({
       vacancyId: vacancyId(vacancy), score: scoreOf(vacancy),
-      reason: selectedIds.has(vacancyId(vacancy)) ? 'deterministic-rank' : 'exploration',
+      reason: deterministicIds.has(vacancyId(vacancy)) ? 'deterministic-rank' : 'exploration',
     })),
+    notSelected,
     constraintsRelaxed: deterministic.constraintsRelaxed,
     seed,
+    threshold: Number(threshold),
   };
 }

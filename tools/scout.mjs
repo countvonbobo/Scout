@@ -123,7 +123,7 @@ function scanCompatibility({
     journalSchemaVersion: 1,
     artifactSchemaVersion: RUN_ARTIFACT_SCHEMA_VERSION,
     stageArtifactSchemaVersion: PIPELINE_STAGE_ARTIFACT_SCHEMA_VERSION,
-    pipelineVersion: 'scan-pipeline-v3-semantic-stage-artifacts',
+    pipelineVersion: 'scan-pipeline-v4-reconciled-coverage',
     rankingVersion: `ranked-discovery-v1-${scanDigest(tracker).slice(0, 32)}`,
     promptVersion: `assessment-prompt-v2-${scanDigest(contextDigests).slice(0, 32)}`,
     assessmentSchemaVersion: 2,
@@ -709,6 +709,9 @@ export async function runScanWith(root, provider, mode, {
           verificationScoped,
           funnel,
           selection,
+          ranked: discovery?.ranked || [],
+          selectionDecision: discovery?.selection || null,
+          runId: run.runId,
           discoveryEngine,
           exclusions: discovery?.exclusions || [],
           profileId: publishedProfile?.id || publishedAtStart?.id || null,
@@ -756,7 +759,7 @@ export async function runScanWith(root, provider, mode, {
               url: candidate.url,
               vacancyId: candidate.vacancyId,
               preRankScore: candidate.preRankScore,
-              reason: discovery.selection.reasons.find((item) => item.vacancyId === candidate.vacancyId)?.reason || 'deterministic-rank',
+              reason: discovery.selection.reasons.find((item) => item.vacancyId === candidate.vacancyId)?.reason || 'liveness-replacement',
             }));
             funnel = { ...discovery.funnel, selected: candidates.length };
           } else {
@@ -862,7 +865,12 @@ export async function runScanWith(root, provider, mode, {
             provider, mode, sources: collected.sources, queries: collected.queries, candidates, assessmentResult,
             policy: config.triage, startedAt,
             assessmentFailures,
-            dropped, hardExcluded, closedAdverts, exclusions: discovery?.exclusions || [], livenessSummary, verificationScoped, funnel, selection, discoveryEngine, profileId: publishedProfile?.id || null,
+            dropped, hardExcluded, closedAdverts, exclusions: discovery?.exclusions || [],
+            livenessSummary, verificationScoped, funnel, selection,
+            ranked: discovery?.ranked || [],
+            selectionDecision: discovery?.selection || null,
+            runId: run.runId,
+            discoveryEngine, profileId: publishedProfile?.id || null,
             staleInboxEntries, inboxRechecked,
           }, { run, lease, hooks: mutationHooks });
           result = { ok: true, status: artifacts.run.degraded ? 'degraded' : candidates.length ? 'completed' : 'healthy-empty', scan: artifacts.run, usage };

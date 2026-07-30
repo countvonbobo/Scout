@@ -1239,10 +1239,42 @@ test('latest scan API exposes only bounded review fields and scan health omits r
 test('latest scan API exposes reconciled metrics and bounded explanations only', async () => {
   fs.mkdirSync(path.join(testWorkspace, 'data'), { recursive: true });
   fs.writeFileSync(path.join(testWorkspace, 'data', 'scan-runs.jsonl'), `${JSON.stringify({
-    schemaVersion: 4, timestamp: '2026-07-26T10:00:00.000Z', agent: 'codex', mode: 'primary', errors: [],
+    schemaVersion: 5, timestamp: '2026-07-26T10:00:00.000Z', agent: 'codex', mode: 'primary', errors: [],
     profile_id: 'profile-123456789abc', discovery_engine: 'ranked-discovery',
-    funnel: { sourceRecords: 2532, sourceErrors: 2, failedSourceRecords: 3, uniqueVacancies: 120, deterministicallyExcluded: 40, eligible: 80, ranked: 80, selected: 60, assessed: 59, assessmentFailed: 1 },
-    explanations: [{ vacancy_id: 'vacancy-1', pre_rank: { score: 82, positive: [{ code: 'title', score: 4, raw: 'private payload' }], negative: [{ code: 'negative', score: -1, path: 'C:\\private' }] }, selection_reason: 'score-band', assessment_status: 'assessed', source: 'ats', sourceUrl: 'https://example.test/job', raw: 'private payload', path: 'C:\\private' }],
+    funnel: {
+      sourceRecords: 2532, sourceErrors: 2, failedSourceRecords: 3, parsed: 2532,
+      normalised: 2529, duplicateObservations: 2409, uniqueVacancies: 120,
+      deterministicallyExcluded: 40, eligible: 80, ranked: 80, aboveThreshold: 60,
+      selected: 60, assessed: 59, assessmentFailed: 1,
+      bySource: {
+        ats: {
+          count: 2532, failedRecords: 3, sourceErrors: 2, sourceRecords: 2532,
+          parsed: 2532, normalised: 2529, duplicateObservations: 2409,
+          uniqueVacancies: 120, deterministicallyExcluded: 40, eligible: 80,
+          ranked: 80, aboveThreshold: 60, selected: 60, assessed: 59, assessmentFailed: 1,
+        },
+      },
+    },
+    coverage: {
+      schemaVersion: 1,
+      source: [{ value: 'ats', found: 120, ranked: 80, selected: 60, excluded: 40, assessed: 59, assessmentFailed: 1 }],
+      employer: [{ value: 'Acme', found: 1, ranked: 1, selected: 0, excluded: 0, assessed: 0, assessmentFailed: 0 }],
+      lane: [], roleFamily: [], location: [],
+      provider: [{ value: 'codex', found: 120, ranked: 80, selected: 60, excluded: 40, assessed: 59, assessmentFailed: 1 }],
+      run: [{ value: 'run-123', found: 120, ranked: 80, selected: 60, excluded: 40, assessed: 59, assessmentFailed: 1 }],
+      date: [{ value: '2026-07-26', found: 120, ranked: 80, selected: 60, excluded: 40, assessed: 59, assessmentFailed: 1 }],
+      failureReasons: [{ value: 'diversity-limit', count: 20 }],
+    },
+    explanations: [{
+      vacancy_id: 'vacancy-1', company: 'Acme', role: 'Platform Engineer',
+      dimensions: { source: 'ats', employer: 'Acme', lane: 'primary', role_family: 'engineering', location: 'London' },
+      stages: { found: true, ranked: true, selected: false, excluded: false, assessed: false },
+      above_threshold: true,
+      pre_rank: { score: 82, positive: [{ code: 'title', score: 4, raw: 'private payload' }], negative: [{ code: 'negative', score: -1, path: 'C:\\private' }] },
+      reason_code: 'diversity-limit', selection_reason: null, assessment_status: 'not-selected',
+      source: 'ats', sourceUrl: 'https://example.test/job?private=query#fragment',
+      raw: 'private payload', path: 'C:\\private',
+    }],
   })}\n`);
   const response = await request({ path: '/api/scans/latest' });
   assert.equal(response.status, 200);
@@ -1250,16 +1282,20 @@ test('latest scan API exposes reconciled metrics and bounded explanations only',
   const latest = JSON.parse(response.text).scan;
   assert.equal(latest.funnel.sourceErrors, 2);
   assert.equal(latest.funnel.failedSourceRecords, 3);
+  assert.equal(latest.funnel.bySource.ats.uniqueVacancies, 120);
+  assert.equal(latest.coverage.source[0].found, 120);
+  assert.equal(latest.explanations[0].reasonCode, 'diversity-limit');
+  assert.equal(latest.explanations[0].sourceUrl, 'https://example.test/job');
   assert.doesNotMatch(response.text, /private payload|C:\\private/);
 });
 
-test('latest scan API bounds source URLs in persisted explanation records', async () => {
+test('latest scan API strips oversized query data from persisted explanation URLs', async () => {
   fs.mkdirSync(path.join(testWorkspace, 'data'), { recursive: true });
   const oversizedUrl = `https://example.test/job?${'x'.repeat(5000)}`;
   fs.writeFileSync(path.join(testWorkspace, 'data', 'scan-runs.jsonl'), `${JSON.stringify({ timestamp: '2026-07-26T10:00:00.000Z', explanations: [{ vacancy_id: 'vacancy-1', pre_rank: {}, assessment_status: 'assessed', source: 'ats', sourceUrl: oversizedUrl }] })}\n`);
   const response = await request({ path: '/api/scans/latest' });
   const { scan } = JSON.parse(response.text);
-  assert.equal(scan.explanations[0].sourceUrl, null);
+  assert.equal(scan.explanations[0].sourceUrl, 'https://example.test/job');
 });
 
 test('run and queue APIs expose journal-backed state through privacy-safe summaries', async () => {

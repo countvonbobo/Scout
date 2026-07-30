@@ -28,6 +28,9 @@ const FUNNEL_COUNTERS = [
   'assessmentFailed', 'added', 'updated', 'unchanged', 'closed',
 ];
 const SELECTION_COUNTERS = ['selected', 'assessed', 'assessmentFailed'];
+const COVERAGE_COUNTERS = ['found', 'ranked', 'selected', 'excluded', 'assessed', 'assessmentFailed'];
+const COVERAGE_DIMENSIONS = ['source', 'employer', 'lane', 'roleFamily', 'location', 'provider', 'run', 'date'];
+const MAX_EXPLANATIONS = 10_000;
 
 function boundedLabel(value, maximum) {
   const text = String(value || '').replace(/[\r\n\t]+/g, ' ').replace(/\s{2,}/g, ' ').trim();
@@ -66,10 +69,34 @@ function safeFunnel(value) {
         count: number(counts?.count),
         failedRecords: number(counts?.failedRecords),
         sourceErrors: number(counts?.sourceErrors),
+        ...Object.fromEntries(FUNNEL_COUNTERS
+          .filter((key) => !['sourceErrors', 'failedSourceRecords'].includes(key) && counts?.[key] !== undefined)
+          .map((key) => [key, number(counts[key])])),
       },
     ]));
   }
   return projected;
+}
+
+function safeCoverage(value) {
+  return {
+    schemaVersion: number(value?.schemaVersion, 1),
+    ...Object.fromEntries(COVERAGE_DIMENSIONS.map((dimension) => [
+      dimension,
+      (value?.[dimension] || []).map((row) => ({
+        value: dimension === 'source' || dimension === 'provider'
+          ? code(row?.value, 'unknown')
+          : dimension === 'run'
+            ? identifier(row?.value) || 'unknown-run'
+            : boundedLabel(row?.value, 160) || 'unknown',
+        ...Object.fromEntries(COVERAGE_COUNTERS.map((counter) => [counter, number(row?.[counter])])),
+      })),
+    ])),
+    failureReasons: (value?.failureReasons || []).map((row) => ({
+      value: code(row?.value, 'unknown-failure'),
+      count: number(row?.count),
+    })),
+  };
 }
 
 function safeSelectionSummary(value) {
@@ -195,6 +222,9 @@ export function trackerMergeRecipe(currentContent, intendedContent) {
 }
 
 function safeRunRecord(record) {
+  if ((record?.explanations || []).length > MAX_EXPLANATIONS) {
+    throw new Error(`scan explanation capacity exceeded (${record.explanations.length} > ${MAX_EXPLANATIONS})`);
+  }
   const sourceHealth = Object.fromEntries(Object.entries(record?.source_health || {}).map(([name, value]) => [
     code(name, 'source'),
     {
@@ -208,7 +238,7 @@ function safeRunRecord(record) {
     },
   ]));
   return {
-    schemaVersion: number(record?.schemaVersion, 4),
+    schemaVersion: number(record?.schemaVersion, 5),
     timestamp: isoTimestamp(record?.timestamp),
     started_at: isoTimestamp(record?.started_at),
     agent: code(record?.agent, 'unknown'),
@@ -235,6 +265,7 @@ function safeRunRecord(record) {
     discovery_engine: code(record?.discovery_engine, 'legacy-discovery'),
     ...(record?.funnel ? { funnel: safeFunnel(record.funnel) } : {}),
     ...(record?.selection_summary ? { selection_summary: safeSelectionSummary(record.selection_summary) } : {}),
+    ...(record?.coverage ? { coverage: safeCoverage(record.coverage) } : {}),
     assessment_failures: (record?.assessment_failures || []).map((failure) => ({
       jobId: identifier(failure?.jobId),
       code: code(failure?.code, 'assessment-failed'),
@@ -243,6 +274,23 @@ function safeRunRecord(record) {
     })),
     explanations: (record?.explanations || []).map((item) => ({
       vacancy_id: identifier(item?.vacancy_id),
+      company: boundedLabel(item?.company, 120),
+      role: boundedLabel(item?.role, 160),
+      dimensions: {
+        source: code(item?.dimensions?.source, 'unknown-source'),
+        employer: boundedLabel(item?.dimensions?.employer, 120) || 'unknown-employer',
+        lane: boundedLabel(item?.dimensions?.lane, 120) || 'unknown-lane',
+        role_family: boundedLabel(item?.dimensions?.role_family, 120) || 'unknown-role-family',
+        location: boundedLabel(item?.dimensions?.location, 120) || 'unknown-location',
+      },
+      stages: {
+        found: Boolean(item?.stages?.found),
+        ranked: Boolean(item?.stages?.ranked),
+        selected: Boolean(item?.stages?.selected),
+        excluded: Boolean(item?.stages?.excluded),
+        assessed: Boolean(item?.stages?.assessed),
+      },
+      above_threshold: Boolean(item?.above_threshold),
       pre_rank: {
         score: Number.isFinite(Number(item?.pre_rank?.score)) ? Number(item.pre_rank.score) : null,
         positive: (item?.pre_rank?.positive || []).map((value) => code(value?.code ?? value)).filter(Boolean).slice(0, 3),
@@ -250,10 +298,13 @@ function safeRunRecord(record) {
       },
       selection_reason: code(item?.selection_reason),
       deterministic_exclusion: code(item?.deterministic_exclusion),
+      deterministic_exclusions: (item?.deterministic_exclusions || []).map((value) => code(value)).filter(Boolean).slice(0, 8),
+      reason_code: code(item?.reason_code, 'unknown'),
       assessment_status: code(item?.assessment_status, 'unknown'),
+      outcome: code(item?.outcome),
       source: code(item?.source),
       sourceUrl: canonicalUrl(item?.sourceUrl),
-    })).slice(0, 180),
+    })),
     reviewed: (record?.reviewed || []).map((item) => ({
       vacancyId: identifier(item?.vacancyId),
       company: boundedLabel(item?.company, 120),

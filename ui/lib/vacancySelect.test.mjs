@@ -157,6 +157,45 @@ test('seeded exploration only replaces deterministic above-threshold selections'
   assert.ok(exploratory.selected.every((job) => job.preRankScore >= 40));
 });
 
+test('records one stable reason for every ranked vacancy not selected for assessment', () => {
+  const jobs = [
+    ...Array.from({ length: 8 }, (_, index) => ranked({
+      vacancyId: `dominant-${index}`, score: 100 - index,
+      employerId: 'dominant', source: 'ats', laneId: 'lane-a',
+    })),
+    ...Array.from({ length: 7 }, (_, index) => ranked({
+      vacancyId: `alternative-${index}`, score: 90 - index,
+      employerId: `alternative-${index}`, source: index % 2 ? 'board' : 'ats',
+      laneId: index % 3 ? 'lane-b' : 'lane-c',
+      roleFamily: index % 2 ? 'operations' : 'research',
+      location: index % 2 ? 'Manchester' : 'Bristol',
+    })),
+    ranked({ vacancyId: 'below-threshold', score: 39 }),
+  ];
+  const result = selectVacancies(jobs, {
+    limit: 10, threshold: 40, exploration: 2, seed: 'reason-audit',
+  });
+
+  assert.equal(result.selected.length + result.notSelected.length, jobs.length);
+  assert.deepEqual(
+    [...result.selected.map(({ vacancyId }) => vacancyId), ...result.notSelected.map(({ vacancyId }) => vacancyId)].sort(),
+    jobs.map(({ vacancyId }) => vacancyId).sort(),
+  );
+  assert.equal(result.notSelected.find(({ vacancyId }) => vacancyId === 'below-threshold').reason, 'below-relevance-threshold');
+  assert.ok(result.notSelected.some(({ reason }) => reason === 'diversity-limit'));
+  assert.ok(result.notSelected.some(({ reason }) => reason === 'exploration-replacement'));
+  assert.ok(result.notSelected.every(({ vacancyId, score, reason }) => (
+    vacancyId && Number.isFinite(score) && [
+      'below-relevance-threshold', 'diversity-limit', 'assessment-capacity', 'exploration-replacement',
+    ].includes(reason)
+  )));
+  const capacity = selectVacancies(
+    Array.from({ length: 4 }, (_, index) => ranked({ vacancyId: `capacity-${index}`, score: 80 - index })),
+    { limit: 2, threshold: 40, exploration: 0, seed: 'reason-audit' },
+  );
+  assert.ok(capacity.notSelected.every(({ reason }) => reason === 'assessment-capacity'));
+});
+
 test('exploration preserves diversity limits that were not relaxed', () => {
   const result = selectVacancies([
     ...Array.from({ length: 8 }, (_, index) => ranked({

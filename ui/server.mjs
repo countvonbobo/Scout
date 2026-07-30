@@ -234,8 +234,18 @@ function publicLatestScan() {
   const run = readScanRecords().at(-1);
   if (!run) return null;
   const safePublicUrl = (value) => {
-    const url = String(value || '');
-    return /^https?:\/\//i.test(url) && url.length <= 2048 ? url : null;
+    try {
+      const url = new URL(String(value || ''));
+      if (!['http:', 'https:'].includes(url.protocol)) return null;
+      url.username = '';
+      url.password = '';
+      url.search = '';
+      url.hash = '';
+      const result = url.toString().replace(/\/$/, '');
+      return result.length <= 2048 ? result : null;
+    } catch {
+      return null;
+    }
   };
   const reviewed = Array.isArray(run.reviewed) ? run.reviewed.map((item) => ({
     company: String(item?.company || '').slice(0, 120), role: String(item?.role || '').slice(0, 160),
@@ -249,21 +259,72 @@ function publicLatestScan() {
   const boundedContribution = (item) => typeof item === 'string' ? item.slice(0, 100) : ({ code: String(item?.code || '').slice(0, 100), score: Number.isFinite(Number(item?.score)) ? Number(item.score) : null });
   const boundedFunnel = (value) => {
     const names = [
-      'sourceRecords', 'sourceErrors', 'failedSourceRecords', 'uniqueVacancies',
-      'deterministicallyExcluded', 'eligible', 'ranked', 'selected', 'assessed', 'assessmentFailed',
+      'sourceRecords', 'sourceErrors', 'failedSourceRecords', 'parsed', 'normalised',
+      'duplicateObservations', 'uniqueVacancies', 'deterministicallyExcluded',
+      'eligible', 'ranked', 'aboveThreshold', 'selected', 'assessed', 'assessmentFailed',
+      'added', 'updated', 'unchanged', 'closed',
     ];
-    return value && typeof value === 'object' ? Object.fromEntries(names.filter((name) => Number.isFinite(Number(value[name]))).map((name) => [name, Number(value[name])])) : null;
+    if (!value || typeof value !== 'object') return null;
+    const projected = Object.fromEntries(names.filter((name) => Number.isFinite(Number(value[name])))
+      .map((name) => [name, Number(value[name])]));
+    if (value.bySource && typeof value.bySource === 'object' && !Array.isArray(value.bySource)) {
+      projected.bySource = Object.fromEntries(Object.entries(value.bySource).map(([source, row]) => [
+        String(source).slice(0, 80),
+        {
+          count: Number(row?.count || 0),
+          failedRecords: Number(row?.failedRecords || 0),
+          sourceErrors: Number(row?.sourceErrors || 0),
+          ...Object.fromEntries(names.filter((name) => Number.isFinite(Number(row?.[name])))
+            .map((name) => [name, Number(row[name])])),
+        },
+      ]));
+    }
+    return projected;
   };
   const boundedSelectionSummary = (value) => value && typeof value === 'object' ? Object.fromEntries(['selected', 'assessed', 'assessmentFailed'].filter((name) => Number.isFinite(Number(value[name]))).map((name) => [name, Number(value[name])])) : null;
+  const boundedCoverageRow = (row) => ({
+    value: String(row?.value || 'unknown').slice(0, 160),
+    ...Object.fromEntries(['found', 'ranked', 'selected', 'excluded', 'assessed', 'assessmentFailed']
+      .map((name) => [name, Number(row?.[name] || 0)])),
+  });
+  const coverage = run.coverage && typeof run.coverage === 'object' ? {
+    schemaVersion: Number(run.coverage.schemaVersion || 1),
+    ...Object.fromEntries(['source', 'employer', 'lane', 'roleFamily', 'location', 'provider', 'run', 'date']
+      .map((name) => [name, (Array.isArray(run.coverage[name]) ? run.coverage[name] : []).map(boundedCoverageRow)])),
+    failureReasons: (Array.isArray(run.coverage.failureReasons) ? run.coverage.failureReasons : [])
+      .map((row) => ({ value: String(row?.value || 'unknown-failure').slice(0, 100), count: Number(row?.count || 0) })),
+  } : null;
+  if ((run.explanations || []).length > 10_000) throw new Error('latest scan explanation capacity exceeded');
   const explanations = Array.isArray(run.explanations) ? run.explanations.map((item) => ({
     vacancyId: String(item?.vacancy_id || '').slice(0, 160),
+    company: String(item?.company || '').slice(0, 120),
+    role: String(item?.role || '').slice(0, 160),
+    dimensions: {
+      source: String(item?.dimensions?.source || item?.source || '').slice(0, 80),
+      employer: String(item?.dimensions?.employer || '').slice(0, 120),
+      lane: String(item?.dimensions?.lane || '').slice(0, 120),
+      roleFamily: String(item?.dimensions?.role_family || '').slice(0, 120),
+      location: String(item?.dimensions?.location || '').slice(0, 120),
+    },
+    stages: {
+      found: Boolean(item?.stages?.found),
+      ranked: Boolean(item?.stages?.ranked),
+      selected: Boolean(item?.stages?.selected),
+      excluded: Boolean(item?.stages?.excluded),
+      assessed: Boolean(item?.stages?.assessed),
+    },
+    aboveThreshold: Boolean(item?.above_threshold),
     preRank: { score: Number.isFinite(Number(item?.pre_rank?.score)) ? Number(item.pre_rank.score) : null,
       positive: (Array.isArray(item?.pre_rank?.positive) ? item.pre_rank.positive : []).slice(0, 3).map(boundedContribution), negative: (Array.isArray(item?.pre_rank?.negative) ? item.pre_rank.negative : []).slice(0, 3).map(boundedContribution) },
+    reasonCode: item?.reason_code ? String(item.reason_code).slice(0, 100) : 'unknown',
     selectionReason: item?.selection_reason ? String(item.selection_reason).slice(0, 100) : null,
     deterministicExclusion: item?.deterministic_exclusion ? String(item.deterministic_exclusion).slice(0, 100) : null,
+    deterministicExclusions: (Array.isArray(item?.deterministic_exclusions) ? item.deterministic_exclusions : [])
+      .map((value) => String(value).slice(0, 100)).slice(0, 8),
     assessmentStatus: ['assessed', 'assessment-failed', 'not-selected'].includes(item?.assessment_status) ? item.assessment_status : 'not-selected',
+    outcome: item?.outcome ? String(item.outcome).slice(0, 100) : null,
     source: String(item?.source || '').slice(0, 80), sourceUrl: safePublicUrl(item?.sourceUrl),
-  })).slice(0, 180) : [];
+  })) : [];
   return {
     schemaVersion: Number(run.schemaVersion || 1), runAt: run.timestamp || null,
     provider: run.agent || null, mode: run.mode || null, degraded: Boolean(run.degraded),
@@ -272,7 +333,8 @@ function publicLatestScan() {
     sourceHealth: run.source_health || {}, reportDate: String(run.timestamp || '').slice(0, 10) || null,
     profileId: run.profile_id ? String(run.profile_id).slice(0, 80) : null,
     discoveryEngine: run.discovery_engine ? String(run.discovery_engine).slice(0, 80) : null,
-    funnel: boundedFunnel(run.funnel), selectionSummary: boundedSelectionSummary(run.selection_summary), explanations,
+    funnel: boundedFunnel(run.funnel), selectionSummary: boundedSelectionSummary(run.selection_summary),
+    coverage, explanations,
     automaticBroadened: run.mode === 'broadened', reviewed,
   };
 }

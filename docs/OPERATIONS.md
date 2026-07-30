@@ -73,6 +73,13 @@ The maintained beta deployment uses one private, single-owner Ubuntu VPS:
   origin/path only. Semantic scan artifacts preserve bounded ordered clauses
   and operators, redact credential-shaped values as a whole fact, and retain
   a fact for every non-empty description clause.
+- Ranked scan schema v5 retains one bounded explanation per unique vacancy and
+  exact total/per-configured-source funnel equations. The configured collection
+  source survives separately from vendor identity through normalisation and
+  deduplication. Coverage rollups are available by source, employer, lane, role
+  family, location, provider, run, date and bounded failure reason. More than
+  10,000 unique vacancies fails the artifact boundary explicitly; it is never
+  silently truncated into a misleading funnel.
 - Assessment work is split into stable provider batches of at most ten jobs,
   with smaller deterministic batches when the context budget requires them.
   The strict provider-neutral schema accepts nuanced responsibility fit,

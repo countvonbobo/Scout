@@ -297,7 +297,11 @@ test('deterministic exclusion accounting counts unique vacancies while retaining
     profileId: profile.id,
   });
   assert.equal(artifacts.run.discarded.hard_exclusion, 1);
-  assert.equal(artifacts.run.explanations.length, 2);
+  assert.equal(artifacts.run.explanations.length, 1);
+  assert.deepEqual(
+    artifacts.run.explanations[0].deterministic_exclusions.sort(),
+    ['excluded-employer', 'excluded-title'],
+  );
 });
 
 test('explicit provider compensation remains comparable through ranked discovery', () => {
@@ -434,7 +438,7 @@ test('runtime writes canonical scan records and preserves user tracker state', (
     sources: { hiring_cafe: { configured: true, status: 'healthy', count: 1, jobs: [] } },
     assessmentResult: { assessments: [assessment('met')] }, policy: { actionScore: 70, checkScore: 55 },
   });
-  assert.equal(artifacts.run.schemaVersion, 4);
+  assert.equal(artifacts.run.schemaVersion, 5);
   assert.deepEqual(artifacts.run.sources_checked, ['hiring_cafe']);
   assert.deepEqual(artifacts.run.queries_checked, ['engineer']);
   assert.equal(artifacts.run.candidates_found, 1);
@@ -486,17 +490,37 @@ test('scan artifact exposes a reconciled funnel without claiming all jobs were a
   fs.writeFileSync(path.join(root, 'data', 'opportunities.json'), '{"updated":"2026-07-01","opportunities":[]}\n');
   const candidates = Array.from({ length: 60 }, (_, index) => ({
     candidateId: `candidate-${String(index + 1).padStart(3, '0')}`, company: `Company ${index + 1}`,
-    role: 'Engineer', url: `https://example.test/jobs/${index + 1}`, source: 'ats',
+    vacancyId: `vacancy-${index + 1}`, role: 'Engineer',
+    url: `https://example.test/jobs/${index + 1}`, source: 'ats',
     preRank: { vacancyId: `vacancy-${index + 1}`, score: 80, positive: ['title'], negative: [] },
     selectionReason: 'score-band',
   }));
+  const exclusion = {
+    vacancyId: 'vacancy-excluded', company: 'Excluded Company', role: 'Engineer',
+    exclusionCode: 'confirmed-location', source: 'ats', url: 'https://example.test/excluded',
+  };
   const artifacts = writeScanArtifacts(root, {
     provider: 'codex', mode: 'primary', sources: { ats: { configured: true, status: 'healthy', count: 2532 } },
     candidates, assessmentResult: { assessments: candidates.slice(0, 59).map((candidate) => ({ ...assessment('met'), candidateId: candidate.candidateId })) },
     policy: {}, startedAt: '2026-07-26T09:00:00Z', profileId: 'profile-123456789abc', discoveryEngine: 'ranked-discovery',
-    funnel: { sourceRecords: 2532, uniqueVacancies: 120, deterministicallyExcluded: 60, eligible: 60, ranked: 60, aboveThreshold: 60, selected: 60, assessed: 59, assessmentFailed: 1 },
-    selection: [{ vacancyId: 'vacancy-1', score: 80, selectionReason: 'score-band', source: 'ats', sourceUrl: 'https://example.test/jobs/1' }],
-    exclusions: [{ vacancyId: 'vacancy-excluded', exclusionCode: 'confirmed-location', source: 'ats', sourceUrl: 'https://example.test/excluded' }],
+    funnel: {
+      sourceRecords: 2532, sourceErrors: 0, failedSourceRecords: 0, parsed: 2532,
+      normalised: 2532, duplicateObservations: 2471, uniqueVacancies: 61,
+      deterministicallyExcluded: 1, eligible: 60, ranked: 60, aboveThreshold: 60,
+      selected: 60, assessed: 59, assessmentFailed: 1,
+      added: 0, updated: 0, unchanged: 0, closed: 0,
+      bySource: { ats: { count: 2532, failedRecords: 0, sourceErrors: 0 } },
+    },
+    ranked: candidates,
+    selection: candidates.map((candidate) => ({
+      vacancyId: candidate.vacancyId, score: 80, reason: 'deterministic-rank',
+    })),
+    selectionDecision: {
+      threshold: 40, selected: candidates,
+      reasons: candidates.map((candidate) => ({ vacancyId: candidate.vacancyId, reason: 'deterministic-rank' })),
+      notSelected: [], assessmentSkipped: [],
+    },
+    exclusions: [exclusion],
   });
   assert.equal(artifacts.run.funnel.sourceRecords, 2532);
   assert.equal(artifacts.run.funnel.selected, 60);
@@ -505,7 +529,15 @@ test('scan artifact exposes a reconciled funnel without claiming all jobs were a
   assert.equal(artifacts.run.candidates_found, 60);
   assert.equal(artifacts.run.profile_id, 'profile-123456789abc');
   assert.equal(artifacts.run.selection_summary.selected, 60);
-  assert.deepEqual(Object.keys(artifacts.run.explanations[0]).sort(), ['assessment_status', 'deterministic_exclusion', 'pre_rank', 'selection_reason', 'source', 'sourceUrl', 'vacancy_id'].sort());
+  assert.equal(artifacts.run.explanations.length, 61);
+  assert.deepEqual(Object.keys(artifacts.run.explanations[0]).sort(), [
+    'above_threshold', 'assessment_status', 'company', 'deterministic_exclusion',
+    'deterministic_exclusions', 'dimensions', 'outcome', 'pre_rank', 'reason_code',
+    'role', 'selection_reason', 'source', 'sourceUrl', 'stages', 'vacancy_id',
+  ].sort());
+  assert.equal(artifacts.run.funnel.bySource.ats.uniqueVacancies, 61);
+  assert.equal(artifacts.run.funnel.bySource.ats.duplicateObservations, 2471);
+  assert.equal(artifacts.run.coverage.provider[0].assessed, 59);
   assert.doesNotMatch(JSON.stringify(artifacts.run), /description|profileEvidence/);
 });
 

@@ -7,13 +7,43 @@ const reviewed = Array.from({ length: 40 }, (_, index) => ({
   categoryId: 'priority', outcome: index < 16 ? 'mandatory_unmet' : 'provider_discarded',
   score: 54 - (index % 10), reasons: [index < 16 ? 'Required synthetic evidence was not met' : 'Insufficient evidence-led fit'],
 }));
+const coverageRow = (value) => ({
+  value, found: 42, ranked: 42, selected: 40, excluded: 0, assessed: 40, assessmentFailed: 0,
+});
 
 const scan = {
-  schemaVersion: 3, runAt: '2026-07-22T10:00:00.000Z', provider: 'codex', mode: 'broadened',
+  schemaVersion: 5, runAt: '2026-07-22T10:00:00.000Z', provider: 'codex', mode: 'broadened',
   degraded: false, candidatesFound: 40, keepersAdded: 0, keepersUpdated: 0,
   discarded: { hard_exclusion: 0, mandatory_unmet: 16, below_threshold: 0, provider_discarded: 24 },
   sourceHealth: { synthetic: { status: 'healthy', count: 40 } }, reportDate: '2026-07-22',
-  automaticBroadened: true, reviewed,
+  automaticBroadened: true,
+  coverage: {
+    source: [coverageRow('synthetic')],
+    employer: [coverageRow('Synthetic employers')],
+    lane: [coverageRow('primary')],
+    roleFamily: [coverageRow('engineering')],
+    location: [coverageRow('United Kingdom')],
+    provider: [coverageRow('codex')],
+    run: [coverageRow('run-synthetic')],
+    date: [coverageRow('2026-07-22')],
+    failureReasons: [{ value: 'diversity-limit', count: 1 }],
+  },
+  explanations: [{
+    vacancyId: 'promising-diversity-miss', company: 'Promising Company', role: 'Platform Lead',
+    dimensions: { source: 'synthetic', lane: 'primary', roleFamily: 'engineering', location: 'London' },
+    stages: { found: true, ranked: true, selected: false, excluded: false, assessed: false },
+    aboveThreshold: true, preRank: { score: 88, positive: [], negative: [] },
+    reasonCode: 'diversity-limit', assessmentStatus: 'not-selected',
+    sourceUrl: 'https://example.test/jobs/promising',
+  }, {
+    vacancyId: 'threshold-miss', company: 'Lower Match Company', role: 'Operations Lead',
+    dimensions: { source: 'synthetic', lane: 'adjacent', roleFamily: 'operations', location: 'Leeds' },
+    stages: { found: true, ranked: true, selected: false, excluded: false, assessed: false },
+    aboveThreshold: false, preRank: { score: 32, positive: [], negative: [] },
+    reasonCode: 'below-relevance-threshold', assessmentStatus: 'not-selected',
+    sourceUrl: 'https://example.test/jobs/lower',
+  }],
+  reviewed,
 };
 
 test.beforeEach(async ({ page }) => {
@@ -62,7 +92,14 @@ test('zero-keeper results remain visible and expose the complete sanitised audit
   const dialog = page.getByRole('dialog', { name: 'Latest scan result' });
   await expect(dialog.getByText('Mandatory gates (16)')).toBeVisible();
   await expect(dialog.getByText('Assessment discards (24)')).toBeVisible();
-  await expect(dialog.locator('.scan-review-item')).toHaveCount(40);
+  await expect(dialog.getByText('Coverage by source (1)')).toBeVisible();
+  await expect(dialog.getByText('Coverage by role family (1)')).toBeVisible();
+  await expect(dialog.getByText('Coverage failures (1)')).toBeVisible();
+  await expect(dialog.getByText('Why roles missed detailed assessment (2)')).toBeVisible();
+  await expect(dialog.getByText('Promising Company — Platform Lead')).toBeVisible();
+  await expect(dialog.locator('.scan-explanation-item p').filter({ hasText: /stronger mix of employers, sources, role families/i })).toBeVisible();
+  await expect(dialog.locator('.scan-review-item:not(.scan-explanation-item)')).toHaveCount(49);
+  await expect(dialog.locator('.scan-explanation-item')).toHaveCount(2);
   await expect(page.locator('.card[data-id]')).toHaveCount(0);
 });
 

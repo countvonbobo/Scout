@@ -119,12 +119,15 @@ function canonicalVacancy(observations) {
   const fields = Object.fromEntries(DISPLAY_FIELDS.map((name) => [name, displayField(orderedObservations, name)]));
   const canonicalUrl = orderedObservations.map((observation) => observation?.canonicalUrl).find(Boolean) || null;
   const sourceReferences = mergeSourceReferences(...orderedObservations);
+  const collectionSources = metadataValues(orderedObservations, 'collectionSource');
   const laneIds = metadataValues(orderedObservations, 'laneId');
   const roleFamilies = metadataValues(orderedObservations, 'roleFamily');
   return {
     observations: orderedObservations,
     canonicalUrl,
     sourceReferences,
+    collectionSources,
+    collectionSource: collectionSources[0] || null,
     description,
     postedAt: dateBound(orderedObservations, 'postedAt', 1),
     closingAt: dateBound(orderedObservations, 'closingAt', 1),

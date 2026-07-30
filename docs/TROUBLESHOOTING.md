@@ -22,6 +22,17 @@ Files must be PDF, DOCX, Markdown or plain text and no larger than 10 MB. Passwo
 
 Confirm both variables exist in the selected workspace `.env`, without quotes accidentally becoming part of their values. Test `scout source adzuna`. Missing Adzuna credentials are non-fatal; invalid credentials, quota and network failures should be recorded as reduced coverage.
 
+## A promising vacancy was not assessed
+
+Open **Jobs -> Review this scan**, then expand **Why roles missed detailed
+assessment**. Scout shows the deterministic score and a stable reason, including
+the relevance threshold, diversity limit, assessment capacity, seeded
+exploration, an unchanged prior decision, a closed advert or second-pass scope.
+Expand **Coverage by source** to compare found, ranked, selected, excluded and
+assessed counts. Do not infer that every found vacancy was sent to the provider.
+If the displayed total and source funnels do not reconcile, preserve the run
+record and stop; schema-v5 writers fail closed rather than publishing that state.
+
 ## Scheduled scan does not run
 
 Check `scout schedule status`, confirm the native scheduler entry points to the current application/workspace and run `scout schedule run-now`. Inspect workspace logs and Task Scheduler, launchd, or systemd-user history. Remove/reinstall the schedule after moving a workspace.

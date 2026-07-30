@@ -957,16 +957,56 @@ const Scout = {
     const scan = this.latestScan;
     if (!scan) return;
     const labels = { kept: 'Kept', hard_exclusion: 'Hard exclusions', mandatory_unmet: 'Mandatory gates', below_threshold: 'Below threshold', provider_discarded: 'Assessment discards' };
+    const reasonLabels = {
+      'advert-closed': 'The advert was no longer live when Scout checked it.',
+      'assessment-capacity': 'It cleared the relevance threshold, but the detailed-assessment capacity was already full.',
+      'assessment-failed': 'Scout selected it, but its bounded assessment did not complete successfully.',
+      'below-relevance-threshold': 'Its deterministic relevance score was below the configured assessment threshold.',
+      'diversity-limit': 'A stronger mix of employers, sources, role families, lanes or locations filled the assessment set.',
+      'exploration-replacement': 'A seeded exploration place replaced this deterministic selection.',
+      'unchanged-rejection': 'The advert and profile were unchanged since the previous rejection, so Scout did not repeat the assessment.',
+      'unchanged-prior-assessment': 'The advert and profile were unchanged since the previous assessment.',
+      'verification-scope': 'This verification pass was limited to vacancies requiring a second assessment.',
+    };
+    const reasonText = (code) => reasonLabels[code]
+      || String(code || 'not-selected').replaceAll('-', ' ').replace(/^./, (letter) => letter.toUpperCase());
     const groups = Object.entries(labels).map(([outcome, label]) => {
       const items = (scan.reviewed || []).filter((item) => item.outcome === outcome).sort((a, b) => Number(b.score || 0) - Number(a.score || 0));
       if (!items.length) return '';
       return `<details ${outcome !== 'kept' ? 'open' : ''}><summary>${this.esc(label)} (${items.length})</summary><div class="scan-review-list">${items.map((item) => `<article class="scan-review-item"><div><b>${this.esc(item.company)} — ${this.esc(item.role)}</b><span class="chip">${this.esc(item.score ?? '—')}</span></div><p>${this.esc((item.reasons || []).join('; ') || label)}</p>${item.sourceUrl ? `<a href="${this.safeHref(item.sourceUrl)}" target="_blank" rel="noopener">View source ↗</a>` : ''}</article>`).join('')}</div></details>`;
     }).join('');
+    const coverageSources = (scan.coverage?.source || []).map((item) => (
+      `<article class="scan-review-item"><div><b>${this.esc(item.value)}</b><span class="chip">${this.esc(item.assessed)} assessed</span></div><p>${this.esc(`${item.found} found · ${item.ranked} ranked · ${item.selected} selected · ${item.excluded} excluded`)}</p></article>`
+    )).join('');
+    const coverage = coverageSources ? `<details><summary>Coverage by source (${scan.coverage.source.length})</summary><div class="scan-review-list">${coverageSources}</div></details>` : '';
+    const coverageDimensionLabels = {
+      employer: 'employer', lane: 'lane', roleFamily: 'role family', location: 'location',
+      provider: 'provider', run: 'run', date: 'date',
+    };
+    const coverageDimensions = Object.entries(coverageDimensionLabels).map(([dimension, label]) => {
+      const items = scan.coverage?.[dimension] || [];
+      if (!items.length) return '';
+      return `<details><summary>Coverage by ${this.esc(label)} (${items.length})</summary><div class="scan-review-list">${items.map((item) => `<article class="scan-review-item"><div><b>${this.esc(item.value)}</b><span class="chip">${this.esc(item.assessed)} assessed</span></div><p>${this.esc(`${item.found} found · ${item.ranked} ranked · ${item.selected} selected · ${item.excluded} excluded`)}</p></article>`).join('')}</div></details>`;
+    }).join('');
+    const failureReasons = (scan.coverage?.failureReasons || []).length
+      ? `<details><summary>Coverage failures (${scan.coverage.failureReasons.length})</summary><div class="scan-review-list">${scan.coverage.failureReasons.map((item) => `<article class="scan-review-item"><div><b>${this.esc(reasonText(item.value))}</b><span class="chip">${this.esc(item.count)}</span></div></article>`).join('')}</div></details>`
+      : '';
+    const missed = (scan.explanations || []).filter((item) => (
+      item.stages?.excluded || (item.stages?.ranked && !item.stages?.selected)
+    )).sort((left, right) => (
+      Number(right.aboveThreshold) - Number(left.aboveThreshold)
+      || Number(right.preRank?.score || 0) - Number(left.preRank?.score || 0)
+    ));
+    const missedGroup = missed.length ? `<details open><summary>Why roles missed detailed assessment (${missed.length})</summary><div class="scan-review-list">${missed.map((item) => `<article class="scan-review-item scan-explanation-item"><div><b>${this.esc(item.company || item.dimensions?.employer || 'Unknown employer')} — ${this.esc(item.role || 'Unknown role')}</b><span class="chip">${this.esc(item.preRank?.score ?? '—')}</span></div><p>${this.esc(reasonText(item.reasonCode))}</p><p class="meta">${this.esc([item.dimensions?.source, item.dimensions?.lane, item.dimensions?.roleFamily, item.dimensions?.location].filter(Boolean).join(' · '))}</p>${item.sourceUrl ? `<a href="${this.safeHref(item.sourceUrl)}" target="_blank" rel="noopener">View source ↗</a>` : ''}</article>`).join('')}</div></details>` : '';
     const overlay = document.getElementById('scan-result-overlay');
     document.getElementById('scan-result-body').innerHTML = `
       <p><strong>${this.esc(scan.funnel?.assessed ?? scan.candidatesFound)} assessed, ${this.esc(scan.keepersAdded)} kept</strong>${this.discardBreakdown(scan) ? ` — ${this.esc(this.discardBreakdown(scan))}` : ''}.</p>
       ${scan.automaticBroadened ? '<div class="setup-callout"><strong>Discovery widened automatically</strong><p>Scout ran one broader query pass but kept every approved salary, location, commute, exclusion and evidence gate.</p></div>' : ''}
-      ${groups || '<p class="meta">This older scan contains aggregate totals only. Run a new scan for candidate-level explanations.</p>'}
+      ${coverage}
+      ${coverageDimensions}
+      ${failureReasons}
+      ${missedGroup}
+      ${groups || (!missedGroup ? '<p class="meta">This older scan contains aggregate totals only. Run a new scan for candidate-level explanations.</p>' : '')}
       <div class="controls">${scan.reportDate ? `<button class="act" data-action="open-scan-report" data-date="${this.esc(scan.reportDate)}">Open dated report</button>` : ''}<button class="act" data-action="close-scan-result">Close</button></div>`;
     overlay.classList.remove('hidden');
     ScoutModal.focus(overlay, '#scan-result-title');

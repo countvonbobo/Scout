@@ -669,6 +669,7 @@ test('a failed ranked scan retains its discovery engine and available orchestrat
   assert.equal(result.ok, false);
   assert.equal(result.scan.discovery_engine, 'ranked-discovery');
   assert.equal(result.scan.funnel.selected, 1);
+  assert.ok(result.scan.explanations.every((item) => /^vacancy-[a-f0-9]{32}$/.test(item.vacancy_id)));
   assert.deepEqual(
     result.scan.explanations.filter((item) => item.selection_reason).map((item) => item.sourceUrl),
     ['https://example.test/failed-ranked'],
@@ -676,7 +677,7 @@ test('a failed ranked scan retains its discovery engine and available orchestrat
   assert.equal(result.scan.profile_id, published.id);
   assert.equal(result.scan.discarded.hard_exclusion, 1);
   assert.deepEqual(
-    result.scan.explanations.filter((item) => item.deterministic_exclusion).map((item) => item.deterministic_exclusion).sort(),
+    result.scan.explanations.flatMap((item) => item.deterministic_exclusions || []).sort(),
     ['excluded-employer', 'excluded-title'],
   );
   assert.equal(result.scan.adverts_checked, 1);
@@ -714,8 +715,12 @@ test('ranked second-pass candidates are renumbered and match persisted selection
   assert.deepEqual(prompted.map((item) => item.candidateId), ['candidate-001']);
   assert.deepEqual(prompted.map((item) => item.url), ['https://example.test/baker']);
   assert.deepEqual(
-    result.scan.explanations.filter((item) => item.selection_reason).map((item) => item.sourceUrl),
+    result.scan.explanations.filter((item) => item.stages?.selected).map((item) => item.sourceUrl),
     prompted.map((item) => item.url),
+  );
+  assert.equal(
+    result.scan.explanations.find((item) => item.sourceUrl === 'https://example.test/able').reason_code,
+    'verification-scope',
   );
   assert.equal(result.scan.funnel.selected, prompted.length);
   assert.equal(result.scan.funnel.assessed, prompted.length);

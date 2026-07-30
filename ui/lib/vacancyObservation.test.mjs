@@ -22,6 +22,18 @@ test('normalisation preserves explicit values and unknowns with provenance', () 
   assert.equal(observation.laneId, 'lane-1');
 });
 
+test('retains the configured collection source separately from the vacancy vendor', () => {
+  const observation = normaliseObservation({
+    providerId: 'greenhouse-123', title: 'Platform Engineer', company: 'Acme',
+    url: 'https://example.test/jobs/123',
+  }, {
+    sourceName: 'greenhouse', collectionSource: 'ats', fetchedAt: NOW, laneId: 'lane-1',
+  });
+
+  assert.equal(observation.source, 'greenhouse');
+  assert.equal(observation.collectionSource, 'ats');
+});
+
 test('normalisation keeps stable identities despite tracking parameters and object key order', () => {
   const context = { sourceName: 'fixture', fetchedAt: NOW, laneId: 'lane-1' };
   const first = normaliseObservation({
