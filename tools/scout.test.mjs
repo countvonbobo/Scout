@@ -247,6 +247,178 @@ test('runtime preflight labels manual and scheduled scans and never requeues a b
   }
 });
 
+async function seedQueuedScan(root, provider, mode, providerStatusFn) {
+  const active = acquireScanLease(root, currentLeaseOwner(), {
+    kind: 'scan',
+    runId: `provider-state-queue-seed-${mode}`,
+    provider: 'codex',
+    mode: 'primary',
+    phase: 'collect',
+  });
+  try {
+    const queued = await runScanWith(root, provider, mode, {
+      providerStatusFn,
+      collectSourcesFn: async () => {
+        throw new Error('overlap loser must not collect');
+      },
+    });
+    assert.equal(queued.status, 'queued');
+  } finally {
+    releaseScanLease(active);
+  }
+}
+
+test('scheduled direct scan re-detects sign-out after startup queue drain without resending its window', async () => {
+  const root = scanRoot();
+  const authenticatedCodex = {
+    installed: true,
+    authenticated: true,
+    executable: 'codex-before-drain',
+    capabilities: { structuredOutput: true },
+  };
+  const signedOutCodex = {
+    installed: true,
+    authenticated: false,
+    executable: 'codex-after-drain',
+    capabilities: { structuredOutput: true },
+  };
+  const authenticatedClaude = {
+    installed: true,
+    authenticated: true,
+    executable: 'claude',
+    capabilities: { structuredOutput: true },
+  };
+  let codexStatus = authenticatedCodex;
+  let collections = 0;
+  let providerCalls = 0;
+  const detected = [];
+  const providerStatusFn = (provider) => {
+    const status = provider === 'codex' ? codexStatus : authenticatedClaude;
+    detected.push({ provider, status });
+    return status;
+  };
+  try {
+    for (const mode of ['primary', 'second-pass', 'broadened']) {
+      await seedQueuedScan(root, 'claude', mode, providerStatusFn);
+    }
+    const result = await runScanWith(root, 'codex', 'primary', {
+      providerStatusFn,
+      requester: 'scheduled',
+      scheduleId: 'codex-primary',
+      logicalWindowId: '2026-07-30T07:30:00.000Z',
+      windowAt: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
+      collectSourcesFn: async () => {
+        collections += 1;
+        if (collections === 3) codexStatus = signedOutCodex;
+        return {
+          generatedAt: '2026-07-30T08:00:00.000Z',
+          queries: [],
+          sources: { hiring_cafe: { configured: true, status: 'healthy', count: 0, jobs: [] } },
+        };
+      },
+      runStructuredTurnFn: async () => {
+        providerCalls += 1;
+        throw new Error('signed-out direct scan must not call the provider');
+      },
+      queueWorkspaceSyncFn: async () => ({ state: 'disabled', enabled: false }),
+    });
+
+    assert.equal(result.status, 'skipped');
+    assert.equal(result.reason, 'sign-in-required');
+    assert.equal(result.durable.outcome, 'abandoned');
+    assert.equal(collections, 3);
+    assert.equal(providerCalls, 0);
+    assert.equal(projectScanQueue(root).requests.length, 3);
+    assert.ok(projectScanQueue(root).requests.every(({ status }) => status === 'succeeded'));
+    assert.equal(detected.filter(({ provider }) => provider === 'codex').at(-1).status, signedOutCodex);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('direct scan uses the same freshly signed-in provider status detected after startup queue drain', async () => {
+  const root = scanRoot();
+  const signedOutCodex = {
+    installed: true,
+    authenticated: false,
+    executable: 'codex-before-drain',
+    capabilities: { structuredOutput: true },
+  };
+  const freshCodex = {
+    installed: true,
+    authenticated: true,
+    executable: '/trusted/codex-after-drain',
+    env: { SCOUT_PROVIDER_RUNTIME: 'fresh-after-drain' },
+    capabilities: { structuredOutput: true },
+  };
+  const authenticatedClaude = {
+    installed: true,
+    authenticated: true,
+    executable: 'claude',
+    capabilities: { structuredOutput: true },
+  };
+  let codexStatus = signedOutCodex;
+  let collections = 0;
+  const providerStatuses = [];
+  const providerStatusFn = (provider) => (
+    provider === 'codex' ? codexStatus : authenticatedClaude
+  );
+  try {
+    for (const mode of ['primary', 'second-pass', 'broadened']) {
+      await seedQueuedScan(root, 'claude', mode, providerStatusFn);
+    }
+    const result = await runScanWith(root, 'codex', 'primary', {
+      providerStatusFn,
+      collectSourcesFn: async () => {
+        collections += 1;
+        if (collections <= 3) {
+          if (collections === 3) codexStatus = freshCodex;
+          return {
+            generatedAt: '2026-07-30T08:00:00.000Z',
+            queries: [],
+            sources: { hiring_cafe: { configured: true, status: 'healthy', count: 0, jobs: [] } },
+          };
+        }
+        return {
+          generatedAt: '2026-07-30T08:01:00.000Z',
+          queries: ['engineer'],
+          sources: {
+            hiring_cafe: {
+              configured: true,
+              status: 'healthy',
+              count: 1,
+              jobs: [{ company: 'Acme', title: 'Engineer', url: 'https://example.test/fresh-provider' }],
+            },
+          },
+        };
+      },
+      runStructuredTurnFn: async ({ status, validate }) => {
+        providerStatuses.push(status);
+        const value = assessmentFor([{ candidateId: 'candidate-001' }]);
+        validate(value);
+        return { value, usage: {} };
+      },
+      checkLivenessFn: async (candidates) => ({
+        live: candidates,
+        removed: [],
+        summary: { checked: candidates.length, gone: 0, unverified: 0 },
+      }),
+      queueWorkspaceSyncFn: async () => ({ state: 'disabled', enabled: false }),
+    });
+
+    assert.equal(result.ok, true);
+    assert.equal(result.status, 'completed');
+    assert.equal(collections, 4);
+    assert.deepEqual(providerStatuses, [freshCodex]);
+    assert.equal(providerStatuses[0].executable, '/trusted/codex-after-drain');
+    assert.equal(providerStatuses[0].env.SCOUT_PROVIDER_RUNTIME, 'fresh-after-drain');
+    assert.equal(projectScanQueue(root).requests.length, 3);
+    assert.ok(projectScanQueue(root).requests.every(({ status }) => status === 'succeeded'));
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 for (const failedTarget of [2, 3]) {
   test(`runtime finalisation preserves the prepared plan when target ${failedTarget} replacement fails`, async () => {
     const root = scanRoot();

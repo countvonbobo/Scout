@@ -542,7 +542,6 @@ export async function runScanWith(root, provider, mode, {
 } = {}) {
   if (!['codex', 'claude'].includes(provider)) throw new Error('provider must be codex or claude');
   if (!['primary', 'second-pass', 'broadened'].includes(mode)) throw new Error('mode must be primary, broadened or second-pass');
-  const status = providerStatusFn(provider);
   const providerHealthPurpose = requester === 'scheduled' ? 'scheduled-job' : 'manual-run';
   const config = loadWorkspaceConfig(root);
   model = model === undefined
@@ -572,6 +571,7 @@ export async function runScanWith(root, provider, mode, {
   let selection = [];
   let discoveryEngine = 'legacy-discovery';
   let durable = null;
+  let trustedProviderStatus = null;
   const publishedAtStart = loadPublishedSearchProfile(root);
   const trackerAtStart = readScanTracker(root);
   const compatibility = scanCompatibility({
@@ -616,10 +616,13 @@ export async function runScanWith(root, provider, mode, {
       heartbeatOptions,
       healthPreflight({ root: workspaceRoot, provider: selectedProvider, lease }) {
         const source = requester === 'scheduled' ? 'scheduled-preflight' : 'manual-preflight';
+        // Startup can drain up to 128 older requests before this fenced
+        // boundary, so select the executable only when this run is ready.
+        trustedProviderStatus = providerStatusFn(selectedProvider);
         return providerPreflightFn(workspaceRoot, selectedProvider, providerHealthPurpose, {
           lease,
           source,
-          probe: async () => providerLocalHealthSignal(status, { source }),
+          probe: async () => providerLocalHealthSignal(trustedProviderStatus, { source }),
         });
       },
       prepare({ lease }) {
@@ -830,7 +833,7 @@ export async function runScanWith(root, provider, mode, {
                   JSON.stringify(context),
                 ].join('\n\n');
                 const invocation = runStructuredTurnFn({
-                  provider, status, schema: SCAN_ASSESSMENT_SCHEMA, prompt,
+                  provider, status: trustedProviderStatus, schema: SCAN_ASSESSMENT_SCHEMA, prompt,
                   model, validate: (value) => value, timeoutMs, maxInputTokens,
                 });
                 void Promise.resolve(invocation).then(
