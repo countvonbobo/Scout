@@ -1421,3 +1421,116 @@ not acceptance of `d5ebca2`.
   exact pushed head.
 - Exact next action: normally push this repair checkpoint, update draft PR
   #82, require all seven replacement CI jobs to pass, then implement Minor 3.
+
+## 2026-07-30 Important 12 final ledger reconciliation
+
+This section supersedes only stale current-state claims in the historical
+checkpoints above. It does not replace their RED/GREEN evidence or reinterpret
+an earlier candidate review as acceptance of a later tree.
+
+### Rewrite and review identity
+
+- PR #82 still targets exact base
+  `f8732fd005a8b77fa79c7d63abe52c5a08b205bd`.
+- The authorised metadata rewrite retained identical trees and commit
+  messages. Old published head
+  `dcf2c5ef02d726eeb35d997a53f156f90b440a76` maps to rewritten
+  `7953b48`; old final implementation checkpoint `f152950` maps to
+  `ab402c2ffa33d25d1cb6f26cfef5ea765b8b9067`. The two 64-commit
+  ranges have identical final tree
+  `472c7856ad85f5a9f0b9514aafccd3331abdee19` and the ordered
+  tree/message digest recorded in the 2026-07-29 bridge above. The complete
+  old-to-rewritten commit map remains in the draft PR body.
+- Two additive Windows portability commits followed the rewrite. Their exact
+  reviewed descendant was
+  `d5ebca214863389aa7febd1bfc88ef5e3d35f67d`.
+- The independent review is resolvable at
+  [review 4812913188](https://github.com/oliver-hitchings/Scout/pull/82#pullrequestreview-4812913188).
+  It records Changes requested against exact head `d5ebca2`: 0 Critical,
+  12 Important and 4 Minor findings. It is the authority for the repair list,
+  but it is not an approval of any descendant.
+
+### Complete post-review behavior bridge
+
+The following additive commits are every behavior-changing repair between the
+reviewed head and the final implementation/evidence head. Ledger-only commits
+between them record the detailed reproductions, verification counts and CI
+runs above.
+
+- `173e792` restarts in-place Scout character state animations; `8fcedce`
+  isolates the Codex deep-link test; `f0f9289` documents the one-way fenced
+  lease upgrade; and `5618adb` retains the immediately previous exact offline
+  shell cache.
+- `4ffa882` makes guided-login parsing record-complete and preserves only a
+  strictly allowlisted equivalent Claude OAuth URL; `25235b7` adds
+  provider-scoped authentication-mutation authority.
+- `221de5a` replaces the stale service-worker source-spelling assertion with
+  executed cache-contract semantics and lets durable scan stages yield to the
+  existing heartbeat. `35a94df` observes durable takeover readiness and
+  `93da518` aligns injected recovery clocks.
+- `5988b4c` routes chat, assessment and onboarding results through durable
+  provider health without resending work; `871ef5e` asserts assessment retry
+  bounds semantically rather than by whole-suite wall time.
+- `393eede` refreshes the selected provider after queue drain and uses the
+  same freshly trusted status for the direct run.
+- `05842b7` recovers a Windows reused-PID guard with progress-aware retry and
+  one post-cleanup acquisition attempt. `51e55b6` replaces a circular
+  fixture-cleanup poll with explicit input, and `0285fd2` injects provider
+  timeout signals instead of targeting a real process group.
+- `4458c18` admits a valid hash-checked journal prefix with a torn final
+  append; `5452ad8` closes the heartbeat fixture input; and `2db30f3`
+  exercises the production recovery fault matrix through real interfaces.
+- `c81bf59` publishes cross-process readiness atomically. `b59e81a` excludes
+  nested ignored private artifacts at every copied-tree boundary, while
+  `95270fe` preserves only the exact reviewed public workspace template.
+  `700e6c2` gives recovery fault heartbeats the same deterministic clocks as
+  their leases.
+- `b000061` audits actual staged production dependencies.
+- `0d975c6` closes cross-format and cross-platform privacy-audit gaps;
+  `ce17134` keeps the audit's own public evidence privacy-safe; and
+  `f550c61` avoids a redundant platform process-identity probe for an opaque
+  in-process heartbeat capability while retaining fail-closed manual renewal.
+- `136e4a1` scopes generic serialized output and payload fields by provenance
+  while retaining explicit raw payload, stdout and stderr detection.
+  `db14348` treats a Windows busy result during canonical guard publication as
+  the same bounded lost race already used for other contention results.
+
+All 16 findings from review `4812913188` are therefore fixed as candidate
+changes. The review decision correctly remains Changes requested until a
+reviewer evaluates this descendant; no historical review is represented as
+approval.
+
+### Exact implementation head, publication and verification
+
+- Final implementation/evidence head before this ledger-only reconciliation:
+  `c63de191d3392d59c3e652fb6670c8105930ee85`.
+- Publication is no longer blocked. The local branch and the published fork
+  branch `agent/finish-epic-77-tasks-12-18` both resolve to that SHA, and
+  cross-repository PR #82 is open and remains draft. No later history rewrite,
+  force push, merge or issue closure occurred.
+- Replacement
+  [CI run 30545561626](https://github.com/oliver-hitchings/Scout/actions/runs/30545561626)
+  passed all seven required jobs at that exact head: Node, release staging and
+  staged audit on Ubuntu, Windows, ARM macOS and Intel macOS, plus browser
+  acceptance on Ubuntu Chromium, Ubuntu Firefox and Windows Chromium.
+- Local verification for the final behavior repair discovered 1,136 Node
+  tests: 1,130 passed, 0 failed and 6 intentional platform skips. Browser
+  acceptance discovered 168 tests: 157 passed, 0 failed and 11 intentional
+  Chromium-only skips. The source audit scanned 519 files and the fresh
+  marker-required installer-stage audit scanned 1,582 files, both clean.
+  Complete-range diff checks passed.
+- Author and committer metadata for every additive post-review commit use the
+  configured GitHub noreply identity. The worktree and published branch were
+  clean and equal before this documentation-only change.
+
+A Git commit cannot embed its own SHA because the file content determines that
+SHA. The commit containing this section is therefore a documentation-only
+descendant of the named, fully green implementation head. After it is
+fast-forward published and its seven jobs pass, an additive attestation must
+record that exact reconciliation SHA and CI run without rewriting history.
+
+- Exact next action: commit and normally publish this reconciliation, require
+  all seven CI jobs to pass, append the exact reconciliation SHA and CI result,
+  normally publish that attestation and require all seven jobs to pass again.
+  Then begin the Gate A requirement-by-requirement evidence reconciliation;
+  keep PR #82 draft and leave every protected issue and epic checkbox open.
