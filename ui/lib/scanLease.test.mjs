@@ -84,15 +84,34 @@ test('an independent heartbeat prevents a competing process from taking over', a
   const root = temp();
   const ready = path.join(root, 'heartbeat-ready');
   const stop = path.join(root, 'heartbeat-stop');
-  const owner = child(['heartbeat-owner', root, ready, stop, 'run-heartbeat', '350', '40', '50']);
+  const leaseDurationMs = 350;
+  const heartbeatIntervalMs = 40;
+  const takeoverMarginMs = 50;
+  const owner = child([
+    'heartbeat-owner', root, ready, stop, 'run-heartbeat',
+    String(leaseDurationMs), String(heartbeatIntervalMs), String(takeoverMarginMs),
+  ]);
   await waitUntil(() => fs.existsSync(ready), 'heartbeat owner did not acquire');
-  await new Promise((resolve) => setTimeout(resolve, 475));
+  const initial = JSON.parse(fs.readFileSync(ready, 'utf8'));
+  let contender;
+  let ownerResult;
+  try {
+    await waitUntil(() => {
+      const current = readScanLease(root);
+      return current?.leaseId === initial.leaseId
+        && current.heartbeatSequence >= 2
+        && Date.now() >= Date.parse(initial.expiresAt) + takeoverMarginMs
+        && Date.parse(current.expiresAt) - Date.now() >= leaseDurationMs / 2;
+    }, 'heartbeat did not renew beyond the original takeover window');
+    contender = await child([
+      'acquire', root, 'run-contender', String(leaseDurationMs), String(takeoverMarginMs),
+    ]).result;
+  } finally {
+    fs.writeFileSync(stop, '', 'utf8');
+    ownerResult = await owner.result;
+  }
 
-  const contender = await child(['acquire', root, 'run-contender', '350', '50']).result;
   assert.equal(contender.acquired, false);
-
-  fs.writeFileSync(stop, '', 'utf8');
-  const ownerResult = await owner.result;
   assert.equal(ownerResult.lost, false);
 });
 
