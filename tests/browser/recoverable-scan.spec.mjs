@@ -332,9 +332,12 @@ test('production assessment repair, retry and completed-work reuse survive final
   test.skip(browserName !== 'chromium', 'the release matrix is browser-independent and runs once');
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'scout-assessment-acceptance-'));
   let now = Date.parse('2026-07-29T10:00:00.000Z');
-  const leaseOptions = {
+  const heartbeatOptions = {
     wallNow: () => now,
     monotonicNow: () => now,
+  };
+  const leaseOptions = {
+    ...heartbeatOptions,
     leaseDurationMs: 1_000,
     takeoverMarginMs: 0,
   };
@@ -383,6 +386,7 @@ test('production assessment repair, retry and completed-work reuse survive final
       compatibility: ACCEPTANCE_COMPATIBILITY,
       stages: acceptanceStages(),
       leaseOptions,
+      heartbeatOptions,
       finalize,
     })).rejects.toThrow(PipelineInterruptedError);
     expect(providerCalls).toEqual([
@@ -408,6 +412,7 @@ test('production assessment repair, retry and completed-work reuse survive final
       compatibility: ACCEPTANCE_COMPATIBILITY,
       stages: acceptanceStages(),
       leaseOptions,
+      heartbeatOptions,
       finalize,
     });
     expect(providerCalls).toHaveLength(callCountBeforeRecovery);
@@ -433,9 +438,12 @@ test('a stale production assessment worker cannot append batch, journal or termi
   let now = Date.parse('2026-07-29T10:00:00.000Z');
   let successor;
   let interruptedRun;
-  const leaseOptions = {
+  const heartbeatOptions = {
     wallNow: () => now,
     monotonicNow: () => now,
+  };
+  const leaseOptions = {
+    ...heartbeatOptions,
     leaseDurationMs: 1_000,
     takeoverMarginMs: 0,
   };
@@ -445,6 +453,7 @@ test('a stale production assessment worker cannot append batch, journal or termi
       compatibility: ACCEPTANCE_COMPATIBILITY,
       stages: acceptanceStages(),
       leaseOptions,
+      heartbeatOptions,
       finalize: async ({ run, lease }) => {
         interruptedRun = run;
         return assessScanCandidates({
