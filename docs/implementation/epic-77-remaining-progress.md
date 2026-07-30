@@ -1299,3 +1299,46 @@ not acceptance of `d5ebca2`.
   exact pushed head.
 - Exact next action: normally push this repair checkpoint, update draft PR
   #82, require all seven replacement CI jobs to pass, then implement Minor 3.
+
+## 2026-07-30 PR #82 review checkpoint 11
+
+- Important 11 replacement CI run
+  [30540952581](https://github.com/oliver-hitchings/Scout/actions/runs/30540952581)
+  passed all three browser jobs and three of the four Node/audit jobs at exact
+  pushed head `e6c3dc1c6f82f7534cc476b6a7d2817b01b3783d`. Windows alone failed
+  `an independent heartbeat prevents a competing process from taking over`
+  after the heartbeat failed to renew beyond its original takeover window.
+- The failure was platform-specific work inside the renewal loop, not an
+  insufficient test allowance. Every heartbeat tick re-observed its own
+  process-start identity; on Windows that can require a PowerShell process
+  query. The heartbeat already holds an opaque hydrated in-process lease
+  capability that cannot be recreated from durable JSON, so repeating that
+  platform observation could consume the lease window under runner load.
+- Repair commit `f550c616d0bb391ac1253066e6336a9fe5ccd2c3` keeps direct/manual
+  renewals fail-closed behind current-process identity proof, while the
+  heartbeat renews through its existing opaque local capability. Renewal
+  still revalidates the persisted fence, expiry, workspace guard and
+  one-way legacy-lock boundary before writing. No lease duration, heartbeat
+  interval or test timeout changed.
+- A deterministic RED regression injected a throwing process-identity
+  observation hook and proved the heartbeat previously attempted the
+  redundant observation instead of renewing. It is GREEN only when the
+  heartbeat advances the durable sequence with zero repeat observations.
+- Verification for the Windows heartbeat repair:
+  - focused real cross-process contender plus opaque-capability regression:
+    20 consecutive runs, 40 passed and 0 failed;
+  - complete lease suite: 63 discovered, 62 passed, 0 failed and 1
+    Windows-only skip;
+  - exact cross-browser durable-recovery integration: 20 consecutive
+    Chromium repetitions passed after an initial isolated pass;
+  - complete `npm test`: 1,134 discovered, 1,128 passed, 0 failed and 6
+    platform skips;
+  - complete cross-browser acceptance: 168 discovered, 157 passed, 0 failed
+    and 11 intentional Chromium-only skips;
+  - fresh marker-required release-stage audit: 1,582 files scanned, passed;
+  - `git diff --check`: passed.
+- Still open from review `4812913188`: Important 12 and Minor 3. Important 12
+  remains a rolling ledger repair and requires another update at the final
+  exact pushed head.
+- Exact next action: normally push this repair checkpoint, update draft PR
+  #82, require all seven replacement CI jobs to pass, then implement Minor 3.
