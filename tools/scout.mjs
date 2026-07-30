@@ -43,6 +43,10 @@ import { assertCurrentFence, synchronousFenceCallback } from '../ui/lib/scanLeas
 import { PIPELINE_STAGE_ARTIFACT_SCHEMA_VERSION, RUN_ARTIFACT_SCHEMA_VERSION } from '../ui/lib/runArtifacts.mjs';
 import { compatibilityFingerprint } from '../ui/lib/runRecovery.mjs';
 import { coverScheduledScanWindow } from '../ui/lib/scanQueue.mjs';
+import {
+  createBeta22WorkspaceSnapshot,
+  materializeBeta22Rollback,
+} from '../ui/lib/workspaceMigration.mjs';
 
 const APP_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const MAX_SCAN_FILE_CHARS = 100_000;
@@ -1006,6 +1010,28 @@ async function main() {
       const target = path.resolve(argValue('--to', argv) || argValue('--workspace', argv) || path.join(os.homedir(), 'Documents', 'Scout Workspace'));
       return print({ ok: true, ...migrateLegacyWorkspace(source, target) });
     }
+    if (action === 'snapshot-beta22') {
+      const snapshot = createBeta22WorkspaceSnapshot(root);
+      return print({
+        ok: true,
+        compatibleVersion: snapshot.compatibleVersion,
+        snapshotDirectory: snapshot.directory,
+        fileCount: snapshot.entries.length,
+        treeDigest: snapshot.treeDigest,
+        created: snapshot.created,
+      });
+    }
+    if (action === 'rollback-beta22') {
+      const target = argValue('--to', argv);
+      if (!target) throw new Error('workspace rollback-beta22 requires --to PATH');
+      return print({
+        ok: true,
+        ...materializeBeta22Rollback(root, path.resolve(target), {
+          snapshotDirectory: argValue('--snapshot', argv),
+        }),
+      });
+    }
+    throw new Error('workspace action must be init, migrate, snapshot-beta22, or rollback-beta22');
   }
   if (command === 'scan') {
     const config = loadWorkspaceConfig(root);
@@ -1110,7 +1136,7 @@ async function main() {
       }));
     }
   }
-  print(`Scout CLI\n\nCommands:\n  doctor [--workspace PATH]\n  remote preflight [--require-enabled] [--url URL]\n  workspace init|migrate [--from PATH] [--to PATH]\n  cv quality <application-slug> [--workspace PATH]\n  lock acquire|release|status\n  source ats|adzuna|hiring-cafe\n  scan --provider codex|claude [--mode primary|second-pass] [--model MODEL]\n  schedule install|status|remove|run-now [--id ID] [--time HH:MM] [--days 0,1,2] [--provider PROVIDER] [--mode primary|second-pass] [--model MODEL]`);
+  print(`Scout CLI\n\nCommands:\n  doctor [--workspace PATH]\n  remote preflight [--require-enabled] [--url URL]\n  workspace init|migrate [--from PATH] [--to PATH]\n  workspace snapshot-beta22 [--workspace PATH]\n  workspace rollback-beta22 --workspace PATH --to PATH [--snapshot PATH]\n  cv quality <application-slug> [--workspace PATH]\n  lock acquire|release|status\n  source ats|adzuna|hiring-cafe\n  scan --provider codex|claude [--mode primary|second-pass] [--model MODEL]\n  schedule install|status|remove|run-now [--id ID] [--time HH:MM] [--days 0,1,2] [--provider PROVIDER] [--mode primary|second-pass] [--model MODEL]`);
 }
 
 const isMain = isMainModule(import.meta.url);

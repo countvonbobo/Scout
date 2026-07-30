@@ -45,6 +45,17 @@ export function decideVacancyLifecycle(previous, current, {
   const profileChanged = Boolean(
     profileId && previous.profileId && String(profileId) !== String(previous.profileId),
   );
+  const legacyProfile = Boolean(profileId && !previous.profileId);
+  if (legacyProfile) {
+    return {
+      change,
+      revalidate: true,
+      rerank: true,
+      reassess: true,
+      skipAssessment: false,
+      reason: 'legacy-profile-rerank',
+    };
+  }
   if (profileChanged) {
     return {
       change,

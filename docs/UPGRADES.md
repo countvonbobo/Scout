@@ -29,6 +29,14 @@ scout doctor --workspace "$HOME/Documents/Scout Workspace"
 
 Scout validates `workspace.json`. Versioned migrations are designed to be safe to rerun and save the pre-migration configuration under `.scout/backups/`. Scout refuses a workspace schema newer than the application understands; upgrade the application rather than manually lowering `schemaVersion`.
 
+The ranked-discovery migration also creates one verified
+`0.1.0-beta.22`-compatible workspace snapshot before staging or publishing the
+new profile. This is a full compatibility boundary rather than the older
+configuration-only JSON backup. It preserves private career data and
+credentials, removes only post-beta.22 profile/fenced runtime state from the
+copy, and records a per-file SHA-256 manifest. The migration is idempotent and
+reuses the newest verified compatibility snapshot.
+
 The first fenced scan-lease activation is a one-way execution boundary, not a
 manual workspace-data conversion. Once activated, the fenced lease is
 authoritative and Scout refuses a downgrade or old/new coexistence against the
@@ -68,5 +76,22 @@ After fenced-lease activation, do not restart an older Scout binary against
 that workspace: downgrade/coexistence is refused to protect it from two
 writers. Restore a copied pre-activation snapshot only when a reviewed rollback
 requires it. Do not overwrite newer workspace history casually.
+
+To rehearse or perform a reviewed beta.22 rollback, materialise the verified
+snapshot into a new, absent directory:
+
+```powershell
+scout workspace rollback-beta22 --workspace 'D:\Private\Scout Workspace' --to 'D:\Private\Scout beta22 rollback'
+```
+
+Scout validates every manifest entry before creating the destination, copies
+into a temporary sibling, verifies the completed copy, and then renames it
+into place. It refuses the live workspace and any path inside it. The newer
+workspace remains untouched, so post-migration data is not destroyed. Inspect
+the returned file count and digest, open the restored tracker, report and
+application, and only then start beta.22 with the separate restored workspace.
+Use `scout workspace snapshot-beta22 --workspace PATH` to display or create the
+compatibility snapshot explicitly. A damaged snapshot fails closed; restore a
+verified private backup instead of editing its manifest.
 
 Uninstall removes application files but intentionally preserves the workspace. Verify this on important deployments and remove schedules separately.

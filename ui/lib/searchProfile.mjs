@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { atomicWriteFile } from './atomicWrite.mjs';
 import { backupWorkspace, workspacePaths } from './workspace.mjs';
+import { createBeta22WorkspaceSnapshot } from './workspaceMigration.mjs';
 
 export const PREFERENCE_STRENGTHS = Object.freeze([
   'mandatory', 'strong-preference', 'nice-to-have',
@@ -187,8 +188,14 @@ export function loadPublishedSearchProfile(root) {
 
 export function migrateSearchProfile(root, { fileSystem = fs } = {}) {
   const paths = workspacePaths(root);
+  const rollback = createBeta22WorkspaceSnapshot(root);
   if (fileSystem.existsSync(paths.searchProfileDraft) || fileSystem.existsSync(paths.searchProfilePublished)) {
-    return { migrated: false, draftPath: paths.searchProfileDraft, backupPath: null };
+    return {
+      migrated: false,
+      draftPath: paths.searchProfileDraft,
+      backupPath: null,
+      rollbackSnapshotPath: rollback.directory,
+    };
   }
   if (!fileSystem.existsSync(paths.config)) throw new Error(`workspace config missing: ${paths.config}`);
 
@@ -217,5 +224,10 @@ export function migrateSearchProfile(root, { fileSystem = fs } = {}) {
     fileSystem.rmSync(stagingDirectory, { recursive: true, force: true });
     throw error;
   }
-  return { migrated: true, draftPath: paths.searchProfileDraft, backupPath };
+  return {
+    migrated: true,
+    draftPath: paths.searchProfileDraft,
+    backupPath,
+    rollbackSnapshotPath: rollback.directory,
+  };
 }

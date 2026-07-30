@@ -16,6 +16,22 @@ Interactive tracker changes use the same workspace lock as scans. Each browser r
 
 Ranked discovery uses only a reviewed, immutable published search profile. Raw setup answers and an editable draft are evidence for review; they do not become scan rules until publication. Scout stages that draft during workspace startup, setup review or scan readiness once the legacy preferences and profile evidence exist. An established beta workspace with tracked opportunities may temporarily remain on the explicitly marked legacy discovery path, but a fresh workspace cannot scan until its staged draft is reviewed and published. Explicit or confirmed rules can exclude a vacancy; unconfirmed inferred rules remain non-blocking even if their draft strength says `mandatory`. Multiple mandatory accepted values for one field are alternatives: matching any one satisfies that field. Unknown source facts remain unknown and follow the published profile's configured policy (`include`, `penalise`, or `exclude`).
 
+Before ranked-discovery profile migration changes the workspace, Scout creates
+and verifies one beta.22-compatible snapshot under `.scout/backups/`. It
+contains the beta.22 private workspace boundaries, including credentials,
+tracker, reports, applications, chats, imports, logs and encrypted
+`.scout-backup` recovery data, but excludes fenced runtime state and
+ranked-profile artifacts. Profile publication reconstructs
+the bounded identities of historical tracker and scan-review vacancies,
+filters and re-ranks them under the new published profile, and writes an
+immutable profile-specific artifact under `profile/search/rankings/`. It does
+not edit an old score, status, note, contact, event, report or assessment.
+Historical profile or scoring inputs that cannot be reconstructed exactly are
+labelled `legacy-unreconstructable`; a rejected vacancy that resurfaces is
+re-ranked and may be assessed once under the published profile. Its new
+profile-bound decision then prevents unchanged repeats from consuming later
+assessment capacity.
+
 ## Candidate selection, liveness and cost
 
 When a published profile is available, before the provider is asked for detailed assessment, the trusted runtime:

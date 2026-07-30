@@ -669,6 +669,12 @@ test('search-profile routes review a complete draft and publish only the current
   assert.equal(published.status, 200);
   const result = JSON.parse(published.text);
   assert.match(result.published.id, /^profile-[a-f0-9]{12}$/);
+  assert.equal(result.historicalRerank.created, true);
+  assert.ok(result.historicalRerank.totals.reconstructed >= 0);
+  assert.equal(
+    fs.existsSync(path.join(paths.profile, 'search', 'rankings', `${result.published.id}.json`)),
+    true,
+  );
   assert.deepEqual(JSON.parse(fs.readFileSync(paths.searchProfilePublished, 'utf8')), result.published);
   assert.equal(loadWorkspaceConfig(WORKSPACE_ROOT).searchProfile.publishedId, result.published.id);
 });

@@ -95,3 +95,29 @@ test('reopened vacancies are reassessed even after a prior rejection', () => {
   assert.equal(decision.reassess, true);
   assert.equal(decision.reason, 'reopened-vacancy');
 });
+
+test('a resurfaced legacy rejection is re-ranked and reassessed once under the published profile', () => {
+  const previous = {
+    ...vacancy,
+    outcome: 'below_threshold',
+    profileId: null,
+  };
+  const decision = decideVacancyLifecycle(previous, vacancy, { profileId: 'profile-current' });
+
+  assert.deepEqual(decision, {
+    change: 'unchanged',
+    revalidate: true,
+    rerank: true,
+    reassess: true,
+    skipAssessment: false,
+    reason: 'legacy-profile-rerank',
+  });
+
+  const currentDecision = decideVacancyLifecycle(
+    { ...previous, profileId: 'profile-current' },
+    vacancy,
+    { profileId: 'profile-current' },
+  );
+  assert.equal(currentDecision.reason, 'unchanged-rejection');
+  assert.equal(currentDecision.skipAssessment, true);
+});

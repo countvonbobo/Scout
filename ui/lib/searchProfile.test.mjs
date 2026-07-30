@@ -241,6 +241,8 @@ test('migration stages byte-preserved legacy evidence in an unpublished draft', 
   assert.equal(result.migrated, true);
   assert.equal(result.draftPath, paths.searchProfileDraft);
   assert.match(result.backupPath, /search-profile-v1\.json$/);
+  assert.match(result.rollbackSnapshotPath, /beta22-compatible$/);
+  assert.equal(fs.existsSync(`${result.rollbackSnapshotPath}.manifest.json`), true);
   assert.equal(raw.workspaceJson, workspaceJson);
   assert.equal(raw.context, context);
   assert.equal(draft.status, 'draft');
@@ -256,26 +258,32 @@ test('migration stages byte-preserved legacy evidence in an unpublished draft', 
   assert.equal(fs.readFileSync(path.join(paths.applications, 'example', 'outreach.md'), 'utf8'), 'Existing application\n');
   assert.equal(fs.readFileSync(paths.profileContext, 'utf8'), context);
   assert.deepEqual(migrateSearchProfile(root), {
-    migrated: false, draftPath: paths.searchProfileDraft, backupPath: null,
+    migrated: false,
+    draftPath: paths.searchProfileDraft,
+    backupPath: null,
+    rollbackSnapshotPath: result.rollbackSnapshotPath,
   });
 });
 
 test('migration is idempotent when a draft or published profile already exists', () => {
   const root = temp();
-  fs.writeFileSync(path.join(root, 'workspace.json'), '{"locale":"en-GB","search":{}}\n');
+  fs.writeFileSync(path.join(root, 'workspace.json'), '{"schemaVersion":2,"locale":"en-GB","search":{}}\n');
   const paths = workspacePaths(root);
   fs.mkdirSync(path.dirname(paths.searchProfileDraft), { recursive: true });
   fs.writeFileSync(paths.searchProfileDraft, '{"status":"draft"}\n');
 
   const result = migrateSearchProfile(root);
 
-  assert.deepEqual(result, { migrated: false, draftPath: paths.searchProfileDraft, backupPath: null });
+  assert.equal(result.migrated, false);
+  assert.equal(result.draftPath, paths.searchProfileDraft);
+  assert.equal(result.backupPath, null);
+  assert.match(result.rollbackSnapshotPath, /beta22-compatible$/);
   assert.equal(fs.existsSync(paths.searchProfileRaw), false);
 });
 
 test('migration leaves the legacy config untouched when its paired artifact swap fails', () => {
   const root = temp();
-  const workspaceJson = '{"locale":"en-GB","search":{}}\n';
+  const workspaceJson = '{"schemaVersion":2,"locale":"en-GB","search":{}}\n';
   fs.writeFileSync(path.join(root, 'workspace.json'), workspaceJson);
   const searchDirectory = path.dirname(workspacePaths(root).searchProfileRaw);
   const fileSystem = {

@@ -7,6 +7,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { isMainModule } from './lib/mainModule.mjs';
 import { atomicWriteFile } from './lib/atomicWrite.mjs';
+import { rerankHistoricalVacancies } from './lib/workspaceMigration.mjs';
 import { codexDeepLinkCapability } from './lib/codexDeepLink.mjs';
 import { triage } from './lib/derive.mjs';
 import { emptyTrackerView, pipeline } from './lib/pipeline.mjs';
@@ -1305,6 +1306,7 @@ routes['POST /api/search-profile/publish'] = (req, res, body) => {
       throw error;
     }
     const published = publishSearchProfile(draft);
+    const historicalRerank = rerankHistoricalVacancies(WORKSPACE_ROOT, published);
     atomicWriteFile(WORKSPACE.searchProfilePublished, `${JSON.stringify(published, null, 2)}\n`);
     const config = loadWorkspaceConfig(WORKSPACE_ROOT);
     writeWorkspaceConfig(WORKSPACE_ROOT, {
@@ -1312,7 +1314,14 @@ routes['POST /api/search-profile/publish'] = (req, res, body) => {
       searchProfile: { ...(config.searchProfile || {}), publishedId: published.id },
     });
     void queueCheckpoint('ui: publish search profile');
-    return replyJson(res, 200, { ok: true, published });
+    return replyJson(res, 200, {
+      ok: true,
+      published,
+      historicalRerank: {
+        created: historicalRerank.created,
+        totals: historicalRerank.totals,
+      },
+    });
   } catch (e) {
     if (Object.hasOwn(e, 'currentRevision')) return replySearchProfileConflict(res, e);
     return replyJson(res, 400, publicApiError('Search profile could not be published.'));

@@ -98,6 +98,8 @@ scout doctor [--workspace PATH]
 scout remote preflight [--require-enabled] [--url URL]
 scout workspace init [--workspace PATH]
 scout workspace migrate --from PATH --to PATH
+scout workspace snapshot-beta22 [--workspace PATH]
+scout workspace rollback-beta22 --workspace PATH --to PATH [--snapshot PATH]
 scout cv quality <application-slug> [--workspace PATH]
 scout scan --provider codex|claude --mode primary|second-pass
 scout schedule install|status|remove|run-now

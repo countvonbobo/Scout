@@ -10,6 +10,18 @@ Confirm the directory contains `workspace.json`. Check `--workspace` first, then
 
 Restore valid JSON from a private backup or correct the reported field. Do not reduce `schemaVersion` to bypass a newer-schema error; install a compatible Scout version. Migration backups are under `.scout/backups/`.
 
+## Beta.22 rollback snapshot is missing or damaged
+
+Do not point beta.22 at the newer live workspace and do not edit a snapshot
+manifest to make verification pass. Stop Scout and run
+`scout workspace snapshot-beta22 --workspace PATH` to inspect the newest
+verified compatibility point. Materialise it only into a separate absent
+directory with `scout workspace rollback-beta22 --workspace PATH --to PATH`.
+If the command reports a missing file, digest mismatch, symbolic link or
+incompatible schema, preserve both workspaces and restore a verified private
+pre-activation backup. The rollback command never overwrites the live
+workspace.
+
 ## Provider not found or not authenticated
 
 Run the provider's `--version` and authentication status command in a new PowerShell window. Restart Scout after `PATH` changes. Clear unsupported `ai.model` overrides. See [Providers](PROVIDERS.md).
