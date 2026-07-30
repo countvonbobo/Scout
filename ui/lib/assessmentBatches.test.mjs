@@ -591,17 +591,21 @@ test('settled provider failures remain bounded while an independent heartbeat ke
       timeoutMs: 35,
     });
     let heartbeats = 0;
-    const started = Date.now();
+    const attempts = [];
     const result = await executeAssessmentBatch(batch, {
       run: fixture.run,
       lease: fixture.lease,
       heartbeatIntervalMs: 5,
       heartbeat: () => { heartbeats += 1; },
-      invokeProvider: () => new Promise((_, reject) => {
+      invokeProvider: ({ kind, timeoutMs }) => new Promise((_, reject) => {
+        attempts.push({ kind, timeoutMs });
         setTimeout(() => reject(new Error('synthetic settled provider failure')), 20);
       }),
     });
-    assert.ok(Date.now() - started < 1_000, 'provider timeout must remain bounded');
+    assert.deepEqual(attempts, [
+      { kind: 'batch', timeoutMs: 35 },
+      { kind: 'retry', timeoutMs: 35 },
+    ]);
     assert.ok(heartbeats >= 2, `expected independent heartbeats, received ${heartbeats}`);
     assert.equal(result.assessments.length, 0);
     assert.equal(result.failures[0].code, 'assessment-provider-exhausted');
