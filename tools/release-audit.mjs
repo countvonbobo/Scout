@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
@@ -54,6 +55,20 @@ const PUBLIC_DOC_SCREENSHOTS = new Set([
   'docs/screenshots/0.1.0-beta.23/trustworthy-model-picker.png',
   'docs/screenshots/0.1.0-beta.23/usage-and-engine-regions.png',
 ]);
+const REVIEWED_PUBLIC_BINARY_DIGESTS = new Map(Object.entries({
+  'ui/assets/scout-explaining.png': 'ebc8920f843543f098af494f61f0592a1fd4db84467e571f8bdaec6528a20f72',
+  'ui/assets/scout-found.png': '913425712ba5eea7f5d6a28244cf3621c651706ea4bab9e3b3aa91c25dfb5918',
+  'ui/assets/scout-icon.ico': 'eaa34428c23de32f00ab2687d1f8b8409d024fb0ecf12d015720c788f951ae52',
+  'ui/assets/scout-icon.png': 'a8a22f54d179b00290b0fd47d18637689b2881e852e21ac42da366ff54a93e18',
+  'ui/assets/scout-idle.png': 'b6743c5ed1e4804a2e36d79029711546b68e4c25b5f63ee2ed7982c5a436342a',
+  'ui/assets/scout-searching.png': 'f8619a583c5e4d72e69d6ee7c5c46dc4c456bec4d1c0deffd30c19e2168974c6',
+  'ui/assets/scout-static.png': 'ff940cd16c2c37a03ef85d6f12069ff3964f84a8cc06ee4ec9f2e384f4f342ef',
+  'ui/assets/scout-thinking.png': '86a247f523bddfd940db81d566f603092ab853580857015a393c3fc74e777a68',
+  'ui/assets/scout-warning.png': '2230faf4c3faaf1bbdf46d2c6096cd1c584019b43f962e6e303030a24579a22f',
+  'docs/screenshots/0.1.0-beta.23/codex-remote-fallback.png': '57589a685757b6b8d5deb88b4843b0274b9bf0879ac78cbf74bd5e9019e5cda0',
+  'docs/screenshots/0.1.0-beta.23/trustworthy-model-picker.png': '583deedd4ac6da79454305e0093e3d03098ee82721e3bbd613671c23eff8daf1',
+  'docs/screenshots/0.1.0-beta.23/usage-and-engine-regions.png': '19d73fce9cac11306d0092cc26d4dc8af52b847dab6f77a8194aedb003ee77bf',
+}));
 const BINARY_OR_DOCUMENT_EXTENSION = /\.(?:7z|bin|bz2|db|dmg|doc|docx|exe|gz|ico|icc|jpeg|jpg|msi|node|odt|pdf|pfb|pkg|png|rtf|sqlite|sqlite3|tar|tgz|ttf|wasm|xz|zip)$/i;
 
 function normaliseRelative(root, file) {
@@ -400,6 +415,13 @@ function allowedReleaseBinary(relative) {
   return false;
 }
 
+function reviewedPublicBinaryDigest(relative) {
+  const value = String(relative).replaceAll('\\', '/').toLocaleLowerCase('en-US');
+  const appIndex = value.lastIndexOf('/app/');
+  const packaged = appIndex === -1 ? value : value.slice(appIndex + 5);
+  return REVIEWED_PUBLIC_BINARY_DIGESTS.get(packaged) || null;
+}
+
 function binaryContent(content) {
   const sample = content.subarray(0, Math.min(content.length, 64 * 1024));
   if (sample.includes(0)) return true;
@@ -497,6 +519,11 @@ export function auditRelease({
     if (binaryContent(content) || BINARY_OR_DOCUMENT_EXTENSION.test(relative)) {
       if (!privateRuntime && !allowedReleaseBinary(relative)) {
         findings.push({ file: publicFile, line: 1, rule: 'unexpected-binary' });
+      }
+      const expectedDigest = reviewedPublicBinaryDigest(relative);
+      if (expectedDigest
+        && crypto.createHash('sha256').update(content).digest('hex') !== expectedDigest) {
+        findings.push({ file: publicFile, line: 1, rule: 'reviewed-binary-digest-mismatch' });
       }
       findings.push(...pathFindings.map((finding) => ({ file: publicFile, ...finding })));
       continue;

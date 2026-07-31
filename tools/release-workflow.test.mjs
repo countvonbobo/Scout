@@ -69,6 +69,15 @@ test('privileged release jobs reject every mutable action reference', () => {
   }
 });
 
+test('secret-bearing workspace repair rejects every mutable action reference', () => {
+  const references = [...workspaceRepair.matchAll(/^\s+-?\s*uses:\s+([^\s#]+)(?:\s+#.*)?$/gm)]
+    .map((match) => match[1]);
+  assert.ok(references.length > 0);
+  for (const reference of references) {
+    assert.match(reference, /@[a-f0-9]{40}$/, `mutable action reference ${reference}`);
+  }
+});
+
 test('release documentation defines checksum, keyless identity and platform-signing boundaries', () => {
   assert.match(supplyChain, /checksums\.intoto\.jsonl/);
   assert.match(supplyChain, /gh attestation verify/);
@@ -151,7 +160,8 @@ test('VPS dirty check permits only Scout managed Typst files', () => {
 test('workspace repair is protected, local-only and verifies backup plus rendered CVs', () => {
   assert.match(workspaceRepair, /environment: beta-vps/);
   assert.match(workspaceRepair, /concurrency:[\s\S]*group: scout-beta-vps/);
-  assert.match(workspaceRepair, /tailscale\/github-action@v4/);
+  assert.match(workspaceRepair, /actions\/checkout@11d5960a8842f3f29f17d4e3b5fc8b5fd0948060 # v4/);
+  assert.match(workspaceRepair, /tailscale\/github-action@306e68a486fd2350f2bfc3b19fcd143891a4a2d8 # v4/);
   assert.match(workspaceRepair, /StrictHostKeyChecking=yes/);
   assert.match(workspaceRepair, /127\.0\.0\.1:8459\/api\/sync\/deploy-key/);
   assert.match(workspaceRepair, /127\.0\.0\.1:8459\/api\/workspace\/adopt-private/);

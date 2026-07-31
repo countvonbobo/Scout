@@ -575,11 +575,28 @@ test('ignores credential variable expressions and exact allowlisted binary asset
   for (const relative of binaries) {
     const binary = path.join(root, relative);
     fs.mkdirSync(path.dirname(binary), { recursive: true });
-    fs.writeFileSync(binary, Buffer.from([137, 80, 78, 71, 0, 1, 2, 3]));
+    fs.writeFileSync(binary, relative === 'ui/assets/scout-icon.png'
+      ? fs.readFileSync(new URL('../ui/assets/scout-icon.png', import.meta.url))
+      : Buffer.from([137, 80, 78, 71, 0, 1, 2, 3]));
   }
   const result = auditRelease({ root, trackedFiles: ['source.mjs', ...binaries], buildDirs: [] });
   assert.equal(result.ok, true);
   assert.equal(result.filesScanned, 5);
+});
+
+test('rejects replacement content at an exact allowlisted public screenshot path', () => {
+  const root = fixture();
+  const relative = 'docs/screenshots/0.1.0-beta.23/trustworthy-model-picker.png';
+  const file = path.join(root, relative);
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file, Buffer.from([137, 80, 78, 71, 0, 1, 2, 3]));
+
+  const result = auditRelease({ root, trackedFiles: [relative], buildDirs: [] });
+
+  assert.equal(result.ok, false);
+  assert.deepEqual(result.findings, [{
+    file: relative, line: 1, rule: 'reviewed-binary-digest-mismatch',
+  }]);
 });
 
 test('rejects arbitrary packaged binary documents and screenshots outside exact public allowlists', () => {
