@@ -1,7 +1,8 @@
 import crypto from 'node:crypto';
 
-const TRACKING_PARAMETERS = /^(?:utm_[^=]+|gclid|fbclid|mc_[^=]+|gh_src|ref(?:errer)?|source|tracking|trk)$/i;
-const CREDENTIAL_PARAMETERS = /^(?:access[-_]?token|api[-_]?(?:key|token)|auth(?:orization)?|code|cookie|credential|jwt|key|password|redirect|secret|session(?:[-_]?id)?|sig(?:nature)?|state|token)$/i;
+const TRACKING_PARAMETERS = /^(?:utm_[^=]+|gclid|fbclid|msclkid|mc_[^=]+)$/i;
+const CREDENTIAL_PARAMETERS = /^(?:(?:access|auth|client|id|oauth|private|refresh|secret|session)[-_]?(?:key|secret|token)|api[-_]?(?:key|token)|auth(?:orization)?|key|password|secret|session[-_]?id|sig(?:nature)?|token)$/i;
+const IDENTITY_ONLY_PARAMETERS = /^(?:code|cookie|credential|gh_src|jwt|redirect|ref(?:errer)?|session|source|state|tracking|trk)$/i;
 const CREDENTIAL_VALUE = /(?:\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b)|(?:\b(?:access[-_ ]?token|api[-_ ]?(?:key|token)|authorization|password|secret|session[-_ ]?id|token)\s*[:=]\s*\S+)|(?:\bbearer\s+[A-Za-z0-9._~+/-]{8,})|(?:\bsk-[A-Za-z0-9_-]{16,})|(?:\bgh[pousr]_[A-Za-z0-9]{20,})|(?:\bxox[baprs]-[A-Za-z0-9-]{10,})|(?:\bAKIA[0-9A-Z]{16}\b)/i;
 const MAX_SOURCE_RECORD_ID_LENGTH = 160;
 
@@ -66,13 +67,21 @@ export function canonicaliseUrl(value) {
   }
 }
 
-export function queryAddressedUrlIdentityDigest(value, supplied) {
+export function queryAddressedUrlIdentityDigest(
+  value,
+  supplied,
+  { trustedSupplied = false } = {},
+) {
   const provided = String(supplied || '');
   const canonicalUrl = canonicaliseUrl(value);
   try {
     const parsed = new URL(String(canonicalUrl || ''));
-    if (parsed.search) return fingerprint(canonicalUrl);
-    return /^[a-f0-9]{64}$/.test(provided) ? provided : null;
+    for (const key of [...parsed.searchParams.keys()]) {
+      if (IDENTITY_ONLY_PARAMETERS.test(key)) parsed.searchParams.delete(key);
+    }
+    parsed.searchParams.sort();
+    if (parsed.search) return fingerprint(parsed.toString());
+    return trustedSupplied && /^[a-f0-9]{64}$/.test(provided) ? provided : null;
   } catch {
     return null;
   }
@@ -121,16 +130,36 @@ function compensation(job, warnings) {
 function sourceRecordId(job, canonicalUrl) {
   const providerId = text(job.sourceRecordId) || text(job.providerId);
   if (!providerId) return canonicalUrl ? `url-${fingerprint(canonicalUrl).slice(0, 16)}` : null;
-  let urlShaped = false;
+  return durableProviderIdentifier(providerId);
+}
+
+export function durableProviderIdentifier(value) {
+  const providerId = text(value);
+  if (!providerId) return null;
+  let urlIdentity = null;
   try {
     const parsed = new URL(providerId);
-    urlShaped = ['http:', 'https:'].includes(parsed.protocol);
+    if (['http:', 'https:'].includes(parsed.protocol)) {
+      urlIdentity = canonicaliseUrl(providerId);
+      if (urlIdentity) {
+        const identityDigest = queryAddressedUrlIdentityDigest(urlIdentity);
+        urlIdentity = identityDigest || urlIdentity;
+      }
+    }
   } catch {}
-  if (urlShaped || providerId.includes('?')
+  if (urlIdentity || providerId.includes('?')
     || providerId.length > MAX_SOURCE_RECORD_ID_LENGTH || CREDENTIAL_VALUE.test(providerId)) {
-    return `provider-${fingerprint(providerId).slice(0, 32)}`;
+    return `provider-${fingerprint(urlIdentity || providerId).slice(0, 32)}`;
   }
   return providerId;
+}
+
+export function durableSourceIdentifier(value) {
+  const source = metadataText(value);
+  if (!source) return null;
+  return CREDENTIAL_VALUE.test(source)
+    ? `source-${fingerprint(source).slice(0, 32)}`
+    : source;
 }
 
 function diagnosticCode(warning) {
@@ -144,10 +173,10 @@ function diagnosticCode(warning) {
 export function normaliseObservation(job, {
   sourceName, collectionSource, fetchedAt, laneId, laneIds, roleFamily,
 } = {}) {
-  const source = metadataText(sourceName) || metadataText(job?.source);
+  const source = durableSourceIdentifier(sourceName) || durableSourceIdentifier(job?.source);
   if (!job || !source) return null;
   const canonicalUrl = canonicaliseUrl(job.url || job.sourceUrl);
-  const identityDigest = queryAddressedUrlIdentityDigest(canonicalUrl, job.urlIdentityDigest);
+  const identityDigest = queryAddressedUrlIdentityDigest(canonicalUrl);
   const title = text(job.title);
   const recordId = sourceRecordId(job, canonicalUrl);
   if (!title || !recordId) return null;

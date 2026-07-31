@@ -849,7 +849,11 @@ export async function runScanWith(root, provider, mode, {
     : {
       collect,
       normalise({ priorArtifact }) {
-        const compacted = compactCandidates(priorArtifact.sources, DEFAULT_CANDIDATE_LIMIT);
+        const compacted = compactCandidates(
+          priorArtifact.sources,
+          DEFAULT_CANDIDATE_LIMIT,
+          { trustedStageArtifact: true },
+        );
         return { candidates: compacted.candidates, dropped: compacted.dropped };
       },
       deduplicate: ({ priorArtifact }) => priorArtifact,

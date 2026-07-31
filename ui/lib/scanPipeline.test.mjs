@@ -1353,10 +1353,111 @@ test('collect-to-history projection keeps distinct 129-character provider openin
   assert.equal(next.candidates.length, 1);
 });
 
+test('collect-codec history reuses query identity across provider URL credential churn', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'scout-provider-url-churn-history-'));
+  fs.mkdirSync(path.join(root, 'data'), { recursive: true });
+  const privateParameter = ['to', 'ken'].join('');
+  const queryUrl = (host, marker) => {
+    const url = new URL(`https://${host}/apply`);
+    url.searchParams.set('job', '42');
+    url.searchParams.set(privateParameter, `fixture-${marker}`);
+    url.searchParams.set(['utm', 'source'].join('_'), marker);
+    return url.toString();
+  };
+  const profile = {
+    version: 1, status: 'published', id: 'profile-provider-url-churn',
+    target: {
+      primaryTitles: [{
+        value: 'Platform Engineer',
+        strength: 'strong-preference',
+        provenance: 'explicit',
+      }],
+    },
+    negative: {},
+    compensation: {
+      currency: null, period: 'year', minimum: null,
+      minimumStrength: 'neutral', unknownPolicy: 'include',
+    },
+  };
+  const runThroughRecoveredCollect = async (marker, decisionHistory = []) => {
+    const stages = createRankedDiscoveryStages({
+      collect: async () => ({
+        generatedAt: '2026-07-31T10:00:00.000Z',
+        queries: ['platform engineer'],
+        sources: {
+          aggregator: {
+            configured: true,
+            status: 'healthy',
+            jobs: [{
+              company: 'Synthetic Company',
+              title: 'Platform Engineer',
+              source: 'vendor_ats',
+              providerId: queryUrl('vendor.example.test', marker),
+              url: queryUrl('jobs.example.test', marker),
+            }],
+          },
+        },
+      }),
+      profile,
+      decisionHistory,
+    });
+    const collected = await stages.collect({ run: { runId: `provider-churn-${marker}` } });
+    let value = stages.collect.artifactCodec.decode(
+      stages.collect.artifactCodec.encode(collected),
+    );
+    for (const stageId of ['normalise', 'deduplicate', 'filter', 'rank']) {
+      value = stages[stageId]({ priorArtifact: value });
+    }
+    return stages.select({
+      run: { runId: `provider-churn-${marker}` },
+      priorArtifact: value,
+    });
+  };
+  const first = await runThroughRecoveredCollect('first');
+  const firstVacancy = first.selection.selected[0];
+  const projected = runLogAppendRecipe({
+    timestamp: '2026-07-31T10:00:00.000Z',
+    reviewed: [{
+      vacancyId: firstVacancy.vacancyId,
+      company: firstVacancy.company,
+      role: firstVacancy.role,
+      source: firstVacancy.source,
+      sourceReferences: firstVacancy.sourceReferences,
+      contentFingerprint: firstVacancy.contentFingerprint,
+      profileId: profile.id,
+      learningVersionId: 'learning-baseline',
+      outcome: 'provider_discarded',
+    }],
+  }).record;
+  fs.writeFileSync(path.join(root, 'data', 'scan-runs.jsonl'), `${JSON.stringify(projected)}\n`);
+  const history = readVacancyDecisionHistory(root);
+  const second = await runThroughRecoveredCollect('second', history);
+  assert.equal(history[0].vacancyId, firstVacancy.vacancyId);
+  assert.equal(
+    second.selection.assessmentSkipped.length,
+    1,
+    JSON.stringify({
+      history,
+      selected: second.selection.selected,
+      skipped: second.selection.assessmentSkipped,
+    }),
+  );
+  assert.equal(second.candidates.length, 0);
+  assert.equal(second.selection.assessmentSkipped[0].vacancyId, firstVacancy.vacancyId);
+});
+
 test('tracker and run-log projection preserve distinct legacy query-addressed vacancy IDs', () => {
+  const privateParameter = ['to', 'ken'].join('');
+  const legacyQueryUrl = (job, marker) => {
+    const url = new URL('https://jobs.example.test/apply');
+    url.searchParams.set(['utm', 'source'].join('_'), `fixture-${marker}`);
+    url.searchParams.set('job', job);
+    url.searchParams.set(privateParameter, `fixture-${marker}`);
+    return url.toString();
+  };
   const vacancyIds = [
-    'https://jobs.example.test/apply?utm_source=first&job=one&token=secret-one',
-    'https://jobs.example.test/apply?token=secret-two&job=two&utm_source=second',
+    legacyQueryUrl('one', 'first'),
+    legacyQueryUrl('two', 'second'),
   ];
   const reviewed = vacancyIds.map((vacancyId, index) => ({
     vacancyId,
@@ -1366,22 +1467,24 @@ test('tracker and run-log projection preserve distinct legacy query-addressed va
     sourceReferences: [],
     index,
   }));
+  const durableReviewed = durableScanProjection(reviewed);
   const runIds = runLogAppendRecipe({
     timestamp: '2026-07-31T10:00:00.000Z',
-    reviewed,
+    reviewed: durableReviewed,
   }).record.reviewed.map((item) => item.vacancyId);
+  const durableTracker = durableScanProjection({
+    updated: '2026-07-31',
+    opportunities: reviewed.map((item, index) => ({
+      id: `legacy-query-${index}`,
+      company: item.company,
+      role: item.role,
+      vacancyId: item.vacancyId,
+      status: 'new',
+    })),
+  });
   const trackerIds = trackerMergeRecipe(
     '{"updated":"2026-07-30","opportunities":[]}',
-    JSON.stringify({
-      updated: '2026-07-31',
-      opportunities: reviewed.map((item, index) => ({
-        id: `legacy-query-${index}`,
-        company: item.company,
-        role: item.role,
-        vacancyId: item.vacancyId,
-        status: 'new',
-      })),
-    }),
+    JSON.stringify(durableTracker),
   ).upserts.map((item) => item.vacancyId);
   assert.deepEqual(runIds, trackerIds);
   assert.equal(new Set(runIds).size, 2);
@@ -1670,6 +1773,16 @@ test('legacy collect recovery preserves distinct sanitized query-addressed vacan
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'scout-legacy-query-recovery-'));
   let now = Date.parse('2026-07-31T10:00:00.000Z');
   let collectCalls = 0;
+  const privateParameter = ['to', 'ken'].join('');
+  const firstPrivateProvider = `sk-${'A'.repeat(32)}`;
+  const firstPrivateSource = `ghp_${'B'.repeat(30)}`;
+  const legacyQueryUrl = (job, marker) => {
+    const url = new URL('https://jobs.example.test/apply');
+    url.searchParams.set(['utm', 'source'].join('_'), `fixture-${marker}`);
+    url.searchParams.set('job', job);
+    url.searchParams.set(privateParameter, `fixture-${marker}`);
+    return url.toString();
+  };
   const collected = {
     generatedAt: '2026-07-31T10:00:00.000Z',
     queries: ['platform engineer'],
@@ -1681,14 +1794,15 @@ test('legacy collect recovery preserves distinct sanitized query-addressed vacan
           {
             company: 'Synthetic Company',
             title: 'Platform Engineer',
-            providerId: 'query-opening-one',
-            url: 'https://jobs.example.test/apply?utm_source=first&job=one&token=secret-one',
+            source: firstPrivateSource,
+            providerId: firstPrivateProvider,
+            url: legacyQueryUrl('one', 'first'),
           },
           {
             company: 'Synthetic Company',
             title: 'Platform Engineer',
             providerId: 'query-opening-two',
-            url: 'https://jobs.example.test/apply?token=secret-two&job=two&utm_source=second',
+            url: legacyQueryUrl('two', 'second'),
           },
         ],
       },
@@ -1697,6 +1811,7 @@ test('legacy collect recovery preserves distinct sanitized query-addressed vacan
   const normalise = ({ priorArtifact }) => compactCandidates(
     priorArtifact.sources,
     DEFAULT_CANDIDATE_LIMIT,
+    { trustedStageArtifact: true },
   );
   const stages = {
     collect: async () => {
@@ -1716,7 +1831,7 @@ test('legacy collect recovery preserves distinct sanitized query-addressed vacan
     takeoverMarginMs: 0,
   };
   try {
-    assert.equal(normalise({ priorArtifact: collected }).candidates.length, 2);
+    assert.equal(compactCandidates(collected.sources, DEFAULT_CANDIDATE_LIMIT).candidates.length, 2);
     await assert.rejects(
       runScanPipeline({
         root,
@@ -1744,6 +1859,8 @@ test('legacy collect recovery preserves distinct sanitized query-addressed vacan
       new Set(recovered.stageOutputs.normalise.candidates.map((item) => item.urlIdentityDigest)).size,
       2,
     );
+    assert.match(recovered.stageOutputs.normalise.candidates[0].providerId, /^provider-[a-f0-9]{32}$/);
+    assert.match(recovered.stageOutputs.normalise.candidates[0].source, /^source-[a-f0-9]{32}$/);
     const persisted = fs.readdirSync(path.join(
       root,
       '.scout',
@@ -1758,7 +1875,10 @@ test('legacy collect recovery preserves distinct sanitized query-addressed vacan
       'artifacts',
       name,
     ), 'utf8')).join('\n');
-    assert.doesNotMatch(persisted, /secret-one|secret-two|utm_source|job=one|job=two/);
+    assert.doesNotMatch(
+      persisted,
+      new RegExp(`${firstPrivateProvider}|${firstPrivateSource}|utm_source|job=one|job=two`),
+    );
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }

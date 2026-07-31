@@ -35,6 +35,7 @@ const COVERAGE_COUNTERS = ['found', 'ranked', 'selected', 'excluded', 'assessed'
 const COVERAGE_DIMENSIONS = ['source', 'employer', 'lane', 'roleFamily', 'location', 'provider', 'run', 'date'];
 const MAX_EXPLANATIONS = 10_000;
 const PRIVATE_SOURCE_TOKEN = /^(?:access|api|auth|authorization|bearer|code|cookie|credential|jwt|key|password|secret|session|signature|state|token)$/;
+const PRIVATE_IDENTIFIER_VALUE = /(?:\bsk-[A-Za-z0-9_-]{16,}|\bgh[pousr]_[A-Za-z0-9]{20,}|\bxox[baprs]-[A-Za-z0-9-]{10,}|\bAKIA[0-9A-Z]{16}\b|\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b|\bbearer\s+[A-Za-z0-9._~+/-]{8,}|(?:token|secret|password|key)\s*[:=]\s*\S+)/i;
 
 function boundedLabel(value, maximum) {
   const text = String(value || '').replace(/[\r\n\t]+/g, ' ').replace(/\s{2,}/g, ' ').trim();
@@ -55,12 +56,14 @@ function identifier(value) {
 function providerIdentifier(value) {
   const text = String(value || '').trim();
   if (!text) return null;
-  if (SAFE_PROVIDER_IDENTIFIER.test(text)) return text;
+  if (SAFE_PROVIDER_IDENTIFIER.test(text) && !PRIVATE_IDENTIFIER_VALUE.test(text)) return text;
   return `provider-${digest(text).slice(0, 32)}`;
 }
 
 function sourceIdentityLabel(value) {
-  const label = boundedLabel(normaliseIdentityText(value), 80);
+  const raw = String(value || '').trim();
+  if (PRIVATE_IDENTIFIER_VALUE.test(raw)) return `source-${digest(raw).slice(0, 32)}`;
+  const label = boundedLabel(normaliseIdentityText(raw), 80);
   const words = label?.split(' ') || [];
   if (!label || words.length > 4 || words.some((word) => PRIVATE_SOURCE_TOKEN.test(word))) return null;
   return label;

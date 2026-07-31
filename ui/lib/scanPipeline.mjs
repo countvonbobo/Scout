@@ -12,7 +12,8 @@ import { canonicaliseObservations, vacancyContentFingerprint } from './vacancyCa
 import { createDiscoveryFunnel, advanceDiscoveryFunnel, assertDiscoveryFunnel } from './discoveryFunnel.mjs';
 import { filterVacancies } from './vacancyFilter.mjs';
 import {
-  normaliseObservation, queryAddressedUrlIdentityDigest,
+  durableProviderIdentifier, durableSourceIdentifier, normaliseObservation,
+  queryAddressedUrlIdentityDigest,
 } from './vacancyObservation.mjs';
 import { rankVacancies, vacancyNoveltyComparison } from './vacancyRank.mjs';
 import { selectVacancies } from './vacancySelect.mjs';
@@ -1411,6 +1412,13 @@ function encodeRankedStageValue(value) {
   const encoded = {};
   for (const [key, item] of Object.entries(value)) {
     if (OMIT_PRIVATE_STAGE_KEY.test(key)) continue;
+    if (['vacancyId', 'vacancy_id'].includes(key) && typeof item === 'string') {
+      const urlIdentityDigest = queryAddressedUrlIdentityDigest(item);
+      encoded[key] = urlIdentityDigest
+        ? `vacancy-url-${urlIdentityDigest.slice(0, 24)}`
+        : privacySafeStageUrl(item) ?? item.slice(0, 160);
+      continue;
+    }
     if (URL_STAGE_KEY.test(key) && typeof item === 'string') {
       encoded[key] = privacySafeStageUrl(item);
       continue;
@@ -1619,6 +1627,7 @@ function legacySemanticJob(job, sourceName, { durableUrls = true } = {}) {
     source: candidate.source || sourceName,
     providerId: candidate.providerId,
     ...(urlIdentityDigest ? { urlIdentityDigest } : {}),
+    ...(urlIdentityDigest ? { urlIdentityProvenance: 'durable-query-v1' } : {}),
     sourceReferences: candidate.sourceReferences.map((reference) => ({
       ...reference,
       url: durableUrls ? privacySafeStageUrl(reference.url) : reference.url,
@@ -1965,7 +1974,7 @@ export function buildAssessmentPrompt(context, {
   ].join('\n\n');
 }
 
-function normaliseJob(job) {
+function normaliseJob(job, { trustedStageArtifact = false } = {}) {
   const company = String(job?.company || '').trim();
   const role = String(job?.title || job?.role || '').trim();
   const url = String(job?.url || '').trim();
@@ -1976,13 +1985,32 @@ function normaliseJob(job) {
   if ((job?.semanticEvidence?.responsibilityFacts || []).length > 64) {
     throw new Error('advert responsibility evidence exceeds the supported limit');
   }
-  const urlIdentityDigest = queryAddressedUrlIdentityDigest(job.url, job.urlIdentityDigest);
+  const urlIdentityDigest = queryAddressedUrlIdentityDigest(
+    job.url,
+    job.urlIdentityDigest,
+    {
+      trustedSupplied: trustedStageArtifact
+        && job.urlIdentityProvenance === 'durable-query-v1',
+    },
+  );
+  const source = durableSourceIdentifier(job?.source) || '';
+  const providerId = durableProviderIdentifier(job?.providerId) || '';
+  const safeReferenceInput = {
+    ...job,
+    source,
+    providerId,
+    sourceReferences: (job?.sourceReferences || []).map((reference) => ({
+      ...reference,
+      source: durableSourceIdentifier(reference?.source) || '',
+      providerId: durableProviderIdentifier(reference?.providerId) || '',
+    })),
+  };
   return {
     company, role, url, location: String(job?.location || ''), salary: job?.salary || null,
     workingType: String(job?.workingType || ''), postedDate: job?.postedDate || null,
-    source: String(job?.source || ''), providerId: String(job?.providerId || ''),
+    source, providerId,
     description: String(job?.description || ''), requirements: String(job?.requirements || ''),
-    tags: Array.isArray(job?.tags) ? job.tags : [], sourceReferences: sourceReferencesOf(job), duplicateCount: 1,
+    tags: Array.isArray(job?.tags) ? job.tags : [], sourceReferences: sourceReferencesOf(safeReferenceInput), duplicateCount: 1,
     semanticEvidence: job?.semanticEvidence || null,
     ...(urlIdentityDigest ? { urlIdentityDigest } : {}),
   };
@@ -2032,7 +2060,11 @@ function absorbDuplicate(existing, incoming) {
 // never recorded. Each source now gets a guaranteed share of the budget first,
 // leftover capacity is shared among the sources that still have jobs, and what
 // could not fit is reported so a truncated scan is visible rather than silent.
-export function compactCandidates(sources, maximum = DEFAULT_CANDIDATE_LIMIT) {
+export function compactCandidates(
+  sources,
+  maximum = DEFAULT_CANDIDATE_LIMIT,
+  { trustedStageArtifact = false } = {},
+) {
   const pools = new Map();
   // sameUnderlyingJob only matches jobs that share a URL or a normalised
   // company, so comparing every new job against every earlier one is wasted
@@ -2043,7 +2075,7 @@ export function compactCandidates(sources, maximum = DEFAULT_CANDIDATE_LIMIT) {
   for (const [name, source] of Object.entries(sources || {})) {
     const pool = [];
     for (const job of source?.jobs || []) {
-      const incoming = normaliseJob(job);
+      const incoming = normaliseJob(job, { trustedStageArtifact });
       if (!incoming) continue;
       const key = jobIdentity(incoming).company || '';
       const bucket = byCompany.get(key) || [];

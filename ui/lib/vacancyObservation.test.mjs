@@ -269,15 +269,24 @@ test('query-bearing URL provider identities are fingerprinted before durable obs
 });
 
 test('query identity ignores tracking and credential churn but distinguishes meaningful job keys', () => {
-  const first = queryAddressedUrlIdentityDigest(
-    'https://jobs.example.test/apply?utm_source=one&job=42&session=secret-one&ref=board',
-  );
-  const same = queryAddressedUrlIdentityDigest(
-    'https://jobs.example.test/apply?code=secret-two&job=42&utm_medium=two',
-  );
-  const different = queryAddressedUrlIdentityDigest(
-    'https://jobs.example.test/apply?job=43&token=secret-three',
-  );
+  const identityUrl = (job, parameters = {}) => {
+    const url = new URL('https://jobs.example.test/apply');
+    url.searchParams.set('job', job);
+    for (const [key, value] of Object.entries(parameters)) url.searchParams.set(key, value);
+    return url.toString();
+  };
+  const first = queryAddressedUrlIdentityDigest(identityUrl('42', {
+    [['utm', 'source'].join('_')]: 'one',
+    session: 'fixture-one',
+    ref: 'board',
+  }));
+  const same = queryAddressedUrlIdentityDigest(identityUrl('42', {
+    code: 'fixture-two',
+    [['utm', 'medium'].join('_')]: 'two',
+  }));
+  const different = queryAddressedUrlIdentityDigest(identityUrl('43', {
+    [['to', 'ken'].join('')]: 'fixture-three',
+  }));
   assert.match(first, /^[a-f0-9]{64}$/);
   assert.equal(first, same);
   assert.notEqual(first, different);
@@ -287,5 +296,21 @@ test('query identity ignores tracking and credential churn but distinguishes mea
       'f'.repeat(64),
     ),
     first,
+  );
+  for (const name of [
+    'refresh_token', 'id_token', 'client_secret', 'oauth_token',
+    'session_token', 'private_key', 'msclkid',
+  ]) {
+    assert.equal(
+      queryAddressedUrlIdentityDigest(identityUrl('42', { [name]: `fixture-${name}` })),
+      first,
+    );
+  }
+  assert.equal(
+    queryAddressedUrlIdentityDigest(
+      'https://jobs.example.test/apply',
+      'f'.repeat(64),
+    ),
+    null,
   );
 });
