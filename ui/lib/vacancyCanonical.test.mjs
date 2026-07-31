@@ -333,6 +333,44 @@ test('duplicate prior records cannot assign one durable vacancy ID to two curren
   assert.equal(current.filter(({ vacancyId }) => vacancyId === prior.vacancyId).length, 1);
 });
 
+test('conflicting duplicate prior IDs reconcile independently of prior input order', () => {
+  const priorA = canonicaliseObservations([observation({
+    source: 'provider-a',
+    providerId: 'opening-a',
+    url: null,
+    description: 'Build stable services.',
+  })]).vacancies[0];
+  const priorB = canonicaliseObservations([observation({
+    source: 'provider-a',
+    providerId: 'opening-b',
+    url: null,
+    description: 'Build stable services.',
+  })]).vacancies[0];
+  priorB.vacancyId = priorA.vacancyId;
+  const current = [
+    observation({
+      source: 'provider-a',
+      providerId: 'opening-a',
+      url: null,
+      description: 'Build stable services.',
+    }),
+    observation({
+      source: 'provider-a',
+      providerId: 'opening-b',
+      url: null,
+      description: 'Build stable services.',
+    }),
+  ];
+  const forward = canonicaliseObservations(current, {
+    priorVacancies: [priorA, priorB],
+  });
+  const reverse = canonicaliseObservations(current, {
+    priorVacancies: [priorB, priorA],
+  });
+  assert.deepEqual(forward, reverse);
+  assert.equal(new Set(forward.vacancies.map(({ vacancyId }) => vacancyId)).size, 2);
+});
+
 test('canonicalisation rejects semantic responsibility overflow instead of truncating evidence', () => {
   const semantic = {
     ...observation({ source: 'provider-z', providerId: 'capacity-1' }),

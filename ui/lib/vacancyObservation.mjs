@@ -66,6 +66,17 @@ export function canonicaliseUrl(value) {
   }
 }
 
+function urlIdentityDigest(canonicalUrl, supplied) {
+  const provided = String(supplied || '');
+  if (/^[a-f0-9]{64}$/.test(provided)) return provided;
+  try {
+    const parsed = new URL(String(canonicalUrl || ''));
+    return parsed.search ? fingerprint(canonicalUrl) : null;
+  } catch {
+    return null;
+  }
+}
+
 function extraction(description, patterns) {
   const matches = [...new Set(patterns.filter(([, pattern]) => pattern.test(description)).map(([value]) => value))];
   return { value: matches.length === 1 ? matches[0] : null, ambiguous: matches.length > 1 };
@@ -135,6 +146,7 @@ export function normaliseObservation(job, {
   const source = metadataText(sourceName) || metadataText(job?.source);
   if (!job || !source) return null;
   const canonicalUrl = canonicaliseUrl(job.url || job.sourceUrl);
+  const identityDigest = urlIdentityDigest(canonicalUrl, job.urlIdentityDigest);
   const title = text(job.title);
   const recordId = sourceRecordId(job, canonicalUrl);
   if (!title || !recordId) return null;
@@ -196,6 +208,7 @@ export function normaliseObservation(job, {
     sourceRecordId: recordId,
     sourceUrl: canonicalUrl,
     canonicalUrl,
+    urlIdentityDigest: identityDigest,
     employer: field(text(job.company || job.employer), 'explicit-source'),
     employerReference: field(text(job.employerReference || job.companyReference || job.employerId), 'explicit-source'),
     title: field(title, 'explicit-source'),

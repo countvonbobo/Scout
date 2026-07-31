@@ -636,6 +636,15 @@ export function createProviderLoginManager({
     const health = reportHealth
       ? persistHealth(session, terminalHealth(reasonCode, state)).catch(() => {})
       : Promise.resolve();
+    const boundedHealth = deadlineAt === undefined
+      ? health
+      : Promise.race([
+        health,
+        new Promise((resolve) => {
+          const timer = setTimeout(resolve, Math.max(0, deadlineAt - Date.now()));
+          timer.unref?.();
+        }),
+      ]);
     const authLease = session.authLease;
     const confirmation = session.confirmation;
     session.buffers = { stdout: '', stderr: '' };
@@ -649,7 +658,7 @@ export function createProviderLoginManager({
       if (sessions.get(session.sessionId) === session) sessions.delete(session.sessionId);
     }, retentionMs);
     retention.unref?.();
-    return Promise.all([cleanup, health]).then(() => {
+    return Promise.all([cleanup, boundedHealth]).then(() => {
       const closures = [];
       if (record && !record.closed) closures.push(record.closedPromise);
       if (confirmation) closures.push(

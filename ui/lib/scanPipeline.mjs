@@ -1601,6 +1601,11 @@ function legacySemanticJob(job, sourceName, { durableUrls = true } = {}) {
   if (!candidate) return null;
   const description = String(job?.description || '');
   const requirements = String(job?.requirements || '');
+  let urlIdentityDigest = null;
+  try {
+    const parsed = new URL(String(candidate.url || ''));
+    if (parsed.search) urlIdentityDigest = digestText(candidate.url);
+  } catch {}
   return {
     company: candidate.company,
     title: candidate.role,
@@ -1611,6 +1616,7 @@ function legacySemanticJob(job, sourceName, { durableUrls = true } = {}) {
     postedDate: candidate.postedDate,
     source: candidate.source || sourceName,
     providerId: candidate.providerId,
+    urlIdentityDigest,
     sourceReferences: candidate.sourceReferences.map((reference) => ({
       ...reference,
       url: durableUrls ? privacySafeStageUrl(reference.url) : reference.url,

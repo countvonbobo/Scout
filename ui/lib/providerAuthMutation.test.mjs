@@ -149,8 +149,13 @@ test('an old guard owned by this live process cannot be stolen', (t) => {
 
 test('expired authentication authority is recovered with a new capability', (t) => {
   const root = workspace(t);
+  const deadOwner = {
+    ...currentLeaseOwner(),
+    pid: 2_147_483_647,
+    processStart: 'definitely-dead-owner',
+  };
   const expired = acquireProviderAuthMutation(root, 'codex', {
-    owner, now: 1_000, durationMs: 10, mutationId: 'expired-mutation-01',
+    owner: deadOwner, now: 1_000, durationMs: 10, mutationId: 'expired-mutation-01',
   });
   assert.equal(readProviderAuthMutation(root, 'codex', { now: 1_011 }), null);
   const recovered = acquireProviderAuthMutation(root, 'codex', {
@@ -163,6 +168,74 @@ test('expired authentication authority is recovered with a new capability', (t) 
   );
   assert.equal(releaseProviderAuthMutation(root, recovered, { now: 1_012 }), true);
   assert.equal(readProviderAuthMutation(root, 'codex', { now: 1_012 }), null);
+});
+
+test('expired live auth and work records remain mutually exclusive and renewable', (t) => {
+  const root = workspace(t);
+  const liveOwner = currentLeaseOwner();
+  const auth = acquireProviderAuthMutation(root, 'codex', {
+    owner: liveOwner,
+    now: 1_000,
+    durationMs: 10,
+    mutationId: 'live-expired-auth-01',
+  });
+  assert.equal(acquireProviderAuthMutation(root, 'codex', {
+    owner: liveOwner,
+    now: 1_011,
+    durationMs: 10,
+    mutationId: 'overlap-auth-denied',
+  }), null);
+  assert.throws(() => acquireProviderWork(root, 'codex', {
+    owner: liveOwner,
+    now: 1_011,
+    durationMs: 10,
+    workId: 'overlap-work-denied',
+  }), (error) => error.reasonCode === 'provider-auth-in-progress');
+  const renewedAuth = renewProviderAuthMutation(root, auth, {
+    now: 1_011,
+    durationMs: 10,
+  });
+  releaseProviderAuthMutation(root, renewedAuth, { now: 1_012 });
+
+  const work = acquireProviderWork(root, 'codex', {
+    owner: liveOwner,
+    now: 2_000,
+    durationMs: 10,
+    workId: 'live-expired-work-01',
+  });
+  assert.equal(acquireProviderAuthMutation(root, 'codex', {
+    owner: liveOwner,
+    now: 2_011,
+    durationMs: 10,
+    mutationId: 'overlap-auth-denied2',
+  }), null);
+  const renewedWork = renewProviderWork(root, work, {
+    now: 2_011,
+    durationMs: 10,
+  });
+  releaseProviderWork(root, renewedWork, { now: 2_012 });
+});
+
+test('an orphaned guard candidate never blocks the published guard path', (t) => {
+  const root = workspace(t);
+  const candidate = path.join(
+    root,
+    '.scout',
+    'provider-auth',
+    'v1',
+    'codex.guard.candidate-orphaned-process',
+  );
+  fs.mkdirSync(candidate, { recursive: true });
+  fs.writeFileSync(path.join(candidate, 'owner.json'), '{}');
+  const auth = acquireProviderAuthMutation(root, 'codex', {
+    owner: currentLeaseOwner(),
+    now: 1_000,
+    durationMs: 10,
+    mutationId: 'candidate-safe-auth1',
+  });
+  assert.ok(auth);
+  assert.equal(fs.existsSync(candidate), true);
+  releaseProviderAuthMutation(root, auth, { now: 1_001 });
 });
 
 test('provider work and authentication mutation are mutually exclusive under one guard', (t) => {

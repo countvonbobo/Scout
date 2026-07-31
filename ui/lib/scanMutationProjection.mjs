@@ -4,6 +4,7 @@ import { serializeTracker } from './tracker.mjs';
 const RECIPE_VERSION = 1;
 const SAFE_CODE = /^[a-z0-9]+(?:[-_:][a-z0-9]+)*$/;
 const SAFE_IDENTIFIER = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
+const SAFE_PROVIDER_IDENTIFIER = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,159}$/;
 const SAFE_STATUS = new Set([
   'new', 'shortlist', 'watch', 'outreach', 'applied', 'interviewing',
   'accepted', 'rejected', 'ignore',
@@ -46,6 +47,13 @@ function code(value, fallback = null) {
 function identifier(value) {
   const text = String(value || '').trim();
   return SAFE_IDENTIFIER.test(text) ? text : null;
+}
+
+function providerIdentifier(value) {
+  const text = String(value || '').trim();
+  if (!text) return null;
+  if (SAFE_PROVIDER_IDENTIFIER.test(text)) return text;
+  return `provider-${digest(text).slice(0, 32)}`;
 }
 
 function number(value, fallback = 0) {
@@ -172,7 +180,7 @@ function safeReferences(entry) {
     : (entry?.sources || []).map((url) => ({ url }));
   return values.map((reference) => ({
     source: code(reference?.source),
-    providerId: identifier(reference?.providerId),
+    providerId: providerIdentifier(reference?.providerId),
     url: canonicalUrl(reference?.url),
   })).filter((reference) => reference.source || reference.providerId || reference.url).slice(0, 8);
 }
@@ -317,7 +325,7 @@ function safeRunRecord(record) {
       validationFailures: (failure?.validationFailures || []).map((value) => code(value, 'validation-failed')).slice(0, 8),
     })),
     explanations: (record?.explanations || []).map((item) => ({
-      vacancy_id: identifier(item?.vacancy_id),
+      vacancy_id: durableVacancyId(item?.vacancy_id),
       company: boundedLabel(item?.company, 120),
       role: boundedLabel(item?.role, 160),
       dimensions: {
@@ -351,7 +359,7 @@ function safeRunRecord(record) {
       sourceReferences: safeReferences({ sourceReferences: item?.sourceReferences }),
     })),
     reviewed: (record?.reviewed || []).map((item) => ({
-      vacancyId: identifier(item?.vacancyId),
+      vacancyId: durableVacancyId(item?.vacancyId),
       company: boundedLabel(item?.company, 120),
       role: boundedLabel(item?.role, 160),
       source: code(item?.source),

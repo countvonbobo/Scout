@@ -1025,6 +1025,21 @@ test('shutdown deadline bounds a credential clear blocked in provider status', a
   await manager.shutdown();
 });
 
+test('shutdown deadline bounds a terminal provider-health write', async () => {
+  const h = harness({
+    onHealthSignal: () => new Promise(() => {}),
+    shutdownDeadlineMs: 20,
+  });
+  await h.manager.startProviderLogin('codex', OWNER);
+  const startedAt = Date.now();
+  await assert.rejects(
+    h.manager.shutdown(),
+    /provider health write did not settle during shutdown/,
+  );
+  assert.ok(Date.now() - startedAt < 1_000);
+  h.login.close(null);
+});
+
 test('Codex device-code parsing rejects token-shaped output', async () => {
   const h = harness();
   const started = await h.manager.startProviderLogin('codex', OWNER);

@@ -1,5 +1,4 @@
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { atomicWriteFile } from './atomicWrite.mjs';
@@ -129,7 +128,7 @@ function activeWorkRecords(target, provider, at, { prune = false } = {}) {
     const bytes = fs.readFileSync(file);
     if (bytes.length > 4_096) throw new Error('provider work record is oversized');
     const record = validateWork(JSON.parse(bytes.toString('utf8')), provider);
-    if (record.expiresAt > at) active.push(record);
+    if (record.expiresAt > at || processOwnerIsLiveOrAmbiguous(record.owner)) active.push(record);
     else if (prune) fs.rmSync(file);
   }
   if (prune && fs.existsSync(target.work) && fs.readdirSync(target.work).length === 0) {
@@ -169,15 +168,17 @@ function removeOwnedGuard(directory, token) {
 
 function createOwnedGuard(directory, acquiredAt) {
   const token = randomUUID();
-  fs.mkdirSync(directory, { mode: 0o700 });
+  const candidate = `${directory}.candidate-${token}`;
+  fs.mkdirSync(candidate, { mode: 0o700 });
   try {
-    atomicWriteFile(path.join(directory, GUARD_RECORD), `${JSON.stringify({
+    atomicWriteFile(path.join(candidate, GUARD_RECORD), `${JSON.stringify({
       token,
       owner: currentLeaseOwner(),
       acquiredAt,
     })}\n`, { mode: 0o600 });
+    fs.renameSync(candidate, directory);
   } catch (error) {
-    fs.rmSync(directory, { recursive: true, force: true });
+    fs.rmSync(candidate, { recursive: true, force: true });
     throw error;
   }
   return token;
@@ -189,7 +190,7 @@ function withGuard(root, provider, now, callback) {
   try {
     token = createOwnedGuard(target.guard, checkedNow(now));
   } catch (error) {
-    if (error?.code !== 'EEXIST') throw error;
+    if (!['EEXIST', 'ENOTEMPTY'].includes(error?.code)) throw error;
     const observed = readGuardRecord(target.guard);
     if (!observed
       || checkedNow(now) - observed.acquiredAt <= GUARD_STALE_MS
@@ -222,7 +223,9 @@ export function readProviderAuthMutation(root, provider, { now } = {}) {
   const bytes = fs.readFileSync(file);
   if (bytes.length > 4_096) throw new Error('provider authentication mutation record is oversized');
   const record = validate(JSON.parse(bytes.toString('utf8')), provider);
-  return record.expiresAt > at ? structuredClone(record) : null;
+  return record.expiresAt > at || processOwnerIsLiveOrAmbiguous(record.owner)
+    ? structuredClone(record)
+    : null;
 }
 
 export function assertProviderAuthIdle(root, provider, options = {}) {
@@ -235,11 +238,7 @@ export function acquireProviderAuthMutation(root, provider, {
   durationMs = DEFAULT_DURATION_MS,
   mutationId = randomUUID(),
   now,
-  owner = {
-    host: os.hostname(),
-    pid: process.pid,
-    processStart: `${process.pid}-${Math.floor(process.uptime() * 1000)}`,
-  },
+  owner = currentLeaseOwner(),
   phase = 'login',
 } = {}) {
   const at = checkedNow(now);
@@ -274,11 +273,7 @@ export function acquireProviderWork(root, provider, {
   durationMs = DEFAULT_WORK_DURATION_MS,
   workId = randomUUID(),
   now,
-  owner = {
-    host: os.hostname(),
-    pid: process.pid,
-    processStart: `${process.pid}-${Math.floor(process.uptime() * 1000)}`,
-  },
+  owner = currentLeaseOwner(),
 } = {}) {
   const at = checkedNow(now);
   if (!Number.isSafeInteger(durationMs) || durationMs <= 0 || durationMs > DEFAULT_WORK_DURATION_MS) {
@@ -321,7 +316,7 @@ export function renewProviderWork(root, capability, {
     const file = path.join(target.work, `${capability.workId}.json`);
     if (!fs.existsSync(file)) throw new Error('provider work capability was lost');
     const current = validateWork(JSON.parse(fs.readFileSync(file, 'utf8')), provider);
-    if (current.workId !== capability.workId || current.expiresAt <= at) {
+    if (current.workId !== capability.workId) {
       throw new Error('provider work capability was lost');
     }
     const mutation = readProviderAuthMutation(root, provider, { now: at });
@@ -348,7 +343,7 @@ export function renewProviderAuthMutation(root, capability, {
       throw new Error('provider authentication mutation capability was lost');
     }
     const current = validate(JSON.parse(fs.readFileSync(target.file, 'utf8')), provider);
-    if (current.mutationId !== capability.mutationId || current.expiresAt <= at) {
+    if (current.mutationId !== capability.mutationId) {
       throw new Error('provider authentication mutation capability was lost');
     }
     if (activeWorkRecords(target, provider, at, { prune: true }).length) {

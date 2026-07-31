@@ -185,7 +185,10 @@ function reconcileDurableVacancyIds(vacancies, priorVacancies) {
       + Number(Boolean(jobIdentity(value).company))
       + Number(Boolean(jobIdentity(value).title))
     );
-    if (!existing || evidenceScore(prior) > evidenceScore(existing)) {
+    const score = evidenceScore(prior);
+    const existingScore = existing ? evidenceScore(existing) : -1;
+    if (!existing || score > existingScore
+      || (score === existingScore && compareStable(stableJson(prior), stableJson(existing)) < 0)) {
       priorById.set(prior.vacancyId, prior);
     }
   }
@@ -325,6 +328,9 @@ function canonicalVacancy(observations) {
       .sort((left, right) => right.length - left.length || compareStable(left, right))[0] || '';
   const fields = Object.fromEntries(DISPLAY_FIELDS.map((name) => [name, displayField(orderedObservations, name)]));
   const canonicalUrl = orderedObservations.map((observation) => observation?.canonicalUrl).find(Boolean) || null;
+  const urlIdentityDigest = orderedObservations
+    .map((observation) => observation?.urlIdentityDigest)
+    .find((value) => /^[a-f0-9]{64}$/.test(String(value || ''))) || null;
   const sourceReferences = mergeSourceReferences(...orderedObservations);
   const identity = jobIdentity({
     company: fields.employer,
@@ -332,12 +338,14 @@ function canonicalVacancy(observations) {
     location: fields.location,
     seniority: fields.seniority,
   });
-  const vacancyId = canonicalVacancyId(canonicalUrl, {
+  const vacancyId = urlIdentityDigest
+    ? `vacancy-url-${urlIdentityDigest.slice(0, 24)}`
+    : canonicalVacancyId(canonicalUrl, {
     company: identity.company,
     title: identity.title,
     location: identity.location,
     seniority: identity.seniority,
-  }, sourceReferences);
+    }, sourceReferences);
   const collectionSources = metadataValues(orderedObservations, 'collectionSource');
   const laneIds = [...new Set([
     ...metadataValues(orderedObservations, 'laneId'),
@@ -348,6 +356,7 @@ function canonicalVacancy(observations) {
     observations: orderedObservations,
     vacancyId,
     canonicalUrl,
+    urlIdentityDigest,
     sourceReferences,
     collectionSources,
     collectionSource: collectionSources[0] || null,

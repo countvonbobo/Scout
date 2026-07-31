@@ -15,7 +15,7 @@ import {
 } from './runJournal.mjs';
 import { ProviderLifecycleUnclosedError } from './structuredTurn.mjs';
 import { applyPreparedMutation, prepareMutation } from './mutationCoordinator.mjs';
-import { scanReportRecipe } from './scanMutationProjection.mjs';
+import { runLogAppendRecipe, scanReportRecipe } from './scanMutationProjection.mjs';
 import { profileRuleId } from './searchProfile.mjs';
 import { createEmployerRegistry, employerRegistryRevision } from './employerRegistry.mjs';
 import { partitionVacanciesForAssessment } from './vacancyLifecycle.mjs';
@@ -448,6 +448,61 @@ test('production deduplicate stage reuses URL-less tracker identity as source co
 
   assert.equal(enriched.vacancies.length, 1);
   assert.equal(enriched.vacancies[0].vacancyId, prior.vacancyId);
+});
+
+test('query-addressed vacancy identity is identical live and after collect or normalise replay', async () => {
+  const profile = {
+    version: 1,
+    status: 'published',
+    id: 'profile-query-recovery',
+    target: {},
+    negative: {},
+    compensation: {
+      currency: null,
+      period: 'year',
+      minimum: null,
+      minimumStrength: 'neutral',
+      unknownPolicy: 'include',
+    },
+  };
+  const stages = createRankedDiscoveryStages({
+    collect: async () => ({
+      generatedAt: '2026-07-31T10:00:00.000Z',
+      queries: ['platform engineer'],
+      sources: {
+        provider: {
+          configured: true,
+          status: 'healthy',
+          jobs: [{
+            company: 'Example Co',
+            title: 'Platform Engineer',
+            providerId: 'query-opening-one',
+            url: 'https://jobs.example.test/apply?job=one',
+          }],
+        },
+      },
+    }),
+    profile,
+  });
+  const collected = await stages.collect({ run: { runId: 'query-recovery' } });
+  const liveCollect = stages.collect.artifactCodec.transient(collected);
+  const recoveredCollect = stages.collect.artifactCodec.decode(
+    stages.collect.artifactCodec.encode(collected),
+  );
+  const liveNormalised = stages.normalise({ priorArtifact: liveCollect });
+  const recoveredNormalised = stages.normalise({ priorArtifact: recoveredCollect });
+  const replayedNormalised = stages.normalise.artifactCodec.decode(
+    stages.normalise.artifactCodec.encode(liveNormalised),
+  );
+  const vacancyIds = [liveNormalised, recoveredNormalised, replayedNormalised].map(
+    (priorArtifact) => stages.deduplicate({ priorArtifact }).vacancies[0].vacancyId,
+  );
+  assert.equal(new Set(vacancyIds).size, 1);
+  assert.match(vacancyIds[0], /^vacancy-url-[a-f0-9]{24}$/);
+  assert.doesNotMatch(
+    JSON.stringify(stages.collect.artifactCodec.encode(collected)),
+    /job=one/,
+  );
 });
 
 test('durable collection preserves bounded employer monitoring evidence for finalisation', async () => {
@@ -1184,6 +1239,42 @@ test('bounded decision history reserves space for a newest pre-assessment outcom
   const history = readVacancyDecisionHistory(root);
   assert.equal(history.length, 512);
   assert.equal(history.some(({ vacancyId }) => vacancyId === 'newest-pre-assessment'), true);
+});
+
+test('projected 129-character provider references keep distinct openings assessable', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'scout-provider-reference-history-'));
+  fs.mkdirSync(path.join(root, 'data'), { recursive: true });
+  const firstProviderId = 'a'.repeat(129);
+  const nextProviderId = 'b'.repeat(129);
+  const projected = runLogAppendRecipe({
+    timestamp: '2026-07-31T10:00:00.000Z',
+    reviewed: [{
+      vacancyId: 'vacancy-ref-prior',
+      company: 'Synthetic Company',
+      role: 'Platform Engineer',
+      source: 'provider-z',
+      sourceReferences: [{
+        source: 'provider-z',
+        providerId: firstProviderId,
+      }],
+      outcome: 'provider_discarded',
+    }],
+  }).record;
+  fs.writeFileSync(path.join(root, 'data', 'scan-runs.jsonl'), `${JSON.stringify(projected)}\n`);
+  const history = readVacancyDecisionHistory(root);
+  assert.equal(history[0].sourceReferences[0].providerId, firstProviderId);
+  const lifecycle = partitionVacanciesForAssessment([{
+    vacancyId: 'vacancy-ref-current',
+    company: 'Synthetic Company',
+    role: 'Platform Engineer',
+    source: 'provider-z',
+    sourceReferences: [{
+      source: 'provider-z',
+      providerId: nextProviderId,
+    }],
+  }], history);
+  assert.equal(lifecycle.skipped.length, 0);
+  assert.equal(lifecycle.eligible.length, 1);
 });
 
 test('durable URL-less decision history preserves provider identity across changing source coverage', () => {

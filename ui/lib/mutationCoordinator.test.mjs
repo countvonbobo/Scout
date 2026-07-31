@@ -915,3 +915,29 @@ test('tracker recipes preserve bounded durable scan identity and ranking lineage
   }]);
   assert.doesNotMatch(JSON.stringify(recipe), /must not persist|access_token/);
 });
+
+test('run-log recipes preserve URL vacancy IDs and full supported provider references', () => {
+  const providerId = 'a'.repeat(129);
+  const vacancyId = 'https://jobs.example.test/opening/42?tracking=private';
+  const recipe = runLogAppendRecipe({
+    timestamp: '2026-07-31T09:00:00.000Z',
+    explanations: [{
+      vacancy_id: vacancyId,
+      company: 'Safe Company',
+      role: 'Safe Role',
+      outcome: 'below_threshold',
+      sourceReferences: [{ source: 'provider-z', providerId }],
+    }],
+    reviewed: [{
+      vacancyId,
+      company: 'Safe Company',
+      role: 'Safe Role',
+      outcome: 'below_threshold',
+      sourceReferences: [{ source: 'provider-z', providerId }],
+    }],
+  });
+  assert.equal(recipe.record.explanations[0].vacancy_id, 'https://jobs.example.test/opening/42');
+  assert.equal(recipe.record.reviewed[0].vacancyId, 'https://jobs.example.test/opening/42');
+  assert.equal(recipe.record.explanations[0].sourceReferences[0].providerId, providerId);
+  assert.equal(recipe.record.reviewed[0].sourceReferences[0].providerId, providerId);
+});
