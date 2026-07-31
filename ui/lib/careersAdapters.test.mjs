@@ -252,6 +252,36 @@ test('deep JSON-LD graphs degrade with a fixed structural limit instead of abort
   assert.deepEqual(monitored.jobs, []);
 });
 
+test('more structured postings than the bounded payload reports degraded capacity', async () => {
+  const postings = Array.from({ length: 101 }, (_, index) => ({
+    '@type': 'JobPosting',
+    title: `Capacity role ${index + 1}`,
+    url: `https://careers.example.test/jobs/capacity-${index + 1}`,
+    hiringOrganization: { name: 'Example Systems' },
+  }));
+  const target = employer({
+    access: {
+      terms: 'allowed',
+      robots: 'allowed',
+      genericEnabled: true,
+      minIntervalMinutes: 60,
+    },
+  });
+  const result = await collectEmployer(target, {
+    fetchImpl: async () => response(
+      `<script type="application/ld+json">${JSON.stringify({ '@graph': postings })}</script>`,
+      { type: 'text/html' },
+    ),
+    lookupFn: publicLookup,
+    now: () => AT,
+  });
+  assert.equal(result.status, 'degraded');
+  assert.equal(result.failureCode, 'structured-data-capacity');
+  assert.equal(result.returned, 101);
+  assert.equal(result.parsed, 100);
+  assert.equal(result.jobs.length, 100);
+});
+
 test('terms, robots, authentication, anti-bot, rate limits and JavaScript shells fail safely', async () => {
   let calls = 0;
   const fetchImpl = async () => { calls += 1; return response(''); };

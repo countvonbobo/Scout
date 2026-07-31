@@ -37,7 +37,7 @@ import {
   PROVIDER_HEALTH_STATES, providerPreflight, readProviderHealth,
 } from './lib/providerHealth.mjs';
 import {
-  acquireProviderAuthMutation, releaseProviderAuthMutation,
+  acquireProviderAuthMutation, releaseProviderAuthMutation, renewProviderAuthMutation,
 } from './lib/providerAuthMutation.mjs';
 import { createProviderLoginManager } from './lib/providerLogin.mjs';
 import { runStructuredTurn } from './lib/structuredTurn.mjs';
@@ -718,6 +718,10 @@ const runtimeProviderLoginManager = createProviderLoginManager({
     WORKSPACE_ROOT,
     provider,
     { phase, owner: currentLeaseOwner() },
+  ),
+  renewAuthMutation: async (capability) => renewProviderAuthMutation(
+    WORKSPACE_ROOT,
+    capability,
   ),
   releaseAuthMutation: async (capability) => releaseProviderAuthMutation(
     WORKSPACE_ROOT,

@@ -218,11 +218,29 @@ test('URL-less canonical identities are stable, collision-free and source-order 
   ];
   const forward = canonicaliseObservations(crossSource);
   const reverse = canonicaliseObservations([...crossSource].reverse());
-  assert.equal(forward.vacancies.length, 1);
+  assert.equal(forward.vacancies.length, 2);
   assert.deepEqual(forward, reverse);
   assert.equal(
-    forward.vacancies[0].vacancyId,
-    canonicaliseObservations([first]).vacancies[0].vacancyId,
+    forward.vacancies.find(({ sourceReferences }) => (
+      sourceReferences[0].providerId === 'reference-1'
+    )).vacancyId,
+    firstAloneId,
   );
-  assert.match(forward.vacancies[0].vacancyId, /^vacancy-ref-[a-f0-9]{24}$/);
+  assert.ok(forward.vacancies.every(
+    ({ vacancyId }) => /^vacancy-ref-[a-f0-9]{24}$/.test(vacancyId),
+  ));
+
+  const laterEarlierSource = observation({
+    source: 'provider-0',
+    providerId: 'earlier-reference',
+    url: null,
+    description: 'Build stable services.',
+  });
+  const firstWithEarlier = canonicaliseObservations([first, laterEarlierSource]).vacancies;
+  assert.equal(
+    firstWithEarlier.find(({ sourceReferences }) => (
+      sourceReferences[0].providerId === 'reference-1'
+    )).vacancyId,
+    firstAloneId,
+  );
 });

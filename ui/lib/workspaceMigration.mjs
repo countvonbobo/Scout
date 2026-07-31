@@ -11,6 +11,11 @@ import { withWorkspaceMutationAuthority } from './workspaceMutationAuthority.mjs
 export const BETA22_COMPATIBLE_VERSION = '0.1.0-beta.22';
 const SNAPSHOT_SCHEMA_VERSION = 1;
 const HISTORICAL_RANKING_SCHEMA_VERSION = 1;
+const MAX_SNAPSHOT_DEPTH = 64;
+const MAX_SNAPSHOT_ENTRIES = 20_000;
+const MAX_SNAPSHOT_FILE_BYTES = 64 * 1024 * 1024;
+const MAX_SNAPSHOT_TOTAL_BYTES = 512 * 1024 * 1024;
+const SNAPSHOT_COPY_CHUNK_BYTES = 1024 * 1024;
 const SNAPSHOT_PATHS = Object.freeze([
   '.env',
   '.gitignore',
@@ -56,15 +61,42 @@ function physicalDestination(value) {
   return path.join(fs.realpathSync(current), ...missing);
 }
 
-function assertPhysicalTree(source, relative = '') {
+function snapshotBudget() {
+  return { entries: 0, totalBytes: 0 };
+}
+
+function inspectSnapshotEntry(source, relative, budget, depth) {
+  if (depth > MAX_SNAPSHOT_DEPTH) throw new Error('beta.22 workspace snapshot exceeds the depth limit');
   const stat = fs.lstatSync(source);
   if (stat.isSymbolicLink()) {
     throw new Error(`beta.22 workspace snapshot does not accept symbolic links: ${slash(relative)}`);
   }
-  if (!stat.isDirectory()) return;
-  for (const name of fs.readdirSync(source)) {
-    assertPhysicalTree(path.join(source, name), path.join(relative, name));
+  if (!stat.isDirectory() && !stat.isFile()) {
+    throw new Error(`beta.22 workspace snapshot only accepts regular files and directories: ${slash(relative)}`);
   }
+  budget.entries += 1;
+  if (budget.entries > MAX_SNAPSHOT_ENTRIES) {
+    throw new Error('beta.22 workspace snapshot exceeds the entry limit');
+  }
+  if (stat.isFile()) {
+    if (stat.size > MAX_SNAPSHOT_FILE_BYTES) {
+      throw new Error(`beta.22 workspace snapshot file exceeds the size limit: ${slash(relative)}`);
+    }
+    budget.totalBytes += stat.size;
+    if (budget.totalBytes > MAX_SNAPSHOT_TOTAL_BYTES) {
+      throw new Error('beta.22 workspace snapshot exceeds the total size limit');
+    }
+  }
+  return stat;
+}
+
+function assertPhysicalTree(source, relative = '', budget = snapshotBudget(), depth = 0) {
+  const stat = inspectSnapshotEntry(source, relative, budget, depth);
+  if (!stat.isDirectory()) return budget;
+  for (const name of fs.readdirSync(source)) {
+    assertPhysicalTree(path.join(source, name), path.join(relative, name), budget, depth + 1);
+  }
+  return budget;
 }
 
 function ignoredSnapshotPath(relative) {
@@ -72,27 +104,67 @@ function ignoredSnapshotPath(relative) {
   return normalised === 'profile/search' || normalised.startsWith('profile/search/');
 }
 
-function copySnapshotEntry(source, target, relative, renew = () => {}) {
+function copySnapshotEntry(
+  source,
+  target,
+  relative,
+  renew = () => {},
+  budget = snapshotBudget(),
+  depth = 0,
+) {
   renew();
-  const stat = fs.lstatSync(source);
-  if (stat.isSymbolicLink()) {
-    throw new Error(`beta.22 workspace snapshot does not accept symbolic links: ${slash(relative)}`);
-  }
+  const stat = inspectSnapshotEntry(source, relative, budget, depth);
   if (stat.isDirectory()) {
     if (ignoredSnapshotPath(relative)) return;
     fs.mkdirSync(target, { recursive: true, mode: 0o700 });
     fs.chmodSync(target, 0o700);
     for (const name of fs.readdirSync(source).sort()) {
-      copySnapshotEntry(path.join(source, name), path.join(target, name), path.join(relative, name), renew);
+      copySnapshotEntry(
+        path.join(source, name),
+        path.join(target, name),
+        path.join(relative, name),
+        renew,
+        budget,
+        depth + 1,
+      );
     }
     return;
   }
   fs.mkdirSync(path.dirname(target), { recursive: true });
-  fs.copyFileSync(source, target);
+  const inputFlags = fs.constants.O_RDONLY
+    | (fs.constants.O_NOFOLLOW || 0)
+    | (fs.constants.O_NONBLOCK || 0);
+  const input = fs.openSync(source, inputFlags);
+  let output;
+  try {
+    const opened = fs.fstatSync(input);
+    if (!opened.isFile() || opened.dev !== stat.dev || opened.ino !== stat.ino) {
+      throw new Error(`beta.22 workspace snapshot file changed during copy: ${slash(relative)}`);
+    }
+    output = fs.openSync(target, 'wx', stat.mode & 0o100 ? 0o700 : 0o600);
+    const buffer = Buffer.allocUnsafe(SNAPSHOT_COPY_CHUNK_BYTES);
+    let position = 0;
+    while (position < stat.size) {
+      renew();
+      const count = fs.readSync(input, buffer, 0, Math.min(buffer.length, stat.size - position), position);
+      if (count <= 0) throw new Error(`beta.22 workspace snapshot file changed during copy: ${slash(relative)}`);
+      let written = 0;
+      while (written < count) written += fs.writeSync(output, buffer, written, count - written);
+      position += count;
+    }
+    if (fs.fstatSync(input).size !== stat.size) {
+      throw new Error(`beta.22 workspace snapshot file changed during copy: ${slash(relative)}`);
+    }
+  } finally {
+    fs.closeSync(input);
+    if (output !== undefined) fs.closeSync(output);
+  }
   fs.chmodSync(target, stat.mode & 0o100 ? 0o700 : 0o600);
 }
 
-function beta22WorkspaceConfigBytes(file) {
+function beta22WorkspaceConfigBytes(file, budget = snapshotBudget()) {
+  const stat = inspectSnapshotEntry(file, 'workspace.json', budget, 0);
+  if (!stat.isFile()) throw new Error('beta.22 rollback workspace config must be a regular file');
   const source = fs.readFileSync(file);
   const value = JSON.parse(source.toString('utf8'));
   if (!Number.isInteger(value.schemaVersion) || value.schemaVersion < 1 || value.schemaVersion > 2) {
@@ -103,22 +175,57 @@ function beta22WorkspaceConfigBytes(file) {
   return Buffer.from(`${JSON.stringify(value, null, 2)}\n`);
 }
 
-function snapshotEntries(directory) {
+function digestSnapshotFile(file, stat, renew) {
+  const hash = crypto.createHash('sha256');
+  const descriptor = fs.openSync(
+    file,
+    fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0) | (fs.constants.O_NONBLOCK || 0),
+  );
+  try {
+    const opened = fs.fstatSync(descriptor);
+    if (!opened.isFile() || opened.dev !== stat.dev || opened.ino !== stat.ino) {
+      throw new Error('beta.22 snapshot file changed during verification');
+    }
+    const buffer = Buffer.allocUnsafe(SNAPSHOT_COPY_CHUNK_BYTES);
+    let position = 0;
+    while (position < stat.size) {
+      renew();
+      const count = fs.readSync(
+        descriptor,
+        buffer,
+        0,
+        Math.min(buffer.length, stat.size - position),
+        position,
+      );
+      if (count <= 0) throw new Error('beta.22 snapshot file changed during verification');
+      hash.update(buffer.subarray(0, count));
+      position += count;
+    }
+    if (fs.fstatSync(descriptor).size !== stat.size) {
+      throw new Error('beta.22 snapshot file changed during verification');
+    }
+    return hash.digest('hex');
+  } finally {
+    fs.closeSync(descriptor);
+  }
+}
+
+function snapshotEntries(directory, renew = () => {}) {
   const entries = [];
-  function visit(current, relative = '') {
-    const stat = fs.lstatSync(current);
-    if (stat.isSymbolicLink()) throw new Error(`beta.22 snapshot contains a symbolic link: ${slash(relative)}`);
+  const budget = snapshotBudget();
+  function visit(current, relative = '', depth = 0) {
+    renew();
+    const stat = inspectSnapshotEntry(current, relative, budget, depth);
     if (stat.isDirectory()) {
       for (const name of fs.readdirSync(current).sort()) {
-        visit(path.join(current, name), path.join(relative, name));
+        visit(path.join(current, name), path.join(relative, name), depth + 1);
       }
       return;
     }
-    const bytes = fs.readFileSync(current);
     entries.push({
       path: slash(relative),
-      bytes: bytes.length,
-      sha256: digest(bytes),
+      bytes: stat.size,
+      sha256: digestSnapshotFile(current, stat, renew),
     });
   }
   visit(directory);
@@ -165,6 +272,11 @@ function verifySnapshotDirectory(directory) {
     throw new Error('beta.22 snapshot or manifest is missing');
   }
   assertPhysicalTree(directory);
+  const manifestStat = fs.lstatSync(manifestFile);
+  if (manifestStat.isSymbolicLink() || !manifestStat.isFile()
+    || manifestStat.size > MAX_SNAPSHOT_FILE_BYTES) {
+    throw new Error('beta.22 snapshot manifest is invalid');
+  }
   const manifest = validateManifest(JSON.parse(fs.readFileSync(manifestFile, 'utf8')));
   const entries = snapshotEntries(directory);
   if (JSON.stringify(entries) !== JSON.stringify(manifest.entries)
@@ -226,18 +338,23 @@ function createBeta22WorkspaceSnapshotUnderAuthority(root, {
   const staging = path.join(parent, `.${name}.${crypto.randomUUID()}.tmp`);
   try {
     fs.mkdirSync(staging, { recursive: false, mode: 0o700 });
+    const budget = snapshotBudget();
     for (const relative of SNAPSHOT_PATHS) {
       renew();
       _testHooks.beforeCopy?.(relative);
       const source = path.join(workspaceRoot, relative);
       if (!fs.existsSync(source)) continue;
       if (relative === 'workspace.json') {
-        atomicWriteFile(path.join(staging, relative), beta22WorkspaceConfigBytes(source), { mode: 0o600 });
+        atomicWriteFile(
+          path.join(staging, relative),
+          beta22WorkspaceConfigBytes(source, budget),
+          { mode: 0o600 },
+        );
       } else {
-        copySnapshotEntry(source, path.join(staging, relative), relative, renew);
+        copySnapshotEntry(source, path.join(staging, relative), relative, renew, budget);
       }
     }
-    const entries = snapshotEntries(staging);
+    const entries = snapshotEntries(staging, renew);
     const currentTreeDigest = treeDigest(entries);
     if (existing
       && JSON.stringify(entries) === JSON.stringify(existing.entries)
@@ -312,7 +429,7 @@ export function materializeBeta22Rollback(root, destination, { snapshotDirectory
   const staging = `${target}.scout-rollback-${crypto.randomUUID()}`;
   if (fs.existsSync(staging)) throw new Error('beta.22 rollback staging destination already exists');
   try {
-    fs.cpSync(chosen.directory, staging, { recursive: true, force: false, errorOnExist: true });
+    copySnapshotEntry(chosen.directory, staging, '', () => {});
     const copiedEntries = snapshotEntries(staging);
     if (JSON.stringify(copiedEntries) !== JSON.stringify(manifest.entries)
       || treeDigest(copiedEntries) !== manifest.treeDigest) {

@@ -117,6 +117,8 @@ test('profile review names every decision area and keeps unconfirmed inferences 
         primaryTitles: [{ value: 'Researcher', strength: 'mandatory', provenance: 'explicit' }],
         sectors: [{ value: 'Education', strength: 'nice-to-have', provenance: 'unconfirmed-inference' }],
         locations: [{ value: 'Remote', strength: 'strong-preference', provenance: 'explicit' }],
+        mobility: [{ value: 'Monthly travel', strength: 'nice-to-have', provenance: 'explicit' }],
+        workingPatterns: [{ value: 'Hybrid', strength: 'strong-preference', provenance: 'explicit' }],
       },
       negative: {
         excludedTitles: [{ value: 'Commission-only', strength: 'hard-exclusion', provenance: 'explicit' }],
@@ -129,10 +131,12 @@ test('profile review names every decision area and keeps unconfirmed inferences 
 
   for (const label of [
     'Primary work', 'Adjacent work', 'Mandatory requirements', 'Preferences',
-    'Confirmed exclusions', 'Accepted locations and working patterns',
+    'Confirmed exclusions', 'Accepted locations', 'Mobility', 'Working patterns',
     'Compensation and unknown handling', 'Focused, balanced or exploratory breadth',
   ]) assert.match(html, new RegExp(label));
   assert.match(html, /unknown location facts: penalise/i);
+  assert.match(html, /Monthly travel/);
+  assert.match(html, /Hybrid/);
   assert.match(html, /Unconfirmed inferences remain non-blocking/);
   assert.match(html, /Publish this reviewed profile/);
 });

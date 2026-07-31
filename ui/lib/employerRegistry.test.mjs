@@ -49,6 +49,17 @@ test('URL-valued origin references discard query credentials and fragments', () 
   assert.doesNotMatch(JSON.stringify(registry), /PRIVATE_VALUE|access_token/);
 });
 
+test('URL-shaped origins with user information fail closed without persisting credentials', () => {
+  const userInfo = ['synthetic-user', 'synthetic-pass'].join(':');
+  assert.throws(() => createEmployerRegistry([discovery('Unsafe Origin Example', {
+    origin: {
+      kind: 'advert-discovered',
+      recordedAt: AT,
+      reference: `https://${userInfo}@jobs.example.test/role`,
+    },
+  })], { now: () => AT }), /origin URL is invalid/);
+});
+
 test('registry accepts all four discovery origins without inventing priority', () => {
   const registry = createEmployerRegistry([
     discovery('Named Example', {

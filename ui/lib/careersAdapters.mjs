@@ -142,7 +142,7 @@ function parseJobPostingRecords(html, {
         stale += 1;
         continue;
       }
-      postings.push({
+      const candidate = {
         providerId: text(posting.identifier?.value || posting.identifier || url, 300),
         sourceRecordId: `careers-structured:${text(posting.identifier?.value || posting.identifier || url, 300)}`,
         title,
@@ -156,14 +156,16 @@ function parseJobPostingRecords(html, {
         validThrough: validThrough ? validThrough.toISOString() : null,
         source: 'careers-structured',
         ...(employerId ? { employerId } : {}),
-      });
-      if (postings.length >= MAX_PAGE_JOBS) return {
-        postings, found, invalid, stale,
       };
+      if (postings.length < MAX_PAGE_JOBS) postings.push(candidate);
     }
   }
   return {
-    postings, found, invalid, stale,
+    postings,
+    found,
+    invalid,
+    stale,
+    capacityExceeded: found - invalid - stale > postings.length,
   };
 }
 
@@ -396,11 +398,18 @@ async function collectCareersPage(employer, fetchImpl, checkedAt, {
   }
   const postings = await publicJobs(structured.postings, { lookupFn });
   if (postings.length) {
-    return result(employer, 'structured-data', 'healthy', checkedAt, {
-      jobs: postings,
-      returned: structured.found,
-      parsed: postings.length,
-    });
+    return result(
+      employer,
+      'structured-data',
+      structured.capacityExceeded ? 'degraded' : 'healthy',
+      checkedAt,
+      {
+        jobs: postings,
+        returned: structured.found,
+        parsed: postings.length,
+        ...(structured.capacityExceeded ? { failureCode: 'structured-data-capacity' } : {}),
+      },
+    );
   }
   if (structured.found) {
     return result(employer, 'structured-data',

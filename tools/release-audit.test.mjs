@@ -64,13 +64,28 @@ test('rejects private runtime artifact paths from a release tree', () => {
     'applications/synthetic-role/cv.typ',
     'reports/2026-07-29.md',
     'chats/synthetic.json',
+    '.env',
+    '.envrc',
+    '.env.production',
+    '.scout-backup/v1/header.json',
+    'imports/source.txt',
+    'logs/status.log',
+    'workspace.json',
   ];
+  const allowedTemplate = 'templates/workspace/workspace.json';
+  const templateFile = path.join(root, allowedTemplate);
+  fs.mkdirSync(path.dirname(templateFile), { recursive: true });
+  fs.writeFileSync(templateFile, '{}\n');
   for (const relative of files) {
     const file = path.join(root, relative);
     fs.mkdirSync(path.dirname(file), { recursive: true });
     fs.writeFileSync(file, '{}\n');
   }
-  const result = auditRelease({ root, trackedFiles: files, buildDirs: [] });
+  const result = auditRelease({
+    root,
+    trackedFiles: [...files, allowedTemplate],
+    buildDirs: [],
+  });
   assert.equal(result.ok, false);
   assert.deepEqual(
     [...new Set(result.findings.map(({ rule }) => rule))],

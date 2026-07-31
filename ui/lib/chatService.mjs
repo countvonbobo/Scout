@@ -20,7 +20,8 @@ import { detectProviderModelCataloguesAsync, providerStatus } from './providers.
 import { runStructuredTurn } from './structuredTurn.mjs';
 import { recordProviderResultHealth } from './providerHealth.mjs';
 import {
-  acquireProviderWork, assertProviderAuthIdle, releaseProviderWork,
+  acquireProviderWork, assertProviderAuthIdle, createProviderWorkSupervisor,
+  releaseProviderWork, renewProviderWork,
 } from './providerAuthMutation.mjs';
 import {
   interviewPrepAgentPrompt, interviewPrepPrefills, readInterviewPrep,
@@ -131,6 +132,7 @@ export function registerChatRoutes({
   recordProviderResultHealthFn = recordProviderResultHealth, onCheckpoint = () => {},
   assertProviderAuthIdleFn = assertProviderAuthIdle,
   acquireProviderWorkFn = acquireProviderWork,
+  renewProviderWorkFn = renewProviderWork,
   releaseProviderWorkFn = releaseProviderWork,
 }) {
   const catalogueReasonCodes = new Set([
@@ -156,6 +158,13 @@ export function registerChatRoutes({
     while (values.size > 100) values.delete(values.values().next().value);
   };
   function checkpoint(reason) { Promise.resolve(onCheckpoint(reason)).catch(() => {}); }
+  function superviseProviderWork(provider) {
+    return createProviderWorkSupervisor(repoRoot, provider, {
+      acquire: acquireProviderWorkFn,
+      renew: renewProviderWorkFn,
+      release: releaseProviderWorkFn,
+    });
+  }
   async function observeProviderResult(provider, result) {
     try {
       await recordProviderResultHealthFn(repoRoot, provider, result, { purpose: 'manual-run' });
@@ -401,7 +410,7 @@ export function registerChatRoutes({
     let t1;
     let work1;
     try {
-      work1 = acquireProviderWorkFn(repoRoot, from);
+      work1 = superviseProviderWork(from);
       t1 = runTurnFn({
         ...engineBuild(from, chat.cliSessionId),
         prompt: HANDOFF_SUMMARY_PROMPT,
@@ -410,7 +419,7 @@ export function registerChatRoutes({
         onEvent: () => {},
       });
     } catch (e) {
-      if (work1) releaseProviderWorkFn(repoRoot, work1);
+      if (work1) await work1.release();
       sseSend(res, 'error', {
         message: turnStartMessage(e, 'Handoff summary could not start.'),
       });
@@ -419,15 +428,18 @@ export function registerChatRoutes({
     running.set(id, t1);
     let r1;
     let r1Health;
+    let r1LifecycleError = null;
     try {
       r1 = await t1.finished;
+      work1.assertCurrent();
       r1Health = r1;
     } catch (e) {
+      r1LifecycleError = e;
       r1Health = e;
       r1 = { ok: false, reasonCode: 'provider-error' };
     } finally {
       if (running.get(id) === t1) running.delete(id);
-      releaseProviderWorkFn(repoRoot, work1);
+      await work1.release(r1LifecycleError);
     }
     await observeProviderResult(from, r1Health);
     if (!r1.ok || !r1.text) {
@@ -461,7 +473,7 @@ export function registerChatRoutes({
     let t2;
     let work2;
     try {
-      work2 = acquireProviderWorkFn(repoRoot, to);
+      work2 = superviseProviderWork(to);
       t2 = runTurnFn({
         ...engineBuild(to, null),
         prompt: opening,
@@ -470,7 +482,7 @@ export function registerChatRoutes({
         onEvent: (ev) => { if (ev.kind === 'delta') sseSend(res, 'delta', { text: ev.text }); },
       });
     } catch (e) {
-      if (work2) releaseProviderWorkFn(repoRoot, work2);
+      if (work2) await work2.release();
       const message = turnStartMessage(e, 'Handoff provider turn could not start.');
       appendMessage(chat, 'system', message, nowIso());
       try { saveChatFn(repoRoot, id, chat, purpose); } catch { /* the earlier handoff state is already persisted */ }
@@ -480,15 +492,18 @@ export function registerChatRoutes({
     running.set(id, t2);
     let r2;
     let r2Health;
+    let r2LifecycleError = null;
     try {
       r2 = await t2.finished;
+      work2.assertCurrent();
       r2Health = r2;
     } catch (e) {
+      r2LifecycleError = e;
       r2Health = e;
       r2 = { ok: false, reasonCode: 'provider-error' };
     } finally {
       if (running.get(id) === t2) running.delete(id);
-      releaseProviderWorkFn(repoRoot, work2);
+      await work2.release(r2LifecycleError);
     }
     await observeProviderResult(to, r2Health);
 
@@ -549,10 +564,10 @@ export function registerChatRoutes({
     let built;
     let providerWork;
     try {
-      providerWork = acquireProviderWorkFn(repoRoot, engine);
+      providerWork = superviseProviderWork(engine);
       built = engineBuild(engine, chat.cliSessionId, model);
     } catch (e) {
-      if (providerWork) releaseProviderWorkFn(repoRoot, providerWork);
+      if (providerWork) await providerWork.release();
       sseSend(res, 'error', {
         message: turnStartMessage(e, 'Provider turn could not start.'),
         reasonCode: e?.reasonCode === 'provider-auth-in-progress'
@@ -578,7 +593,7 @@ export function registerChatRoutes({
         },
       });
     } catch (error) {
-      releaseProviderWorkFn(repoRoot, providerWork);
+      await providerWork.release();
       sseSend(res, 'error', { message: turnStartMessage(error, 'Provider turn could not start.') });
       return sseEnd(res);
     }
@@ -586,15 +601,18 @@ export function registerChatRoutes({
     stopTurnOnDisconnect(req, res, id);
     let r;
     let healthResult;
+    let lifecycleError = null;
     try {
       r = await turn.finished;
+      providerWork.assertCurrent();
       healthResult = r;
     } catch (e) {
+      lifecycleError = e;
       healthResult = e;
       r = { ok: false, reasonCode: 'provider-error' };
     } finally {
       running.delete(id);
-      releaseProviderWorkFn(repoRoot, providerWork);
+      await providerWork.release(lifecycleError);
     }
     await observeProviderResult(engine, healthResult);
     if (attemptedModel && isSafeModelId(attemptedModel)) {
@@ -636,8 +654,9 @@ export function registerChatRoutes({
     running.set(id, marker);
     stopTurnOnDisconnect(req, res, id);
     let providerWork;
+    let lifecycleError = null;
     try {
-      providerWork = acquireProviderWorkFn(repoRoot, engine);
+      providerWork = superviseProviderWork(engine);
       const { status, model } = engineStatus(engine);
       const context = {
         selectedOpportunity: JSON.parse(selectedEntryContext(entry).split('\n').slice(1).join('\n')),
@@ -655,7 +674,9 @@ export function registerChatRoutes({
         result = await runStructuredTurnFn({
           provider: engine, status, schema: FIT_SCHEMA, prompt, model, maxInputTokens: 50_000,
         });
+        providerWork.assertCurrent();
       } catch (error) {
+        lifecycleError = error;
         await observeProviderResult(engine, error);
         throw error;
       }
@@ -675,6 +696,7 @@ export function registerChatRoutes({
       sseSend(res, 'delta', { text: answer });
       sseSend(res, 'done', { text: answer, engine, usage: result.usage, filesTouched: chat.filesTouched });
     } catch (error) {
+      lifecycleError = error;
       const message = turnStartMessage(error, 'Fit assessment failed.');
       if (error?.reasonCode !== 'provider-auth-in-progress') {
         appendMessage(chat, 'user', text, nowIso());
@@ -690,7 +712,7 @@ export function registerChatRoutes({
         filesTouched: chat.filesTouched,
       });
     } finally {
-      if (providerWork) releaseProviderWorkFn(repoRoot, providerWork);
+      if (providerWork) await providerWork.release(lifecycleError);
       running.delete(id);
       sseEnd(res);
     }

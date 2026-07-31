@@ -122,12 +122,20 @@ function origin(value) {
   try {
     const parsed = new URL(rawReference);
     if (['http:', 'https:'].includes(parsed.protocol)) {
+      if (parsed.username || parsed.password) {
+        throw new TypeError('employer origin URL must not contain credentials');
+      }
       const clean = canonicalUrl(rawReference);
       reference = clean.length <= 160
         ? clean
         : `${new URL(clean).origin}/scout-ref-${digest(clean).slice(0, 16)}`;
     }
-  } catch { /* non-URL origin references are valid */ }
+  } catch (error) {
+    if (/^[a-z][a-z0-9+.-]*:\/\//i.test(rawReference)) {
+      throw new TypeError('employer origin URL is invalid', { cause: error });
+    }
+    // Non-URL origin references are valid and remain bounded text.
+  }
   if (!reference) throw new TypeError('employer origin reference is required');
   return {
     kind: value.kind,

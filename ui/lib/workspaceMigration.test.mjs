@@ -187,6 +187,45 @@ test('beta.22 snapshot holds the shared backup lease throughout tree copying', (
   assert.equal(checked, true);
 });
 
+test('beta.22 snapshot rejects special files and oversized regular files before copying', (t) => {
+  if (process.platform !== 'win32') {
+    const fifoRoot = productionShapedWorkspace();
+    const fifo = path.join(fifoRoot, 'logs', 'provider.pipe');
+    const created = spawnSync('mkfifo', [fifo], { encoding: 'utf8' });
+    if (created.status === 0) {
+      assert.throws(
+        () => createBeta22WorkspaceSnapshot(fifoRoot, { now: () => NOW }),
+        /only accepts regular files and directories/,
+      );
+    } else {
+      t.diagnostic('mkfifo is unavailable; special-file assertion skipped');
+    }
+  }
+
+  const oversizedRoot = productionShapedWorkspace();
+  const oversized = path.join(oversizedRoot, 'logs', 'oversized.log');
+  fs.mkdirSync(path.dirname(oversized), { recursive: true });
+  fs.writeFileSync(oversized, '');
+  fs.truncateSync(oversized, (64 * 1024 * 1024) + 1);
+  assert.throws(
+    () => createBeta22WorkspaceSnapshot(oversizedRoot, { now: () => NOW }),
+    /file exceeds the size limit/,
+  );
+});
+
+test('beta.22 snapshot rejects trees deeper than its traversal bound', () => {
+  const root = productionShapedWorkspace();
+  let directory = path.join(root, 'logs');
+  for (let index = 0; index < 66; index += 1) {
+    directory = path.join(directory, `d${index}`);
+    fs.mkdirSync(directory);
+  }
+  assert.throws(
+    () => createBeta22WorkspaceSnapshot(root, { now: () => NOW }),
+    /exceeds the depth limit/,
+  );
+});
+
 test('snapshot verification rejects tampering before creating a rollback workspace', () => {
   const root = productionShapedWorkspace();
   const snapshot = createBeta22WorkspaceSnapshot(root, { now: () => NOW });

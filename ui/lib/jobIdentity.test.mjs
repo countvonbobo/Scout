@@ -12,6 +12,10 @@ test('cross-provider copies of one role match by normalised evidence', () => {
   const first = { company: 'Acme Ltd', title: 'Senior Platform Engineer', location: 'London, UK', source: 'adzuna', providerId: 'a1', url: 'https://a.test/1', description: 'Build reliable Kubernetes services with AWS observability and mentor engineers.' };
   const second = { company: 'Acme', role: 'Senior Platform Engineer', location: 'London', source: 'ats-greenhouse', providerId: 'g9', url: 'https://g.test/9', description: 'Mentor engineers and build reliable Kubernetes services with AWS observability.' };
   assert.equal(sameUnderlyingJob(first, second), true);
+  assert.equal(sameUnderlyingJob(
+    { ...first, url: 'https://careers.acme.test/jobs/platform' },
+    { ...second, url: 'https://careers.acme.test/jobs/platform' },
+  ), true);
 });
 
 test('location identity retains country tokens without a country-specific default', () => {

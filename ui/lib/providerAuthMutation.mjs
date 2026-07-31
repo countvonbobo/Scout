@@ -279,6 +279,95 @@ export function renewProviderWork(root, capability, {
   return renewed;
 }
 
+export function renewProviderAuthMutation(root, capability, {
+  durationMs = DEFAULT_DURATION_MS,
+  now,
+} = {}) {
+  const provider = checkedProvider(capability?.provider);
+  const at = checkedNow(now);
+  if (!Number.isSafeInteger(durationMs) || durationMs <= 0 || durationMs > DEFAULT_DURATION_MS) {
+    throw new TypeError('provider authentication mutation renewal settings are invalid');
+  }
+  const renewed = withGuard(root, provider, at, (target) => {
+    if (!fs.existsSync(target.file)) {
+      throw new Error('provider authentication mutation capability was lost');
+    }
+    const current = validate(JSON.parse(fs.readFileSync(target.file, 'utf8')), provider);
+    if (current.mutationId !== capability.mutationId || current.expiresAt <= at) {
+      throw new Error('provider authentication mutation capability was lost');
+    }
+    if (activeWorkRecords(target, provider, at, { prune: true }).length) {
+      throw new Error('provider authentication mutation authority is inconsistent');
+    }
+    const record = validate({ ...current, expiresAt: at + durationMs }, provider);
+    atomicWriteFile(target.file, `${JSON.stringify(record)}\n`, { mode: 0o600 });
+    return structuredClone(record);
+  });
+  if (!renewed) throw new Error('provider authentication mutation authority could not be renewed');
+  return renewed;
+}
+
+export function createProviderWorkSupervisor(root, provider, {
+  acquire = acquireProviderWork,
+  renew = renewProviderWork,
+  release = releaseProviderWork,
+  intervalMs = 5 * 60 * 1000,
+  setIntervalFn = setInterval,
+  clearIntervalFn = clearInterval,
+} = {}) {
+  if (typeof acquire !== 'function' || typeof renew !== 'function' || typeof release !== 'function'
+    || !Number.isSafeInteger(intervalMs) || intervalMs <= 0) {
+    throw new TypeError('provider work supervisor settings are invalid');
+  }
+  let capability = acquire(root, provider);
+  let renewalError = null;
+  let renewalPending = false;
+  let releasePromise = null;
+  let finished = false;
+  const timer = setIntervalFn(() => {
+    if (renewalPending || finished) return;
+    renewalPending = true;
+    Promise.resolve()
+      .then(() => renew(root, capability))
+      .then((value) => {
+        if (value) capability = value;
+      })
+      .catch((error) => {
+        renewalError = error;
+      })
+      .finally(() => {
+        renewalPending = false;
+      });
+  }, intervalMs);
+  timer?.unref?.();
+
+  const finish = () => {
+    finished = true;
+    clearIntervalFn(timer);
+    return release(root, capability);
+  };
+  return {
+    assertCurrent() {
+      if (renewalError) throw renewalError;
+      return true;
+    },
+    release(error = null) {
+      const closure = error?.closure;
+      if (releasePromise) {
+        return closure && typeof closure.then === 'function'
+          ? Promise.resolve(false)
+          : releasePromise;
+      }
+      const transferred = closure && typeof closure.then === 'function';
+      releasePromise = transferred
+        ? Promise.resolve(closure).catch(() => {}).then(finish)
+        : Promise.resolve().then(finish);
+      releasePromise.catch(() => {});
+      return transferred ? Promise.resolve(false) : releasePromise;
+    },
+  };
+}
+
 export function releaseProviderWork(root, capability, { now } = {}) {
   const provider = checkedProvider(capability?.provider);
   const at = checkedNow(now);

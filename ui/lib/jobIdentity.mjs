@@ -133,6 +133,12 @@ export function sameUnderlyingJob(left, right) {
       }
     }
   }
+  // Distinct URL-less provider references cannot be safely collapsed without
+  // a shared durable identity. Keeping them separate is the only stateless
+  // choice that preserves each vacancy ID as sources appear over time.
+  if (!a.references.some(({ url }) => url) && !b.references.some(({ url }) => url)
+    && a.references.some(({ providerId }) => providerId)
+    && b.references.some(({ providerId }) => providerId)) return false;
   if (!a.company || a.company !== b.company || !a.title || !b.title) return false;
   if (a.title !== b.title && similarity(a.titleTokens, b.titleTokens) < 0.8) return false;
   if (a.evidenceTokens.length >= 8 && b.evidenceTokens.length >= 8) {

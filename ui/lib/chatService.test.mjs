@@ -11,6 +11,7 @@ import { emptyChat, loadChat, saveChat } from './chatStore.mjs';
 import { HANDOFF_SUMMARY_PROMPT } from './chatPrompts.mjs';
 import { interviewPrepPath } from './interviewPrep.mjs';
 import { readProviderHealth } from './providerHealth.mjs';
+import { ProviderLifecycleUnclosedError } from './structuredTurn.mjs';
 import {
   acquireProviderAuthMutation, releaseProviderAuthMutation,
 } from './providerAuthMutation.mjs';
@@ -740,6 +741,35 @@ test('bounded fit assessment records remote-auth failure without automatically r
   assert.equal(readProviderHealth(root, 'codex').state, 'sign-in-required');
   assert.equal(readProviderHealth(root, 'codex').remoteAuthBarrier, true);
   assert.equal(loadChat(root, ID).messages.find((message) => message.role === 'user').text, 'Assess once.');
+});
+
+test('fit assessment retains provider-work fencing until an unclosed child settles', async () => {
+  const root = tmpRoot();
+  let close;
+  const closure = new Promise((resolve) => { close = resolve; });
+  let releases = 0;
+  const routes = routeFixture(root, {
+    runStructuredTurnFn: async () => {
+      throw new ProviderLifecycleUnclosedError('fit child remains open', closure);
+    },
+    recordProviderResultHealthFn: async () => {},
+    acquireProviderWorkFn: () => ({ provider: 'codex', workId: 'fit-work-00000001' }),
+    renewProviderWorkFn: (_root, capability) => capability,
+    releaseProviderWorkFn: () => { releases += 1; },
+  });
+  await callRoute(
+    routes['POST /api/chat/send'],
+    JSON.stringify({
+      id: ID,
+      engine: 'codex',
+      mode: 'fit-assessment',
+      text: 'Assess once.',
+    }),
+  );
+  assert.equal(releases, 0);
+  close();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(releases, 1);
 });
 
 test('completed assistant updates persist as separate chat messages', async () => {

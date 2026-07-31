@@ -9,6 +9,7 @@ import {
   validateOnboardingProposal,
 } from './onboardingProposal.mjs';
 import { readProviderHealth } from './providerHealth.mjs';
+import { ProviderLifecycleUnclosedError } from './structuredTurn.mjs';
 import {
   acquireProviderAuthMutation, releaseProviderAuthMutation,
 } from './providerAuthMutation.mjs';
@@ -162,6 +163,27 @@ test('onboarding proposal generation obeys the durable per-provider auth barrier
   assert.equal(claude.provider, 'claude');
   assert.equal(invocations, 1);
   releaseProviderAuthMutation(dir, mutation);
+});
+
+test('onboarding transfers provider-work fencing until an unclosed turn really closes', async () => {
+  const dir = root();
+  let close;
+  const closure = new Promise((resolve) => { close = resolve; });
+  let releases = 0;
+  await assert.rejects(createOnboardingProposal(dir, 'codex', {
+    providerStatusFn: status,
+    runStructuredTurnFn: async () => {
+      throw new ProviderLifecycleUnclosedError('provider child remains open', closure);
+    },
+    recordProviderResultHealthFn: async () => {},
+    acquireProviderWorkFn: () => ({ provider: 'codex', workId: 'onboarding-work-01' }),
+    renewProviderWorkFn: (_root, capability) => capability,
+    releaseProviderWorkFn: () => { releases += 1; },
+  }), /provider child remains open/);
+  assert.equal(releases, 0);
+  close();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(releases, 1);
 });
 
 test('activation rejects stale targets and rolls back every active file if doctor fails', async () => {

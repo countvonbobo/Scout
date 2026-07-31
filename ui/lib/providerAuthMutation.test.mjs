@@ -7,9 +7,11 @@ import test from 'node:test';
 import {
   acquireProviderAuthMutation,
   acquireProviderWork,
+  createProviderWorkSupervisor,
   readProviderAuthMutation,
   releaseProviderAuthMutation,
   releaseProviderWork,
+  renewProviderAuthMutation,
   renewProviderWork,
 } from './providerAuthMutation.mjs';
 
@@ -187,6 +189,63 @@ test('active provider work renews before expiry and remains an auth barrier', (t
     mutationId: 'blocked-by-renewal',
   }), null);
   assert.equal(releaseProviderWork(root, renewed, { now: 2_002 }), true);
+});
+
+test('active authentication mutation renews before expiry and retains its original acquisition', (t) => {
+  const root = workspace(t);
+  const auth = acquireProviderAuthMutation(root, 'codex', {
+    owner, now: 1_000, durationMs: 1_000, mutationId: 'renewed-auth-000001',
+  });
+  const renewed = renewProviderAuthMutation(root, auth, {
+    now: 1_900, durationMs: 1_000,
+  });
+  assert.equal(renewed.acquiredAt, 1_000);
+  assert.equal(renewed.expiresAt, 2_900);
+  assert.throws(
+    () => renewProviderAuthMutation(root, { ...auth, mutationId: 'forged-auth-000001' }, {
+      now: 2_000,
+      durationMs: 1_000,
+    }),
+    /capability was lost/,
+  );
+  assert.equal(releaseProviderAuthMutation(root, renewed, { now: 2_001 }), true);
+});
+
+test('provider work supervisor renews long work and transfers release to lifecycle closure', async () => {
+  let intervalCallback;
+  let released = 0;
+  let renewed = 0;
+  let close;
+  const closure = new Promise((resolve) => { close = resolve; });
+  const supervisor = createProviderWorkSupervisor('/synthetic', 'codex', {
+    acquire: () => ({ provider: 'codex', workId: 'supervised-work-01' }),
+    renew: (_root, capability) => {
+      renewed += 1;
+      return capability;
+    },
+    release: () => {
+      released += 1;
+      return true;
+    },
+    setIntervalFn(callback) {
+      intervalCallback = callback;
+      return { unref() {} };
+    },
+    clearIntervalFn() {},
+    intervalMs: 1,
+  });
+  intervalCallback();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(renewed, 1);
+  assert.equal(await supervisor.release({ closure }), false);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(released, 0);
+  intervalCallback();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(renewed, 2);
+  close();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(released, 1);
 });
 
 test('simultaneous auth and provider-work processes admit exactly one class of operation', async (t) => {

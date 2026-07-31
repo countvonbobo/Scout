@@ -1105,7 +1105,7 @@ function mandatorySignals(description, requirements) {
   const explicitLanguage = String(description || '').split(/(?:\r?\n|[.;]\s+)/)
     .map((text) => text.trim()).filter((text) => text && /\b(?:required|essential|must|mandatory|non-negotiable)\b/i.test(text));
   return [...new Set([...sourceRequirements, ...explicitLanguage])]
-    .slice(0, 12).map((text, index) => ({ id: `mandatory-${String(index + 1).padStart(2, '0')}`, text: text.slice(0, 300) }));
+    .slice(0, 64).map((text, index) => ({ id: `mandatory-${String(index + 1).padStart(2, '0')}`, text: text.slice(0, 300) }));
 }
 
 function valueOf(value) {
@@ -1426,7 +1426,7 @@ function responsibilityFacts(description) {
     .map((sentence) => sentence.trim())
     .filter(Boolean)
     .map(semanticFact)
-    .filter(Boolean))].slice(0, 6);
+    .filter(Boolean))].slice(0, 64);
 }
 
 function semanticPhraseMatches(value, phrase) {

@@ -235,7 +235,6 @@ export function runProviderCommand(command, args, options = {}) {
       timeoutMs = 10_000,
       maxOutputBytes: configuredMaxOutputBytes = 64 * 1024,
       terminateGraceMs = 750,
-      closeDeadlineMs = 2_000,
       spawn = spawnProcess,
       platform = process.platform,
       kill = process.kill,
@@ -262,14 +261,12 @@ export function runProviderCommand(command, args, options = {}) {
     let error = null;
     let closed = false;
     let forcedTimer = null;
-    let deadlineTimer = null;
     let timeout = null;
     const finish = (status = null) => {
       if (closed) return;
       closed = true;
       clearTimeout(timeout);
       clearTimeout(forcedTimer);
-      clearTimeout(deadlineTimer);
       resolve({
         status,
         stdout: Buffer.concat(stdout).toString('utf8'),
@@ -287,10 +284,6 @@ export function runProviderCommand(command, args, options = {}) {
           terminateGraceMs,
         );
         forcedTimer.unref?.();
-      }
-      if (!deadlineTimer) {
-        deadlineTimer = setTimeout(() => finish(null), closeDeadlineMs);
-        deadlineTimer.unref?.();
       }
     };
     timeout = setTimeout(() => {

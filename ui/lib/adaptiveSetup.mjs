@@ -25,8 +25,15 @@ const UNIVERSAL = Object.freeze([
   {
     id: 'accepted-locations',
     field: 'target.locations',
-    label: 'Locations and mobility',
+    label: 'Locations',
     prompt: 'Which locations or mobility areas should Scout search?',
+    maxItems: 8,
+  },
+  {
+    id: 'accepted-mobility',
+    field: 'target.mobility',
+    label: 'Mobility',
+    prompt: 'Which travel, relocation or mobility arrangements would you consider?',
     maxItems: 8,
   },
   {

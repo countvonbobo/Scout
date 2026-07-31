@@ -60,7 +60,9 @@ function harness({
   onHealthSignal = async () => {},
   canClearClaudeCredentials = async () => true,
   acquireAuthMutation,
+  renewAuthMutation,
   releaseAuthMutation,
+  authRenewalIntervalMs,
 } = {}) {
   const login = fakeChild({ closeOnKill });
   const validation = fakeChild({ closeOnKill });
@@ -99,7 +101,9 @@ function harness({
     confirmProviderHealth,
     canClearClaudeCredentials,
     ...(acquireAuthMutation === undefined ? {} : { acquireAuthMutation }),
+    ...(renewAuthMutation === undefined ? {} : { renewAuthMutation }),
     ...(releaseAuthMutation === undefined ? {} : { releaseAuthMutation }),
+    ...(authRenewalIntervalMs === undefined ? {} : { authRenewalIntervalMs }),
     onHealthSignal: async (name, signal) => {
       health.push([name, signal]);
       await onHealthSignal(name, signal);
@@ -432,7 +436,36 @@ test('login authority is released only after child closure and terminal health p
   assert.deepEqual(events, ['acquire:codex:login']);
   healthPersisted.resolve();
   await cancellation;
+  assert.deepEqual(events, ['acquire:codex:login']);
+  h.login.close(null);
+  await new Promise((resolve) => setImmediate(resolve));
   assert.deepEqual(events, ['acquire:codex:login', 'release']);
+});
+
+test('stubborn login children keep renewing authentication authority until closure', async () => {
+  const events = [];
+  const capability = { provider: 'codex', phase: 'login', mutationId: 'login-authority-0002' };
+  const h = harness({
+    closeOnKill: false,
+    acquireAuthMutation: async () => capability,
+    renewAuthMutation: async (current) => {
+      assert.equal(current, capability);
+      events.push('renew');
+      return current;
+    },
+    releaseAuthMutation: async () => { events.push('release'); },
+    authRenewalIntervalMs: 5,
+    terminateGraceMs: 5,
+    shutdownDeadlineMs: 20,
+  });
+  const started = await h.manager.startProviderLogin('codex', OWNER);
+  await h.manager.cancelProviderLogin(started.sessionId, OWNER);
+  await new Promise((resolve) => setTimeout(resolve, 15));
+  assert.ok(events.includes('renew'));
+  assert.equal(events.includes('release'), false);
+  h.login.close(null);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(events.at(-1), 'release');
 });
 
 test('cancel and retry have distinct bounded owner/provider rate limits', async () => {
@@ -591,6 +624,39 @@ test('Claude credential clearing is an explicit owner-only fixed logout operatio
     'claude',
     { kind: 'local-signed-out', source: 'post-auth' },
   ]);
+});
+
+test('Claude logout keeps authentication authority until a stubborn child closes', async () => {
+  let acquired = 0;
+  let released = 0;
+  let renewed = 0;
+  const h = await expiredClaudeHarness({
+    closeOnKill: false,
+    terminateGraceMs: 5,
+    shutdownDeadlineMs: 20,
+    authRenewalIntervalMs: 5,
+    acquireAuthMutation: async (provider, phase) => ({
+      provider,
+      phase,
+      mutationId: `claude-auth-${String(++acquired).padStart(8, '0')}`,
+    }),
+    renewAuthMutation: async (capability) => {
+      renewed += 1;
+      return capability;
+    },
+    releaseAuthMutation: async () => { released += 1; },
+  });
+  const baselineReleases = released;
+  const clearing = h.manager.clearClaudeCredentials(h.expired.sessionId, OWNER);
+  await new Promise((resolve) => setImmediate(resolve));
+  h.children[2].emit('error', new Error('synthetic logout failure'));
+  await clearing;
+  await new Promise((resolve) => setTimeout(resolve, 12));
+  assert.ok(renewed > 0);
+  assert.equal(released, baselineReleases);
+  h.children[2].close(null);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(released, baselineReleases + 1);
 });
 
 test('Claude login cannot start while credential clearing owns the provider', async () => {

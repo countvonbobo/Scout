@@ -58,7 +58,7 @@ test('async provider status does not block the event loop', async () => {
   assert.equal(result.capabilities.structuredOutput, true);
 });
 
-test('provider command timeout escalates and settles even when close never arrives', async () => {
+test('provider command timeout escalates but does not settle before child closure', async () => {
   const child = new EventEmitter();
   child.pid = 4242;
   child.stdout = new PassThrough();
@@ -69,17 +69,21 @@ test('provider command timeout escalates and settles even when close never arriv
     return true;
   };
   const processGroupSignals = [];
-  const started = Date.now();
-  const result = await runProviderCommand('synthetic-provider', ['--version'], {
+  let settled = false;
+  const pending = runProviderCommand('synthetic-provider', ['--version'], {
     timeoutMs: 10,
     terminateGraceMs: 10,
-    closeDeadlineMs: 40,
     spawn: () => child,
     platform: 'linux',
     kill(pid, signal) {
       processGroupSignals.push({ pid, signal });
     },
   });
+  pending.then(() => { settled = true; });
+  await new Promise((resolve) => setTimeout(resolve, 35));
+  assert.equal(settled, false);
+  child.emit('close', null);
+  const result = await pending;
   assert.equal(result.timedOut, true);
   assert.equal(result.status, null);
   assert.deepEqual(processGroupSignals, [
@@ -87,7 +91,6 @@ test('provider command timeout escalates and settles even when close never arriv
     { pid: -4242, signal: 'SIGKILL' },
   ]);
   assert.deepEqual(child.killSignals, []);
-  assert.ok(Date.now() - started < 500);
 });
 
 test('provider detector shares an in-flight probe and caches the result briefly', async () => {

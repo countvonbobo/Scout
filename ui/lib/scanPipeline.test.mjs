@@ -624,6 +624,31 @@ test('mandatory advert language is assigned stable signals that assessments cann
   assert.equal(validateAssessments({ assessments: [covered] }, candidates).assessments.length, 1);
 });
 
+test('candidate codec preserves more than the former mandatory and responsibility limits', () => {
+  const mandatory = Array.from({ length: 13 }, (_, index) => ({
+    id: `mandatory-${String(index + 1).padStart(2, '0')}`,
+    fact: `requirement number ${index + 1}`,
+  }));
+  const responsibilities = Array.from(
+    { length: 8 },
+    (_, index) => `responsibility number ${index + 1}`,
+  );
+  const { candidates } = compactCandidates({ one: { jobs: [{
+    company: 'Capacity Example',
+    title: 'Evidence Lead',
+    url: 'https://example.test/capacity',
+    description: 'Full advert was normalised.',
+    semanticEvidence: {
+      descriptionPresent: true,
+      descriptionLength: 500,
+      mandatorySignals: mandatory,
+      responsibilityFacts: responsibilities,
+    },
+  }] } });
+  assert.equal(candidates[0].mandatorySignals.length, 13);
+  for (const fact of responsibilities) assert.match(candidates[0].description, new RegExp(fact));
+});
+
 test('normalized source requirement summaries are mandatory without keyword heuristics', () => {
   const { candidates } = compactCandidates({ one: { jobs: [{
     company: 'Example', title: 'Senior Rust Engineer', url: 'https://example.test/rust',

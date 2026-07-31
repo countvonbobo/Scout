@@ -17,6 +17,7 @@ function draft(overrides = {}) {
       adjacentTitles: [],
       titles: [],
       locations: [],
+      mobility: [],
       workingPatterns: [],
       employmentTypes: [],
       responsibilities: [],
@@ -122,6 +123,27 @@ test('adjacent-work reads and replaces the exact adjacentTitles field', () => {
   }]);
   assert.deepEqual(updated.target.adjacentTitles, [rule('Platform operations', 'nice-to-have')]);
   assert.deepEqual(updated.target.titles, original.target.titles);
+});
+
+test('accepted mobility is asked and updates only the exact mobility field', () => {
+  const original = draft({
+    target: {
+      locations: [rule('London')],
+      mobility: [rule('Occasional travel')],
+      workingPatterns: [rule('Hybrid')],
+    },
+  });
+  const question = buildAdaptiveQuestionnaire(original).questions
+    .find(({ id }) => id === 'accepted-mobility');
+  assert.equal(question.field, 'target.mobility');
+  assert.deepEqual(question.current, original.target.mobility);
+  const updated = applyAdaptiveAnswers(original, [{
+    questionId: 'accepted-mobility',
+    values: [{ value: 'Monthly UK travel', strength: 'nice-to-have' }],
+  }]);
+  assert.deepEqual(updated.target.mobility, [rule('Monthly UK travel', 'nice-to-have')]);
+  assert.deepEqual(updated.target.locations, original.target.locations);
+  assert.deepEqual(updated.target.workingPatterns, original.target.workingPatterns);
 });
 
 test('adaptive answers reject unbounded, unknown and unconfirmed blocking values', () => {

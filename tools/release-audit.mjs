@@ -23,7 +23,8 @@ const SECRET_RULES = Object.freeze([
   { id: 'openai-token', regex: /\bsk-(?:proj-)?[A-Za-z0-9_-]{16,}\b/g },
 ]);
 const PRIVATE_RUNTIME_ROOTS = new Set([
-  '.scout', 'applications', 'chats', 'cv', 'data', 'profile', 'reports',
+  '.scout', '.scout-backup', 'applications', 'chats', 'cv', 'data',
+  'imports', 'logs', 'profile', 'reports',
 ]);
 const STATE_SHAPED_TEXT_EXTENSIONS = /\.(?:json|jsonl|ndjson|log|out|toml|txt|yaml|yml)$/i;
 const CROSS_FORMAT_CONFIG_EXTENSIONS = /\.(?:toml|yaml|yml)$/i;
@@ -392,7 +393,12 @@ function scanText(text, markers, relative = '', { dependency = false } = {}) {
 function privateRuntimeArtifact(relative) {
   const parts = String(relative).split(/[\\/]+/).filter(Boolean)
     .map((part) => part.toLocaleLowerCase('en-US'));
-  if (PRIVATE_RUNTIME_ROOTS.has(parts[0])) return true;
+  const runtimeRoot = parts[0] === 'app' ? parts[1] : parts[0];
+  const runtimeTail = parts[0] === 'app' ? parts.slice(1) : parts;
+  const templateWorkspace = parts.slice(-3).join('/') === 'templates/workspace/workspace.json';
+  if (PRIVATE_RUNTIME_ROOTS.has(runtimeRoot)) return true;
+  if (runtimeTail.some((part) => part.startsWith('.env'))) return true;
+  if (runtimeTail.at(-1) === 'workspace.json' && !templateWorkspace) return true;
   // Release build output wraps the source tree under paths such as
   // dist/release/stage/app/. The app boundary, wherever its staging parents
   // live, must apply the same private-root exclusion as a direct stage audit.

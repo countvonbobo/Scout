@@ -8,7 +8,8 @@ import { providerStatus } from './providers.mjs';
 import { runStructuredTurn } from './structuredTurn.mjs';
 import { recordProviderResultHealth } from './providerHealth.mjs';
 import {
-  acquireProviderWork, assertProviderAuthIdle, releaseProviderWork,
+  acquireProviderWork, assertProviderAuthIdle, createProviderWorkSupervisor,
+  releaseProviderWork, renewProviderWork,
 } from './providerAuthMutation.mjs';
 import { withWorkspaceMutationAuthority } from './workspaceMutationAuthority.mjs';
 
@@ -256,6 +257,7 @@ export async function createOnboardingProposal(root, provider, {
   recordProviderResultHealthFn = recordProviderResultHealth,
   assertProviderAuthIdleFn = assertProviderAuthIdle,
   acquireProviderWorkFn = acquireProviderWork,
+  renewProviderWorkFn = renewProviderWork,
   releaseProviderWorkFn = releaseProviderWork,
   onProgress = () => {},
 } = {}) {
@@ -280,8 +282,13 @@ export async function createOnboardingProposal(root, provider, {
   };
   let turn;
   let providerWork;
+  let lifecycleError = null;
   try {
-    providerWork = acquireProviderWorkFn(root, provider);
+    providerWork = createProviderWorkSupervisor(root, provider, {
+      acquire: acquireProviderWorkFn,
+      renew: renewProviderWorkFn,
+      release: releaseProviderWorkFn,
+    });
     assertProviderAuthIdleFn(root, provider);
     const status = providerStatusFn(provider);
     turn = await runStructuredTurnFn({
@@ -289,11 +296,13 @@ export async function createOnboardingProposal(root, provider, {
       model: config.ai?.provider === provider ? config.ai?.model : null,
       validate: (value) => validateOnboardingProposal(value, input.evidence), maxInputTokens: 60_000,
     });
+    providerWork.assertCurrent();
   } catch (error) {
+    lifecycleError = error;
     await observeProviderResult(error);
     throw error;
   } finally {
-    if (providerWork) releaseProviderWorkFn(root, providerWork);
+    if (providerWork) await providerWork.release(lifecycleError);
   }
   await observeProviderResult({ ...turn, ok: true });
   onProgress({ phase: 'Validating and staging proposal', current: 3, total: 4 });

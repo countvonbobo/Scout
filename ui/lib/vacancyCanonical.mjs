@@ -10,7 +10,7 @@ const PROVENANCE_RANK = { 'explicit-source': 2, 'deterministic-extraction': 1, u
 const APPLICATION_BOILERPLATE = /(?:\bapply now\.?|\bclick here to apply\.?|\bsubmit your application\.?)/gi;
 const MAX_SEMANTIC_RULE_MATCHES = 64;
 const MAX_SEMANTIC_MATCH_SOURCES = 8;
-const MAX_RESPONSIBILITY_FACTS = 24;
+const MAX_RESPONSIBILITY_FACTS = 64;
 
 function valueOf(value) {
   return value && typeof value === 'object' && 'value' in value ? value.value : value;
