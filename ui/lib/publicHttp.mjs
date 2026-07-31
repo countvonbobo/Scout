@@ -62,6 +62,8 @@ for (const [address, prefix] of [
   ['fe80::', 10],
   ['ff00::', 8],
 ]) blockedIpv6.addSubnet(address, prefix, 'ipv6');
+const globallyRoutableIpv6 = new net.BlockList();
+globallyRoutableIpv6.addSubnet('2000::', 3, 'ipv6');
 
 function mappedIpv4(value) {
   const match = String(value).toLowerCase().match(/^::ffff:(\d{1,3}(?:\.\d{1,3}){3})$/);
@@ -79,7 +81,8 @@ export function isPublicIpAddress(address) {
   if (family !== 6) return false;
   const mapped = mappedIpv4(address);
   if (mapped) return isPublicIpAddress(mapped);
-  return !blockedIpv6.check(address, 'ipv6');
+  return globallyRoutableIpv6.check(address, 'ipv6')
+    && !blockedIpv6.check(address, 'ipv6');
 }
 
 function hostnameValue(url) {

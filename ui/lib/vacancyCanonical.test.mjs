@@ -213,5 +213,9 @@ test('URL-less canonical identities are stable, collision-free and source-order 
   const reverse = canonicaliseObservations([...crossSource].reverse());
   assert.equal(forward.vacancies.length, 1);
   assert.deepEqual(forward, reverse);
+  assert.equal(
+    forward.vacancies[0].vacancyId,
+    canonicaliseObservations([first]).vacancies[0].vacancyId,
+  );
   assert.match(forward.vacancies[0].vacancyId, /^vacancy-ref-[a-f0-9]{24}$/);
 });

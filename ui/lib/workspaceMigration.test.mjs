@@ -6,6 +6,7 @@ import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { afterEach, test } from 'node:test';
 import { publishSearchProfile } from './searchProfile.mjs';
+import { acquireScanLease, currentLeaseOwner } from './scanLease.mjs';
 import {
   createBeta22WorkspaceSnapshot,
   materializeBeta22Rollback,
@@ -95,7 +96,7 @@ function productionShapedWorkspace() {
   write(root, 'applications/acme-platform/outreach.md', 'Historical outreach draft\n');
   write(root, 'imports/source.txt', 'Historical import\n');
   write(root, 'logs/scout.log', 'Historical bounded log\n');
-  write(root, '.scout/scan-lease.json', '{"schemaVersion":1,"generation":9}\n');
+  write(root, '.scout/ephemeral-runtime.json', '{"schemaVersion":1,"generation":9}\n');
   return root;
 }
 
@@ -163,6 +164,27 @@ test('a verified beta.22 snapshot materialises into a separate compatible worksp
   assert.ok(fs.readFileSync(path.join(destination, 'applications', 'acme-platform', 'cv.pdf'))
     .equals(Buffer.from([0x25, 0x50, 0x44, 0x46, 0x00, 0xff])));
   assert.equal(fs.existsSync(path.join(destination, '.scout')), false);
+});
+
+test('beta.22 snapshot holds the shared backup lease throughout tree copying', () => {
+  const root = productionShapedWorkspace();
+  let checked = false;
+  createBeta22WorkspaceSnapshot(root, {
+    now: () => NOW,
+    _testHooks: {
+      beforeCopy(relative) {
+        if (checked || relative !== 'workspace.json') return;
+        checked = true;
+        const backup = acquireScanLease(root, currentLeaseOwner(), {
+          kind: 'backup',
+          runId: 'concurrent-backup',
+          phase: 'checkpoint',
+        });
+        assert.equal(backup, null);
+      },
+    },
+  });
+  assert.equal(checked, true);
 });
 
 test('snapshot verification rejects tampering before creating a rollback workspace', () => {

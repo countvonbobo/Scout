@@ -8,6 +8,7 @@ const PROVIDERS = new Set(['codex', 'claude']);
 const PHASES = new Set(['login', 'logout']);
 const SCHEMA_VERSION = 1;
 const DEFAULT_DURATION_MS = 11 * 60 * 1000;
+const DEFAULT_WORK_DURATION_MS = 30 * 60 * 1000;
 const GUARD_STALE_MS = 15_000;
 
 export class ProviderAuthMutationActiveError extends Error {
@@ -68,6 +69,7 @@ function paths(root, provider, create = false) {
   return {
     file: path.join(directory, `${provider}.json`),
     guard: path.join(directory, `${provider}.guard`),
+    work: path.join(directory, `${provider}.work`),
   };
 }
 
@@ -89,6 +91,49 @@ function validate(record, provider) {
     throw new Error('provider authentication mutation record is invalid');
   }
   return record;
+}
+
+function validateWork(record, provider) {
+  const keys = Object.keys(record || {}).sort().join(',');
+  if (keys !== 'acquiredAt,expiresAt,owner,provider,schemaVersion,workId'
+    || record.schemaVersion !== SCHEMA_VERSION
+    || record.provider !== provider
+    || !/^[A-Za-z0-9_-]{16,128}$/.test(record.workId)
+    || !record.owner
+    || Object.keys(record.owner).sort().join(',') !== 'host,pid,processStart'
+    || typeof record.owner.host !== 'string'
+    || !Number.isSafeInteger(record.owner.pid)
+    || typeof record.owner.processStart !== 'string'
+    || !Number.isSafeInteger(record.acquiredAt)
+    || !Number.isSafeInteger(record.expiresAt)
+    || record.expiresAt <= record.acquiredAt) {
+    throw new Error('provider work record is invalid');
+  }
+  return record;
+}
+
+function activeWorkRecords(target, provider, at, { prune = false } = {}) {
+  if (!fs.existsSync(target.work)) return [];
+  const stat = fs.lstatSync(target.work);
+  if (stat.isSymbolicLink() || !stat.isDirectory()) {
+    throw new Error('provider work authority path is redirected');
+  }
+  const active = [];
+  for (const name of fs.readdirSync(target.work)) {
+    if (!/^[A-Za-z0-9_-]{16,128}\.json$/.test(name)) {
+      throw new Error('provider work authority directory is invalid');
+    }
+    const file = path.join(target.work, name);
+    const bytes = fs.readFileSync(file);
+    if (bytes.length > 4_096) throw new Error('provider work record is oversized');
+    const record = validateWork(JSON.parse(bytes.toString('utf8')), provider);
+    if (record.expiresAt > at) active.push(record);
+    else if (prune) fs.rmSync(file);
+  }
+  if (prune && fs.existsSync(target.work) && fs.readdirSync(target.work).length === 0) {
+    fs.rmdirSync(target.work);
+  }
+  return active;
 }
 
 function withGuard(root, provider, now, callback) {
@@ -147,9 +192,11 @@ export function acquireProviderAuthMutation(root, provider, {
     || !PHASES.has(phase)) {
     throw new TypeError('provider authentication mutation settings are invalid');
   }
-  return withGuard(root, provider, at, ({ file }) => {
+  return withGuard(root, provider, at, (target) => {
+    const { file } = target;
     const current = readProviderAuthMutation(root, provider, { now: at });
     if (current) return null;
+    if (activeWorkRecords(target, provider, at, { prune: true }).length) return null;
     const record = validate({
       schemaVersion: SCHEMA_VERSION,
       provider,
@@ -166,6 +213,60 @@ export function acquireProviderAuthMutation(root, provider, {
     atomicWriteFile(file, `${JSON.stringify(record)}\n`, { mode: 0o600 });
     return structuredClone(record);
   });
+}
+
+export function acquireProviderWork(root, provider, {
+  durationMs = DEFAULT_WORK_DURATION_MS,
+  workId = randomUUID(),
+  now,
+  owner = {
+    host: os.hostname(),
+    pid: process.pid,
+    processStart: `${process.pid}-${Math.floor(process.uptime() * 1000)}`,
+  },
+} = {}) {
+  const at = checkedNow(now);
+  if (!Number.isSafeInteger(durationMs) || durationMs <= 0 || durationMs > DEFAULT_WORK_DURATION_MS) {
+    throw new TypeError('provider work authority settings are invalid');
+  }
+  const capability = withGuard(root, provider, at, (target) => {
+    const current = readProviderAuthMutation(root, provider, { now: at });
+    if (current) throw new ProviderAuthMutationActiveError(provider, current.phase);
+    activeWorkRecords(target, provider, at, { prune: true });
+    if (!fs.existsSync(target.work)) fs.mkdirSync(target.work, { mode: 0o700 });
+    const record = validateWork({
+      schemaVersion: SCHEMA_VERSION,
+      provider,
+      workId,
+      owner: {
+        host: String(owner.host),
+        pid: Number(owner.pid),
+        processStart: String(owner.processStart),
+      },
+      acquiredAt: at,
+      expiresAt: at + durationMs,
+    }, provider);
+    atomicWriteFile(path.join(target.work, `${workId}.json`), `${JSON.stringify(record)}\n`, { mode: 0o600 });
+    return structuredClone(record);
+  });
+  if (!capability) throw new ProviderAuthMutationActiveError(provider, 'unknown');
+  return capability;
+}
+
+export function releaseProviderWork(root, capability, { now } = {}) {
+  const provider = checkedProvider(capability?.provider);
+  const at = checkedNow(now);
+  const released = withGuard(root, provider, at, (target) => {
+    const file = path.join(target.work, `${capability.workId}.json`);
+    if (!fs.existsSync(file)) return false;
+    const current = validateWork(JSON.parse(fs.readFileSync(file, 'utf8')), provider);
+    if (current.workId !== capability.workId) throw new Error('provider work capability was lost');
+    fs.rmSync(file);
+    if (fs.readdirSync(target.work).length === 0) fs.rmdirSync(target.work);
+    return true;
+  });
+  if (released === null) throw new Error('provider work authority could not be released');
+  return released;
 }
 
 export function releaseProviderAuthMutation(root, capability, { now } = {}) {

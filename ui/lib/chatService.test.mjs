@@ -696,10 +696,11 @@ test('a settled late chat result is not resent or allowed to overwrite login-in-
     res,
     JSON.stringify({ id: ID, engine: 'codex', text: 'Finish exactly once.' }),
   );
-  const mutation = acquireProviderAuthMutation(root, 'codex', {
+  const mutationWhileRunning = acquireProviderAuthMutation(root, 'codex', {
     owner: { host: 'synthetic-host', pid: 43, processStart: 'synthetic-start-2' },
     mutationId: 'chat-auth-mutation-0002',
   });
+  assert.equal(mutationWhileRunning, null);
   resolveTurn({
     ok: true, text: 'Settled result.', updates: ['Settled result.'],
     sessionId: 'settled-session', filesTouched: [], usage: {},
@@ -708,8 +709,12 @@ test('a settled late chat result is not resent or allowed to overwrite login-in-
 
   assert.equal(invocations, 1);
   assert.equal(sseEvents(res.text()).at(-1).event, 'done');
-  assert.equal(readProviderHealth(root, 'codex').state, 'login-in-progress');
   assert.equal(loadChat(root, ID).messages.filter(({ role }) => role === 'assistant').length, 1);
+  const mutation = acquireProviderAuthMutation(root, 'codex', {
+    owner: { host: 'synthetic-host', pid: 43, processStart: 'synthetic-start-2' },
+    mutationId: 'chat-auth-mutation-0002',
+  });
+  assert.ok(mutation);
   releaseProviderAuthMutation(root, mutation);
 });
 

@@ -1,5 +1,5 @@
 import crypto from 'node:crypto';
-import { mergeSourceReferences, sameUnderlyingJob } from './jobIdentity.mjs';
+import { jobIdentity, mergeSourceReferences, sameUnderlyingJob } from './jobIdentity.mjs';
 
 const DISPLAY_FIELDS = [
   'employer', 'employerReference', 'title', 'location', 'workingPattern',
@@ -110,14 +110,9 @@ function metadataValues(observations, name) {
     .filter(Boolean))].sort(compareStable);
 }
 
-function canonicalVacancyId(canonicalUrl, sourceReferences) {
+function canonicalVacancyId(canonicalUrl, identity) {
   if (canonicalUrl) return canonicalUrl;
-  const references = sourceReferences.map((reference) => ({
-    source: boundedSemanticText(reference?.source, 80),
-    providerId: boundedSemanticText(reference?.providerId, 160),
-  })).filter(({ source, providerId }) => source || providerId)
-    .sort((left, right) => compareStable(stableJson(left), stableJson(right)));
-  return `vacancy-ref-${crypto.createHash('sha256').update(stableJson(references)).digest('hex').slice(0, 24)}`;
+  return `vacancy-ref-${crypto.createHash('sha256').update(stableJson(identity)).digest('hex').slice(0, 24)}`;
 }
 
 function boundedSemanticText(value, maximum) {
@@ -222,7 +217,19 @@ function canonicalVacancy(observations) {
   const fields = Object.fromEntries(DISPLAY_FIELDS.map((name) => [name, displayField(orderedObservations, name)]));
   const canonicalUrl = orderedObservations.map((observation) => observation?.canonicalUrl).find(Boolean) || null;
   const sourceReferences = mergeSourceReferences(...orderedObservations);
-  const vacancyId = canonicalVacancyId(canonicalUrl, sourceReferences);
+  const identity = jobIdentity({
+    company: fields.employer,
+    title: fields.title,
+    location: fields.location,
+    seniority: fields.seniority,
+  });
+  const fallbackIdentity = {
+    company: identity.company,
+    title: identity.title,
+    location: identity.location,
+    seniority: identity.seniority,
+  };
+  const vacancyId = canonicalVacancyId(canonicalUrl, fallbackIdentity);
   const collectionSources = metadataValues(orderedObservations, 'collectionSource');
   const laneIds = [...new Set([
     ...metadataValues(orderedObservations, 'laneId'),
@@ -248,6 +255,7 @@ function canonicalVacancy(observations) {
     ...(semanticEvidence ? { semanticEvidence } : {}),
     ...fields,
     ...Object.fromEntries(LIST_FIELDS.map((name) => [name, listDisplayField(orderedObservations, name)])),
+    _fallbackIdentity: fallbackIdentity,
   };
 }
 
@@ -259,8 +267,27 @@ export function canonicaliseObservations(observations) {
     if (group) group.push(observation);
     else groups.push([observation]);
   }
+  const vacancies = groups.sort((left, right) => compareStable(groupKey(left), groupKey(right))).map(canonicalVacancy);
+  const collisions = new Map();
+  for (const vacancy of vacancies) {
+    if (vacancy.canonicalUrl) continue;
+    const peers = collisions.get(vacancy.vacancyId) || [];
+    peers.push(vacancy);
+    collisions.set(vacancy.vacancyId, peers);
+  }
+  for (const peers of collisions.values()) {
+    if (peers.length < 2) continue;
+    for (const vacancy of peers) {
+      vacancy.vacancyId = `vacancy-ref-${crypto.createHash('sha256')
+        .update(stableJson({
+          identity: vacancy._fallbackIdentity,
+          references: vacancy.sourceReferences,
+        })).digest('hex').slice(0, 24)}`;
+    }
+  }
+  for (const vacancy of vacancies) delete vacancy._fallbackIdentity;
   return {
-    vacancies: groups.sort((left, right) => compareStable(groupKey(left), groupKey(right))).map(canonicalVacancy),
+    vacancies,
     duplicateObservations: orderedObservations.length - groups.length,
   };
 }

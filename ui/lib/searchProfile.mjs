@@ -4,7 +4,7 @@ import path from 'node:path';
 import { atomicWriteFile } from './atomicWrite.mjs';
 import { backupWorkspace, workspacePaths } from './workspace.mjs';
 import {
-  createBeta22WorkspaceSnapshot, latestBeta22WorkspaceSnapshot,
+  latestBeta22WorkspaceSnapshot, withBeta22MigrationAuthority,
 } from './workspaceMigration.mjs';
 
 export const PREFERENCE_STRENGTHS = Object.freeze([
@@ -25,6 +25,28 @@ export const UNKNOWN_POLICY_FIELDS = Object.freeze([
 export const COMPENSATION_AMOUNT_TYPES = Object.freeze(['base', 'total', 'rate', 'unknown']);
 export const COMPENSATION_CERTAINTIES = Object.freeze(['exact', 'range', 'estimated', 'unknown']);
 export const SEARCH_BREADTHS = Object.freeze(['focused', 'balanced', 'broad']);
+export const TARGET_RULE_FIELDS = Object.freeze([
+  'primaryTitles', 'adjacentTitles', 'titles', 'responsibilities', 'skills',
+  'qualifications', 'eligibility', 'industries', 'sectors', 'locations',
+  'mobility', 'workingPatterns', 'employmentTypes', 'seniority', 'employers',
+]);
+export const NEGATIVE_RULE_FIELDS = Object.freeze([
+  'excludedTitles', 'excludedResponsibilities', 'excludedSkills',
+  'excludedQualifications', 'excludedEligibility', 'excludedIndustries',
+  'excludedSectors', 'excludedLocations', 'excludedMobility',
+  'excludedWorkingPatterns', 'excludedEmploymentTypes', 'excludedSeniority',
+  'excludedEmployers',
+]);
+export const SEMANTIC_TARGET_RULE_FIELDS = Object.freeze([
+  'responsibilities', 'skills', 'qualifications', 'eligibility', 'mobility',
+  'industries', 'sectors',
+]);
+export const SEMANTIC_NEGATIVE_RULE_FIELDS = Object.freeze([
+  'excludedResponsibilities', 'excludedSkills', 'excludedQualifications',
+  'excludedEligibility', 'excludedMobility', 'excludedIndustries', 'excludedSectors',
+]);
+export const MAX_SEMANTIC_PROFILE_RULES = 64;
+const MAX_PROFILE_RULE_VALUE_LENGTH = 160;
 
 function isPlainObject(value) {
   if (!value || typeof value !== 'object') return false;
@@ -43,6 +65,9 @@ function requireEnum(value, values, name) {
 function validateRule(rule, name) {
   requirePlainObject(rule, name);
   if (typeof rule.value !== 'string' || !rule.value.trim()) throw new Error(`${name}.value must be a non-empty string`);
+  if (rule.value.normalize('NFKC').trim().length > MAX_PROFILE_RULE_VALUE_LENGTH) {
+    throw new Error(`${name}.value must be at most ${MAX_PROFILE_RULE_VALUE_LENGTH} characters`);
+  }
   requireEnum(rule.strength, PREFERENCE_STRENGTHS, `${name}.strength`);
   requireEnum(rule.provenance, PROVENANCE, `${name}.provenance`);
   if (rule.strength === 'hard-exclusion' && !['explicit', 'confirmed-inference'].includes(rule.provenance)) {
@@ -50,8 +75,10 @@ function validateRule(rule, name) {
   }
 }
 
-function validateRuleLists(section, name) {
+function validateRuleLists(section, name, supportedFields) {
   requirePlainObject(section, name);
+  const unsupported = Object.keys(section).find((key) => !supportedFields.includes(key));
+  if (unsupported) throw new Error(`${name} contains unsupported field: ${unsupported}`);
   for (const [key, rules] of Object.entries(section)) {
     if (!Array.isArray(rules)) throw new Error(`${name}.${key} must be an array`);
     rules.forEach((rule, index) => validateRule(rule, `${name}.${key}[${index}]`));
@@ -89,8 +116,15 @@ export function validateSearchProfile(profile) {
   requirePlainObject(profile.target, 'search profile.target');
   requirePlainObject(profile.negative, 'search profile.negative');
   requirePlainObject(profile.compensation, 'search profile.compensation');
-  validateRuleLists(profile.target, 'search profile.target');
-  validateRuleLists(profile.negative, 'search profile.negative');
+  validateRuleLists(profile.target, 'search profile.target', TARGET_RULE_FIELDS);
+  validateRuleLists(profile.negative, 'search profile.negative', NEGATIVE_RULE_FIELDS);
+  const semanticRuleCount = [
+    ...SEMANTIC_TARGET_RULE_FIELDS.map((field) => profile.target[field] || []),
+    ...SEMANTIC_NEGATIVE_RULE_FIELDS.map((field) => profile.negative[field] || []),
+  ].reduce((count, rules) => count + rules.length, 0);
+  if (semanticRuleCount > MAX_SEMANTIC_PROFILE_RULES) {
+    throw new Error(`search profile has more than ${MAX_SEMANTIC_PROFILE_RULES} semantic rules`);
+  }
 
   const {
     currency, period, rateType, amountType, certainty, minimum, minimumStrength, unknownPolicy,
@@ -215,13 +249,14 @@ export function loadPublishedSearchProfile(root) {
 }
 
 export function migrateSearchProfile(root, { fileSystem = fs } = {}) {
+  return withBeta22MigrationAuthority(root, ({ createSnapshot, renew }) => {
   const paths = workspacePaths(root);
   if (fileSystem.existsSync(paths.searchProfileDraft) || fileSystem.existsSync(paths.searchProfilePublished)) {
     // No migration boundary remains once a draft or publication exists. Keep
     // the rollback that authorised that boundary; re-snapshotting the migrated
     // live tree would manufacture a different historical pre-migration state.
     const rollback = latestBeta22WorkspaceSnapshot(root)
-      || createBeta22WorkspaceSnapshot(root);
+      || createSnapshot();
     return {
       migrated: false,
       draftPath: paths.searchProfileDraft,
@@ -229,7 +264,8 @@ export function migrateSearchProfile(root, { fileSystem = fs } = {}) {
       rollbackSnapshotPath: rollback.directory,
     };
   }
-  const rollback = createBeta22WorkspaceSnapshot(root);
+  const rollback = createSnapshot();
+  renew();
   if (!fileSystem.existsSync(paths.config)) throw new Error(`workspace config missing: ${paths.config}`);
 
   // Retain the legacy source text itself as evidence, rather than reserialising
@@ -263,4 +299,5 @@ export function migrateSearchProfile(root, { fileSystem = fs } = {}) {
     backupPath,
     rollbackSnapshotPath: rollback.directory,
   };
+  });
 }

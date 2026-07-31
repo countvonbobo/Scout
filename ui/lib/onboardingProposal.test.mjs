@@ -12,6 +12,7 @@ import { readProviderHealth } from './providerHealth.mjs';
 import {
   acquireProviderAuthMutation, releaseProviderAuthMutation,
 } from './providerAuthMutation.mjs';
+import { acquireScanLease, currentLeaseOwner } from './scanLease.mjs';
 import { DEFAULT_WORKSPACE_CONFIG, writeWorkspaceConfig } from './workspace.mjs';
 
 function root() {
@@ -83,6 +84,31 @@ test('proposal staging, explicit zero-AI activation and discard are isolated', a
   assert.equal(readOnboardingProposal(dir), null);
   assert.equal(discardOnboardingProposal(dir).ok, true);
   assert.equal(fs.existsSync(path.join(dir, '.scout', 'onboarding', 'activated.json')), true);
+});
+
+test('activation holds the shared backup lease across every active-file replacement', async () => {
+  const dir = root();
+  const staged = await createOnboardingProposal(dir, 'codex', {
+    providerStatusFn: status,
+    runStructuredTurnFn: run,
+  });
+  let checked = false;
+  activateOnboardingProposal(dir, staged.proposalId, true, {
+    doctorFn: healthyDoctor,
+    _testHooks: {
+      beforeWrite(relative) {
+        if (checked || relative !== 'workspace.json') return;
+        checked = true;
+        const backup = acquireScanLease(dir, currentLeaseOwner(), {
+          kind: 'backup',
+          runId: 'activation-backup',
+          phase: 'checkpoint',
+        });
+        assert.equal(backup, null);
+      },
+    },
+  });
+  assert.equal(checked, true);
 });
 
 test('onboarding records remote-auth failure without resending proposal generation', async () => {

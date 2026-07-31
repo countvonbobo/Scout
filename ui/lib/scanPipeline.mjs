@@ -1455,7 +1455,7 @@ function semanticObservation(job, sourceName, source, profile, { durableUrls = t
       'excludedResponsibilities', 'excludedSkills', 'excludedQualifications',
       'excludedEligibility', 'excludedMobility', 'excludedIndustries', 'excludedSectors',
     ].flatMap((field) => profile?.negative?.[field] || []),
-  ].slice(0, 128);
+  ];
   const descriptionDigest = digestText(description);
   const profileRuleEvidence = [...new Map(descriptionRules.map((rule) => {
     const id = semanticRuleId(rule);

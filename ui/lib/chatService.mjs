@@ -19,7 +19,9 @@ import { loadWorkspaceConfig, modelForProvider } from './workspace.mjs';
 import { detectProviderModelCataloguesAsync, providerStatus } from './providers.mjs';
 import { runStructuredTurn } from './structuredTurn.mjs';
 import { recordProviderResultHealth } from './providerHealth.mjs';
-import { assertProviderAuthIdle } from './providerAuthMutation.mjs';
+import {
+  acquireProviderWork, assertProviderAuthIdle, releaseProviderWork,
+} from './providerAuthMutation.mjs';
 import {
   interviewPrepAgentPrompt, interviewPrepPrefills, readInterviewPrep,
 } from './interviewPrep.mjs';
@@ -128,6 +130,8 @@ export function registerChatRoutes({
   runCvQualityFn = runCvQuality, runStructuredTurnFn = runStructuredTurn,
   recordProviderResultHealthFn = recordProviderResultHealth, onCheckpoint = () => {},
   assertProviderAuthIdleFn = assertProviderAuthIdle,
+  acquireProviderWorkFn = acquireProviderWork,
+  releaseProviderWorkFn = releaseProviderWork,
 }) {
   const catalogueReasonCodes = new Set([
     'catalogue-check-failed',
@@ -395,7 +399,9 @@ export function registerChatRoutes({
 
     sseSend(res, 'status', { message: `asking ${from} for a handoff summary…` });
     let t1;
+    let work1;
     try {
+      work1 = acquireProviderWorkFn(repoRoot, from);
       t1 = runTurnFn({
         ...engineBuild(from, chat.cliSessionId),
         prompt: HANDOFF_SUMMARY_PROMPT,
@@ -404,6 +410,7 @@ export function registerChatRoutes({
         onEvent: () => {},
       });
     } catch (e) {
+      if (work1) releaseProviderWorkFn(repoRoot, work1);
       sseSend(res, 'error', {
         message: turnStartMessage(e, 'Handoff summary could not start.'),
       });
@@ -420,6 +427,7 @@ export function registerChatRoutes({
       r1 = { ok: false, reasonCode: 'provider-error' };
     } finally {
       if (running.get(id) === t1) running.delete(id);
+      releaseProviderWorkFn(repoRoot, work1);
     }
     await observeProviderResult(from, r1Health);
     if (!r1.ok || !r1.text) {
@@ -451,7 +459,9 @@ export function registerChatRoutes({
       ? `${selectedEntryContext(selected)}\n\n${interviewPrepAgentPrompt(selected, handoff)}`
       : `${selectedEntryContext(selected)}\n\n${handoff}`;
     let t2;
+    let work2;
     try {
+      work2 = acquireProviderWorkFn(repoRoot, to);
       t2 = runTurnFn({
         ...engineBuild(to, null),
         prompt: opening,
@@ -460,6 +470,7 @@ export function registerChatRoutes({
         onEvent: (ev) => { if (ev.kind === 'delta') sseSend(res, 'delta', { text: ev.text }); },
       });
     } catch (e) {
+      if (work2) releaseProviderWorkFn(repoRoot, work2);
       const message = turnStartMessage(e, 'Handoff provider turn could not start.');
       appendMessage(chat, 'system', message, nowIso());
       try { saveChatFn(repoRoot, id, chat, purpose); } catch { /* the earlier handoff state is already persisted */ }
@@ -477,6 +488,7 @@ export function registerChatRoutes({
       r2 = { ok: false, reasonCode: 'provider-error' };
     } finally {
       if (running.get(id) === t2) running.delete(id);
+      releaseProviderWorkFn(repoRoot, work2);
     }
     await observeProviderResult(to, r2Health);
 
@@ -535,7 +547,12 @@ export function registerChatRoutes({
 
     sseStart(res);
     let built;
-    try { built = engineBuild(engine, chat.cliSessionId, model); } catch (e) {
+    let providerWork;
+    try {
+      providerWork = acquireProviderWorkFn(repoRoot, engine);
+      built = engineBuild(engine, chat.cliSessionId, model);
+    } catch (e) {
+      if (providerWork) releaseProviderWorkFn(repoRoot, providerWork);
       sseSend(res, 'error', {
         message: turnStartMessage(e, 'Provider turn could not start.'),
         reasonCode: e?.reasonCode === 'provider-auth-in-progress'
@@ -544,20 +561,27 @@ export function registerChatRoutes({
       return sseEnd(res);
     }
     const attemptedModel = model || modelForProvider(loadWorkspaceConfig(repoRoot), engine);
-    const turn = runTurnFn({
-      ...built,
-      prompt: entry.id === ONBOARDING_CHAT_ID
-        ? text
-        : purpose === 'interview-prep'
-          ? `${selectedEntryContext(entry)}\n\n${interviewPrepAgentPrompt(entry, text)}`
-          : `${selectedEntryContext(entry)}\n\nUser request:\n${text}`,
-      cwd: repoRoot,
-      parseLine: ENGINES[engine].parse,
-      onEvent: (ev) => {
-        if (ev.kind === 'delta') sseSend(res, 'delta', { text: ev.text });
-        if (ev.kind === 'tool') sseSend(res, 'tool', publicToolProjection(ev));
-      },
-    });
+    let turn;
+    try {
+      turn = runTurnFn({
+        ...built,
+        prompt: entry.id === ONBOARDING_CHAT_ID
+          ? text
+          : purpose === 'interview-prep'
+            ? `${selectedEntryContext(entry)}\n\n${interviewPrepAgentPrompt(entry, text)}`
+            : `${selectedEntryContext(entry)}\n\nUser request:\n${text}`,
+        cwd: repoRoot,
+        parseLine: ENGINES[engine].parse,
+        onEvent: (ev) => {
+          if (ev.kind === 'delta') sseSend(res, 'delta', { text: ev.text });
+          if (ev.kind === 'tool') sseSend(res, 'tool', publicToolProjection(ev));
+        },
+      });
+    } catch (error) {
+      releaseProviderWorkFn(repoRoot, providerWork);
+      sseSend(res, 'error', { message: turnStartMessage(error, 'Provider turn could not start.') });
+      return sseEnd(res);
+    }
     running.set(id, turn);
     stopTurnOnDisconnect(req, res, id);
     let r;
@@ -570,6 +594,7 @@ export function registerChatRoutes({
       r = { ok: false, reasonCode: 'provider-error' };
     } finally {
       running.delete(id);
+      releaseProviderWorkFn(repoRoot, providerWork);
     }
     await observeProviderResult(engine, healthResult);
     if (attemptedModel && isSafeModelId(attemptedModel)) {
@@ -610,7 +635,9 @@ export function registerChatRoutes({
     const marker = { stop() {} };
     running.set(id, marker);
     stopTurnOnDisconnect(req, res, id);
+    let providerWork;
     try {
+      providerWork = acquireProviderWorkFn(repoRoot, engine);
       const { status, model } = engineStatus(engine);
       const context = {
         selectedOpportunity: JSON.parse(selectedEntryContext(entry).split('\n').slice(1).join('\n')),
@@ -663,6 +690,7 @@ export function registerChatRoutes({
         filesTouched: chat.filesTouched,
       });
     } finally {
+      if (providerWork) releaseProviderWorkFn(repoRoot, providerWork);
       running.delete(id);
       sseEnd(res);
     }

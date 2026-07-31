@@ -7,7 +7,10 @@ import { loadWorkspaceConfig, validateWorkspaceConfig, workspacePaths } from './
 import { providerStatus } from './providers.mjs';
 import { runStructuredTurn } from './structuredTurn.mjs';
 import { recordProviderResultHealth } from './providerHealth.mjs';
-import { assertProviderAuthIdle } from './providerAuthMutation.mjs';
+import {
+  acquireProviderWork, assertProviderAuthIdle, releaseProviderWork,
+} from './providerAuthMutation.mjs';
+import { withWorkspaceMutationAuthority } from './workspaceMutationAuthority.mjs';
 
 export const ONBOARDING_INPUT_LIMIT = 80_000;
 export const ONBOARDING_FILES = Object.freeze([
@@ -252,11 +255,12 @@ export async function createOnboardingProposal(root, provider, {
   providerStatusFn = providerStatus, runStructuredTurnFn = runStructuredTurn, now = () => new Date().toISOString(),
   recordProviderResultHealthFn = recordProviderResultHealth,
   assertProviderAuthIdleFn = assertProviderAuthIdle,
+  acquireProviderWorkFn = acquireProviderWork,
+  releaseProviderWorkFn = releaseProviderWork,
   onProgress = () => {},
 } = {}) {
   onProgress({ phase: 'Preparing approved evidence', current: 1, total: 4 });
   const config = loadWorkspaceConfig(root);
-  const status = providerStatusFn(provider);
   const input = buildOnboardingEvidence(root, config);
   const prompt = [
     'Create one evidence-only Scout onboarding proposal from the JSON input below.',
@@ -275,8 +279,11 @@ export async function createOnboardingProposal(root, provider, {
     }
   };
   let turn;
+  let providerWork;
   try {
+    providerWork = acquireProviderWorkFn(root, provider);
     assertProviderAuthIdleFn(root, provider);
+    const status = providerStatusFn(provider);
     turn = await runStructuredTurnFn({
       provider, status, schema: ONBOARDING_SCHEMA, prompt,
       model: config.ai?.provider === provider ? config.ai?.model : null,
@@ -285,6 +292,8 @@ export async function createOnboardingProposal(root, provider, {
   } catch (error) {
     await observeProviderResult(error);
     throw error;
+  } finally {
+    if (providerWork) releaseProviderWorkFn(root, providerWork);
   }
   await observeProviderResult({ ...turn, ok: true });
   onProgress({ phase: 'Validating and staging proposal', current: 3, total: 4 });
@@ -337,9 +346,13 @@ function activeMatchesReviewedStage(root, relative) {
 }
 
 export function activateOnboardingProposal(root, proposalId, confirmed, {
-  doctorFn = doctor, now = () => new Date().toISOString(),
+  doctorFn = doctor, now = () => new Date().toISOString(), _testHooks = {},
 } = {}) {
   if (confirmed !== true) throw new Error('explicit proposal confirmation is required');
+  return withWorkspaceMutationAuthority(root, {
+    kind: 'onboarding',
+    phase: 'activate',
+  }, ({ renew }) => {
   const proposal = readOnboardingProposal(root);
   if (!proposal || proposal.proposalId !== proposalId) throw new Error('onboarding proposal is missing or no longer current');
   if ((proposal.unresolvedQuestions || []).length) throw new Error('resolve the proposal questions before activation');
@@ -368,7 +381,11 @@ export function activateOnboardingProposal(root, proposalId, confirmed, {
     }
   }
   try {
-    for (const relative of ONBOARDING_FILES) atomicWrite(targetPath(root, relative), stagedFiles[relative]);
+    for (const relative of ONBOARDING_FILES) {
+      renew();
+      _testHooks.beforeWrite?.(relative);
+      atomicWrite(targetPath(root, relative), stagedFiles[relative]);
+    }
     for (const relative of ONBOARDING_FILES) {
       const active = fs.readFileSync(targetPath(root, relative), 'utf8');
       if (!meaningfulContent(relative, active)) throw new Error(`activated ${relative} is empty or incomplete`);
@@ -398,6 +415,7 @@ export function activateOnboardingProposal(root, proposalId, confirmed, {
     }
     throw error;
   }
+  });
 }
 
 export function activatedProposalRecovery(root) {

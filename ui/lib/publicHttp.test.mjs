@@ -26,6 +26,7 @@ test('non-public IPv4 and IPv6 destinations are rejected before a request', asyn
     '0.0.0.0', '10.2.3.4', '100.64.0.1', '127.0.0.1', '169.254.169.254',
     '172.20.0.1', '192.168.1.1', '224.0.0.1', '255.255.255.255',
     '::', '::1', 'fe80::1', 'fc00::1', 'ff02::1', '::ffff:127.0.0.1',
+    'fec0::1', '64:ff9b::7f00:1', '64:ff9b::101:101', '4000::1', '5f00::1',
   ]) {
     assert.equal(isPublicIpAddress(address), false, address);
   }

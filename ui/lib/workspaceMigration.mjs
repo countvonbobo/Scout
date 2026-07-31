@@ -6,6 +6,7 @@ import { jobIdentity, sameUnderlyingJob } from './jobIdentity.mjs';
 import { filterVacancies } from './vacancyFilter.mjs';
 import { rankVacancies } from './vacancyRank.mjs';
 import { workspacePaths } from './workspace.mjs';
+import { withWorkspaceMutationAuthority } from './workspaceMutationAuthority.mjs';
 
 export const BETA22_COMPATIBLE_VERSION = '0.1.0-beta.22';
 const SNAPSHOT_SCHEMA_VERSION = 1;
@@ -71,7 +72,8 @@ function ignoredSnapshotPath(relative) {
   return normalised === 'profile/search' || normalised.startsWith('profile/search/');
 }
 
-function copySnapshotEntry(source, target, relative) {
+function copySnapshotEntry(source, target, relative, renew = () => {}) {
+  renew();
   const stat = fs.lstatSync(source);
   if (stat.isSymbolicLink()) {
     throw new Error(`beta.22 workspace snapshot does not accept symbolic links: ${slash(relative)}`);
@@ -81,7 +83,7 @@ function copySnapshotEntry(source, target, relative) {
     fs.mkdirSync(target, { recursive: true, mode: 0o700 });
     fs.chmodSync(target, 0o700);
     for (const name of fs.readdirSync(source).sort()) {
-      copySnapshotEntry(path.join(source, name), path.join(target, name), path.join(relative, name));
+      copySnapshotEntry(path.join(source, name), path.join(target, name), path.join(relative, name), renew);
     }
     return;
   }
@@ -206,7 +208,11 @@ export function latestBeta22WorkspaceSnapshot(root) {
   return null;
 }
 
-export function createBeta22WorkspaceSnapshot(root, { now = () => new Date().toISOString() } = {}) {
+function createBeta22WorkspaceSnapshotUnderAuthority(root, {
+  now = () => new Date().toISOString(),
+  renew = () => {},
+  _testHooks = {},
+} = {}) {
   const workspaceRoot = path.resolve(root);
   const existing = latestBeta22WorkspaceSnapshot(workspaceRoot);
   const configFile = path.join(workspaceRoot, 'workspace.json');
@@ -221,12 +227,14 @@ export function createBeta22WorkspaceSnapshot(root, { now = () => new Date().toI
   try {
     fs.mkdirSync(staging, { recursive: false, mode: 0o700 });
     for (const relative of SNAPSHOT_PATHS) {
+      renew();
+      _testHooks.beforeCopy?.(relative);
       const source = path.join(workspaceRoot, relative);
       if (!fs.existsSync(source)) continue;
       if (relative === 'workspace.json') {
         atomicWriteFile(path.join(staging, relative), beta22WorkspaceConfigBytes(source), { mode: 0o600 });
       } else {
-        copySnapshotEntry(source, path.join(staging, relative), relative);
+        copySnapshotEntry(source, path.join(staging, relative), relative, renew);
       }
     }
     const entries = snapshotEntries(staging);
@@ -263,6 +271,23 @@ export function createBeta22WorkspaceSnapshot(root, { now = () => new Date().toI
     }
     throw error;
   }
+}
+
+export function withBeta22MigrationAuthority(root, commit) {
+  return withWorkspaceMutationAuthority(root, {
+    kind: 'workspace-migration',
+    phase: 'beta22-snapshot',
+  }, ({ renew }) => commit({
+    createSnapshot: (options = {}) => createBeta22WorkspaceSnapshotUnderAuthority(
+      root,
+      { ...options, renew },
+    ),
+    renew,
+  }));
+}
+
+export function createBeta22WorkspaceSnapshot(root, options = {}) {
+  return withBeta22MigrationAuthority(root, ({ createSnapshot }) => createSnapshot(options));
 }
 
 export function materializeBeta22Rollback(root, destination, { snapshotDirectory = null } = {}) {

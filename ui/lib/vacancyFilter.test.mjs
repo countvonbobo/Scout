@@ -274,6 +274,42 @@ test('exclude unknown compensation policy rejects non-comparable supplied values
   assert.equal(result.excluded[0].code, 'compensation-non-comparable');
 });
 
+test('mandatory compensation excludes a comparable vacancy below the minimum', () => {
+  const belowMinimum = {
+    ...softwareJob,
+    compensation: {
+      value: {
+        minimum: 55000,
+        maximum: 59000,
+        currency: 'GBP',
+        period: 'year',
+        rateType: 'salary',
+        amountType: 'base',
+        certainty: 'exact',
+      },
+      provenance: 'explicit-source',
+    },
+  };
+  const result = filterVacancies([belowMinimum], {
+    ...profile(),
+    compensation: {
+      currency: 'GBP',
+      period: 'year',
+      rateType: 'salary',
+      amountType: 'base',
+      certainty: 'exact',
+      minimum: 60000,
+      minimumStrength: 'mandatory',
+      unknownPolicy: 'include',
+    },
+  });
+
+  assert.equal(result.eligible.length, 0);
+  assert.equal(result.excluded[0].code, 'mandatory-compensation-unmet');
+  assert.equal(result.excluded[0].profileRuleId, 'policy-compensation-minimum');
+  assert.equal(result.excluded[0].evidence.comparison, 'below-minimum');
+});
+
 test('structured title and employer rules read compacted runtime candidate fields', () => {
   const candidate = { vacancyId: 'runtime-001', company: 'Acme', role: 'Software Engineer', workingType: 'permanent', description: '' };
   const title = filterVacancies([candidate], profile({ primaryTitles: [rule('Data Engineer', 'mandatory')] }));

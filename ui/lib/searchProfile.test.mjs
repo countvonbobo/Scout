@@ -8,9 +8,13 @@ import {
   draftProfileFromLegacy,
   loadPublishedSearchProfile,
   migrateSearchProfile,
+  MAX_SEMANTIC_PROFILE_RULES,
+  NEGATIVE_RULE_FIELDS,
   profileFingerprint,
   publishSearchProfile,
+  TARGET_RULE_FIELDS,
 } from './searchProfile.mjs';
+import { PROFILE_RULE_SUPPORT } from './vacancyFilter.mjs';
 import { workspacePaths } from './workspace.mjs';
 
 const NOW = '2026-07-26T20:00:00.000Z';
@@ -122,6 +126,38 @@ test('published profile supports the complete domain-neutral preference foundati
     breadth: 'balanced', relevanceThreshold: 45, exploration: 0.1,
   });
   assert.equal(profile.unknownPolicies.workingPattern, 'exclude');
+});
+
+test('profile validation rejects unsupported and silently truncatable rule evidence', () => {
+  const unsupported = genericProfileDraft();
+  unsupported.target.futureField = [{
+    value: 'ignored by runtime', strength: 'nice-to-have', provenance: 'explicit',
+  }];
+  assert.throws(
+    () => publishSearchProfile(unsupported, { publishedAt: NOW }),
+    /unsupported field: futureField/,
+  );
+
+  const oversized = genericProfileDraft();
+  oversized.negative.excludedResponsibilities = Array.from(
+    { length: MAX_SEMANTIC_PROFILE_RULES + 1 },
+    (_, index) => ({
+      value: `excluded activity ${index}`,
+      strength: 'hard-exclusion',
+      provenance: 'explicit',
+    }),
+  );
+  assert.throws(
+    () => publishSearchProfile(oversized, { publishedAt: NOW }),
+    /more than 64 semantic rules/,
+  );
+});
+
+test('validated profile rule fields exactly cover filtering support', () => {
+  const supportedTarget = [...new Set(PROFILE_RULE_SUPPORT.flatMap(({ target }) => target))].sort();
+  const supportedNegative = [...new Set(PROFILE_RULE_SUPPORT.flatMap(({ negative }) => negative))].sort();
+  assert.deepEqual([...TARGET_RULE_FIELDS].sort(), supportedTarget);
+  assert.deepEqual([...NEGATIVE_RULE_FIELDS].sort(), supportedNegative);
 });
 
 test('profile publication rejects invalid compensation and unbounded search behaviour', () => {

@@ -170,6 +170,25 @@ function structuredExclusions(vacancy, profile) {
 function compensationExclusions(vacancy, profile) {
   const source = vacancy?.compensation;
   const amount = valueOf(source);
+  const minimum = profile?.compensation?.minimum;
+  const comparison = minimum === null || minimum === undefined
+    ? 'not-configured'
+    : compareCompensation(amount, profile.compensation);
+  if (profile?.compensation?.minimumStrength === 'mandatory' && comparison === 'below-minimum') {
+    return [{
+      vacancyId: vacancy?.vacancyId || vacancy?.candidateId || vacancy?.canonicalUrl || 'unknown-vacancy',
+      code: 'mandatory-compensation-unmet',
+      profileRuleId: 'policy-compensation-minimum',
+      profileVersion: profileVersion(profile),
+      evidence: {
+        vacancy: amount,
+        rule: minimum,
+        comparison,
+      },
+      confidence: confidence(source),
+      overrideable: true,
+    }];
+  }
   if (profile?.compensation?.unknownPolicy !== 'exclude') return [];
   const missing = amount === null || amount === undefined || amount === '';
   if (missing) {
@@ -180,8 +199,7 @@ function compensationExclusions(vacancy, profile) {
         comparison: 'unknown',
       }, confidence(source), true)];
   }
-  if (profile?.compensation?.minimum === null || profile?.compensation?.minimum === undefined) return [];
-  const comparison = compareCompensation(amount, profile.compensation);
+  if (minimum === null || minimum === undefined) return [];
   if (comparison !== 'unknown') return [];
   return [exclusion(vacancy, profile, 'compensation-non-comparable', null,
     {
