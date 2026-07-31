@@ -346,6 +346,73 @@ test('handoff route summarises the old session, starts the other engine, and per
   }
 });
 
+test('runtime shutdown waits for an admitted handoff and prevents its second provider turn', { concurrency: false }, async () => {
+  const root = tmpRoot();
+  const chat = emptyChat('claude');
+  chat.cliSessionId = 'old-session';
+  saveChat(root, ID, chat);
+  const oldClaude = ENGINES.claude;
+  const oldCodex = ENGINES.codex;
+  ENGINES.claude = { build: fakeBuild([], 'claude'), parse: parseClaudeLine };
+  ENGINES.codex = { build: fakeBuild([], 'codex'), parse: parseClaudeLine };
+  let turnCount = 0;
+  let releaseHealth;
+  let healthStartedResolve;
+  const healthStarted = new Promise((resolve) => { healthStartedResolve = resolve; });
+  const holdHealth = new Promise((resolve) => { releaseHealth = resolve; });
+  const routes = {};
+  const runtime = registerChatRoutes({
+    routes,
+    repoRoot: root,
+    readTracker: () => ({ opportunities: [ENTRY] }),
+    providerStatusFn: () => ({
+      installed: true, authenticated: true, executable: 'provider', env: process.env,
+    }),
+    runTurnFn: () => {
+      turnCount += 1;
+      return {
+        stop() {},
+        finished: Promise.resolve({
+          ok: true,
+          text: 'bounded handoff summary',
+          sessionId: 'summary-session',
+          filesTouched: [],
+          usage: {},
+        }),
+      };
+    },
+    recordProviderResultHealthFn: async () => {
+      healthStartedResolve();
+      await holdHealth;
+    },
+  });
+  const req = new EventEmitter();
+  const res = new MockResponse();
+
+  try {
+    routes['POST /api/chat/handoff'](req, res, JSON.stringify({ id: ID }));
+    await healthStarted;
+    let shutdownSettled = false;
+    const shutdown = runtime.shutdown({ timeoutMs: 1_000 }).then(() => { shutdownSettled = true; });
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(shutdownSettled, false);
+    releaseHealth();
+    await shutdown;
+    await res.finished;
+    assert.equal(turnCount, 1);
+    assert.equal(sseEvents(res.text()).at(-1).event, 'error');
+
+    const rejected = await callRoute(
+      routes['POST /api/chat/send'],
+      JSON.stringify({ id: ID, engine: 'codex', text: 'late work' }),
+    );
+    assert.equal(rejected.statusCode, 503);
+  } finally {
+    ENGINES.claude = oldClaude;
+    ENGINES.codex = oldCodex;
+  }
+});
+
 test('handoff route persists the switch and summary when the replacement turn fails', { concurrency: false }, async () => {
   const root = tmpRoot();
   const chat = emptyChat('claude');

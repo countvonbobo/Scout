@@ -177,6 +177,43 @@ test('URL-less provider vacancies retain distinct stable identities through sele
   assert.ok(forward.selection.reasons.every(({ vacancyId }) => vacancyId !== 'unknown-vacancy'));
 });
 
+test('durable reviewed rejections are seen for novelty and lane productivity', () => {
+  const profile = {
+    version: 1, status: 'published', id: 'profile-reviewed-history',
+    target: {}, negative: {},
+    selection: { breadth: 'balanced' },
+    compensation: {
+      currency: null, period: 'year', minimum: null,
+      minimumStrength: 'neutral', unknownPolicy: 'include',
+    },
+  };
+  const url = 'https://example.test/reviewed-opening';
+  const result = prepareRankedDiscovery({
+    sources: {
+      reviewed_lane: {
+        count: 1,
+        jobs: [{ company: 'Example Co', title: 'Engineer', url, providerId: 'reviewed-1' }],
+      },
+    },
+    profile,
+    tracker: { opportunities: [] },
+    decisionHistory: [{
+      vacancyId: url,
+      company: 'Example Co',
+      role: 'Engineer',
+      url,
+      outcome: 'provider_discarded',
+    }],
+    relevanceThreshold: 0,
+  });
+
+  assert.deepEqual(result.discoveryCounts, []);
+  assert.equal(
+    result.ranked[0].dimensions.find(({ name }) => name === 'novelty').evidence[0].comparison,
+    'seen-exact',
+  );
+});
+
 test('privacy projection cannot collapse distinct query-addressed provider vacancies', () => {
   const profile = {
     version: 1, status: 'published', id: 'profile-query-identity-collision',

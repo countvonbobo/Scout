@@ -30,6 +30,7 @@ export class OperationManager {
     this.id = id;
     this.records = new Map();
     this.executions = new Map();
+    this.accepting = true;
   }
 
   get(operationId) { return clone(this.records.get(operationId)); }
@@ -48,7 +49,13 @@ export class OperationManager {
 
   activeList() { return [...this.records.values()].filter((record) => ACTIVE.has(record.status)).map(clone); }
 
+  resumeAdmission() {
+    if (this.executions.size) throw new Error('cannot resume operation admission while work is active');
+    this.accepting = true;
+  }
+
   async shutdown({ timeoutMs = 10_000 } = {}) {
+    this.accepting = false;
     const active = [...this.executions.values()];
     for (const execution of active) execution.controller.abort(new Error('operation cancelled for shutdown'));
     if (!active.length) return;
@@ -67,6 +74,7 @@ export class OperationManager {
   }
 
   start(type, executor, { phase = 'Queued', total = 1, estimate = null } = {}) {
+    if (!this.accepting) throw new Error('operation manager is shutting down');
     const active = this.active(type);
     if (active) throw new OperationConflictError(type, active);
     const timestamp = this.now().toISOString();

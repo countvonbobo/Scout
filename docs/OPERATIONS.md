@@ -213,9 +213,12 @@ Critical mutable workspace records are replaced atomically. Scout writes new con
 
 Multi-file onboarding activation additionally writes a prepared intent before
 the first replacement and reconciles it at startup under the shared workspace
-mutation authority. Shutdown and restart drain acknowledged backup batches,
-provider-health probes, managed operations and chat children before process
-handoff; a failed child shutdown leaves the process in place for a safe retry.
+mutation authority. Proposal staging and discard cannot erase that intent;
+conflicting post-crash bytes are preserved for review, and terminal marker
+cleanup is idempotent. Shutdown and restart close background-work admission,
+settle checkpoint producers, then drain acknowledged backup batches,
+provider-health probes, managed operations and complete chat handlers before
+process handoff; a failed drain leaves the listener in place for a safe retry.
 
 Update this file in the same pull request whenever any of these change:
 

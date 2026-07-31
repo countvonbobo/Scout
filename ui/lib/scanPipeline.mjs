@@ -1302,9 +1302,10 @@ export function prepareRankedDiscovery({
   const initialFunnel = createDiscoveryFunnel(input.funnelSources);
   const canonical = canonicaliseObservations(observations);
   const vacancies = canonical.vacancies.map(assessmentVacancy);
-  const discoveryCounts = laneDiscoveryCounts(vacancies, profile, tracker?.opportunities || []);
+  const reviewedHistory = [...(tracker?.opportunities || []), ...(decisionHistory || [])];
+  const discoveryCounts = laneDiscoveryCounts(vacancies, profile, reviewedHistory);
   const filtered = filterVacancies(vacancies, profile, { learningPolicy });
-  const ranked = rankVacancies(filtered.eligible, profile, tracker?.opportunities || [], { learningPolicy });
+  const ranked = rankVacancies(filtered.eligible, profile, reviewedHistory, { learningPolicy });
   const lifecycle = partitionVacanciesForAssessment(ranked, decisionHistory, { profileId: profile.id });
   const configuredThreshold = Number(relevanceThreshold ?? profile?.selection?.relevanceThreshold ?? 1);
   const threshold = Number.isFinite(configuredThreshold) ? Math.max(Number.EPSILON, configuredThreshold) : 1;
@@ -1708,6 +1709,7 @@ export function createRankedDiscoveryStages({
 } = {}) {
   if (typeof collect !== 'function') throw new TypeError('ranked discovery collection stage is required');
   if (!profile || profile.status !== 'published') throw new Error('ranked discovery requires a published search profile');
+  const reviewedHistory = [...(tracker?.opportunities || []), ...(decisionHistory || [])];
   const collectWithLanes = async (...args) => {
     const value = await collect(...args);
     return {
@@ -1749,7 +1751,7 @@ export function createRankedDiscoveryStages({
         discoveryCounts: laneDiscoveryCounts(
           priorArtifact.vacancies,
           profile,
-          tracker?.opportunities || [],
+          reviewedHistory,
         ),
         eligible: filtered.eligible,
         reconsidered: filtered.reconsidered || [],
@@ -1776,7 +1778,7 @@ export function createRankedDiscoveryStages({
         ranked: rankVacancies(
           priorArtifact.eligible,
           profile,
-          tracker?.opportunities || [],
+          reviewedHistory,
           { learningPolicy },
         ),
       };

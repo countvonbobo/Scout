@@ -73,9 +73,10 @@ one of those SHAs requires a reviewed dependency change and another
 release-candidate rehearsal.
 
 Release staging refuses symbolic links for both copied trees and individually
-allowlisted inputs. Regular files are opened without following links and their
-opened identity is checked before bytes are copied; the staged-tree privacy
-audit also fails on any symlink.
+allowlisted inputs, including a link in any ancestor component. Regular files
+are opened without following links; ancestor and opened-file identities are
+checked before and after bytes are read. The staged-tree privacy audit applies
+the same component and identity checks and fails on any symlink.
 
 Attestation establishes build provenance, not software safety. It does not prove that the source or resulting package is free of vulnerabilities or malicious behaviour.
 

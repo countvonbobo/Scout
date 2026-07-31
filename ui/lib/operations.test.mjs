@@ -61,4 +61,8 @@ test('shutdown aborts and awaits every managed background operation', async () =
   assert.equal(observedAbort, true);
   assert.deepEqual(manager.activeList(), []);
   assert.equal(manager.get('op-shutdown').status, 'succeeded');
+  assert.throws(
+    () => manager.start('scan', async () => null),
+    /shutting down/,
+  );
 });

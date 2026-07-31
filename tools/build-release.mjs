@@ -166,14 +166,15 @@ export function productionLockfile(lock) {
 }
 
 function writeProductionManifests(root, appDir) {
-  const manifest = JSON.parse(readRegularFile(required(root, 'package.json')).toString('utf8'));
-  const lock = JSON.parse(readRegularFile(required(root, 'package-lock.json')).toString('utf8'));
+  const manifest = JSON.parse(readRegularFile(required(root, 'package.json'), root).toString('utf8'));
+  const lock = JSON.parse(readRegularFile(required(root, 'package-lock.json'), root).toString('utf8'));
   fs.writeFileSync(path.join(appDir, 'package.json'), `${JSON.stringify(productionPackageManifest(manifest), null, 2)}\n`);
   fs.writeFileSync(path.join(appDir, 'package-lock.json'), `${JSON.stringify(productionLockfile(lock), null, 2)}\n`);
   return lock;
 }
 
-function readRegularFile(source) {
+function readRegularFileRecord(source, verifiedRoot = path.dirname(source)) {
+  const ancestorsBefore = releasePathIdentity(verifiedRoot, source);
   const before = fs.lstatSync(source, { bigint: true });
   if (!before.isFile() || before.isSymbolicLink()) {
     throw new Error(`release input must be a regular file: ${source}`);
@@ -182,25 +183,34 @@ function readRegularFile(source) {
   const descriptor = fs.openSync(source, fs.constants.O_RDONLY | noFollow);
   try {
     const opened = fs.fstatSync(descriptor, { bigint: true });
+    const ancestorsAfter = releasePathIdentity(verifiedRoot, source);
     const after = fs.lstatSync(source, { bigint: true });
     if (!opened.isFile() || after.isSymbolicLink() || !after.isFile()
       || opened.dev !== before.dev || opened.ino !== before.ino
-      || after.dev !== opened.dev || after.ino !== opened.ino) {
+      || after.dev !== opened.dev || after.ino !== opened.ino
+      || ancestorsAfter !== ancestorsBefore) {
       throw new Error(`release input identity changed while opening: ${source}`);
     }
-    return fs.readFileSync(descriptor);
+    return {
+      content: fs.readFileSync(descriptor),
+      mode: Number(opened.mode & 0o777n),
+    };
   } finally {
     fs.closeSync(descriptor);
   }
 }
 
-function copyRegularFile(source, target) {
-  const content = readRegularFile(source);
-  fs.mkdirSync(path.dirname(target), { recursive: true });
-  fs.writeFileSync(target, content, { flag: 'wx', mode: fs.statSync(source).mode & 0o777 });
+function readRegularFile(source, verifiedRoot = path.dirname(source)) {
+  return readRegularFileRecord(source, verifiedRoot).content;
 }
 
-function copyTree(source, target, relative = '', include = includeReleasePath) {
+function copyRegularFile(source, target, verifiedRoot = path.dirname(source)) {
+  const { content, mode } = readRegularFileRecord(source, verifiedRoot);
+  fs.mkdirSync(path.dirname(target), { recursive: true });
+  fs.writeFileSync(target, content, { flag: 'wx', mode });
+}
+
+function copyTree(source, target, relative = '', include = includeReleasePath, verifiedRoot = source) {
   const stat = fs.lstatSync(source);
   if (stat.isSymbolicLink()) throw new Error(`release input may not be a symbolic link: ${source}`);
   if (stat.isDirectory()) {
@@ -208,11 +218,11 @@ function copyTree(source, target, relative = '', include = includeReleasePath) {
     for (const name of fs.readdirSync(source).sort()) {
       const childRelative = relative ? path.join(relative, name) : name;
       if (!include(childRelative)) continue;
-      copyTree(path.join(source, name), path.join(target, name), childRelative, include);
+      copyTree(path.join(source, name), path.join(target, name), childRelative, include, verifiedRoot);
     }
     return;
   }
-  copyRegularFile(source, target);
+  copyRegularFile(source, target, verifiedRoot);
 }
 
 export function stagePublicSource({
@@ -225,8 +235,8 @@ export function stagePublicSource({
   for (const entry of PUBLIC_SOURCE_FILES) {
     const source = required(resolvedRoot, entry.source);
     const target = path.join(resolvedStage, entry.target);
-    if (entry.tree) copyTree(source, target, normalise(entry.target), includePublicSourcePath);
-    else copyRegularFile(source, target);
+    if (entry.tree) copyTree(source, target, normalise(entry.target), includePublicSourcePath, resolvedRoot);
+    else copyRegularFile(source, target, resolvedRoot);
   }
   return { root: resolvedRoot, stageDir: resolvedStage };
 }
@@ -254,9 +264,36 @@ export function auditPublicSourceStage({
   return { status: result.status, output: String(result.stdout || '') };
 }
 
+function releasePathIdentity(root, file) {
+  const resolvedRoot = path.resolve(root);
+  const value = path.resolve(file);
+  const fromRoot = path.relative(resolvedRoot, value);
+  if (!fromRoot || fromRoot === '..' || fromRoot.startsWith(`..${path.sep}`) || path.isAbsolute(fromRoot)) {
+    if (value !== resolvedRoot) throw new Error('required release input escapes its root');
+  }
+  const identities = [];
+  let component = resolvedRoot;
+  for (const segment of fromRoot ? fromRoot.split(path.sep) : []) {
+    const rootStat = fs.lstatSync(component);
+    if (rootStat.isSymbolicLink() || !rootStat.isDirectory()) {
+      throw new Error(`release input ancestor must be a real directory: ${component}`);
+    }
+    identities.push(`${rootStat.dev}:${rootStat.ino}`);
+    component = path.join(component, segment);
+  }
+  const rootStat = fs.lstatSync(resolvedRoot);
+  if (rootStat.isSymbolicLink() || !rootStat.isDirectory()) {
+    throw new Error(`release input root must be a real directory: ${resolvedRoot}`);
+  }
+  if (!identities.length) identities.push(`${rootStat.dev}:${rootStat.ino}`);
+  return identities.join('|');
+}
+
 function required(root, relative) {
-  const value = path.join(root, relative);
+  const resolvedRoot = path.resolve(root);
+  const value = path.resolve(resolvedRoot, relative);
   if (!fs.existsSync(value)) throw new Error(`required release input is missing: ${relative}`);
+  releasePathIdentity(resolvedRoot, value);
   return value;
 }
 
@@ -276,8 +313,8 @@ export function stageRelease({
   for (const entry of RELEASE_FILES) {
     const source = required(resolvedRoot, entry.source);
     const target = path.join(appDir, entry.target);
-    if (entry.tree) copyTree(source, target, normalise(entry.target));
-    else copyRegularFile(source, target);
+    if (entry.tree) copyTree(source, target, normalise(entry.target), includeReleasePath, resolvedRoot);
+    else copyRegularFile(source, target, resolvedRoot);
   }
 
   const lock = writeProductionManifests(resolvedRoot, appDir);
@@ -288,16 +325,27 @@ export function stageRelease({
       path.join(appDir, 'node_modules'),
       '',
       (relative) => includeReleasePath(relative) && includeProductionDependency(relative),
+      resolvedRoot,
     );
   }
   const runtimeDir = path.join(resolvedStage, 'runtime');
   fs.mkdirSync(runtimeDir, { recursive: true });
   const runtimeName = platform === 'win32' ? 'ScoutRuntime.exe' : 'node';
-  copyRegularFile(required(path.dirname(nodeExecutable), path.basename(nodeExecutable)), path.join(runtimeDir, runtimeName));
+  const nodeRoot = path.dirname(nodeExecutable);
+  copyRegularFile(
+    required(nodeRoot, path.basename(nodeExecutable)),
+    path.join(runtimeDir, runtimeName),
+    nodeRoot,
+  );
   if (platform !== 'win32') fs.chmodSync(path.join(runtimeDir, runtimeName), 0o755);
   const typstName = platform === 'win32' ? 'typst.exe' : 'typst';
   const typstSource = typstExecutable || path.join(resolvedRoot, '.scout-runtime', typstName);
-  copyRegularFile(required(path.dirname(typstSource), path.basename(typstSource)), path.join(runtimeDir, typstName));
+  const typstRoot = path.dirname(typstSource);
+  copyRegularFile(
+    required(typstRoot, path.basename(typstSource)),
+    path.join(runtimeDir, typstName),
+    typstRoot,
+  );
   if (platform !== 'win32') fs.chmodSync(path.join(runtimeDir, typstName), 0o755);
 
   return { root: resolvedRoot, stageDir: resolvedStage, appDir };

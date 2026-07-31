@@ -14,12 +14,13 @@ process.env.SCOUT_DEVICE_SETTINGS = path.join(testWorkspace, 'device-settings.js
 const {
   APP_ROOT, APP_VERSION, UI_BUILD_FILES, UI_BUILD_ID, WORKSPACE_ROOT,
   canAutoDownloadUpdate, checkStartupProviderHealth, confirmProviderLoginHealth, createRuntimeProviderHealthMonitor,
-  codexDeepLinkDetection, computeUiBuildId, createServer,
+  closeServerSafely, codexDeepLinkDetection, computeUiBuildId, createServer,
   inspectCodexDeepLinkHandler, operations, providerDetection, providerLoginControl,
   publicApiError, publicCvImportError, publicDeviceSettings, publicProviderStatus,
   publicSetupConfigError, recoverProfilePublicationsAtStartup, requestAccess,
   restartControl, runtimeProviderPreflight, shutdownControl,
   stageSearchProfileReviewAtStartup, scheduleCheckpoint, drainScheduledCheckpoints,
+  drainRuntimeWork,
 } = await import('./server.mjs');
 const { seedWorkspace, loadWorkspaceConfig, workspacePaths, writeWorkspaceConfig } = await import('./lib/workspace.mjs');
 const {
@@ -87,6 +88,19 @@ test('shutdown drainage starts a queued checkpoint immediately and settles its p
   await drainScheduledCheckpoints();
   const result = await pending;
   assert.ok(['success', 'pending', 'partial', 'needs-attention', 'disabled'].includes(result.state));
+});
+
+test('a failed runtime drain leaves the production listener available for a safe retry', async () => {
+  const listener = http.createServer((_req, res) => res.end('ok'));
+  await new Promise((resolve) => listener.listen(0, '127.0.0.1', resolve));
+  await assert.rejects(
+    closeServerSafely(listener, {
+      drain: async () => { throw new Error('provider child did not close'); },
+    }),
+    /provider child did not close/,
+  );
+  assert.equal(listener.listening, true);
+  await new Promise((resolve) => listener.close(resolve));
 });
 
 test('server startup retries a live-fenced profile publication without starting unsafely', () => {
@@ -2100,4 +2114,24 @@ test('a UI mutation racing scan completion preserves every tracked user field', 
   assert.deepEqual(saved.application, original.opportunities[0].application);
   assert.match(saved.notes, /Existing note/);
   assert.match(saved.notes, /Arrived during scan completion/);
+});
+
+test('runtime shutdown closes admission and drains checkpoints produced while work settles', async () => {
+  let lateCheckpoint;
+  operations.start('shutdown-checkpoint-test', async (_update, { signal }) => new Promise((resolve) => {
+    signal.addEventListener('abort', () => {
+      lateCheckpoint = scheduleCheckpoint('test: checkpoint produced during shutdown');
+      resolve({ stopped: true });
+    }, { once: true });
+  }));
+  await new Promise((resolve) => setImmediate(resolve));
+
+  await drainRuntimeWork({ timeoutMs: 5_000 });
+  assert.ok(lateCheckpoint);
+  const result = await lateCheckpoint;
+  assert.ok(['success', 'pending', 'partial', 'needs-attention', 'disabled'].includes(result.state));
+  assert.throws(
+    () => operations.start('late-shutdown-work', async () => null),
+    /shutting down/,
+  );
 });

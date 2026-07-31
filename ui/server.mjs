@@ -1196,13 +1196,12 @@ export function createServer() {
   return server;
 }
 
-export async function closeServerSafely(server) {
-  const close = server?.listening
-    ? new Promise((resolve, reject) => {
-      server.close((error) => (error ? reject(error) : resolve()));
-    })
-    : Promise.resolve();
-  await Promise.all([close, drainRuntimeWork()]);
+export async function closeServerSafely(server, { drain = drainRuntimeWork } = {}) {
+  await drain();
+  if (!server?.listening) return;
+  await new Promise((resolve, reject) => {
+    server.close((error) => (error ? reject(error) : resolve()));
+  });
 }
 
 // --- Mutation wiring (Task 5) ---
@@ -2240,7 +2239,7 @@ routes['POST /api/cv/quality/override'] = (req, res, body) => {
   catch { return replyJson(res, 409, publicApiError('CV quality decision could not be saved.')); }
 };
 
-import { activeChatTurnCount, registerChatRoutes, shutdownActiveChatTurns } from './lib/chatService.mjs';
+import { activeChatTurnCount, registerChatRoutes } from './lib/chatService.mjs';
 import { registerCompanyRoutes } from './lib/companyService.mjs';
 routes['POST /api/setup/proposal'] = (req, res, body) => {
   const b = parseBody(body); if (!b) return replyJson(res, 400, { error: 'bad json' });
@@ -2628,25 +2627,44 @@ routes['POST /api/restart'] = (req, res, body) => {
   }
   replyJson(res, 200, { ok: true, restarting: true });
   setTimeout(() => {
-    const quiesced = runtimeHttpServer?.listening
-      ? closeServerSafely(runtimeHttpServer)
+    const productionServer = runtimeHttpServer?.listening ? runtimeHttpServer : null;
+    const quiesced = productionServer
+      ? closeServerSafely(productionServer)
       : drainRuntimeWork();
-    void quiesced.then(() => restartControl.respawn()).catch(() => {});
+    void quiesced.then(() => {
+      restartControl.respawn();
+      if (!productionServer) resumeRuntimeAdmission();
+    }).catch(() => {
+      if (!productionServer) resumeRuntimeAdmission();
+    });
   }, 200);
 };
 
 routes['POST /api/shutdown'] = (req, res) => {
   replyJson(res, 200, { ok: true, shuttingDown: true });
   setTimeout(() => {
-    const quiesced = runtimeHttpServer?.listening
-      ? closeServerSafely(runtimeHttpServer)
+    const productionServer = runtimeHttpServer?.listening ? runtimeHttpServer : null;
+    const quiesced = productionServer
+      ? closeServerSafely(productionServer)
       : drainRuntimeWork();
-    void quiesced.then(() => shutdownControl.exit()).catch(() => {});
+    void quiesced.then(() => {
+      shutdownControl.exit();
+      if (!productionServer) resumeRuntimeAdmission();
+    }).catch(() => {
+      if (!productionServer) resumeRuntimeAdmission();
+    });
   }, 200);
 };
 
 registerCompanyRoutes({ routes, repoRoot: WORKSPACE_ROOT, readTracker, onCheckpoint: scheduleCheckpoint });
-registerChatRoutes({ routes, repoRoot: WORKSPACE_ROOT, readTracker, onCheckpoint: scheduleCheckpoint });
+const chatRuntime = registerChatRoutes({
+  routes, repoRoot: WORKSPACE_ROOT, readTracker, onCheckpoint: scheduleCheckpoint,
+});
+
+function resumeRuntimeAdmission() {
+  operations.resumeAdmission();
+  chatRuntime.openAdmission();
+}
 
 export async function runtimeProviderPreflight(root, provider, purpose, {
   source,
@@ -2681,23 +2699,25 @@ function trackRuntimeBackgroundTask(task) {
 
 export async function drainRuntimeWork({ timeoutMs = 10_000 } = {}) {
   runtimeProviderHealthMonitor?.stop();
-  const work = [
-    operations.shutdown({ timeoutMs }),
-    shutdownActiveChatTurns({ timeoutMs }),
-    drainScheduledCheckpoints(),
-    runtimeProviderHealthMonitor?.drain?.(),
-    ...runtimeBackgroundTasks,
-  ].filter(Boolean);
+  chatRuntime.closeAdmission();
   let timer;
   try {
     await Promise.race([
-      Promise.all(work),
+      (async () => {
+        await Promise.all([
+          operations.shutdown({ timeoutMs }),
+          chatRuntime.shutdown({ timeoutMs }),
+          runtimeProviderHealthMonitor?.drain?.(),
+          ...runtimeBackgroundTasks,
+        ].filter(Boolean));
+        await drainScheduledCheckpoints();
+        await providerLoginControl.shutdown();
+      })(),
       new Promise((_, reject) => {
         timer = setTimeout(() => reject(new Error('Scout runtime work did not close before shutdown')), timeoutMs);
         timer.unref?.();
       }),
     ]);
-    await providerLoginControl.shutdown();
   } finally {
     clearTimeout(timer);
   }

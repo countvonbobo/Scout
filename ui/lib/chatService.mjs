@@ -153,6 +153,14 @@ export function registerChatRoutes({
   renewProviderWorkFn = renewProviderWork,
   releaseProviderWorkFn = releaseProviderWork,
 }) {
+  let accepting = true;
+  const activeHandlers = new Set();
+  const trackHandler = (task) => {
+    const pending = Promise.resolve(task);
+    activeHandlers.add(pending);
+    void pending.finally(() => activeHandlers.delete(pending)).catch(() => {});
+    return pending;
+  };
   const catalogueReasonCodes = new Set([
     'catalogue-check-failed',
     'command-failed',
@@ -395,15 +403,17 @@ export function registerChatRoutes({
   };
 
   routes['POST /api/chat/send'] = (req, res, body) => {
+    if (!accepting) return replyJson(res, 503, { error: 'Scout is shutting down' });
     const b = parseBody(body);
     if (!b) return replyJson(res, 400, { error: 'bad json' });
-    handleSend(req, res, b);
+    trackHandler(handleSend(req, res, b));
   };
 
   routes['POST /api/chat/handoff'] = (req, res, body) => {
+    if (!accepting) return replyJson(res, 503, { error: 'Scout is shutting down' });
     const b = parseBody(body);
     if (!b) return replyJson(res, 400, { error: 'bad json' });
-    handleHandoff(req, res, b).catch((e) => {
+    trackHandler(handleHandoff(req, res, b)).catch((e) => {
       const id = b.id || '';
       const turn = running.get(id);
       if (turn) turn.stop();
@@ -471,6 +481,10 @@ export function registerChatRoutes({
       await work1.release(r1LifecycleError);
     }
     await observeProviderResult(from, r1Health);
+    if (!accepting) {
+      sseSend(res, 'error', { message: 'Scout is shutting down.' });
+      return sseEnd(res);
+    }
     if (!r1.ok || !r1.text) {
       const failure = safeTurnFailure(r1);
       const message = `Summary failed: ${failure.message}`;
@@ -761,4 +775,17 @@ export function registerChatRoutes({
       sseEnd(res);
     }
   }
+
+  return {
+    closeAdmission() { accepting = false; },
+    openAdmission() {
+      if (activeHandlers.size || running.size) throw new Error('cannot resume chat admission while work is active');
+      accepting = true;
+    },
+    async shutdown({ timeoutMs = 10_000 } = {}) {
+      accepting = false;
+      await shutdownActiveChatTurns({ timeoutMs });
+      await Promise.allSettled([...activeHandlers]);
+    },
+  };
 }

@@ -255,10 +255,16 @@ function canonicalVacancy(observations) {
     location: fields.location,
     seniority: fields.seniority,
   });
-  const fallbackIdentity = {
-    company: identity.company,
-    title: identity.title,
-  };
+  const sourceReference = [...sourceReferences]
+    .sort((left, right) => compareStable(stableJson(left), stableJson(right)))[0] || null;
+  const fallbackIdentity = sourceReference
+    ? { sourceReference }
+    : {
+      company: identity.company,
+      title: identity.title,
+      location: identity.location,
+      seniority: identity.seniority,
+    };
   const vacancyId = canonicalVacancyId(canonicalUrl, fallbackIdentity);
   const collectionSources = metadataValues(orderedObservations, 'collectionSource');
   const laneIds = [...new Set([

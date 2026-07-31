@@ -234,6 +234,58 @@ test('startup reconciles a prepared activation after process death at every repl
   }
 });
 
+test('activation recovery preserves conflicting post-crash user state and its intent', async () => {
+  const dir = root();
+  const staged = await createOnboardingProposal(dir, 'codex', {
+    providerStatusFn: status, runStructuredTurnFn: run,
+  });
+  const crash = new Error('synthetic process death');
+  crash.simulateProcessDeath = true;
+  assert.throws(() => activateOnboardingProposal(dir, staged.proposalId, true, {
+    doctorFn: healthyDoctor,
+    _testHooks: {
+      afterWrite(relative) {
+        if (relative === 'workspace.json') throw crash;
+      },
+    },
+  }), /synthetic process death/);
+  const context = path.join(dir, 'profile', 'context.md');
+  fs.mkdirSync(path.dirname(context), { recursive: true });
+  fs.writeFileSync(context, 'a legitimate post-crash user mutation\n');
+
+  assert.throws(
+    () => recoverOnboardingActivationAtStartup(dir, { doctorFn: healthyDoctor }),
+    /conflicts with prepared onboarding activation/,
+  );
+  assert.equal(fs.readFileSync(context, 'utf8'), 'a legitimate post-crash user mutation\n');
+  assert.equal(fs.existsSync(path.join(dir, '.scout', 'onboarding', 'activation.json')), true);
+  assert.throws(() => discardOnboardingProposal(dir), /requires recovery/);
+  await assert.rejects(createOnboardingProposal(dir, 'codex', {
+    providerStatusFn: status, runStructuredTurnFn: run,
+  }), /requires recovery/);
+});
+
+test('startup finalises activation after death in each terminal cleanup window', async () => {
+  for (const hook of ['afterActivatedMarker', 'afterProposalRemoval']) {
+    const dir = root();
+    const staged = await createOnboardingProposal(dir, 'codex', {
+      providerStatusFn: status, runStructuredTurnFn: run,
+    });
+    const crash = new Error(`synthetic process death at ${hook}`);
+    crash.simulateProcessDeath = true;
+    assert.throws(() => activateOnboardingProposal(dir, staged.proposalId, true, {
+      doctorFn: healthyDoctor,
+      now: () => '2026-07-14T10:05:00.000Z',
+      _testHooks: { [hook]: () => { throw crash; } },
+    }), /synthetic process death/);
+    assert.equal(fs.existsSync(path.join(dir, '.scout', 'onboarding', 'activation.json')), true);
+    const recovered = recoverOnboardingActivationAtStartup(dir, { doctorFn: healthyDoctor });
+    assert.equal(recovered.ok, true);
+    assert.equal(fs.existsSync(path.join(dir, '.scout', 'onboarding', 'activation.json')), false);
+    assert.equal(readOnboardingProposal(dir), null);
+  }
+});
+
 test('activated empty master CV recovery is narrow, backed up, and integrity checked', async () => {
   const dir = root();
   const staged = await createOnboardingProposal(dir, 'codex', { providerStatusFn: status, runStructuredTurnFn: run });

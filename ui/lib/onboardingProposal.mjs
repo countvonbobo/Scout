@@ -292,6 +292,30 @@ function writeStaged(root, files) {
   }
 }
 
+function completedActivation(root, intent) {
+  const markerFile = path.join(root, '.scout', 'onboarding', 'activated.json');
+  if (!fs.existsSync(markerFile)) return false;
+  let marker;
+  try { marker = JSON.parse(fs.readFileSync(markerFile, 'utf8')); } catch { return false; }
+  if (marker?.proposalId !== intent.proposalId || marker?.activatedAt !== intent.activatedAt) return false;
+  return ONBOARDING_FILES.every((relative) => (
+    marker?.activatedHashes?.[relative] === intent.intendedHashes[relative]
+    && sha256(targetPath(root, relative)) === intent.intendedHashes[relative]
+  ));
+}
+
+function rollbackInputsRemainTrusted(root, intent) {
+  const backupDir = path.join(root, intent.backupDir);
+  return ONBOARDING_FILES.every((relative) => {
+    const activeHash = sha256(targetPath(root, relative));
+    if (activeHash !== intent.expectedHashes[relative] && activeHash !== intent.intendedHashes[relative]) {
+      return false;
+    }
+    if (!intent.existed[relative]) return intent.expectedHashes[relative] === null;
+    return sha256(path.join(backupDir, ...relative.split('/'))) === intent.expectedHashes[relative];
+  });
+}
+
 export async function createOnboardingProposal(root, provider, {
   providerStatusFn = providerStatus, runStructuredTurnFn = runStructuredTurn, now = () => new Date().toISOString(),
   recordProviderResultHealthFn = recordProviderResultHealth,
@@ -302,6 +326,7 @@ export async function createOnboardingProposal(root, provider, {
   onProgress = () => {},
   signal = null,
 } = {}) {
+  if (readActivationIntent(root)) throw new Error('an onboarding activation requires recovery');
   onProgress({ phase: 'Preparing approved evidence', current: 1, total: 4 });
   const config = loadWorkspaceConfig(root);
   const input = buildOnboardingEvidence(root, config);
@@ -359,14 +384,21 @@ export async function createOnboardingProposal(root, provider, {
   const proposalId = crypto.randomUUID();
   const files = renderOnboardingFiles(config, turn.value);
   validateMeaningfulFiles(files, 'generated');
-  writeStaged(root, files);
-  const manifest = {
-    schemaVersion: 1, proposalId, createdAt: now(), provider, summary: turn.value.summary, valid: true,
-    unresolvedQuestions: turn.value.unresolvedQuestions, usage: turn.usage,
-    targetHashes: Object.fromEntries(ONBOARDING_FILES.map((relative) => [relative, sha256(targetPath(root, relative))])),
-    stagedHashes: Object.fromEntries(ONBOARDING_FILES.map((relative) => [relative, sha256(stagePath(root, relative))])),
-  };
-  atomicWriteFile(path.join(root, '.scout', 'onboarding', 'proposal.json'), `${JSON.stringify(manifest, null, 2)}\n`);
+  const manifest = withWorkspaceMutationAuthority(root, {
+    kind: 'onboarding',
+    phase: 'stage-proposal',
+  }, () => {
+    if (readActivationIntent(root)) throw new Error('an onboarding activation requires recovery');
+    writeStaged(root, files);
+    const prepared = {
+      schemaVersion: 1, proposalId, createdAt: now(), provider, summary: turn.value.summary, valid: true,
+      unresolvedQuestions: turn.value.unresolvedQuestions, usage: turn.usage,
+      targetHashes: Object.fromEntries(ONBOARDING_FILES.map((relative) => [relative, sha256(targetPath(root, relative))])),
+      stagedHashes: Object.fromEntries(ONBOARDING_FILES.map((relative) => [relative, sha256(stagePath(root, relative))])),
+    };
+    atomicWriteFile(path.join(root, '.scout', 'onboarding', 'proposal.json'), `${JSON.stringify(prepared, null, 2)}\n`);
+    return prepared;
+  });
   onProgress({ phase: 'Proposal ready to review', current: 4, total: 4 });
   return { ...manifest, files: ONBOARDING_FILES, valid: true };
 }
@@ -408,13 +440,30 @@ export function activateOnboardingProposal(root, proposalId, confirmed, {
   doctorFn = doctor, now = () => new Date().toISOString(), _testHooks = {},
 } = {}) {
   if (confirmed !== true) throw new Error('explicit proposal confirmation is required');
+  const proposalPreview = readOnboardingProposal(root);
+  const providerHealth = doctorFn === doctor && proposalPreview?.provider
+    ? providerStatus(proposalPreview.provider)
+    : null;
   return withWorkspaceMutationAuthority(root, {
     kind: 'onboarding',
     phase: 'activate',
   }, ({ renew }) => {
-    const proposal = readOnboardingProposal(root);
     const existingIntent = readActivationIntent(root);
-    if (!proposal || proposal.proposalId !== proposalId) throw new Error('onboarding proposal is missing or no longer current');
+    const proposal = readOnboardingProposal(root);
+    if (!proposal || proposal.proposalId !== proposalId) {
+      if (existingIntent?.proposalId === proposalId && completedActivation(root, existingIntent)) {
+        renew();
+        fs.rmSync(path.join(root, '.scout', 'onboarding', 'proposal.json'), { force: true });
+        fs.rmSync(activationIntentFile(root), { force: true });
+        return {
+          ok: true,
+          activatedAt: existingIntent.activatedAt,
+          backupDir: path.join(root, existingIntent.backupDir),
+          files: ONBOARDING_FILES,
+        };
+      }
+      throw new Error('onboarding proposal is missing or no longer current');
+    }
     if ((proposal.unresolvedQuestions || []).length) throw new Error('resolve the proposal questions before activation');
     if (existingIntent && existingIntent.proposalId !== proposalId) {
       throw new Error('another onboarding activation requires recovery');
@@ -493,7 +542,11 @@ export function activateOnboardingProposal(root, proposalId, confirmed, {
           throw new Error(`activated ${relative} does not match the reviewed proposal`);
         }
       }
-      const result = doctorFn(root);
+      renew();
+      const result = doctorFn(root, providerHealth ? {
+        providers: { [proposal.provider]: providerHealth },
+      } : undefined);
+      renew();
       const activationProvider = result?.checks?.providers?.[proposal.provider];
       const requiredOk = result?.checks?.config?.ok && result?.checks?.tracker?.ok
         && activationProvider?.installed && activationProvider?.authenticated
@@ -505,12 +558,18 @@ export function activateOnboardingProposal(root, proposalId, confirmed, {
         activatedHashes: Object.fromEntries(ONBOARDING_FILES.map((relative) => [relative, sha256(targetPath(root, relative))])),
       };
       atomicWriteFile(path.join(root, '.scout', 'onboarding', 'activated.json'), `${JSON.stringify(marker, null, 2)}\n`);
+      _testHooks.afterActivatedMarker?.();
       fs.rmSync(path.join(root, '.scout', 'onboarding', 'proposal.json'), { force: true });
+      _testHooks.afterProposalRemoval?.();
+      renew();
       fs.rmSync(activationIntentFile(root), { force: true });
       return { ok: true, activatedAt, backupDir, files: ONBOARDING_FILES };
     } catch (error) {
       if (error?.simulateProcessDeath === true) throw error;
+      renew();
+      if (!rollbackInputsRemainTrusted(root, intent)) throw error;
       for (const relative of ONBOARDING_FILES) {
+        renew();
         const target = targetPath(root, relative);
         if (!intent.existed[relative]) fs.rmSync(target, { force: true });
         else atomicWrite(target, fs.readFileSync(path.join(backupDir, ...relative.split('/')), 'utf8'));
@@ -594,13 +653,19 @@ export function recoverActivatedProposal(root, confirmed, { now = () => new Date
 }
 
 export function discardOnboardingProposal(root) {
-  const staging = path.join(root, '.scout', 'onboarding');
-  const markerFile = path.join(staging, 'activated.json');
-  const marker = fs.existsSync(markerFile) ? fs.readFileSync(markerFile) : null;
-  fs.rmSync(staging, { recursive: true, force: true });
-  if (marker) {
-    fs.mkdirSync(staging, { recursive: true });
-    atomicWriteFile(markerFile, marker);
-  }
-  return { ok: true };
+  return withWorkspaceMutationAuthority(root, {
+    kind: 'onboarding',
+    phase: 'discard-proposal',
+  }, () => {
+    if (readActivationIntent(root)) throw new Error('an onboarding activation requires recovery');
+    const staging = path.join(root, '.scout', 'onboarding');
+    const markerFile = path.join(staging, 'activated.json');
+    const marker = fs.existsSync(markerFile) ? fs.readFileSync(markerFile) : null;
+    fs.rmSync(staging, { recursive: true, force: true });
+    if (marker) {
+      fs.mkdirSync(staging, { recursive: true });
+      atomicWriteFile(markerFile, marker);
+    }
+    return { ok: true };
+  });
 }

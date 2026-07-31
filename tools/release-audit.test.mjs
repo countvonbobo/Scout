@@ -50,6 +50,24 @@ test('refuses tracked and staged symlinks without following their targets', () =
   );
 });
 
+test('refuses tracked files reached through a symlinked ancestor', () => {
+  if (process.platform === 'win32') return;
+  const root = fixture();
+  const external = path.join(fixture(), 'docs');
+  fs.mkdirSync(external);
+  fs.writeFileSync(path.join(external, 'README.md'), 'Casey Exampleperson');
+  fs.symlinkSync(external, path.join(root, 'docs'));
+  assert.throws(
+    () => auditRelease({
+      root,
+      trackedFiles: ['docs/README.md'],
+      buildDirs: [],
+      markers: ['Casey Exampleperson'],
+    }),
+    /refuses symbolic link/,
+  );
+});
+
 test('reports marker and secret rules without retaining their values', () => {
   const root = fixture();
   const marker = 'Casey Exampleperson';

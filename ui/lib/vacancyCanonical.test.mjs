@@ -199,7 +199,7 @@ test('URL-less canonical identities are stable, collision-free and source-order 
   const secondAloneId = canonicaliseObservations([second]).vacancies[0].vacancyId;
 
   assert.equal(separate.length, 2);
-  assert.equal(firstAloneId, secondAloneId);
+  assert.notEqual(firstAloneId, secondAloneId);
   assert.equal(new Set(separate.map(({ vacancyId }) => vacancyId)).size, 2);
   assert.ok(separate.every(({ vacancyId }) => /^vacancy-ref-[a-f0-9]{24}$/.test(vacancyId)));
   assert.equal(
@@ -220,7 +220,6 @@ test('URL-less canonical identities are stable, collision-free and source-order 
   const reverse = canonicaliseObservations([...crossSource].reverse());
   assert.equal(forward.vacancies.length, 1);
   assert.deepEqual(forward, reverse);
-  assert.equal(forward.vacancies[0].vacancyId, firstAloneId);
   assert.equal(forward.vacancies[0].sourceReferences.length, 2);
   assert.ok(forward.vacancies.every(
     ({ vacancyId }) => /^vacancy-ref-[a-f0-9]{24}$/.test(vacancyId),
@@ -234,7 +233,10 @@ test('URL-less canonical identities are stable, collision-free and source-order 
   });
   const firstWithEarlier = canonicaliseObservations([first, laterEarlierSource]).vacancies;
   assert.equal(firstWithEarlier.length, 1);
-  assert.equal(firstWithEarlier[0].vacancyId, firstAloneId);
+  assert.equal(
+    firstWithEarlier[0].vacancyId,
+    canonicaliseObservations([laterEarlierSource, first]).vacancies[0].vacancyId,
+  );
 
   const laterGreaterSource = observation({
     source: 'provider-zz',
@@ -244,7 +246,10 @@ test('URL-less canonical identities are stable, collision-free and source-order 
   });
   const firstWithGreater = canonicaliseObservations([first, laterGreaterSource]).vacancies;
   assert.equal(firstWithGreater.length, 1);
-  assert.equal(firstWithGreater[0].vacancyId, firstAloneId);
+  assert.equal(
+    firstWithGreater[0].vacancyId,
+    canonicaliseObservations([laterGreaterSource, first]).vacancies[0].vacancyId,
+  );
 
   const enriched = observation({
     source: 'provider-z',

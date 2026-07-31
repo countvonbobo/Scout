@@ -248,6 +248,38 @@ test('public and release staging refuse allowlisted leaf symlinks', () => {
   }
 });
 
+test('public and release staging refuse symlinked allowlisted ancestors', () => {
+  if (process.platform === 'win32') return;
+  for (const stage of [stagePublicSource, stageRelease]) {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'scout-symlink-ancestor-root-'));
+    const stageDir = path.join(root, 'stage');
+    const entries = stage === stagePublicSource ? PUBLIC_SOURCE_FILES : RELEASE_FILES;
+    for (const entry of entries) {
+      const target = path.join(root, entry.source);
+      if (entry.tree) {
+        fs.mkdirSync(target, { recursive: true });
+        fs.writeFileSync(path.join(target, 'source.mjs'), 'export {};');
+      } else {
+        fs.mkdirSync(path.dirname(target), { recursive: true });
+        fs.writeFileSync(target, entry.source.endsWith('.json') ? '{}' : 'public');
+      }
+    }
+    const ancestorName = stage === stagePublicSource ? 'docs' : 'tools';
+    const ancestor = path.join(root, ancestorName);
+    const external = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'scout-external-ancestor-')), ancestorName);
+    fs.cpSync(ancestor, external, { recursive: true });
+    fs.rmSync(ancestor, { recursive: true });
+    fs.symlinkSync(external, ancestor);
+
+    assert.throws(
+      () => stage === stageRelease
+        ? stage({ root, stageDir, includeDependencies: false, typstExecutable: process.execPath })
+        : stage({ root, stageDir }),
+      /ancestor|symbolic link/,
+    );
+  }
+});
+
 test('staging copies only manifest content and bundled runtime', () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'scout-release-root-'));
   const stageDir = fs.mkdtempSync(path.join(os.tmpdir(), 'scout-release-stage-'));

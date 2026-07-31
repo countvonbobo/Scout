@@ -11,6 +11,7 @@ function binary(name) {
     encoding: 'utf8',
     windowsHide: true,
     shell: false,
+    timeout: 10_000,
     windowsVerbatimArguments: invocation.windowsVerbatimArguments,
   });
   return { available: r.status === 0, version: String(r.stdout || r.stderr || '').trim() || null };

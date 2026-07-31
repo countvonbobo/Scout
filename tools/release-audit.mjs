@@ -460,6 +460,52 @@ function filesUnder(directory, { includeDependencies = false } = {}) {
   return result;
 }
 
+function assertAuditedPath(root, file) {
+  const resolvedRoot = path.resolve(root);
+  const resolvedFile = path.resolve(file);
+  const relative = path.relative(resolvedRoot, resolvedFile);
+  if (!relative || relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
+    if (resolvedFile !== resolvedRoot) throw new Error('release audit path escapes its root');
+  }
+  const components = relative ? relative.split(path.sep) : [];
+  const identities = [];
+  let current = resolvedRoot;
+  for (let index = 0; index < components.length; index += 1) {
+    const stat = fs.lstatSync(current, { bigint: true });
+    if (stat.isSymbolicLink()) throw new Error(`release audit refuses symbolic link: ${current}`);
+    if (!stat.isDirectory()) throw new Error(`release audit ancestor is not a directory: ${current}`);
+    identities.push(`${stat.dev}:${stat.ino}`);
+    current = path.join(current, components[index]);
+  }
+  const rootStat = fs.lstatSync(resolvedRoot, { bigint: true });
+  if (rootStat.isSymbolicLink()) throw new Error(`release audit refuses symbolic link: ${resolvedRoot}`);
+  if (!identities.length) identities.push(`${rootStat.dev}:${rootStat.ino}`);
+  return identities.join('|');
+}
+
+function readAuditedRegularFile(root, file) {
+  const ancestorsBefore = assertAuditedPath(root, file);
+  const before = fs.lstatSync(file, { bigint: true });
+  if (before.isSymbolicLink() || !before.isFile()) {
+    throw new Error(`release audit refuses non-regular file: ${file}`);
+  }
+  const descriptor = fs.openSync(file, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0));
+  try {
+    const opened = fs.fstatSync(descriptor, { bigint: true });
+    const ancestorsAfter = assertAuditedPath(root, file);
+    const after = fs.lstatSync(file, { bigint: true });
+    if (!opened.isFile() || after.isSymbolicLink() || !after.isFile()
+      || opened.dev !== before.dev || opened.ino !== before.ino
+      || after.dev !== opened.dev || after.ino !== opened.ino
+      || ancestorsAfter !== ancestorsBefore) {
+      throw new Error(`release audit input identity changed while opening: ${file}`);
+    }
+    return fs.readFileSync(descriptor);
+  } finally {
+    fs.closeSync(descriptor);
+  }
+}
+
 export function collectTrackedFiles(root) {
   const result = spawnSync('git', ['ls-files', '-z'], { cwd: root, encoding: 'buffer', windowsHide: true });
   if (result.status !== 0) throw new Error('could not list Git-tracked files');
@@ -490,6 +536,7 @@ export function auditRelease({
     .map((file) => path.resolve(absoluteRoot, file))
     .filter((file) => {
       if (!fs.existsSync(file)) return false;
+      assertAuditedPath(absoluteRoot, file);
       const stat = fs.lstatSync(file);
       if (stat.isSymbolicLink()) throw new Error(`release audit refuses symbolic link: ${file}`);
       return stat.isFile();
@@ -501,7 +548,7 @@ export function auditRelease({
   const findings = [];
   let filesScanned = 0;
   for (const file of files) {
-    const content = fs.readFileSync(file);
+    const content = readAuditedRegularFile(absoluteRoot, file);
     filesScanned += 1;
     const relative = normaliseRelative(absoluteRoot, file);
     const privateRuntime = privateRuntimeArtifact(relative);
