@@ -532,6 +532,16 @@ export function auditRelease({
         findings.push({ file: publicFile, line: 1, rule: 'reviewed-binary-digest-mismatch' });
       }
       findings.push(...pathFindings.map((finding) => ({ file: publicFile, ...finding })));
+      for (let markerIndex = 0; markerIndex < markers.length; markerIndex += 1) {
+        const markerBytes = Buffer.from(markers[markerIndex], 'utf8');
+        if (markerBytes.length && content.indexOf(markerBytes) !== -1) {
+          findings.push({
+            file: publicFile,
+            line: 1,
+            rule: `personal-marker-${markerIndex + 1}`,
+          });
+        }
+      }
       continue;
     }
     const text = content.toString('utf8');

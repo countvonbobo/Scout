@@ -291,11 +291,13 @@ export async function createOnboardingProposal(root, provider, {
     });
     assertProviderAuthIdleFn(root, provider);
     const status = providerStatusFn(provider);
-    turn = await runStructuredTurnFn({
+    const operation = runStructuredTurnFn({
       provider, status, schema: ONBOARDING_SCHEMA, prompt,
       model: config.ai?.provider === provider ? config.ai?.model : null,
       validate: (value) => validateOnboardingProposal(value, input.evidence), maxInputTokens: 60_000,
     });
+    providerWork.setFailureHandler(() => operation.stop?.());
+    turn = await operation;
     providerWork.assertCurrent();
   } catch (error) {
     lifecycleError = error;

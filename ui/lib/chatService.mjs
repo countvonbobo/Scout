@@ -418,6 +418,7 @@ export function registerChatRoutes({
         parseLine: ENGINES[from].parse,
         onEvent: () => {},
       });
+      work1.setFailureHandler(() => t1.stop?.());
     } catch (e) {
       if (work1) await work1.release();
       sseSend(res, 'error', {
@@ -481,6 +482,7 @@ export function registerChatRoutes({
         parseLine: ENGINES[to].parse,
         onEvent: (ev) => { if (ev.kind === 'delta') sseSend(res, 'delta', { text: ev.text }); },
       });
+      work2.setFailureHandler(() => t2.stop?.());
     } catch (e) {
       if (work2) await work2.release();
       const message = turnStartMessage(e, 'Handoff provider turn could not start.');
@@ -592,6 +594,7 @@ export function registerChatRoutes({
           if (ev.kind === 'tool') sseSend(res, 'tool', publicToolProjection(ev));
         },
       });
+      providerWork.setFailureHandler(() => turn.stop?.());
     } catch (error) {
       await providerWork.release();
       sseSend(res, 'error', { message: turnStartMessage(error, 'Provider turn could not start.') });
@@ -671,9 +674,11 @@ export function registerChatRoutes({
       ].join('\n\n');
       let result;
       try {
-        result = await runStructuredTurnFn({
+        const operation = runStructuredTurnFn({
           provider: engine, status, schema: FIT_SCHEMA, prompt, model, maxInputTokens: 50_000,
         });
+        providerWork.setFailureHandler(() => operation.stop?.());
+        result = await operation;
         providerWork.assertCurrent();
       } catch (error) {
         lifecycleError = error;

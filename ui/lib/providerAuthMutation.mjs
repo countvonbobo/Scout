@@ -322,31 +322,50 @@ export function createProviderWorkSupervisor(root, provider, {
   let capability = acquire(root, provider);
   let renewalError = null;
   let renewalPending = false;
+  let renewalPromise = null;
   let releasePromise = null;
   let finished = false;
+  let failureHandler = null;
   const timer = setIntervalFn(() => {
     if (renewalPending || finished) return;
     renewalPending = true;
-    Promise.resolve()
+    renewalPromise = Promise.resolve()
       .then(() => renew(root, capability))
       .then((value) => {
         if (value) capability = value;
       })
-      .catch((error) => {
-        renewalError = error;
+      .catch(async (error) => {
+        try {
+          const replacement = await acquire(root, provider);
+          if (!replacement) throw error;
+          capability = replacement;
+          renewalError = null;
+        } catch {
+          renewalError = error;
+          try { failureHandler?.(error); } catch {}
+        }
       })
       .finally(() => {
         renewalPending = false;
+        renewalPromise = null;
       });
   }, intervalMs);
   timer?.unref?.();
 
-  const finish = () => {
+  const finish = async () => {
     finished = true;
     clearIntervalFn(timer);
+    if (renewalPromise) await renewalPromise.catch(() => {});
     return release(root, capability);
   };
   return {
+    setFailureHandler(handler) {
+      if (handler !== null && typeof handler !== 'function') {
+        throw new TypeError('provider work failure handler must be a function');
+      }
+      failureHandler = handler;
+      if (renewalError && failureHandler) failureHandler(renewalError);
+    },
     assertCurrent() {
       if (renewalError) throw renewalError;
       return true;

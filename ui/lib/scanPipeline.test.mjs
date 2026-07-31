@@ -649,6 +649,41 @@ test('candidate codec preserves more than the former mandatory and responsibilit
   for (const fact of responsibilities) assert.match(candidates[0].description, new RegExp(fact));
 });
 
+test('candidate codec rejects mandatory and responsibility overflow instead of losing clauses', () => {
+  const base = {
+    company: 'Capacity Example',
+    title: 'Evidence Lead',
+    url: 'https://example.test/capacity-overflow',
+    description: 'Full advert was normalised.',
+  };
+  assert.throws(() => compactCandidates({ one: { jobs: [{
+    ...base,
+    semanticEvidence: {
+      descriptionPresent: true,
+      descriptionLength: 10_000,
+      mandatorySignals: Array.from({ length: 65 }, (_, index) => ({
+        id: `mandatory-${index + 1}`,
+        fact: `requirement ${index + 1}`,
+      })),
+      responsibilityFacts: [],
+    },
+  }] } }), /mandatory evidence exceeds the supported limit/);
+
+  assert.throws(() => compactCandidates({ one: { jobs: [{
+    ...base,
+    url: 'https://example.test/responsibility-overflow',
+    semanticEvidence: {
+      descriptionPresent: true,
+      descriptionLength: 10_000,
+      mandatorySignals: [],
+      responsibilityFacts: Array.from(
+        { length: 65 },
+        (_, index) => `distinct platform responsibility ${index + 1}`,
+      ),
+    },
+  }] } }), /responsibility evidence exceeds the supported limit/);
+});
+
 test('normalized source requirement summaries are mandatory without keyword heuristics', () => {
   const { candidates } = compactCandidates({ one: { jobs: [{
     company: 'Example', title: 'Senior Rust Engineer', url: 'https://example.test/rust',

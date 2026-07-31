@@ -113,7 +113,7 @@ function metadataValues(observations, name) {
 function canonicalVacancyId(canonicalUrl, identity, sourceReferences) {
   if (canonicalUrl) return canonicalUrl;
   const reference = [...sourceReferences].sort((left, right) => (
-    compareStable(
+    -compareStable(
       `${left.source || ''}\n${left.providerId || ''}\n${left.url || ''}`,
       `${right.source || ''}\n${right.providerId || ''}\n${right.url || ''}`,
     )
@@ -192,7 +192,10 @@ function mergedSemanticEvidence(observations) {
     (semanticEvidence.responsibilityFacts || [])
       .map((fact) => boundedSemanticText(fact, 160))
       .filter(Boolean)
-  )))].sort(compareStable).slice(0, MAX_RESPONSIBILITY_FACTS);
+  )))].sort(compareStable);
+  if (responsibilityFacts.length > MAX_RESPONSIBILITY_FACTS) {
+    throw new Error('canonical advert responsibility evidence exceeds the supported limit');
+  }
   return {
     ...selected.semanticEvidence,
     descriptionPresent: semanticObservations.some(({ semanticEvidence }) => (

@@ -1581,6 +1581,7 @@ function withSearchPlanMutation(res, phase, action) {
   let lease;
   let heartbeat;
   try {
+    if (phase === 'publish') recoverPendingProfilePublications(WORKSPACE_ROOT);
     const runId = phase === 'publish'
       ? `${PROFILE_PUBLICATION_RUN_PREFIX}${randomUUID()}`
       : `search-plan-${phase}-${randomUUID()}`;

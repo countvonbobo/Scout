@@ -236,6 +236,29 @@ test('generic monitoring is opt-in, same-site and bounded', async () => {
   assert.equal(result.jobs[0].url, 'https://careers.example.test/jobs/operations-lead');
 });
 
+test('generic monitoring reports capacity overflow instead of silently truncating links', async () => {
+  const target = employer({
+    access: {
+      terms: 'allowed', robots: 'allowed', genericEnabled: true, minIntervalMinutes: 60,
+    },
+  });
+  const links = Array.from(
+    { length: 101 },
+    (_, index) => `<a href="/jobs/capacity-${index + 1}">Capacity role ${index + 1}</a>`,
+  ).join('\n');
+  const result = await collectEmployer(target, {
+    fetchImpl: async () => response(`<html><body>${links}</body></html>`, { type: 'text/html' }),
+    lookupFn: publicLookup,
+    now: () => AT,
+  });
+
+  assert.equal(result.status, 'degraded');
+  assert.equal(result.failureCode, 'generic-capacity');
+  assert.equal(result.returned, 101);
+  assert.equal(result.parsed, 100);
+  assert.equal(result.jobs.length, 100);
+});
+
 test('deep JSON-LD graphs degrade with a fixed structural limit instead of aborting collection', async () => {
   let graph = { '@type': 'JobPosting', title: 'Too deep' };
   for (let depth = 0; depth < 80; depth += 1) graph = { '@graph': [graph] };

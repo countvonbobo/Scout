@@ -183,13 +183,13 @@ test('canonical vacancies preserve structured evidence and observed lifecycle bo
 
 test('URL-less canonical identities are stable, collision-free and source-order independent', () => {
   const first = observation({
-    source: 'provider-a',
+    source: 'provider-z',
     providerId: 'reference-1',
     url: null,
     description: 'Build stable services.',
   });
   const second = observation({
-    source: 'provider-a',
+    source: 'provider-z',
     providerId: 'reference-2',
     url: null,
     description: 'Build stable services.',
@@ -210,7 +210,7 @@ test('URL-less canonical identities are stable, collision-free and source-order 
   const crossSource = [
     first,
     observation({
-      source: 'provider-b',
+      source: 'provider-a',
       providerId: 'other-reference',
       url: null,
       description: 'Build stable services.',
@@ -218,29 +218,39 @@ test('URL-less canonical identities are stable, collision-free and source-order 
   ];
   const forward = canonicaliseObservations(crossSource);
   const reverse = canonicaliseObservations([...crossSource].reverse());
-  assert.equal(forward.vacancies.length, 2);
+  assert.equal(forward.vacancies.length, 1);
   assert.deepEqual(forward, reverse);
-  assert.equal(
-    forward.vacancies.find(({ sourceReferences }) => (
-      sourceReferences[0].providerId === 'reference-1'
-    )).vacancyId,
-    firstAloneId,
-  );
+  assert.equal(forward.vacancies[0].vacancyId, firstAloneId);
+  assert.equal(forward.vacancies[0].sourceReferences.length, 2);
   assert.ok(forward.vacancies.every(
     ({ vacancyId }) => /^vacancy-ref-[a-f0-9]{24}$/.test(vacancyId),
   ));
 
   const laterEarlierSource = observation({
-    source: 'provider-0',
+    source: 'provider-a',
     providerId: 'earlier-reference',
     url: null,
     description: 'Build stable services.',
   });
   const firstWithEarlier = canonicaliseObservations([first, laterEarlierSource]).vacancies;
-  assert.equal(
-    firstWithEarlier.find(({ sourceReferences }) => (
-      sourceReferences[0].providerId === 'reference-1'
-    )).vacancyId,
-    firstAloneId,
+  assert.equal(firstWithEarlier.length, 1);
+  assert.equal(firstWithEarlier[0].vacancyId, firstAloneId);
+});
+
+test('canonicalisation rejects semantic responsibility overflow instead of truncating evidence', () => {
+  const semantic = {
+    ...observation({ source: 'provider-z', providerId: 'capacity-1' }),
+    semanticEvidence: {
+    descriptionPresent: true,
+    descriptionDigest: 'c'.repeat(64),
+    descriptionLength: 10_000,
+    profileRuleMatches: [],
+    responsibilityFacts: Array.from({ length: 65 }, (_, index) => `distinct fact ${index + 1}`),
+    mandatorySignals: [],
+    },
+  };
+  assert.throws(
+    () => canonicaliseObservations([semantic]),
+    /responsibility evidence exceeds the supported limit/,
   );
 });

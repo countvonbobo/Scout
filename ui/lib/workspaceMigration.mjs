@@ -61,8 +61,12 @@ function physicalDestination(value) {
   return path.join(fs.realpathSync(current), ...missing);
 }
 
-function snapshotBudget() {
-  return { entries: 0, totalBytes: 0 };
+function snapshotBudget(physicalRoot = null) {
+  return {
+    entries: 0,
+    totalBytes: 0,
+    physicalRoot: physicalRoot ? fs.realpathSync(physicalRoot) : null,
+  };
 }
 
 function inspectSnapshotEntry(source, relative, budget, depth) {
@@ -73,6 +77,11 @@ function inspectSnapshotEntry(source, relative, budget, depth) {
   }
   if (!stat.isDirectory() && !stat.isFile()) {
     throw new Error(`beta.22 workspace snapshot only accepts regular files and directories: ${slash(relative)}`);
+  }
+  const physical = fs.realpathSync(source);
+  if (!budget.physicalRoot) budget.physicalRoot = physical;
+  if (!within(budget.physicalRoot, physical)) {
+    throw new Error(`beta.22 workspace snapshot path was redirected outside its physical root: ${slash(relative)}`);
   }
   budget.entries += 1;
   if (budget.entries > MAX_SNAPSHOT_ENTRIES) {
@@ -90,10 +99,21 @@ function inspectSnapshotEntry(source, relative, budget, depth) {
   return stat;
 }
 
-function assertPhysicalTree(source, relative = '', budget = snapshotBudget(), depth = 0) {
+function snapshotDirectoryEntries(source, stat, relative, budget) {
+  const names = fs.readdirSync(source);
+  const current = fs.lstatSync(source);
+  const physical = fs.realpathSync(source);
+  if (!current.isDirectory() || current.dev !== stat.dev || current.ino !== stat.ino
+    || !within(budget.physicalRoot, physical)) {
+    throw new Error(`beta.22 workspace snapshot directory changed during traversal: ${slash(relative)}`);
+  }
+  return names;
+}
+
+function assertPhysicalTree(source, relative = '', budget = snapshotBudget(source), depth = 0) {
   const stat = inspectSnapshotEntry(source, relative, budget, depth);
   if (!stat.isDirectory()) return budget;
-  for (const name of fs.readdirSync(source)) {
+  for (const name of snapshotDirectoryEntries(source, stat, relative, budget)) {
     assertPhysicalTree(path.join(source, name), path.join(relative, name), budget, depth + 1);
   }
   return budget;
@@ -109,7 +129,7 @@ function copySnapshotEntry(
   target,
   relative,
   renew = () => {},
-  budget = snapshotBudget(),
+  budget = snapshotBudget(source),
   depth = 0,
 ) {
   renew();
@@ -118,7 +138,7 @@ function copySnapshotEntry(
     if (ignoredSnapshotPath(relative)) return;
     fs.mkdirSync(target, { recursive: true, mode: 0o700 });
     fs.chmodSync(target, 0o700);
-    for (const name of fs.readdirSync(source).sort()) {
+    for (const name of snapshotDirectoryEntries(source, stat, relative, budget).sort()) {
       copySnapshotEntry(
         path.join(source, name),
         path.join(target, name),
@@ -162,10 +182,27 @@ function copySnapshotEntry(
   fs.chmodSync(target, stat.mode & 0o100 ? 0o700 : 0o600);
 }
 
-function beta22WorkspaceConfigBytes(file, budget = snapshotBudget()) {
+function beta22WorkspaceConfigBytes(file, budget = snapshotBudget(file)) {
   const stat = inspectSnapshotEntry(file, 'workspace.json', budget, 0);
   if (!stat.isFile()) throw new Error('beta.22 rollback workspace config must be a regular file');
-  const source = fs.readFileSync(file);
+  const descriptor = fs.openSync(
+    file,
+    fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0) | (fs.constants.O_NONBLOCK || 0),
+  );
+  let source;
+  try {
+    const opened = fs.fstatSync(descriptor);
+    if (!opened.isFile() || opened.dev !== stat.dev || opened.ino !== stat.ino
+      || opened.size !== stat.size) {
+      throw new Error('beta.22 rollback workspace config changed during copy');
+    }
+    source = fs.readFileSync(descriptor);
+    if (fs.fstatSync(descriptor).size !== stat.size) {
+      throw new Error('beta.22 rollback workspace config changed during copy');
+    }
+  } finally {
+    fs.closeSync(descriptor);
+  }
   const value = JSON.parse(source.toString('utf8'));
   if (!Number.isInteger(value.schemaVersion) || value.schemaVersion < 1 || value.schemaVersion > 2) {
     throw new Error('beta.22 rollback requires workspace schema version 1 or 2');
@@ -212,12 +249,12 @@ function digestSnapshotFile(file, stat, renew) {
 
 function snapshotEntries(directory, renew = () => {}) {
   const entries = [];
-  const budget = snapshotBudget();
+  const budget = snapshotBudget(directory);
   function visit(current, relative = '', depth = 0) {
     renew();
     const stat = inspectSnapshotEntry(current, relative, budget, depth);
     if (stat.isDirectory()) {
-      for (const name of fs.readdirSync(current).sort()) {
+      for (const name of snapshotDirectoryEntries(current, stat, relative, budget).sort()) {
         visit(path.join(current, name), path.join(relative, name), depth + 1);
       }
       return;
@@ -338,7 +375,7 @@ function createBeta22WorkspaceSnapshotUnderAuthority(root, {
   const staging = path.join(parent, `.${name}.${crypto.randomUUID()}.tmp`);
   try {
     fs.mkdirSync(staging, { recursive: false, mode: 0o700 });
-    const budget = snapshotBudget();
+    const budget = snapshotBudget(workspaceRoot);
     for (const relative of SNAPSHOT_PATHS) {
       renew();
       _testHooks.beforeCopy?.(relative);

@@ -1104,8 +1104,14 @@ function mandatorySignals(description, requirements) {
     .filter((text) => text && !/\b(?:benefits?|perks?|stock options?|compensation|salary|remote-friendly)\b/i.test(text));
   const explicitLanguage = String(description || '').split(/(?:\r?\n|[.;]\s+)/)
     .map((text) => text.trim()).filter((text) => text && /\b(?:required|essential|must|mandatory|non-negotiable)\b/i.test(text));
-  return [...new Set([...sourceRequirements, ...explicitLanguage])]
-    .slice(0, 64).map((text, index) => ({ id: `mandatory-${String(index + 1).padStart(2, '0')}`, text: text.slice(0, 300) }));
+  const signals = [...new Set([...sourceRequirements, ...explicitLanguage])];
+  if (signals.length > 64) {
+    throw new Error('advert mandatory evidence exceeds the supported limit');
+  }
+  return signals.map((text, index) => ({
+    id: `mandatory-${String(index + 1).padStart(2, '0')}`,
+    text: text.slice(0, 300),
+  }));
 }
 
 function valueOf(value) {
@@ -1422,11 +1428,15 @@ function semanticFact(value) {
 }
 
 function responsibilityFacts(description) {
-  return [...new Set(String(description || '').split(/(?:\r?\n|[.;]\s+)/)
+  const facts = [...new Set(String(description || '').split(/(?:\r?\n|[.;]\s+)/)
     .map((sentence) => sentence.trim())
     .filter(Boolean)
     .map(semanticFact)
-    .filter(Boolean))].slice(0, 64);
+    .filter(Boolean))];
+  if (facts.length > 64) {
+    throw new Error('advert responsibility evidence exceeds the supported limit');
+  }
+  return facts;
 }
 
 function semanticPhraseMatches(value, phrase) {
@@ -1917,6 +1927,12 @@ function normaliseJob(job) {
   const role = String(job?.title || job?.role || '').trim();
   const url = String(job?.url || '').trim();
   if (!company || !role || !/^https?:\/\//i.test(url)) return null;
+  if ((job?.semanticEvidence?.mandatorySignals || []).length > 64) {
+    throw new Error('advert mandatory evidence exceeds the supported limit');
+  }
+  if ((job?.semanticEvidence?.responsibilityFacts || []).length > 64) {
+    throw new Error('advert responsibility evidence exceeds the supported limit');
+  }
   return {
     company, role, url, location: String(job?.location || ''), salary: job?.salary || null,
     workingType: String(job?.workingType || ''), postedDate: job?.postedDate || null,

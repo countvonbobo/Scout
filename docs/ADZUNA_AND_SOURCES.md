@@ -64,6 +64,10 @@ terms and robots state are explicitly allowed; validated `JobPosting` JSON-LD
 is preferred, and conservative same-site generic links are opt-in. Redirects
 to another origin, authentication, anti-bot challenges, rate limits and
 JavaScript-only shells are recorded honestly rather than bypassed. Priority
+employer pages with more than 100 qualifying structured postings or generic
+job links are reported as degraded capacity with the returned and parsed
+counts; the bounded result is never reported as a healthy complete page.
+Priority
 employers are selected whenever eligible, relevant/normal employers rotate
 fairly, inactive employers receive only a 30-day validation check, and
 irrelevant employers remain excluded until restored.

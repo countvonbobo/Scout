@@ -432,26 +432,53 @@ export function createProviderLoginManager({
       capability,
       renewalError: null,
       renewalPending: false,
+      renewalPromise: null,
       releasePromise: null,
       finished: false,
+      failureHandler: null,
       timer: null,
     };
     lease.timer = setInterval(() => {
       if (lease.renewalPending || lease.finished) return;
       lease.renewalPending = true;
-      Promise.resolve(renewAuthMutation(lease.capability))
+      lease.renewalPromise = Promise.resolve(renewAuthMutation(lease.capability))
         .then((renewed) => {
           if (renewed) lease.capability = renewed;
         })
-        .catch((error) => {
-          lease.renewalError = error;
+        .catch(async (error) => {
+          try {
+            const replacement = await acquireAuthMutation(
+              lease.capability.provider,
+              lease.capability.phase,
+            );
+            if (!replacement) throw error;
+            lease.capability = replacement;
+            lease.renewalError = null;
+          } catch {
+            lease.renewalError = error;
+            try { lease.failureHandler?.(error); } catch {}
+          }
         })
         .finally(() => {
           lease.renewalPending = false;
+          lease.renewalPromise = null;
         });
     }, authRenewalIntervalMs);
     lease.timer.unref?.();
     return lease;
+  }
+
+  function setAuthLeaseFailureHandler(lease, handler) {
+    lease.failureHandler = handler;
+    if (lease.renewalError) handler(lease.renewalError);
+  }
+
+  function assertAuthLeaseCurrent(lease) {
+    if (!lease?.renewalError) return;
+    throw createError(
+      'provider authentication mutation authority was lost',
+      'LOGIN_AUTHORITY_LOST',
+    );
   }
 
   function releaseAuthLease(lease, closures = []) {
@@ -462,6 +489,7 @@ export function createProviderLoginManager({
     )).then(async () => {
       lease.finished = true;
       clearInterval(lease.timer);
+      if (lease.renewalPromise) await lease.renewalPromise.catch(() => {});
       await releaseAuthMutation(lease.capability);
     });
     lease.releasePromise.catch(() => {});
@@ -873,6 +901,7 @@ export function createProviderLoginManager({
       }
       authLease = createAuthLease(authMutation);
       const status = await providerStatus(provider);
+      assertAuthLeaseCurrent(authLease);
       if (shuttingDown) throw createError('provider login manager is shutting down', 'LOGIN_SHUTDOWN');
       const executable = checkedExecutable(status);
       const providerEnv = minimalProviderEnvironment(
@@ -927,6 +956,9 @@ export function createProviderLoginManager({
       sessions.set(id, session);
       active.set(key, session);
       mutationAdopted = true;
+      setAuthLeaseFailureHandler(authLease, () => {
+        void terminal(session, 'failed', 'auth-authority-lost', { kill: true });
+      });
       session.timeout = setTimeout(() => {
         void terminal(session, 'expired', 'expired', { kill: true });
       }, timeoutMs);
@@ -1084,6 +1116,7 @@ export function createProviderLoginManager({
       authLease = createAuthLease(authMutation);
       sourceSession.clearConsumed = true;
       const status = await providerStatus('claude');
+      assertAuthLeaseCurrent(authLease);
       if (shuttingDown) throw createError('provider login manager is shutting down', 'LOGIN_SHUTDOWN');
       const executable = checkedExecutable(status);
       const environment = minimalProviderEnvironment(
@@ -1117,6 +1150,7 @@ export function createProviderLoginManager({
       } finally {
         pendingClearAuthorizations.delete(authorization);
       }
+      assertAuthLeaseCurrent(authLease);
       if (shuttingDown) throw createError('provider login manager is shutting down', 'LOGIN_SHUTDOWN');
       if (!eligible) {
         sourceSession.reasonCode = 'credentials-no-longer-expired';
@@ -1146,6 +1180,9 @@ export function createProviderLoginManager({
           if (kill) await stopTrackedChild(record);
           resolve(result);
         };
+        setAuthLeaseFailureHandler(authLease, () => {
+          void settle('failed', { kill: true });
+        });
         try {
           child = spawn(invocation.command, invocation.args, {
             cwd,

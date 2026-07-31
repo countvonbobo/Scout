@@ -181,6 +181,7 @@ function genericLinks(html, {
   const page = new URL(pageUrl);
   const jobs = [];
   const seen = new Set();
+  let found = 0;
   const anchors = String(html || '').matchAll(
     /<a\b[^>]*href\s*=\s*["']([^"'#]+)["'][^>]*>([\s\S]*?)<\/a>/gi,
   );
@@ -193,22 +194,28 @@ function genericLinks(html, {
     if (!/(?:job|career|vacan|position|opening|role|apply)/i.test(`${label} ${parsed.pathname}`)) continue;
     if (!label || seen.has(url)) continue;
     seen.add(url);
-    jobs.push({
-      providerId: url,
-      sourceRecordId: `careers-generic:${url}`,
-      title: label,
-      company: employerName,
-      description: '',
-      url,
-      location: '',
-      employmentType: '',
-      postedDate: null,
-      source: 'careers-generic',
-      employerId,
-    });
-    if (jobs.length >= MAX_PAGE_JOBS) break;
+    found += 1;
+    if (jobs.length < MAX_PAGE_JOBS) {
+      jobs.push({
+        providerId: url,
+        sourceRecordId: `careers-generic:${url}`,
+        title: label,
+        company: employerName,
+        description: '',
+        url,
+        location: '',
+        employmentType: '',
+        postedDate: null,
+        source: 'careers-generic',
+        employerId,
+      });
+    }
   }
-  return jobs;
+  return {
+    jobs,
+    found,
+    capacityExceeded: found > jobs.length,
+  };
 }
 
 function result(employer, adapter, status, checkedAt, {
@@ -433,12 +440,23 @@ async function collectCareersPage(employer, fetchImpl, checkedAt, {
       failureCode: 'javascript-required',
     });
   }
-  const jobs = genericLinks(html, {
+  const generic = genericLinks(html, {
     pageUrl: employer.careersUrl,
     employerName: employer.canonicalName,
     employerId: employer.id,
   });
-  return result(employer, 'generic', 'healthy', checkedAt, { jobs });
+  return result(
+    employer,
+    'generic',
+    generic.capacityExceeded ? 'degraded' : 'healthy',
+    checkedAt,
+    {
+      jobs: generic.jobs,
+      returned: generic.found,
+      parsed: generic.jobs.length,
+      ...(generic.capacityExceeded ? { failureCode: 'generic-capacity' } : {}),
+    },
+  );
 }
 
 export async function collectEmployer(employer, {

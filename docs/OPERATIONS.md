@@ -84,7 +84,9 @@ The maintained beta deployment uses one private, single-owner Ubuntu VPS:
   bundles, scan history, tracker entries, and reports retain HTTP(S)
   origin/path only. Semantic scan artifacts preserve bounded ordered clauses
   and operators, redact credential-shaped values as a whole fact, and retain
-  a fact for every non-empty description clause.
+  a fact for every non-empty description clause. More than 64 distinct
+  responsibility facts or mandatory signals fails the advert boundary
+  explicitly; neither set is silently truncated.
 - Ranked scan schema v5 retains one bounded explanation per unique vacancy and
   exact total/per-configured-source funnel equations. The configured collection
   source survives separately from vendor identity through normalisation and

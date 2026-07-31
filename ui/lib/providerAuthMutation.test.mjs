@@ -248,6 +248,53 @@ test('provider work supervisor renews long work and transfers release to lifecyc
   assert.equal(released, 1);
 });
 
+test('provider work supervisor re-fences after renewal loss or stops the active operation', async () => {
+  let intervalCallback;
+  let acquisitions = 0;
+  let stopped = 0;
+  const recovered = createProviderWorkSupervisor('/synthetic', 'codex', {
+    acquire: () => ({
+      provider: 'codex',
+      workId: `replacement-${String(++acquisitions).padStart(2, '0')}`,
+    }),
+    renew: async () => { throw new Error('synthetic renewal loss'); },
+    release: () => true,
+    setIntervalFn(callback) {
+      intervalCallback = callback;
+      return { unref() {} };
+    },
+    clearIntervalFn() {},
+    intervalMs: 1,
+  });
+  recovered.setFailureHandler(() => { stopped += 1; });
+  intervalCallback();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(acquisitions, 2);
+  assert.equal(stopped, 0);
+  assert.equal(recovered.assertCurrent(), true);
+  await recovered.release();
+
+  const failed = createProviderWorkSupervisor('/synthetic', 'codex', {
+    acquire: () => (acquisitions++ === 2
+      ? { provider: 'codex', workId: 'initial-failed-work' }
+      : null),
+    renew: async () => { throw new Error('unrecoverable renewal loss'); },
+    release: () => true,
+    setIntervalFn(callback) {
+      intervalCallback = callback;
+      return { unref() {} };
+    },
+    clearIntervalFn() {},
+    intervalMs: 1,
+  });
+  failed.setFailureHandler(() => { stopped += 1; });
+  intervalCallback();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(stopped, 1);
+  assert.throws(() => failed.assertCurrent(), /unrecoverable renewal loss/);
+  await failed.release();
+});
+
 test('simultaneous auth and provider-work processes admit exactly one class of operation', async (t) => {
   const root = workspace(t);
   const outcomes = await Promise.all([
