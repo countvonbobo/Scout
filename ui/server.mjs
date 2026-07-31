@@ -131,7 +131,27 @@ if (fs.existsSync(TRACKER) && path.resolve(APP_ROOT) !== path.resolve(WORKSPACE_
 
 function workspaceInitialised() { return fs.existsSync(TRACKER) && fs.existsSync(WORKSPACE.config); }
 
-if (workspaceInitialised()) recoverPendingProfilePublications(WORKSPACE_ROOT);
+export function recoverProfilePublicationsAtStartup({
+  root = WORKSPACE_ROOT,
+  initialised = workspaceInitialised,
+  recover = recoverPendingProfilePublications,
+  schedule = setTimeout,
+} = {}) {
+  if (!initialised()) return;
+  try {
+    recover(root);
+  } catch (error) {
+    if (error?.reasonCode !== 'profile-publication-fenced') {
+      throw error;
+    }
+    const retry = schedule(() => recoverProfilePublicationsAtStartup({
+      root, initialised, recover, schedule,
+    }), 1_000);
+    retry.unref?.();
+  }
+}
+
+recoverProfilePublicationsAtStartup();
 
 function stageSearchProfileReview() {
   if (!workspaceInitialised()) return null;
@@ -2536,14 +2556,14 @@ routes['POST /api/restart'] = (req, res, body) => {
   }
   replyJson(res, 200, { ok: true, restarting: true });
   setTimeout(() => {
-    void providerLoginControl.shutdown().finally(() => restartControl.respawn());
+    void providerLoginControl.shutdown().then(() => restartControl.respawn()).catch(() => {});
   }, 200);
 };
 
 routes['POST /api/shutdown'] = (req, res) => {
   replyJson(res, 200, { ok: true, shuttingDown: true });
   setTimeout(() => {
-    void providerLoginControl.shutdown().finally(() => shutdownControl.exit());
+    void providerLoginControl.shutdown().then(() => shutdownControl.exit()).catch(() => {});
   }, 200);
 };
 

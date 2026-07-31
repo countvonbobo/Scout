@@ -247,6 +247,23 @@ test('beta.22 snapshot rejects a protected path redirected outside the physical 
   }), /symbolic links|redirected outside its physical root/);
 });
 
+test('beta.22 snapshot rejects redirected backup storage before writing protected data', (t) => {
+  if (process.platform === 'win32') {
+    t.diagnostic('symbolic-link fixture is not portable to Windows');
+    return;
+  }
+  const root = productionShapedWorkspace();
+  const outside = temporaryRoot('scout-beta22-storage-outside-');
+  const backups = path.join(root, '.scout', 'backups');
+  fs.rmSync(backups, { recursive: true, force: true });
+  fs.symlinkSync(outside, backups, 'dir');
+  assert.throws(
+    () => createBeta22WorkspaceSnapshot(root, { now: () => NOW }),
+    /snapshot storage is redirected outside the workspace/,
+  );
+  assert.deepEqual(fs.readdirSync(outside), []);
+});
+
 test('snapshot verification rejects tampering before creating a rollback workspace', () => {
   const root = productionShapedWorkspace();
   const snapshot = createBeta22WorkspaceSnapshot(root, { now: () => NOW });

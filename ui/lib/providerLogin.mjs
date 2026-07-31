@@ -447,12 +447,9 @@ export function createProviderLoginManager({
         })
         .catch(async (error) => {
           try {
-            const replacement = await acquireAuthMutation(
-              lease.capability.provider,
-              lease.capability.phase,
-            );
-            if (!replacement) throw error;
-            lease.capability = replacement;
+            const retried = await renewAuthMutation(lease.capability);
+            if (!retried) throw error;
+            lease.capability = retried;
             lease.renewalError = null;
           } catch {
             lease.renewalError = error;
@@ -1325,6 +1322,9 @@ export function createProviderLoginManager({
     );
     await Promise.allSettled([...pendingClearOperations]);
     await Promise.allSettled([...pendingHealthWrites]);
+    if ([...trackedChildren].some(({ closed }) => !closed)) {
+      throw new Error('provider child did not close during shutdown');
+    }
   }
 
   return Object.freeze({

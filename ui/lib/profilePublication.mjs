@@ -128,7 +128,11 @@ export function recoverPendingProfilePublications(root, { hooks = {} } = {}) {
     phase: 'publish-recovery',
   });
   if (!lease) {
-    throw new MutationConflictError('unfinished profile publication is still fenced by another operation');
+    const error = new MutationConflictError(
+      'unfinished profile publication is still fenced by another operation',
+    );
+    error.reasonCode = 'profile-publication-fenced';
+    throw error;
   }
   try {
     const receipt = applyPreparedMutation(plan, lease, hooks);

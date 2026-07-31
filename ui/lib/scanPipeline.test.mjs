@@ -4,7 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { test } from 'node:test';
 import {
-  assessScanCandidates, assessmentCandidatesForSelection, buildAssessmentPrompt, compactCandidates, createRankedDiscoveryStages, DEFAULT_CANDIDATE_LIMIT, gateAssessment, inboxRecheckCandidates, prepareRankedDiscovery, promptCandidate,
+  assessScanCandidates, assessmentCandidatesForSelection, buildAssessmentPrompt, compactCandidates, createRankedDiscoveryStages, DEFAULT_CANDIDATE_LIMIT, durableScanProjection, gateAssessment, inboxRecheckCandidates, prepareRankedDiscovery, promptCandidate,
   filterVacancies, PipelineInterruptedError, readVacancyDecisionHistory, runScanPipeline, validateAssessments, validateWrittenScanArtifacts,
   verificationCandidates, writeScanArtifacts,
 } from './scanPipeline.mjs';
@@ -174,6 +174,46 @@ test('URL-less provider vacancies retain distinct stable identities through sele
     reverse.ranked.map(({ vacancyId }) => vacancyId),
   );
   assert.ok(forward.selection.reasons.every(({ vacancyId }) => vacancyId !== 'unknown-vacancy'));
+});
+
+test('privacy projection cannot collapse distinct query-addressed provider vacancies', () => {
+  const profile = {
+    version: 1, status: 'published', id: 'profile-query-identity-collision',
+    target: {},
+    negative: {},
+    compensation: {
+      currency: null, period: 'year', minimum: null,
+      minimumStrength: 'neutral', unknownPolicy: 'include',
+    },
+  };
+  const sources = durableScanProjection({
+    provider: {
+      count: 2,
+      jobs: [
+        {
+          company: 'Example Co',
+          title: 'Platform Engineer',
+          providerId: 'query-job-one',
+          url: 'https://jobs.example.test/apply?job=one',
+        },
+        {
+          company: 'Example Co',
+          title: 'Platform Engineer',
+          providerId: 'query-job-two',
+          url: 'https://jobs.example.test/apply?job=two',
+        },
+      ],
+    },
+  });
+  const result = prepareRankedDiscovery({
+    sources,
+    profile,
+    runId: 'query-identity-collision',
+    relevanceThreshold: 0,
+  });
+  assert.equal(result.vacancies.length, 2);
+  assert.equal(new Set(result.vacancies.map(({ vacancyId }) => vacancyId)).size, 2);
+  assert.equal(result.funnel.uniqueVacancies, 2);
 });
 
 test('durable ranked stages preserve the established ranked discovery result', async () => {

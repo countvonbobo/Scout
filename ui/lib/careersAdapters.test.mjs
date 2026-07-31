@@ -259,6 +259,29 @@ test('generic monitoring reports capacity overflow instead of silently truncatin
   assert.equal(result.jobs.length, 100);
 });
 
+test('generic monitoring fingerprints query-bearing provider identities before persistence', async () => {
+  const target = employer({
+    access: {
+      terms: 'allowed', robots: 'allowed', genericEnabled: true, minIntervalMinutes: 60,
+    },
+  });
+  const result = await collectEmployer(target, {
+    fetchImpl: async () => response(
+      '<a href="/jobs/platform-engineer?sig=PRIVATE123">Platform engineer vacancy</a>',
+      { type: 'text/html' },
+    ),
+    lookupFn: publicLookup,
+    now: () => AT,
+  });
+  assert.equal(result.jobs.length, 1);
+  assert.match(result.jobs[0].providerId, /^careers-generic-[a-f0-9]{32}$/);
+  assert.equal(result.jobs[0].sourceRecordId, result.jobs[0].providerId);
+  assert.equal(JSON.stringify({
+    providerId: result.jobs[0].providerId,
+    sourceRecordId: result.jobs[0].sourceRecordId,
+  }).includes('PRIVATE123'), false);
+});
+
 test('deep JSON-LD graphs degrade with a fixed structural limit instead of aborting collection', async () => {
   let graph = { '@type': 'JobPosting', title: 'Too deep' };
   for (let depth = 0; depth < 80; depth += 1) graph = { '@graph': [graph] };

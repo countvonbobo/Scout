@@ -17,7 +17,8 @@ const {
   codexDeepLinkDetection, computeUiBuildId, createServer,
   inspectCodexDeepLinkHandler, operations, providerDetection, providerLoginControl,
   publicApiError, publicCvImportError, publicDeviceSettings, publicProviderStatus,
-  publicSetupConfigError, requestAccess, restartControl, shutdownControl,
+  publicSetupConfigError, recoverProfilePublicationsAtStartup, requestAccess,
+  restartControl, shutdownControl,
 } = await import('./server.mjs');
 const { seedWorkspace, loadWorkspaceConfig, workspacePaths, writeWorkspaceConfig } = await import('./lib/workspace.mjs');
 const {
@@ -75,6 +76,38 @@ test('server startup and periodic provider health use the configured runtime ent
   ]);
   monitor.stop();
   assert.equal(cleared, true);
+});
+
+test('server startup retries a live-fenced profile publication without starting unsafely', () => {
+  const calls = [];
+  let scheduled;
+  let attempts = 0;
+  const recover = (root) => {
+    calls.push(root);
+    attempts += 1;
+    if (attempts === 1) {
+      const error = new Error('publication is still owned');
+      error.reasonCode = 'profile-publication-fenced';
+      throw error;
+    }
+  };
+  const timer = { unrefCalled: false, unref() { this.unrefCalled = true; } };
+  const schedule = (callback, delay) => {
+    scheduled = { callback, delay };
+    return timer;
+  };
+
+  recoverProfilePublicationsAtStartup({
+    root: '/synthetic/workspace',
+    initialised: () => true,
+    recover,
+    schedule,
+  });
+  assert.deepEqual(calls, ['/synthetic/workspace']);
+  assert.equal(scheduled.delay, 1_000);
+  assert.equal(timer.unrefCalled, true);
+  scheduled.callback();
+  assert.deepEqual(calls, ['/synthetic/workspace', '/synthetic/workspace']);
 });
 
 test('guided login confirms health with a bounded real provider turn', async () => {
@@ -1251,6 +1284,31 @@ test('restart responds first, then schedules the respawn', async () => {
     await new Promise((resolve) => setTimeout(resolve, 350));
     assert.equal(respawned, true);
   } finally {
+    restartControl.respawn = originalRespawn;
+  }
+});
+
+test('restart does not hand off to a successor while provider shutdown is unconfirmed', async () => {
+  const originalRespawn = restartControl.respawn;
+  const originalManager = providerLoginControl.manager;
+  let respawned = false;
+  restartControl.respawn = () => { respawned = true; };
+  providerLoginControl.manager = {
+    shutdown: async () => { throw new Error('provider child did not close during shutdown'); },
+  };
+  try {
+    const host = `127.0.0.1:${port}`;
+    const response = await request({
+      method: 'POST',
+      path: '/api/restart',
+      headers: { host, origin: `http://${host}`, 'content-type': 'application/json' },
+      body: '{}',
+    });
+    assert.equal(response.status, 200);
+    await new Promise((resolve) => setTimeout(resolve, 350));
+    assert.equal(respawned, false);
+  } finally {
+    providerLoginControl.manager = originalManager;
     restartControl.respawn = originalRespawn;
   }
 });

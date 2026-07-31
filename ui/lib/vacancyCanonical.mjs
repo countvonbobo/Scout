@@ -110,17 +110,38 @@ function metadataValues(observations, name) {
     .filter(Boolean))].sort(compareStable);
 }
 
-function canonicalVacancyId(canonicalUrl, identity, sourceReferences) {
+function canonicalVacancyId(canonicalUrl, identity) {
   if (canonicalUrl) return canonicalUrl;
-  const reference = [...sourceReferences].sort((left, right) => (
-    -compareStable(
-      `${left.source || ''}\n${left.providerId || ''}\n${left.url || ''}`,
-      `${right.source || ''}\n${right.providerId || ''}\n${right.url || ''}`,
-    )
-  ))[0] || null;
   return `vacancy-ref-${crypto.createHash('sha256')
-    .update(stableJson({ identity, reference }))
+    .update(stableJson({ identity }))
     .digest('hex').slice(0, 24)}`;
+}
+
+function disambiguateVacancyIds(vacancies) {
+  const byBaseId = new Map();
+  for (const vacancy of vacancies) {
+    const candidates = byBaseId.get(vacancy.vacancyId) || [];
+    candidates.push(vacancy);
+    byBaseId.set(vacancy.vacancyId, candidates);
+  }
+  return vacancies.map((vacancy) => {
+    const collisions = byBaseId.get(vacancy.vacancyId);
+    if (collisions.length === 1) return vacancy;
+    const ordered = [...collisions].sort((left, right) => compareStable(
+      stableJson(left.sourceReferences),
+      stableJson(right.sourceReferences),
+    ));
+    if (ordered[0] === vacancy) return vacancy;
+    return {
+      ...vacancy,
+      vacancyId: `vacancy-ref-${crypto.createHash('sha256')
+        .update(stableJson({
+          baseId: vacancy.vacancyId,
+          sourceReferences: vacancy.sourceReferences,
+        }))
+        .digest('hex').slice(0, 24)}`,
+    };
+  });
 }
 
 function boundedSemanticText(value, maximum) {
@@ -237,10 +258,8 @@ function canonicalVacancy(observations) {
   const fallbackIdentity = {
     company: identity.company,
     title: identity.title,
-    location: identity.location,
-    seniority: identity.seniority,
   };
-  const vacancyId = canonicalVacancyId(canonicalUrl, fallbackIdentity, sourceReferences);
+  const vacancyId = canonicalVacancyId(canonicalUrl, fallbackIdentity);
   const collectionSources = metadataValues(orderedObservations, 'collectionSource');
   const laneIds = [...new Set([
     ...metadataValues(orderedObservations, 'laneId'),
@@ -277,7 +296,9 @@ export function canonicaliseObservations(observations) {
     if (group) group.push(observation);
     else groups.push([observation]);
   }
-  const vacancies = groups.sort((left, right) => compareStable(groupKey(left), groupKey(right))).map(canonicalVacancy);
+  const vacancies = disambiguateVacancyIds(
+    groups.sort((left, right) => compareStable(groupKey(left), groupKey(right))).map(canonicalVacancy),
+  );
   return {
     vacancies,
     duplicateObservations: orderedObservations.length - groups.length,

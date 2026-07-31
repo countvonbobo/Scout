@@ -333,8 +333,25 @@ function snapshotsDirectory(root) {
   return path.join(workspacePaths(root).backups);
 }
 
+function validatedSnapshotsDirectory(root, { create = false } = {}) {
+  const workspaceRoot = path.resolve(root);
+  const physicalRoot = fs.realpathSync(workspaceRoot);
+  let current = workspaceRoot;
+  for (const segment of ['.scout', 'backups']) {
+    current = path.join(current, segment);
+    if (create && !fs.existsSync(current)) fs.mkdirSync(current, { mode: 0o700 });
+    if (!fs.existsSync(current)) continue;
+    const stat = fs.lstatSync(current);
+    if (stat.isSymbolicLink() || !stat.isDirectory()
+      || !within(physicalRoot, fs.realpathSync(current))) {
+      throw new Error('beta.22 snapshot storage is redirected outside the workspace');
+    }
+  }
+  return snapshotsDirectory(workspaceRoot);
+}
+
 export function latestBeta22WorkspaceSnapshot(root) {
-  const directory = snapshotsDirectory(root);
+  const directory = validatedSnapshotsDirectory(root);
   if (!fs.existsSync(directory)) return null;
   const manifests = fs.readdirSync(directory)
     .filter((name) => name.endsWith('-beta22-compatible.manifest.json'))
@@ -363,11 +380,10 @@ function createBeta22WorkspaceSnapshotUnderAuthority(root, {
   _testHooks = {},
 } = {}) {
   const workspaceRoot = path.resolve(root);
+  const parent = validatedSnapshotsDirectory(workspaceRoot, { create: true });
   const existing = latestBeta22WorkspaceSnapshot(workspaceRoot);
   const configFile = path.join(workspaceRoot, 'workspace.json');
   if (!fs.existsSync(configFile)) throw new Error('workspace config is required for beta.22 snapshot');
-  const parent = snapshotsDirectory(workspaceRoot);
-  fs.mkdirSync(parent, { recursive: true, mode: 0o700 });
   fs.chmodSync(parent, 0o700);
   const createdAt = new Date(now()).toISOString();
   const name = `${safeTimestamp(createdAt)}-beta22-compatible`;

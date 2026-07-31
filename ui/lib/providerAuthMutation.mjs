@@ -336,9 +336,9 @@ export function createProviderWorkSupervisor(root, provider, {
       })
       .catch(async (error) => {
         try {
-          const replacement = await acquire(root, provider);
-          if (!replacement) throw error;
-          capability = replacement;
+          const retried = await renew(root, capability);
+          if (!retried) throw error;
+          capability = retried;
           renewalError = null;
         } catch {
           renewalError = error;

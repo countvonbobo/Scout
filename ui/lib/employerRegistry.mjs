@@ -478,7 +478,7 @@ function monitoringOrder(left, right) {
     || compareText(left.id, right.id);
 }
 
-export function selectEmployersForMonitoring(registry, {
+export function planEmployerMonitoring(registry, {
   limit = 12,
   now = () => new Date().toISOString(),
 } = {}) {
@@ -486,10 +486,9 @@ export function selectEmployersForMonitoring(registry, {
   const at = now();
   timestamp(at, 'monitoring selection time');
   const capacity = Math.max(0, Math.min(MAX_MONITORED_EMPLOYERS, Math.floor(Number(limit))));
-  if (!capacity) return [];
   const eligible = registry.employers.filter((employer) => eligibleAt(employer, at));
   const priority = eligible.filter(({ userPriority }) => userPriority === 'priority').sort(monitoringOrder);
-  const selected = priority.slice(0, MAX_MONITORED_EMPLOYERS);
+  const selected = capacity ? priority.slice(0, MAX_MONITORED_EMPLOYERS) : [];
   const bands = ['relevant', 'normal', 'inactive'].map((band) => [
     band,
     eligible.filter(({ userPriority }) => userPriority === band).sort(monitoringOrder),
@@ -504,7 +503,20 @@ export function selectEmployersForMonitoring(registry, {
     if (selected.length >= capacity) break;
     selected.push(employer);
   }
-  return selected.slice(0, MAX_MONITORED_EMPLOYERS).map((value) => structuredClone(value));
+  const bounded = selected.slice(0, MAX_MONITORED_EMPLOYERS);
+  const selectedIds = new Set(bounded.map(({ id }) => id));
+  return Object.freeze({
+    selected: bounded.map((value) => structuredClone(value)),
+    eligible: eligible.length,
+    eligiblePriority: priority.length,
+    omitted: eligible.filter(({ id }) => !selectedIds.has(id)).length,
+    omittedPriority: priority.filter(({ id }) => !selectedIds.has(id)).length,
+    capacity: MAX_MONITORED_EMPLOYERS,
+  });
+}
+
+export function selectEmployersForMonitoring(registry, options = {}) {
+  return planEmployerMonitoring(registry, options).selected;
 }
 
 function checkResult(value) {

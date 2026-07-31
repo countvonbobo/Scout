@@ -468,12 +468,11 @@ test('stubborn login children keep renewing authentication authority until closu
   assert.equal(events.at(-1), 'release');
 });
 
-test('login renewal loss re-acquires authority or terminates the provider child', async () => {
+test('login renewal loss retries the same authority then terminates the provider child', async () => {
   let acquisitions = 0;
   const h = harness({
     acquireAuthMutation: async (provider, phase) => {
       acquisitions += 1;
-      if (acquisitions > 1) return null;
       return { provider, phase, mutationId: 'lost-login-authority-01' };
     },
     renewAuthMutation: async () => {
@@ -488,7 +487,7 @@ test('login renewal loss re-acquires authority or terminates the provider child'
   assert.equal(snapshot.state, 'failed');
   assert.equal(snapshot.reasonCode, 'auth-authority-lost');
   assert.equal(h.login.killed, true);
-  assert.ok(acquisitions >= 2);
+  assert.equal(acquisitions, 1);
 });
 
 test('cancel and retry have distinct bounded owner/provider rate limits', async () => {
@@ -909,7 +908,7 @@ test('shutdown tracks login and explicit Claude-clear children until both close'
   await clearing;
 });
 
-test('shutdown forcibly settles a stubborn Claude-clear operation at its final deadline', async () => {
+test('shutdown settles the operation but refuses process handoff until a stubborn child closes', async () => {
   const login = fakeChild();
   const validation = fakeChild();
   const clear = fakeChild({ closeOnKill: false });
@@ -940,13 +939,14 @@ test('shutdown forcibly settles a stubborn Claude-clear operation at its final d
   await new Promise((resolve) => setImmediate(resolve));
   const clearing = manager.clearClaudeCredentials(expired.sessionId, OWNER);
   await new Promise((resolve) => setImmediate(resolve));
-  await manager.shutdown();
+  await assert.rejects(manager.shutdown(), /provider child did not close during shutdown/);
   const raced = await Promise.race([
     clearing,
     new Promise((resolve) => setTimeout(() => resolve('still-pending'), 30)),
   ]);
   clear.close(null);
   await clearing;
+  await manager.shutdown();
   assert.deepEqual(raced, {
     provider: 'claude',
     reasonCode: 'logout-failed',

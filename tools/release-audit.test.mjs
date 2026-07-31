@@ -53,29 +53,32 @@ test('reports marker and secret rules without retaining their values', () => {
   assert.equal(JSON.stringify(result).includes(token), false);
 });
 
-test('reports configured personal markers embedded in binary dependency artifacts', () => {
+test('reports UTF-8 and UTF-16 personal markers embedded in binary dependency artifacts', () => {
   const root = fixture();
   const marker = 'Casey Exampleperson';
-  const relative = 'app/node_modules/synthetic-addon/build/addon.node';
-  const file = path.join(root, relative);
-  fs.mkdirSync(path.dirname(file), { recursive: true });
-  fs.writeFileSync(file, Buffer.concat([
-    Buffer.from([0, 1, 2, 0]),
-    Buffer.from(marker, 'utf8'),
-    Buffer.from([0, 255, 0]),
-  ]));
+  const files = [
+    ['app/node_modules/synthetic-addon/build/addon.node', 'utf8'],
+    ['app/node_modules/synthetic-addon/build/windows.node', 'utf16le'],
+  ];
+  for (const [relative, encoding] of files) {
+    const file = path.join(root, relative);
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, Buffer.concat([
+      Buffer.from([0, 1, 2, 0]),
+      Buffer.from(marker, encoding),
+      Buffer.from([0, 255, 0]),
+    ]));
+  }
   const result = auditRelease({
     root,
-    trackedFiles: [relative],
+    trackedFiles: files.map(([relative]) => relative),
     buildDirs: [],
     markers: [marker],
   });
   assert.equal(result.ok, false);
-  assert.deepEqual(result.findings, [{
-    file: relative,
-    line: 1,
-    rule: 'personal-marker-1',
-  }]);
+  assert.deepEqual(result.findings, files.map(([file]) => ({
+    file, line: 1, rule: 'personal-marker-1',
+  })));
   assert.equal(JSON.stringify(result).includes(marker), false);
 });
 

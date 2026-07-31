@@ -12,6 +12,7 @@ import {
 } from './structuredTurn.mjs';
 
 const MAX_BATCH_JOBS = 10;
+const MAX_MANDATORY_REQUIREMENTS = 64;
 const DEFAULT_TIMEOUT_MS = 20 * 60 * 1000;
 const MAX_TIMEOUT_MS = 30 * 60 * 1000;
 const DEFAULT_MAX_INPUT_TOKENS = 75_000;
@@ -65,7 +66,7 @@ export const ASSESSMENT_RESPONSE_SCHEMA = Object.freeze({
           },
           mandatoryRequirements: {
             type: 'array',
-            maxItems: 24,
+            maxItems: MAX_MANDATORY_REQUIREMENTS,
             items: {
               type: 'object',
               additionalProperties: false,
@@ -400,7 +401,8 @@ export function validateAssessmentJob(value, job) {
       && !String(value.responsibilityFit.profileEvidence || '').trim()) {
       return validationFailure('responsibility-profile-evidence-required');
     }
-    if (!Array.isArray(value.mandatoryRequirements) || value.mandatoryRequirements.length > 24) {
+    if (!Array.isArray(value.mandatoryRequirements)
+      || value.mandatoryRequirements.length > MAX_MANDATORY_REQUIREMENTS) {
       return validationFailure('mandatory-requirements-invalid');
     }
     const knownSignals = new Set((job?.mandatorySignals || []).map((signal) => signal.id));

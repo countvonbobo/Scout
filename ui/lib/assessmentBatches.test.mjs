@@ -243,7 +243,26 @@ test('provider-neutral schema accepts only nuanced fit and evidence fields', () 
   for (const forbidden of ['categoryId', 'dimensions', 'hardExclusionMatches']) {
     assert.equal(Object.hasOwn(item.properties, forbidden), false);
   }
+  assert.equal(item.properties.mandatoryRequirements.maxItems, 64);
   assert.deepEqual(validateAssessmentJob(nuancedAssessment('candidate-001'), jobs(1)[0]), []);
+});
+
+test('assessment validation can cover every supported mandatory advert signal', () => {
+  const mandatorySignals = Array.from({ length: 64 }, (_, index) => ({
+    id: `mandatory-${String(index + 1).padStart(2, '0')}`,
+    text: `Advert mandatory requirement ${index + 1}.`,
+  }));
+  const candidate = { ...jobs(1)[0], mandatorySignals };
+  const value = nuancedAssessment(candidate.candidateId, {
+    mandatoryRequirements: mandatorySignals.map((signal, index) => ({
+      requirement: `Requirement ${index + 1}`,
+      advertEvidence: signal.text,
+      advertEvidenceId: signal.id,
+      status: 'unknown',
+      profileEvidence: null,
+    })),
+  });
+  assert.deepEqual(validateAssessmentJob(value, candidate), []);
 });
 
 test('valid siblings persist while only invalid jobs receive one focused repair', async () => {

@@ -1028,6 +1028,9 @@ export const SCAN_ASSESSMENT_SCHEMA = ASSESSMENT_RESPONSE_SCHEMA;
 function stableAssessmentJobId(candidate) {
   const supplied = String(candidate?.vacancyId || '');
   if (/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(supplied)) return supplied;
+  if (supplied) {
+    return `vacancy-${createHash('sha256').update(supplied).digest('hex').slice(0, 32)}`;
+  }
   return `vacancy-${createHash('sha256')
     .update(JSON.stringify(jobIdentity(candidate)))
     .digest('hex')

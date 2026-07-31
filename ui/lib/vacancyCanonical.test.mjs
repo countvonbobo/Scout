@@ -199,7 +199,7 @@ test('URL-less canonical identities are stable, collision-free and source-order 
   const secondAloneId = canonicaliseObservations([second]).vacancies[0].vacancyId;
 
   assert.equal(separate.length, 2);
-  assert.notEqual(firstAloneId, secondAloneId);
+  assert.equal(firstAloneId, secondAloneId);
   assert.equal(new Set(separate.map(({ vacancyId }) => vacancyId)).size, 2);
   assert.ok(separate.every(({ vacancyId }) => /^vacancy-ref-[a-f0-9]{24}$/.test(vacancyId)));
   assert.equal(
@@ -235,6 +235,46 @@ test('URL-less canonical identities are stable, collision-free and source-order 
   const firstWithEarlier = canonicaliseObservations([first, laterEarlierSource]).vacancies;
   assert.equal(firstWithEarlier.length, 1);
   assert.equal(firstWithEarlier[0].vacancyId, firstAloneId);
+
+  const laterGreaterSource = observation({
+    source: 'provider-zz',
+    providerId: 'greater-reference',
+    url: null,
+    description: 'Build stable services.',
+  });
+  const firstWithGreater = canonicaliseObservations([first, laterGreaterSource]).vacancies;
+  assert.equal(firstWithGreater.length, 1);
+  assert.equal(firstWithGreater[0].vacancyId, firstAloneId);
+
+  const enriched = observation({
+    source: 'provider-z',
+    providerId: 'reference-1',
+    url: null,
+    location: 'London, Greater London, United Kingdom',
+    seniority: 'senior',
+    description: 'Build stable services.',
+  });
+  assert.equal(canonicaliseObservations([enriched]).vacancies[0].vacancyId, firstAloneId);
+});
+
+test('privacy-canonical URLs remain unique for distinct same-source provider vacancies', () => {
+  const vacancies = canonicaliseObservations([
+    observation({
+      source: 'provider-a',
+      providerId: 'query-job-one',
+      url: 'https://jobs.example.test/apply',
+      description: 'Build stable services.',
+    }),
+    observation({
+      source: 'provider-a',
+      providerId: 'query-job-two',
+      url: 'https://jobs.example.test/apply',
+      description: 'Build stable services.',
+    }),
+  ]).vacancies;
+  assert.equal(vacancies.length, 2);
+  assert.equal(new Set(vacancies.map(({ vacancyId }) => vacancyId)).size, 2);
+  assert.ok(vacancies.some(({ vacancyId }) => vacancyId === 'https://jobs.example.test/apply'));
 });
 
 test('canonicalisation rejects semantic responsibility overflow instead of truncating evidence', () => {

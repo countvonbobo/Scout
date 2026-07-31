@@ -533,8 +533,15 @@ export function auditRelease({
       }
       findings.push(...pathFindings.map((finding) => ({ file: publicFile, ...finding })));
       for (let markerIndex = 0; markerIndex < markers.length; markerIndex += 1) {
-        const markerBytes = Buffer.from(markers[markerIndex], 'utf8');
-        if (markerBytes.length && content.indexOf(markerBytes) !== -1) {
+        const utf8 = Buffer.from(markers[markerIndex], 'utf8');
+        const utf16le = Buffer.from(markers[markerIndex], 'utf16le');
+        const utf16be = Buffer.from(utf16le);
+        for (let index = 0; index + 1 < utf16be.length; index += 2) {
+          [utf16be[index], utf16be[index + 1]] = [utf16be[index + 1], utf16be[index]];
+        }
+        if ([utf8, utf16le, utf16be].some((markerBytes) => (
+          markerBytes.length && content.indexOf(markerBytes) !== -1
+        ))) {
           findings.push({
             file: publicFile,
             line: 1,

@@ -53,7 +53,7 @@ import {
 } from '../ui/lib/searchLanes.mjs';
 import {
   employerRegistryRevision, loadEmployerRegistry, migrateLegacyPortals,
-  selectEmployersForMonitoring,
+  planEmployerMonitoring,
 } from '../ui/lib/employerRegistry.mjs';
 import {
   activeLearningPolicy, createLearningLedger, loadLearningLedger,
@@ -577,9 +577,10 @@ export async function collectScanSources(root, config, {
   const employerRegistry = storedRegistry || migrateLegacyPortals(null, legacyPortals, {
     now: () => generatedAt,
   });
-  const monitoredEmployers = selectEmployersForMonitoring(employerRegistry, {
+  const monitoringPlan = planEmployerMonitoring(employerRegistry, {
     now: () => generatedAt,
   });
+  const monitoredEmployers = monitoringPlan.selected;
   let employerCollection = { jobs: [], checks: [], results: [] };
   if (monitoredEmployers.length) {
     try {
@@ -606,14 +607,16 @@ export async function collectScanSources(root, config, {
     ...compactSource({
       status: !employerRegistry.employers.length
         ? 'unavailable'
-        : employerFailures.length ? 'degraded' : 'healthy',
+        : employerFailures.length || monitoringPlan.omittedPriority ? 'degraded' : 'healthy',
       available: employerRegistry.employers.length > 0,
       count: employerCollection.jobs.length,
       reason: !employerRegistry.employers.length
         ? 'no employers registered'
         : !monitoredEmployers.length
           ? 'all registered employers are within their monitoring interval'
-          : employerFailures.length
+          : monitoringPlan.omittedPriority
+            ? 'priority employer monitoring capacity was exceeded'
+            : employerFailures.length
             ? 'one or more employer checks did not complete'
             : null,
       errors: [],
@@ -624,6 +627,13 @@ export async function collectScanSources(root, config, {
     registryRevision: employerRegistryRevision(employerRegistry),
     registrySnapshot: employerRegistry,
     selectedEmployerIds: monitoredEmployers.map(({ id }) => id),
+    monitoringCapacity: {
+      limit: monitoringPlan.capacity,
+      eligible: monitoringPlan.eligible,
+      eligiblePriority: monitoringPlan.eligiblePriority,
+      omitted: monitoringPlan.omitted,
+      omittedPriority: monitoringPlan.omittedPriority,
+    },
   };
   const registryOwnsLegacyPortals = employerRegistry.employers.length > 0 || legacyPortals.length > 0;
   const atsResult = registryOwnsLegacyPortals

@@ -1,6 +1,7 @@
 import crypto from 'node:crypto';
 
 const TRACKING_PARAMETERS = /^(?:utm_[^=]+|gclid|fbclid|mc_[^=]+)$/i;
+const CREDENTIAL_PARAMETERS = /^(?:access[-_]?token|api[-_]?(?:key|token)|auth(?:orization)?|key|password|secret|session[-_]?id|sig(?:nature)?|token)$/i;
 const CREDENTIAL_VALUE = /(?:\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b)|(?:\b(?:access[-_ ]?token|api[-_ ]?(?:key|token)|authorization|password|secret|session[-_ ]?id|token)\s*[:=]\s*\S+)|(?:\bbearer\s+[A-Za-z0-9._~+/-]{8,})|(?:\bsk-[A-Za-z0-9_-]{16,})|(?:\bgh[pousr]_[A-Za-z0-9]{20,})|(?:\bxox[baprs]-[A-Za-z0-9-]{10,})|(?:\bAKIA[0-9A-Z]{16}\b)/i;
 const MAX_SOURCE_RECORD_ID_LENGTH = 160;
 
@@ -50,7 +51,9 @@ export function canonicaliseUrl(value) {
   try {
     const parsed = new URL(url);
     for (const key of [...parsed.searchParams.keys()]) {
-      if (TRACKING_PARAMETERS.test(key)) parsed.searchParams.delete(key);
+      if (TRACKING_PARAMETERS.test(key) || CREDENTIAL_PARAMETERS.test(key)) {
+        parsed.searchParams.delete(key);
+      }
     }
     parsed.hash = '';
     parsed.searchParams.sort();
@@ -103,7 +106,13 @@ function compensation(job, warnings) {
 function sourceRecordId(job, canonicalUrl) {
   const providerId = text(job.sourceRecordId) || text(job.providerId);
   if (!providerId) return canonicalUrl ? `url-${fingerprint(canonicalUrl).slice(0, 16)}` : null;
-  if (providerId.length > MAX_SOURCE_RECORD_ID_LENGTH || CREDENTIAL_VALUE.test(providerId)) {
+  let urlShaped = false;
+  try {
+    const parsed = new URL(providerId);
+    urlShaped = ['http:', 'https:'].includes(parsed.protocol);
+  } catch {}
+  if (urlShaped || providerId.includes('?')
+    || providerId.length > MAX_SOURCE_RECORD_ID_LENGTH || CREDENTIAL_VALUE.test(providerId)) {
     return `provider-${fingerprint(providerId).slice(0, 32)}`;
   }
   return providerId;
@@ -182,7 +191,7 @@ export function normaliseObservation(job, {
     source,
     collectionSource: observationCollectionSource,
     sourceRecordId: recordId,
-    sourceUrl: text(job.url || job.sourceUrl),
+    sourceUrl: canonicalUrl,
     canonicalUrl,
     employer: field(text(job.company || job.employer), 'explicit-source'),
     employerReference: field(text(job.employerReference || job.companyReference || job.employerId), 'explicit-source'),

@@ -248,17 +248,26 @@ test('provider work supervisor renews long work and transfers release to lifecyc
   assert.equal(released, 1);
 });
 
-test('provider work supervisor re-fences after renewal loss or stops the active operation', async () => {
+test('provider work supervisor retries the same fence or stops the active operation', async () => {
   let intervalCallback;
   let acquisitions = 0;
+  let renewals = 0;
   let stopped = 0;
+  const releasedIds = [];
   const recovered = createProviderWorkSupervisor('/synthetic', 'codex', {
     acquire: () => ({
       provider: 'codex',
       workId: `replacement-${String(++acquisitions).padStart(2, '0')}`,
     }),
-    renew: async () => { throw new Error('synthetic renewal loss'); },
-    release: () => true,
+    renew: async (_root, capability) => {
+      renewals += 1;
+      if (renewals === 1) throw new Error('synthetic renewal contention');
+      return capability;
+    },
+    release: (_root, capability) => {
+      releasedIds.push(capability.workId);
+      return true;
+    },
     setIntervalFn(callback) {
       intervalCallback = callback;
       return { unref() {} };
@@ -269,15 +278,16 @@ test('provider work supervisor re-fences after renewal loss or stops the active 
   recovered.setFailureHandler(() => { stopped += 1; });
   intervalCallback();
   await new Promise((resolve) => setImmediate(resolve));
-  assert.equal(acquisitions, 2);
+  assert.equal(acquisitions, 1);
+  assert.equal(renewals, 2);
   assert.equal(stopped, 0);
+  assert.deepEqual(releasedIds, []);
   assert.equal(recovered.assertCurrent(), true);
   await recovered.release();
+  assert.deepEqual(releasedIds, ['replacement-01']);
 
   const failed = createProviderWorkSupervisor('/synthetic', 'codex', {
-    acquire: () => (acquisitions++ === 2
-      ? { provider: 'codex', workId: 'initial-failed-work' }
-      : null),
+    acquire: () => ({ provider: 'codex', workId: 'initial-failed-work' }),
     renew: async () => { throw new Error('unrecoverable renewal loss'); },
     release: () => true,
     setIntervalFn(callback) {
@@ -293,6 +303,33 @@ test('provider work supervisor re-fences after renewal loss or stops the active 
   assert.equal(stopped, 1);
   assert.throws(() => failed.assertCurrent(), /unrecoverable renewal loss/);
   await failed.release();
+});
+
+test('provider work retry keeps one filesystem capability without an authority gap', async (t) => {
+  const root = workspace(t);
+  let intervalCallback;
+  let renewals = 0;
+  const supervisor = createProviderWorkSupervisor(root, 'codex', {
+    renew: async (workspaceRoot, capability) => {
+      renewals += 1;
+      if (renewals === 1) throw new Error('synthetic guard contention');
+      return renewProviderWork(workspaceRoot, capability);
+    },
+    setIntervalFn(callback) {
+      intervalCallback = callback;
+      return { unref() {} };
+    },
+    clearIntervalFn() {},
+    intervalMs: 1,
+  });
+  const workDirectory = path.join(root, '.scout', 'provider-auth', 'v1', 'codex.work');
+  assert.equal(fs.readdirSync(workDirectory).length, 1);
+  intervalCallback();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(renewals, 2);
+  assert.equal(fs.readdirSync(workDirectory).length, 1);
+  await supervisor.release();
+  assert.equal(fs.existsSync(workDirectory), false);
 });
 
 test('simultaneous auth and provider-work processes admit exactly one class of operation', async (t) => {

@@ -107,6 +107,25 @@ test('profile publication recovers coherently after every individual replacement
   }
 });
 
+test('unfinished publication under a live fence exposes a retryable recovery reason', () => {
+  const { root, runId, lease } = fixture('busy-recovery');
+  assert.throws(() => publishProfileGeneration(
+    { root, runId, lease },
+    generation('busy-recovery'),
+    {
+      afterReplacement() {
+        throw new Error('crash-with-live-fence');
+      },
+    },
+  ), /crash-with-live-fence/);
+  assert.throws(
+    () => recoverPendingProfilePublications(root),
+    (error) => error?.reasonCode === 'profile-publication-fenced',
+  );
+  releaseScanLease(lease);
+  assert.equal(recoverPendingProfilePublications(root).length, 1);
+});
+
 test('profile publication recovery fails closed when pending state conflicts', () => {
   const { root, lease } = fixture('conflict');
   assert.throws(

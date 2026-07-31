@@ -372,6 +372,46 @@ test('employer monitoring is selected fairly at collection but remains a durable
   );
 });
 
+test('collection reports exact degraded capacity when priority employers exceed the hard bound', async () => {
+  const root = scanRoot();
+  const discoveries = Array.from({ length: 33 }, (_, index) => ({
+    canonicalName: `Priority Example ${String(index + 1).padStart(2, '0')}`,
+    userPriority: 'priority',
+    careersUrl: `https://careers-${index + 1}.example.test/jobs`,
+    access: {
+      terms: 'allowed', robots: 'allowed', genericEnabled: false, minIntervalMinutes: 60,
+    },
+    origin: {
+      kind: 'manual', recordedAt: '2026-07-30T10:00:00.000Z', reference: 'settings',
+    },
+  }));
+  writeEmployerRegistry(root, createEmployerRegistry(discoveries, {
+    now: () => '2026-07-30T10:00:00.000Z',
+  }));
+  const collected = await collectScanSources(root, DEFAULT_WORKSPACE_CONFIG, {
+    collectEmployersFn: async (employers) => {
+      assert.equal(employers.length, 32);
+      return { jobs: [], checks: [], results: [] };
+    },
+    fetchCafe: async () => ({ status: 'unavailable', jobs: [] }),
+    fetchAdzunaFn: async () => ({ status: 'unavailable', jobs: [] }),
+  });
+
+  assert.equal(collected.sources.employer_registry.status, 'degraded');
+  assert.equal(
+    collected.sources.employer_registry.reason,
+    'priority employer monitoring capacity was exceeded',
+  );
+  assert.deepEqual(collected.sources.employer_registry.monitoringCapacity, {
+    limit: 32,
+    eligible: 33,
+    eligiblePriority: 33,
+    omitted: 1,
+    omittedPriority: 1,
+  });
+  assert.equal(collected.sources.employer_registry.selectedEmployerIds.length, 32);
+});
+
 test('legacy migration overwrites generic seed placeholders and preserves user trees', () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'scout-migrate-'));
   const source = path.join(root, 'legacy');

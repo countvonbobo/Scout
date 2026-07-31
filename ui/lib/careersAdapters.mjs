@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { fetchPortal } from './ats.mjs';
 import {
   fetchPublicResource, PublicHttpError, publicUrl, resolvePublicDestination,
@@ -196,9 +197,10 @@ function genericLinks(html, {
     seen.add(url);
     found += 1;
     if (jobs.length < MAX_PAGE_JOBS) {
+      const providerId = `careers-generic-${createHash('sha256').update(url).digest('hex').slice(0, 32)}`;
       jobs.push({
-        providerId: url,
-        sourceRecordId: `careers-generic:${url}`,
+        providerId,
+        sourceRecordId: providerId,
         title: label,
         company: employerName,
         description: '',

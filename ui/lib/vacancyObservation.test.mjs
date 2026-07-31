@@ -234,3 +234,17 @@ test('source record identity is bounded and credential-shaped values are fingerp
   assert.ok(observation.sourceRecordId.length <= 160);
   assert.doesNotMatch(JSON.stringify(observation), /TOPSECRET|token=/i);
 });
+
+test('query-bearing URL provider identities are fingerprinted before durable observation storage', () => {
+  const observation = normaliseObservation({
+    providerId: 'https://careers.example.test/jobs/42?sig=PRIVATE123',
+    title: 'Engineer',
+    company: 'Example',
+    url: 'https://careers.example.test/jobs/42?sig=PRIVATE123',
+  }, {
+    sourceName: 'careers-generic',
+    fetchedAt: '2026-07-31T12:00:00.000Z',
+  });
+  assert.match(observation.sourceRecordId, /^provider-[a-f0-9]{32}$/);
+  assert.equal(JSON.stringify(observation).includes('PRIVATE123'), false);
+});

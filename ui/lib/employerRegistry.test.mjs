@@ -6,7 +6,7 @@ import test from 'node:test';
 import {
   canonicalEmployerId, createEmployerRegistry, employerRegistryRevision,
   loadEmployerRegistry, migrateLegacyPortals, reconcileEmployerDiscoveries,
-  recordEmployerChecks, selectEmployersForMonitoring, validateEmployerRegistry,
+  planEmployerMonitoring, recordEmployerChecks, selectEmployersForMonitoring, validateEmployerRegistry,
   undoEmployerRegistryReview, updateEmployerRegistryEntry, writeEmployerRegistry,
 } from './employerRegistry.mjs';
 
@@ -139,6 +139,32 @@ test('fair monitoring selects every eligible priority employer and ignores store
   assert.deepEqual(selected.map(({ id }) => id), reversed.map(({ id }) => id));
   assert.ok(selected.some(({ canonicalName }) => canonicalName === 'Priority A'));
   assert.equal(selected.some(({ canonicalName }) => canonicalName === 'Irrelevant A'), false);
+});
+
+test('priority monitoring overflow reports exact bounded omission evidence', () => {
+  const registry = createEmployerRegistry(Array.from({ length: 33 }, (_, index) => (
+    discovery(`Priority ${String(index + 1).padStart(2, '0')}`, {
+      userPriority: 'priority',
+    })
+  )), { now: () => AT });
+  const plan = planEmployerMonitoring(registry, {
+    limit: 12,
+    now: () => '2026-08-10T12:00:00.000Z',
+  });
+  assert.equal(plan.selected.length, 32);
+  assert.deepEqual({
+    capacity: plan.capacity,
+    eligible: plan.eligible,
+    eligiblePriority: plan.eligiblePriority,
+    omitted: plan.omitted,
+    omittedPriority: plan.omittedPriority,
+  }, {
+    capacity: 32,
+    eligible: 33,
+    eligiblePriority: 33,
+    omitted: 1,
+    omittedPriority: 1,
+  });
 });
 
 test('rate eligibility and inactive cadence are explicit rather than silent deletion', () => {

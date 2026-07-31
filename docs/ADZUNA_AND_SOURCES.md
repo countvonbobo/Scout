@@ -67,8 +67,10 @@ JavaScript-only shells are recorded honestly rather than bypassed. Priority
 employer pages with more than 100 qualifying structured postings or generic
 job links are reported as degraded capacity with the returned and parsed
 counts; the bounded result is never reported as a healthy complete page.
-Priority
-employers are selected whenever eligible, relevant/normal employers rotate
+Priority employers are selected first whenever eligible. A scan checks at most
+32 employers; if eligible priority employers exceed that bound, Scout reports
+degraded capacity with exact eligible and omitted counts instead of claiming
+complete coverage. Relevant/normal employers rotate
 fairly, inactive employers receive only a 30-day validation check, and
 irrelevant employers remain excluded until restored.
 
