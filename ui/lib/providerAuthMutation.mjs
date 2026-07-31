@@ -3,6 +3,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { atomicWriteFile } from './atomicWrite.mjs';
+import { currentLeaseOwner, processOwnerIsLiveOrAmbiguous } from './scanLease.mjs';
 
 const PROVIDERS = new Set(['codex', 'claude']);
 const PHASES = new Set(['login', 'logout']);
@@ -10,6 +11,7 @@ const SCHEMA_VERSION = 1;
 const DEFAULT_DURATION_MS = 11 * 60 * 1000;
 const DEFAULT_WORK_DURATION_MS = 30 * 60 * 1000;
 const GUARD_STALE_MS = 15_000;
+const GUARD_RECORD = 'owner.json';
 
 export class ProviderAuthMutationActiveError extends Error {
   constructor(provider, phase) {
@@ -136,19 +138,72 @@ function activeWorkRecords(target, provider, at, { prune = false } = {}) {
   return active;
 }
 
+function readGuardRecord(directory) {
+  try {
+    const stat = fs.lstatSync(directory);
+    if (stat.isSymbolicLink() || !stat.isDirectory()) return null;
+    const file = path.join(directory, GUARD_RECORD);
+    const fileStat = fs.lstatSync(file);
+    if (fileStat.isSymbolicLink() || !fileStat.isFile() || fileStat.size > 4_096) return null;
+    const record = JSON.parse(fs.readFileSync(file, 'utf8'));
+    if (!record || Object.keys(record).sort().join(',') !== 'acquiredAt,owner,token'
+      || !Number.isSafeInteger(record.acquiredAt)
+      || !/^[A-Za-z0-9-]{16,128}$/.test(record.token)
+      || !record.owner
+      || Object.keys(record.owner).sort().join(',') !== 'host,pid,processStart'
+      || typeof record.owner.host !== 'string'
+      || !Number.isSafeInteger(record.owner.pid)
+      || typeof record.owner.processStart !== 'string') return null;
+    return record;
+  } catch {
+    return null;
+  }
+}
+
+function removeOwnedGuard(directory, token) {
+  const current = readGuardRecord(directory);
+  if (!current || current.token !== token) return false;
+  fs.rmSync(directory, { recursive: true, force: true });
+  return true;
+}
+
+function createOwnedGuard(directory, acquiredAt) {
+  const token = randomUUID();
+  fs.mkdirSync(directory, { mode: 0o700 });
+  try {
+    atomicWriteFile(path.join(directory, GUARD_RECORD), `${JSON.stringify({
+      token,
+      owner: currentLeaseOwner(),
+      acquiredAt,
+    })}\n`, { mode: 0o600 });
+  } catch (error) {
+    fs.rmSync(directory, { recursive: true, force: true });
+    throw error;
+  }
+  return token;
+}
+
 function withGuard(root, provider, now, callback) {
   const target = paths(root, provider, true);
+  let token;
   try {
-    fs.mkdirSync(target.guard, { mode: 0o700 });
+    token = createOwnedGuard(target.guard, checkedNow(now));
   } catch (error) {
     if (error?.code !== 'EEXIST') throw error;
-    const stat = fs.lstatSync(target.guard);
-    if (!stat.isDirectory() || checkedNow(now) - Math.floor(stat.mtimeMs) <= GUARD_STALE_MS) return null;
+    const observed = readGuardRecord(target.guard);
+    if (!observed
+      || checkedNow(now) - observed.acquiredAt <= GUARD_STALE_MS
+      || processOwnerIsLiveOrAmbiguous(observed.owner)) return null;
     const quarantine = `${target.guard}.stale-${randomUUID()}`;
     try {
       fs.renameSync(target.guard, quarantine);
+      const moved = readGuardRecord(quarantine);
+      if (!moved || moved.token !== observed.token) {
+        if (!fs.existsSync(target.guard)) fs.renameSync(quarantine, target.guard);
+        return null;
+      }
       fs.rmSync(quarantine, { recursive: true, force: true });
-      fs.mkdirSync(target.guard, { mode: 0o700 });
+      token = createOwnedGuard(target.guard, checkedNow(now));
     } catch {
       return null;
     }
@@ -156,7 +211,7 @@ function withGuard(root, provider, now, callback) {
   try {
     return callback(target);
   } finally {
-    fs.rmSync(target.guard, { recursive: true, force: true });
+    removeOwnedGuard(target.guard, token);
   }
 }
 

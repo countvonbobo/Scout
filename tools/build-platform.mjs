@@ -43,18 +43,31 @@ export function buildMac({ arch = process.arch, nodeExecutable = process.execPat
   const plist = `<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd"><plist version="1.0"><dict><key>CFBundleName</key><string>Scout</string><key>CFBundleDisplayName</key><string>Scout</string><key>CFBundleIdentifier</key><string>app.scout.local</string><key>CFBundleVersion</key><string>${VERSION}</string><key>CFBundleShortVersionString</key><string>${VERSION}</string><key>CFBundleExecutable</key><string>Scout</string><key>CFBundlePackageType</key><string>APPL</string><key>LSMinimumSystemVersion</key><string>13.0</string><key>NSHighResolutionCapable</key><true/></dict></plist>`;
   fs.writeFileSync(path.join(contents, 'Info.plist'), plist);
   auditStageBeforePackaging(stage);
-  const auditedPayloadDigest = verifiedReleaseTreeDigest(bundle);
   fs.symlinkSync('/Applications', path.join(stage, 'dmg-root', 'Applications'));
+  const auditedPayloadDigest = verifiedMacDmgRootDigest(path.join(stage, 'dmg-root'));
   const output = path.join(ROOT, 'installer', 'output'); fs.mkdirSync(output, { recursive: true }); const name = arch === 'arm64' ? artifactNames().macArm : artifactNames().macIntel;
   run('hdiutil', ['create', '-volname', 'Scout', '-srcfolder', path.join(stage, 'dmg-root'), '-ov', '-format', 'UDZO', path.join(output, name)]);
-  if (verifiedReleaseTreeDigest(bundle) !== auditedPayloadDigest) {
-    throw new Error('audited macOS app payload changed during packaging');
+  if (verifiedMacDmgRootDigest(path.join(stage, 'dmg-root')) !== auditedPayloadDigest) {
+    throw new Error('audited macOS package root changed during packaging');
   }
   return { output: path.join(output, name), sha256: sha256(path.join(output, name)) };
 }
 
 function launcher(rootExpression) {
   return `#!/bin/sh\nSCOUT_ROOT=${rootExpression}\nexport SCOUT_ROOT\nexec "$SCOUT_ROOT/launcher/ScoutLauncher.sh" "$@"\n`;
+}
+
+export function verifiedMacDmgRootDigest(root) {
+  const entries = fs.readdirSync(root).sort();
+  if (entries.join('\0') !== ['Applications', 'Scout.app'].join('\0')) {
+    throw new Error('macOS package root contains an unexpected entry');
+  }
+  const applications = path.join(root, 'Applications');
+  const stat = fs.lstatSync(applications);
+  if (!stat.isSymbolicLink() || fs.readlinkSync(applications) !== '/Applications') {
+    throw new Error('macOS Applications link is invalid');
+  }
+  return `${verifiedReleaseTreeDigest(path.join(root, 'Scout.app'))}:Applications=/Applications`;
 }
 export function buildLinux({ nodeExecutable = process.execPath } = {}) {
   if (process.platform !== 'linux' || process.arch !== 'x64') throw new Error('Linux x64 packages must be built on Linux x64');

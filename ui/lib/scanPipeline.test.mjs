@@ -397,6 +397,59 @@ test('durable ranked stages preserve the established ranked discovery result', a
   });
 });
 
+test('production deduplicate stage reuses URL-less tracker identity as source coverage changes', async () => {
+  const profile = {
+    version: 1,
+    status: 'published',
+    id: 'profile-durable-id',
+    target: {},
+    negative: {},
+    compensation: {
+      currency: null,
+      period: 'year',
+      minimum: null,
+      minimumStrength: 'neutral',
+      unknownPolicy: 'include',
+    },
+  };
+  const initialSources = {
+    provider_z: {
+      jobs: [{
+        company: 'Synthetic Company',
+        title: 'Platform Engineer',
+        providerId: 'opening-z',
+        description: 'Operate reliable services and improve production resilience.',
+      }],
+    },
+  };
+  const runDeduplicate = async (sources, tracker) => {
+    const stages = createRankedDiscoveryStages({
+      collect: async () => ({ sources }),
+      profile,
+      tracker,
+    });
+    const collect = await stages.collect({ run: { runId: 'durable-id-run' } });
+    const normalised = stages.normalise({ priorArtifact: collect });
+    return stages.deduplicate({ priorArtifact: normalised });
+  };
+  const first = await runDeduplicate(initialSources, { opportunities: [] });
+  const prior = first.vacancies[0];
+  const enriched = await runDeduplicate({
+    provider_z: initialSources.provider_z,
+    provider_a: {
+      jobs: [{
+        company: 'Synthetic Company',
+        title: 'Platform Engineer',
+        providerId: 'opening-a',
+        description: 'Operate reliable services and improve production resilience.',
+      }],
+    },
+  }, { opportunities: [prior] });
+
+  assert.equal(enriched.vacancies.length, 1);
+  assert.equal(enriched.vacancies[0].vacancyId, prior.vacancyId);
+});
+
 test('durable collection preserves bounded employer monitoring evidence for finalisation', async () => {
   const registry = createEmployerRegistry([], { now: () => '2026-07-31T09:00:00.000Z' });
   const stages = createRankedDiscoveryStages({
@@ -1105,6 +1158,32 @@ test('bounded decision history always preserves reviewed outcomes ahead of pre-a
   assert.equal(history.length, 512);
   assert.equal(history[0].vacancyId, 'reviewed-vacancy');
   assert.equal(history.some(({ vacancyId }) => vacancyId === 'reviewed-vacancy'), true);
+  assert.equal(history.some(({ vacancyId }) => vacancyId?.startsWith('pre-')), true);
+});
+
+test('bounded decision history reserves space for a newest pre-assessment outcome', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'scout-pre-history-reserve-'));
+  fs.mkdirSync(path.join(root, 'data'), { recursive: true });
+  const run = {
+    timestamp: '2026-07-31T10:00:00.000Z',
+    reviewed: Array.from({ length: 512 }, (_, index) => ({
+      vacancyId: `reviewed-${index}`,
+      company: `Reviewed Company ${index}`,
+      role: `Reviewed Role ${index}`,
+      outcome: 'provider_discarded',
+    })),
+    explanations: [{
+      vacancy_id: 'newest-pre-assessment',
+      company: 'Pre Company',
+      role: 'Pre Role',
+      reason_code: 'below-threshold',
+      stages: { assessed: false },
+    }],
+  };
+  fs.writeFileSync(path.join(root, 'data', 'scan-runs.jsonl'), `${JSON.stringify(run)}\n`);
+  const history = readVacancyDecisionHistory(root);
+  assert.equal(history.length, 512);
+  assert.equal(history.some(({ vacancyId }) => vacancyId === 'newest-pre-assessment'), true);
 });
 
 test('durable URL-less decision history preserves provider identity across changing source coverage', () => {

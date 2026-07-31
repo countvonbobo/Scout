@@ -978,6 +978,53 @@ test('shutdown refuses handoff while a pre-session provider start still owns aut
   await manager.shutdown();
 });
 
+test('shutdown deadline bounds a credential clear blocked in provider status', async () => {
+  const login = fakeChild();
+  const validation = fakeChild();
+  let finishClearStatus;
+  const clearStatus = new Promise((resolve) => { finishClearStatus = resolve; });
+  let statusCalls = 0;
+  const providerStatus = async () => {
+    statusCalls += 1;
+    if (statusCalls > 1) return clearStatus;
+    const status = { installed: true, authenticated: false };
+    Object.defineProperties(status, {
+      executable: { value: '/trusted/bin/claude' },
+      env: { value: { PATH: '/trusted/bin', HOME: '/synthetic-owner' } },
+    });
+    return status;
+  };
+  const manager = createProviderLoginManager({
+    providerStatus,
+    spawn: (() => {
+      const children = [login, validation];
+      return () => children.shift();
+    })(),
+    confirmProviderHealth: async () => ({
+      kind: 'remote-auth-failure',
+      source: 'post-auth',
+    }),
+    shutdownDeadlineMs: 20,
+  });
+  const expired = await manager.startProviderLogin('claude', OWNER);
+  login.close(0);
+  await new Promise((resolve) => setImmediate(resolve));
+  validation.close(0);
+  await new Promise((resolve) => setImmediate(resolve));
+
+  const clearing = manager.clearClaudeCredentials(expired.sessionId, OWNER);
+  await new Promise((resolve) => setImmediate(resolve));
+  const startedAt = Date.now();
+  await assert.rejects(
+    manager.shutdown(),
+    /credential clearing did not settle during shutdown/,
+  );
+  assert.ok(Date.now() - startedAt < 1_000);
+  finishClearStatus({ installed: false, authenticated: false });
+  await assert.rejects(clearing, /shutting down/);
+  await manager.shutdown();
+});
+
 test('Codex device-code parsing rejects token-shaped output', async () => {
   const h = harness();
   const started = await h.manager.startProviderLogin('codex', OWNER);

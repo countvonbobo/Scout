@@ -23,6 +23,23 @@ test('normalisation preserves explicit values and unknowns with provenance', () 
   assert.deepEqual(observation.laneIds, ['lane-1']);
 });
 
+test('malformed and non-web URLs fail closed without retaining credentials', () => {
+  const credentialMarker = ['synthetic', 'access', 'value'].join('-');
+  for (const url of [
+    `not a url?access_token=${credentialMarker}`,
+    `ftp://example.test/job?access_token=${credentialMarker}`,
+    `https://user:${credentialMarker}@jobs.example/1?access_token=${credentialMarker}#private`,
+  ]) {
+    const observation = normaliseObservation({
+      providerId: 'job-private-url',
+      title: 'Engineer',
+      company: 'Acme',
+      url,
+    }, { sourceName: 'fixture', fetchedAt: NOW, laneId: 'lane-1' });
+    assert.doesNotMatch(JSON.stringify(observation), new RegExp(credentialMarker));
+  }
+});
+
 test('normalisation retains every bounded matching lane in stable order', () => {
   const observation = normaliseObservation({
     providerId: 'job-lanes', title: 'Researcher', company: 'Acme',

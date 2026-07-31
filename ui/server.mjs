@@ -2712,6 +2712,7 @@ routes['POST /api/restart'] = (req, res, body) => {
     });
   }
   replyJson(res, 200, { ok: true, restarting: true });
+  closeRuntimeAdmission();
   setTimeout(() => {
     const productionServer = runtimeHttpServer?.listening ? runtimeHttpServer : null;
     const quiesced = productionServer
@@ -2728,6 +2729,7 @@ routes['POST /api/restart'] = (req, res, body) => {
 
 routes['POST /api/shutdown'] = (req, res) => {
   replyJson(res, 200, { ok: true, shuttingDown: true });
+  closeRuntimeAdmission();
   setTimeout(() => {
     const productionServer = runtimeHttpServer?.listening ? runtimeHttpServer : null;
     const quiesced = productionServer

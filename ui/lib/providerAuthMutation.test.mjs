@@ -14,6 +14,7 @@ import {
   renewProviderAuthMutation,
   renewProviderWork,
 } from './providerAuthMutation.mjs';
+import { currentLeaseOwner } from './scanLease.mjs';
 
 function workspace(t) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'scout-provider-auth-'));
@@ -121,6 +122,28 @@ test('simultaneous processes admit one auth mutation per provider', async (t) =>
   assert.deepEqual(
     (await Promise.all([contender(root, 'claude'), contender(root, 'claude')])).sort(),
     ['acquired', 'blocked'],
+  );
+});
+
+test('an old guard owned by this live process cannot be stolen', (t) => {
+  const root = workspace(t);
+  const guard = path.join(root, '.scout', 'provider-auth', 'v1', 'codex.guard');
+  const guardIdentity = ['live', 'guard', 'token', '0001'].join('-');
+  fs.mkdirSync(guard, { recursive: true });
+  fs.writeFileSync(path.join(guard, 'owner.json'), JSON.stringify({
+    token: String(guardIdentity),
+    owner: currentLeaseOwner(),
+    acquiredAt: 0,
+  }));
+  assert.equal(acquireProviderAuthMutation(root, 'codex', {
+    owner: currentLeaseOwner(),
+    now: 20_000,
+    durationMs: 5_000,
+    mutationId: 'must-remain-blocked',
+  }), null);
+  assert.equal(
+    JSON.parse(fs.readFileSync(path.join(guard, 'owner.json'), 'utf8')).token,
+    guardIdentity,
   );
 });
 

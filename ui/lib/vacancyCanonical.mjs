@@ -1,5 +1,7 @@
 import crypto from 'node:crypto';
-import { jobIdentity, mergeSourceReferences, sameUnderlyingJob } from './jobIdentity.mjs';
+import {
+  jobIdentity, mergeSourceReferences, sameUnderlyingJob, sourceReferencesOf,
+} from './jobIdentity.mjs';
 
 const DISPLAY_FIELDS = [
   'employer', 'employerReference', 'title', 'location', 'workingPattern',
@@ -174,9 +176,20 @@ function disambiguateCurrentVacancyIds(vacancies) {
 }
 
 function reconcileDurableVacancyIds(vacancies, priorVacancies) {
-  const priors = (priorVacancies || []).filter((prior) => (
-    prior && typeof prior === 'object' && typeof prior.vacancyId === 'string' && prior.vacancyId
-  ));
+  const priorById = new Map();
+  for (const prior of priorVacancies || []) {
+    if (!prior || typeof prior !== 'object' || typeof prior.vacancyId !== 'string' || !prior.vacancyId) continue;
+    const existing = priorById.get(prior.vacancyId);
+    const evidenceScore = (value) => (
+      sourceReferencesOf(value).length * 4
+      + Number(Boolean(jobIdentity(value).company))
+      + Number(Boolean(jobIdentity(value).title))
+    );
+    if (!existing || evidenceScore(prior) > evidenceScore(existing)) {
+      priorById.set(prior.vacancyId, prior);
+    }
+  }
+  const priors = [...priorById.values()];
   const claimed = new Set();
   const reservedPriorIds = new Set(priors.map(({ vacancyId }) => vacancyId));
   const usedIds = new Set();
@@ -199,7 +212,8 @@ function reconcileDurableVacancyIds(vacancies, priorVacancies) {
     if (match) {
       claimed.add(match.index);
       vacancyId = match.prior.vacancyId;
-    } else if (reservedPriorIds.has(vacancyId) || usedIds.has(vacancyId)) {
+    }
+    if ((!match && reservedPriorIds.has(vacancyId)) || usedIds.has(vacancyId)) {
       vacancyId = referenceDisambiguatedId(vacancy);
     }
     usedIds.add(vacancyId);

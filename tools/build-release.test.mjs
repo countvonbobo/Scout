@@ -5,6 +5,7 @@ import path from 'node:path';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 import {
+  auditStageBeforePackaging,
   auditPublicSourceStage,
   includePublicSourcePath, includeReleasePath, productionDependencyFilter, productionLockfile,
   productionPackageManifest, PUBLIC_SOURCE_FILES, RELEASE_FILES,
@@ -66,6 +67,7 @@ test('release manifest is allowlisted and excludes private workspace roots', () 
 
 test('release tree filter omits tests and snapshots', () => {
   assert.equal(includeReleasePath('ui/lib/workspace.mjs'), true);
+  assert.equal(includeReleasePath('ui/.git/private.txt'), false);
   assert.equal(includeReleasePath('templates/workspace/workspace.json'), true);
   assert.equal(includeReleasePath('ui/lib/workspace.test.mjs'), false);
   assert.equal(includeReleasePath('ui/lib/fixtures/fake-cli.mjs'), false);
@@ -215,6 +217,21 @@ test('public source publication refuses to audit without configured personal mar
   assert.throws(
     () => auditPublicSourceStage({ root: ROOT, stageDir, markers: '' }),
     /requires at least one configured personal marker/,
+  );
+});
+
+test('stage audit inspects unexpected nested git metadata', () => {
+  const stageDir = fs.mkdtempSync(path.join(os.tmpdir(), 'scout-git-audit-stage-'));
+  fs.mkdirSync(path.join(stageDir, 'app', 'ui', '.git'), { recursive: true });
+  fs.writeFileSync(
+    path.join(stageDir, 'app', 'ui', '.git', 'private.txt'),
+    ['-----BEGIN PRIVATE', ' KEY-----', 'SyntheticGitAuditMarker'].join(''),
+  );
+  assert.throws(
+    () => auditStageBeforePackaging(stageDir, {
+      env: { ...process.env, SCOUT_RELEASE_MARKERS: 'SyntheticGitAuditMarker' },
+    }),
+    /privacy audit failed|private-key|personal-marker/,
   );
 });
 

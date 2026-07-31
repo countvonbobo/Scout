@@ -1301,6 +1301,18 @@ export function createProviderLoginManager({
   async function shutdown() {
     shuttingDown = true;
     const deadlineAt = Date.now() + shutdownDeadlineMs;
+    const settleBeforeDeadline = async (promises) => {
+      if (!promises.length) return true;
+      let completed = false;
+      await Promise.race([
+        Promise.allSettled(promises).then(() => { completed = true; }),
+        new Promise((resolve) => {
+          const timer = setTimeout(resolve, Math.max(0, deadlineAt - Date.now()));
+          timer.unref?.();
+        }),
+      ]);
+      return completed;
+    };
     if (pendingStartOperations.size) {
       await Promise.race([
         Promise.allSettled([...pendingStartOperations]),
@@ -1333,16 +1345,22 @@ export function createProviderLoginManager({
       ]));
     }
     await Promise.all(cleanup);
-    await Promise.all(
+    await settleBeforeDeadline(
       [...pendingClearSettlers.values()].map((settle) => settle()),
     );
-    await Promise.allSettled([...pendingClearOperations]);
-    await Promise.allSettled([...pendingHealthWrites]);
+    await settleBeforeDeadline([...pendingClearOperations]);
+    await settleBeforeDeadline([...pendingHealthWrites]);
     if (pendingStartOperations.size) {
       throw new Error('provider start did not settle during shutdown');
     }
     if ([...trackedChildren].some(({ closed }) => !closed)) {
       throw new Error('provider child did not close during shutdown');
+    }
+    if (pendingClearOperations.size) {
+      throw new Error('provider credential clearing did not settle during shutdown');
+    }
+    if (pendingHealthWrites.size) {
+      throw new Error('provider health write did not settle during shutdown');
     }
   }
 

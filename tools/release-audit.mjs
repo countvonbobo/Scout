@@ -7,7 +7,7 @@ import { fileURLToPath } from 'node:url';
 import { isMainModule } from '../ui/lib/mainModule.mjs';
 
 const DEFAULT_BUILD_DIRS = ['dist', path.join('installer', 'output')];
-const IGNORED_DIRECTORY_NAMES = new Set(['.git', 'node_modules']);
+const IGNORED_DIRECTORY_NAMES = new Set(['node_modules']);
 const PLACEHOLDER = /^(?:change-?me|dummy|example|fake|not-?set|placeholder|redacted|replace-?me|test|todo|<your-api-key>|<your-password>|\$\{[A-Z][A-Z0-9_]*\}|\$\{\{\s*[A-Z][A-Z0-9_.-]*\s*\}\})$/i;
 const NON_CREDENTIAL_ASSIGNMENT_TOKENS = new Set([
   'cancellationtoken', 'locktoken',

@@ -61,6 +61,19 @@ test('onboarding evidence has stable IDs and oversized imports are never truncat
   assert.throws(() => buildOnboardingEvidence(dir, config, 10), /reduce it below/);
 });
 
+test('onboarding evidence refuses import symlinks before reading provider input', () => {
+  if (process.platform === 'win32') return;
+  const dir = root();
+  const outside = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'scout-host-secret-')), 'secret.txt');
+  fs.writeFileSync(outside, 'SYNTHETIC_HOST_SECRET');
+  fs.symlinkSync(outside, path.join(dir, 'imports', 'escaped.txt'));
+  const config = JSON.parse(fs.readFileSync(path.join(dir, 'workspace.json')));
+  assert.throws(
+    () => buildOnboardingEvidence(dir, config),
+    /symlink|junction/,
+  );
+});
+
 test('proposal validation rejects invented evidence IDs and bad score arithmetic', () => {
   const valid = proposal();
   const evidence = [{ id: 'config-roles' }];

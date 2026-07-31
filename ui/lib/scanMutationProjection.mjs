@@ -123,6 +123,19 @@ function canonicalUrl(value) {
   }
 }
 
+function durableVacancyId(value) {
+  return canonicalUrl(value) || identifier(value);
+}
+
+function safeRankingHistory(value) {
+  return (Array.isArray(value) ? value : []).map((item) => ({
+    rankedAt: /^\d{4}-\d{2}-\d{2}$/.test(item?.rankedAt || '') ? item.rankedAt : null,
+    profileId: identifier(item?.profileId),
+    learningVersionId: identifier(item?.learningVersionId),
+    preRankScore: number(item?.preRankScore),
+  })).filter((item) => item.rankedAt && item.profileId && item.learningVersionId).slice(-32);
+}
+
 function digest(value) {
   return createHash('sha256').update(String(value || '')).digest('hex');
 }
@@ -213,6 +226,10 @@ function safeOpportunity(entry, existed, prior = null) {
     sources: (entry?.sources || []).map(canonicalUrl).filter(Boolean).slice(0, 8),
     sourceReferences: safeReferences(entry),
     jobIdentity: safeIdentity(entry),
+    vacancyId: durableVacancyId(entry?.vacancyId),
+    profileId: identifier(entry?.profileId),
+    learningVersionId: identifier(entry?.learningVersionId),
+    rankingHistory: safeRankingHistory(entry?.rankingHistory),
     lastChecked: /^\d{4}-\d{2}-\d{2}$/.test(entry?.lastChecked || '') ? entry.lastChecked : null,
     foundVia: code(entry?.foundVia),
     ...(entry?.advertUpdate ? {
@@ -288,6 +305,7 @@ function safeRunRecord(record) {
     inbox_rechecked: number(record?.inbox_rechecked),
     inbox_archived: number(record?.inbox_archived),
     profile_id: identifier(record?.profile_id),
+    learning_version_id: identifier(record?.learning_version_id),
     discovery_engine: code(record?.discovery_engine, 'legacy-discovery'),
     ...(record?.funnel ? { funnel: safeFunnel(record.funnel) } : {}),
     ...(record?.selection_summary ? { selection_summary: safeSelectionSummary(record.selection_summary) } : {}),
@@ -343,6 +361,7 @@ function safeRunRecord(record) {
         ? item.contentFingerprint
         : null,
       profileId: identifier(item?.profileId),
+      learningVersionId: identifier(item?.learningVersionId),
       categoryId: code(item?.categoryId),
       outcome: SAFE_OUTCOME.has(item?.outcome) ? item.outcome : 'below_threshold',
       score: number(item?.score),
@@ -445,6 +464,10 @@ function canonicalTrackerRecipe(recipe) {
       sources: (item?.sources || []).map(canonicalUrl).filter(Boolean).slice(0, 8),
       sourceReferences: safeReferences({ sourceReferences: item?.sourceReferences }),
       jobIdentity: safeIdentity({ jobIdentity: item?.jobIdentity }),
+      vacancyId: durableVacancyId(item?.vacancyId),
+      profileId: identifier(item?.profileId),
+      learningVersionId: identifier(item?.learningVersionId),
+      rankingHistory: safeRankingHistory(item?.rankingHistory),
       lastChecked: /^\d{4}-\d{2}-\d{2}$/.test(item?.lastChecked || '') ? item.lastChecked : null,
       foundVia: code(item?.foundVia),
       ...(item?.advertUpdate ? {
@@ -495,6 +518,10 @@ function renderTracker(currentContent, recipe) {
       sources: upsert.sources,
       sourceReferences: upsert.sourceReferences,
       jobIdentity: upsert.jobIdentity,
+      vacancyId: upsert.vacancyId,
+      profileId: upsert.profileId,
+      learningVersionId: upsert.learningVersionId,
+      rankingHistory: upsert.rankingHistory,
       lastChecked: upsert.lastChecked,
       foundVia: upsert.foundVia,
       ...(upsert.advertUpdate ? { advertUpdate: upsert.advertUpdate } : {}),

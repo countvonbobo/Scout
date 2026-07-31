@@ -812,6 +812,7 @@ test('run-log recipes project funnel counters without copying nested source pros
       explanation: privateBody,
     },
     profile_id: privateBody,
+    learning_version_id: 'learning-safe',
     assessment_failures: [{ jobId: privateBody, code: 'assessment-failed' }],
     explanations: [{ vacancy_id: privateBody, assessment_status: 'failed' }],
     reviewed: [{
@@ -822,6 +823,7 @@ test('run-log recipes project funnel counters without copying nested source pros
       sourceUrl: 'https://example.test/jobs/1?token=private#fragment',
       contentFingerprint: 'a'.repeat(64),
       profileId: 'profile-safe',
+      learningVersionId: 'learning-safe',
       categoryId: 'general',
       outcome: 'below_threshold',
       score: 42,
@@ -859,11 +861,13 @@ test('run-log recipes project funnel counters without copying nested source pros
     sourceReferences: [],
     contentFingerprint: 'a'.repeat(64),
     profileId: 'profile-safe',
+    learningVersionId: 'learning-safe',
     categoryId: 'general',
     outcome: 'below_threshold',
     score: 42,
     reasonCodes: ['below-threshold'],
   }]);
+  assert.equal(recipe.record.learning_version_id, 'learning-safe');
   assert.deepEqual(scanReportRecipe({
     date: '2026-07-28',
     discarded: {
@@ -875,4 +879,39 @@ test('run-log recipes project funnel counters without copying nested source pros
       private_counter: 999,
     },
   }).model.discarded, recipe.record.discarded);
+});
+
+test('tracker recipes preserve bounded durable scan identity and ranking lineage', () => {
+  const recipe = trackerMergeRecipe(
+    '{"opportunities":[]}',
+    JSON.stringify({
+      updated: '2026-07-31',
+      opportunities: [{
+        id: 'safe-company-role-2026-07',
+        company: 'Safe Company',
+        role: 'Safe Role',
+        vacancyId: 'https://jobs.example.test/role?access_token=redacted',
+        profileId: 'profile-safe',
+        learningVersionId: 'learning-safe',
+        rankingHistory: [{
+          rankedAt: '2026-07-31',
+          profileId: 'profile-safe',
+          learningVersionId: 'learning-safe',
+          preRankScore: 73,
+          privateBody: 'must not persist',
+        }],
+      }],
+    }),
+  );
+  const upsert = recipe.upserts[0];
+  assert.equal(upsert.vacancyId, 'https://jobs.example.test/role');
+  assert.equal(upsert.profileId, 'profile-safe');
+  assert.equal(upsert.learningVersionId, 'learning-safe');
+  assert.deepEqual(upsert.rankingHistory, [{
+    rankedAt: '2026-07-31',
+    profileId: 'profile-safe',
+    learningVersionId: 'learning-safe',
+    preRankScore: 73,
+  }]);
+  assert.doesNotMatch(JSON.stringify(recipe), /must not persist|access_token/);
 });

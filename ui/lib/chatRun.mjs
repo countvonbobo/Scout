@@ -82,6 +82,7 @@ function providerFailure(detail) {
 export function runTurn({
   command, args, prompt, cwd, parseLine,
   env = process.env,
+  spawnFn = spawn,
   onEvent = () => {},
   timeoutMs = 600000,
   maxOutputBytes = 8 * 1024 * 1024,
@@ -112,7 +113,7 @@ export function runTurn({
       partial: { stdout: '', stderr: '' },
     };
     const invocation = commandInvocation(command, args, { env });
-    child = spawn(invocation.command, invocation.args, {
+    child = spawnFn(invocation.command, invocation.args, {
       cwd,
       shell: false,
       windowsHide: true,
@@ -130,12 +131,7 @@ export function runTurn({
     const timer = setTimeout(() => { timedOut = true; stopChild(); }, timeoutMs);
     child.on('error', (err) => {
       clearTimeout(timer);
-      clearTimeout(terminationTimer);
-      resolve({
-        ok: false,
-        error: err.code === 'ENOENT' ? 'Provider CLI is unavailable.' : 'Provider turn could not start.',
-        reasonCode: err.code === 'ENOENT' ? 'provider-unavailable' : 'process-start-failed',
-      });
+      state.processError = err;
     });
     const observeOutput = (stream, chunk) => {
       if (outputExceeded) return;
@@ -182,7 +178,17 @@ export function runTurn({
       clearTimeout(timer);
       clearTimeout(terminationTimer);
       const filesTouched = [...state.files];
-      if (outputExceeded) {
+      if (state.processError) {
+        resolve({
+          ok: false,
+          error: state.processError.code === 'ENOENT'
+            ? 'Provider CLI is unavailable.'
+            : 'Provider turn could not start.',
+          reasonCode: state.processError.code === 'ENOENT'
+            ? 'provider-unavailable'
+            : 'process-start-failed',
+        });
+      } else if (outputExceeded) {
         resolve({
           ok: false,
           error: 'Provider output exceeded the safe limit.',

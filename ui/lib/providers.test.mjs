@@ -93,6 +93,25 @@ test('provider command timeout escalates but does not settle before child closur
   assert.deepEqual(child.killSignals, []);
 });
 
+test('provider command process errors do not settle before child closure', async () => {
+  const child = new EventEmitter();
+  child.stdout = new PassThrough();
+  child.stderr = new PassThrough();
+  child.kill = () => true;
+  let settled = false;
+  const pending = runProviderCommand('synthetic-provider', [], {
+    spawn: () => child,
+    timeoutMs: 5_000,
+  });
+  pending.then(() => { settled = true; });
+  child.emit('error', Object.assign(new Error('synthetic spawn error'), { code: 'ENOENT' }));
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(settled, false);
+  child.emit('close', null);
+  const result = await pending;
+  assert.equal(result.error.code, 'ENOENT');
+});
+
 test('provider detector shares an in-flight probe and caches the result briefly', async () => {
   let calls = 0;
   let clock = 1_000;

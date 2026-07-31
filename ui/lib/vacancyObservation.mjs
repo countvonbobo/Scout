@@ -50,6 +50,9 @@ export function canonicaliseUrl(value) {
   if (!url) return null;
   try {
     const parsed = new URL(url);
+    if (!['http:', 'https:'].includes(parsed.protocol)) return null;
+    parsed.username = '';
+    parsed.password = '';
     for (const key of [...parsed.searchParams.keys()]) {
       if (TRACKING_PARAMETERS.test(key) || CREDENTIAL_PARAMETERS.test(key)) {
         parsed.searchParams.delete(key);
@@ -59,7 +62,7 @@ export function canonicaliseUrl(value) {
     parsed.searchParams.sort();
     return parsed.toString().replace(/\/$/, '');
   } catch {
-    return url;
+    return null;
   }
 }
 
@@ -179,8 +182,8 @@ export function normaliseObservation(job, {
   const fingerprintInput = {
     ...sourceJob,
     sourceRecordId: recordId,
-    url: canonicalUrl || text(job.url),
-    sourceUrl: canonicalUrl || text(job.sourceUrl),
+    url: canonicalUrl,
+    sourceUrl: canonicalUrl,
   };
   const rawFingerprint = fingerprint(stableJson(fingerprintInput));
   const observationId = fingerprint(

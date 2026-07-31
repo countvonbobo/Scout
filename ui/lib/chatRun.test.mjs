@@ -1,5 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { EventEmitter } from 'node:events';
+import { PassThrough } from 'node:stream';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { runTurn } from './chatRun.mjs';
@@ -119,6 +121,30 @@ test('missing binary resolves with a not-found error', async () => {
   assert.equal(r.ok, false);
   assert.equal(r.error, 'Provider CLI is unavailable.');
   assert.equal(r.reasonCode, 'provider-unavailable');
+});
+
+test('process errors remain close-gated before a chat turn settles', async () => {
+  const child = new EventEmitter();
+  child.pid = 4242;
+  child.stdin = new PassThrough();
+  child.stdout = new PassThrough();
+  child.stderr = new PassThrough();
+  child.kill = () => true;
+  let settled = false;
+  const turn = runTurn({
+    command: 'synthetic-provider',
+    args: [],
+    prompt: 'hello',
+    cwd: REPO,
+    parseLine: () => [],
+    spawnFn: () => child,
+  });
+  turn.finished.then(() => { settled = true; });
+  child.emit('error', Object.assign(new Error('synthetic spawn failure'), { code: 'ENOENT' }));
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(settled, false);
+  child.emit('close', null);
+  assert.equal((await turn.finished).reasonCode, 'provider-unavailable');
 });
 
 test('tool paths on another Windows drive are excluded', { skip: process.platform !== 'win32' }, async () => {

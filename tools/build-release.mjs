@@ -89,6 +89,8 @@ export function includeCopiedTreePath(relative) {
   const value = normalise(relative);
   const lower = value.toLocaleLowerCase('en-US');
   const base = path.posix.basename(lower);
+  const parts = lower.split('/').filter(Boolean);
+  if (parts.includes('.git')) return false;
   if (
     base === 'workspace.json'
     && lower !== 'templates/workspace/workspace.json'

@@ -12,6 +12,7 @@ import {
   releaseProviderWork, renewProviderWork,
 } from './providerAuthMutation.mjs';
 import { withWorkspaceMutationAuthority } from './workspaceMutationAuthority.mjs';
+import { validatePhysicalWorkspacePath } from './physicalPath.mjs';
 
 export const ONBOARDING_INPUT_LIMIT = 80_000;
 export const ONBOARDING_FILES = Object.freeze([
@@ -176,10 +177,19 @@ export function buildOnboardingEvidence(root, config, limit = ONBOARDING_INPUT_L
   const seenImportLines = new Set();
   const imports = workspacePaths(root).imports;
   if (fs.existsSync(imports)) {
+    validatePhysicalWorkspacePath(root, imports, 'onboarding import directory');
     const files = fs.readdirSync(imports).filter((name) => name.toLowerCase().endsWith('.txt')).sort();
     let lineNumber = 0;
     for (const name of files) {
-      const lines = fs.readFileSync(path.join(imports, name), 'utf8').split(/\r?\n/);
+      const file = validatePhysicalWorkspacePath(
+        root,
+        path.join(imports, name),
+        'onboarding import evidence',
+      );
+      if (!fs.lstatSync(file).isFile()) {
+        throw new Error('onboarding import evidence must be a regular file');
+      }
+      const lines = fs.readFileSync(file, 'utf8').split(/\r?\n/);
       for (const line of lines) {
         const text = line.trim();
         if (text && !seenImportLines.has(text)) {

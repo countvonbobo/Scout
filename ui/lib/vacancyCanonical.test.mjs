@@ -306,6 +306,33 @@ test('privacy-canonical URLs remain unique for distinct same-source provider vac
   assert.notEqual(laterDistinct.vacancyId, first.vacancyId);
 });
 
+test('duplicate prior records cannot assign one durable vacancy ID to two current openings', () => {
+  const prior = canonicaliseObservations([observation({
+    source: 'provider-a',
+    providerId: 'opening-old',
+    url: null,
+    description: 'Build stable services.',
+  })]).vacancies[0];
+  const current = canonicaliseObservations([
+    observation({
+      source: 'provider-b',
+      providerId: 'opening-current-1',
+      url: null,
+      description: 'Build stable services.',
+    }),
+    observation({
+      source: 'provider-b',
+      providerId: 'opening-current-2',
+      url: null,
+      description: 'Build stable services.',
+    }),
+  ], { priorVacancies: [prior, structuredClone(prior)] }).vacancies;
+
+  assert.equal(current.length, 2);
+  assert.equal(new Set(current.map(({ vacancyId }) => vacancyId)).size, 2);
+  assert.equal(current.filter(({ vacancyId }) => vacancyId === prior.vacancyId).length, 1);
+});
+
 test('canonicalisation rejects semantic responsibility overflow instead of truncating evidence', () => {
   const semantic = {
     ...observation({ source: 'provider-z', providerId: 'capacity-1' }),

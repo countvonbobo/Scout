@@ -305,7 +305,7 @@ export function runProviderCommand(command, args, options = {}) {
     };
     child.stdout?.on('data', (chunk) => collect(stdout, chunk, 'stdout'));
     child.stderr?.on('data', (chunk) => collect(stderr, chunk, 'stderr'));
-    child.on('error', (value) => { error = value; finish(null); });
+    child.on('error', (value) => { error = value; });
     child.on('close', (status) => finish(status));
   });
 }

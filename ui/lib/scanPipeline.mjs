@@ -1263,8 +1263,18 @@ export function readVacancyDecisionHistory(root, { limit = VACANCY_DECISION_HIST
     };
     for (const item of [...assessed].reverse()) append(item, reviewedRecords);
     for (const item of [...preAssessment].reverse()) append(item, preAssessmentRecords);
+    if (reviewedRecords.length >= boundedLimit && preAssessmentRecords.length >= boundedLimit) break;
   }
-  return [...reviewedRecords, ...preAssessmentRecords].slice(0, boundedLimit);
+  if (!reviewedRecords.length) return preAssessmentRecords.slice(0, boundedLimit);
+  if (!preAssessmentRecords.length) return reviewedRecords.slice(0, boundedLimit);
+  const preAssessmentReserve = Math.max(1, Math.floor(boundedLimit / 4));
+  let reviewedCount = Math.min(reviewedRecords.length, boundedLimit - preAssessmentReserve);
+  let preAssessmentCount = Math.min(preAssessmentRecords.length, boundedLimit - reviewedCount);
+  reviewedCount = Math.min(reviewedRecords.length, boundedLimit - preAssessmentCount);
+  return [
+    ...reviewedRecords.slice(0, reviewedCount),
+    ...preAssessmentRecords.slice(0, preAssessmentCount),
+  ];
 }
 
 function observationInputs(sources) {
@@ -1744,7 +1754,9 @@ export function createRankedDiscoveryStages({
       };
     }),
     deduplicate: withRankedArtifactCodec('deduplicate', function deduplicateStage({ priorArtifact }) {
-      const canonical = canonicaliseObservations(priorArtifact.observations);
+      const canonical = canonicaliseObservations(priorArtifact.observations, {
+        priorVacancies: reviewedHistory,
+      });
       return {
         initialFunnel: priorArtifact.initialFunnel,
         normalisedCount: priorArtifact.observations.length,

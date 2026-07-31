@@ -1,7 +1,9 @@
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { test } from 'node:test';
-import { artifactNames } from './build-platform.mjs';
+import { artifactNames, verifiedMacDmgRootDigest } from './build-platform.mjs';
 test('cross-platform artifacts are versioned and architecture-specific', () => {
   assert.deepEqual(artifactNames('1.2.3-beta.1'), {
     macArm: 'Scout-1.2.3-beta.1-macos-arm64.dmg', macIntel: 'Scout-1.2.3-beta.1-macos-x64.dmg',
@@ -32,4 +34,20 @@ test('platform packaging consumes verified staged inputs and audits payloads bef
     build.match(/export function buildMac[\s\S]*?return \{ output/)?.[0] || '',
     /auditStageBeforePackaging\(stage\)[\s\S]*fs\.symlinkSync\('\/Applications'/,
   );
+});
+
+test('macOS package-root verification covers the exact app and Applications link', () => {
+  if (process.platform === 'win32') return;
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'scout-mac-root-'));
+  fs.mkdirSync(path.join(root, 'Scout.app'));
+  fs.writeFileSync(path.join(root, 'Scout.app', 'payload'), 'reviewed');
+  fs.symlinkSync('/Applications', path.join(root, 'Applications'));
+  assert.match(verifiedMacDmgRootDigest(root), /Applications=\/Applications/);
+
+  fs.writeFileSync(path.join(root, 'unexpected.txt'), 'private');
+  assert.throws(() => verifiedMacDmgRootDigest(root), /unexpected entry/);
+  fs.rmSync(path.join(root, 'unexpected.txt'));
+  fs.rmSync(path.join(root, 'Applications'));
+  fs.symlinkSync('/tmp', path.join(root, 'Applications'));
+  assert.throws(() => verifiedMacDmgRootDigest(root), /link is invalid/);
 });

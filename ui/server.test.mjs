@@ -1403,6 +1403,7 @@ test('restart responds first, then schedules the respawn', async () => {
     assert.equal(response.status, 200);
     assert.deepEqual(JSON.parse(response.text), { ok: true, restarting: true });
     assert.equal(respawned, false, 'respawn must happen after the response is sent');
+    assert.equal((await request({ path: '/api/app-info' })).status, 503);
     const deadline = Date.now() + 2_000;
     while (!respawned && Date.now() < deadline) {
       await new Promise((resolve) => setTimeout(resolve, 10));
@@ -1521,6 +1522,7 @@ test('shutdown responds before scheduling process exit', async () => {
     assert.equal(response.status, 200);
     assert.deepEqual(JSON.parse(response.text), { ok: true, shuttingDown: true });
     assert.equal(exited, false, 'exit must happen after the response is sent');
+    assert.equal((await request({ path: '/api/app-info' })).status, 503);
     await new Promise((resolve) => setTimeout(resolve, 300));
     assert.equal(exited, true);
   } finally {
