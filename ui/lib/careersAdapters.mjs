@@ -1,4 +1,7 @@
 import { fetchPortal } from './ats.mjs';
+import {
+  fetchPublicResource, PublicHttpError, publicUrl, resolvePublicDestination,
+} from './publicHttp.mjs';
 
 const MAX_PAGE_BYTES = 1_000_000;
 const MAX_PAGE_JOBS = 100;
@@ -23,13 +26,28 @@ function stripHtml(value, maximum = 4000) {
 function safeUrl(value, base) {
   if (!value) return null;
   try {
-    const url = new URL(String(value), base);
-    if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password) return null;
-    url.hash = '';
-    return url.toString();
+    const result = publicUrl(String(value), base).toString();
+    return result.length <= 4_096 ? result : null;
   } catch {
     return null;
   }
+}
+
+function postingDate(value, { endOfDay = false } = {}) {
+  if (value === null || value === undefined || value === '') return null;
+  const source = String(value);
+  if (source.length > 40 || !(
+    /^\d{4}-\d{2}-\d{2}$/.test(source)
+    || /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.\d{1,3})?)?(?:Z|[+-]\d{2}:\d{2})$/.test(source)
+  )) return undefined;
+  const [year, month, day] = source.slice(0, 10).split('-').map(Number);
+  const calendar = new Date(Date.UTC(year, month - 1, day));
+  if (calendar.getUTCFullYear() !== year
+    || calendar.getUTCMonth() !== month - 1
+    || calendar.getUTCDate() !== day) return undefined;
+  const parsed = new Date(endOfDay && /^\d{4}-\d{2}-\d{2}$/.test(source)
+    ? `${source}T23:59:59.999Z` : source);
+  return Number.isNaN(parsed.getTime()) ? undefined : parsed;
 }
 
 function addressText(value) {
@@ -51,12 +69,16 @@ function postingObjects(value) {
   return [...self, ...postingObjects(value['@graph'])];
 }
 
-export function parseJobPostingData(html, {
+function parseJobPostingRecords(html, {
   pageUrl,
   employerName,
   employerId = null,
+  now = () => new Date(),
 } = {}) {
   const postings = [];
+  let found = 0;
+  let invalid = 0;
+  let stale = 0;
   const scripts = String(html || '').matchAll(
     /<script\b[^>]*type\s*=\s*["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi,
   );
@@ -64,11 +86,24 @@ export function parseJobPostingData(html, {
     let value;
     try { value = JSON.parse(match[1]); } catch { continue; }
     for (const posting of postingObjects(value)) {
-      const title = text(posting.title, 240);
+      found += 1;
+      const rawTitle = text(posting.title, 4_000);
+      const title = rawTitle.length <= 240 ? rawTitle : '';
       const url = safeUrl(posting.url, pageUrl);
-      if (!title || !url) continue;
-      const company = text(posting.hiringOrganization?.name, 240)
-        || text(employerName, 240);
+      const posted = postingDate(posting.datePosted);
+      const validThrough = postingDate(posting.validThrough, { endOfDay: true });
+      const rawCompany = text(posting.hiringOrganization?.name || employerName, 4_000);
+      const company = rawCompany.length <= 240 ? rawCompany : '';
+      if (!title || !url || !company || posted === undefined || validThrough === undefined) {
+        invalid += 1;
+        continue;
+      }
+      const clock = now();
+      const currentTime = clock instanceof Date ? clock : new Date(clock);
+      if (validThrough && validThrough.getTime() < currentTime.getTime()) {
+        stale += 1;
+        continue;
+      }
       postings.push({
         providerId: text(posting.identifier?.value || posting.identifier || url, 300),
         sourceRecordId: `careers-structured:${text(posting.identifier?.value || posting.identifier || url, 300)}`,
@@ -79,15 +114,23 @@ export function parseJobPostingData(html, {
         location: addressText(posting.jobLocation),
         employmentType: text(Array.isArray(posting.employmentType)
           ? posting.employmentType.join(', ') : posting.employmentType, 120),
-        postedDate: /^\d{4}-\d{2}-\d{2}/.test(String(posting.datePosted || ''))
-          ? String(posting.datePosted).slice(0, 10) : null,
+        postedDate: posted ? String(posting.datePosted).slice(0, 10) : null,
+        validThrough: validThrough ? validThrough.toISOString() : null,
         source: 'careers-structured',
         ...(employerId ? { employerId } : {}),
       });
-      if (postings.length >= MAX_PAGE_JOBS) return postings;
+      if (postings.length >= MAX_PAGE_JOBS) return {
+        postings, found, invalid, stale,
+      };
     }
   }
-  return postings;
+  return {
+    postings, found, invalid, stale,
+  };
+}
+
+export function parseJobPostingData(html, options = {}) {
+  return parseJobPostingRecords(html, options).postings;
 }
 
 function genericLinks(html, {
@@ -170,25 +213,62 @@ function careersPolicyFailure(employer, checkedAt) {
   return null;
 }
 
-async function collectBoard(employer, fetchImpl, checkedAt) {
+function publicFailureCode(error) {
+  if (!(error instanceof PublicHttpError)) return 'request-failed';
+  if (['unsafe-destination', 'url-invalid'].includes(error.reasonCode)) return 'unsafe-destination';
+  if (error.reasonCode === 'external-redirect') return 'external-redirect';
+  if (error.reasonCode === 'response-too-large') return 'response-too-large';
+  if (error.reasonCode === 'content-type-invalid') return 'content-type-invalid';
+  if (error.reasonCode === 'request-timeout') return 'request-timeout';
+  if (error.reasonCode === 'dns-failed') return 'dns-failed';
+  return 'request-failed';
+}
+
+async function publicJobs(jobs, { lookupFn }) {
+  const accepted = [];
+  for (const job of jobs.slice(0, MAX_PAGE_JOBS)) {
+    try {
+      await resolvePublicDestination(job.url, { lookupFn });
+      accepted.push(job);
+    } catch { /* unsafe advert URLs are not published */ }
+  }
+  return accepted;
+}
+
+async function collectBoard(employer, fetchImpl, checkedAt, { lookupFn }) {
   if (employer.access.terms === 'disallowed') {
     return result(employer, employer.board.adapter, 'blocked', checkedAt, {
       failureCode: 'terms-disallowed',
     });
   }
   try {
-    const jobs = (await fetchPortal({
+    const boardFetch = (url, options = {}) => fetchPublicResource(url, {
+      ...options,
+      lookupFn,
+      requestImpl: fetchImpl,
+      maxBytes: MAX_PAGE_BYTES,
+      maxRedirects: 4,
+      allowedContentTypes: ['application/json', 'application/*+json'],
+    });
+    const returnedJobs = (await fetchPortal({
       name: employer.canonicalName,
       ats: employer.board.adapter,
       token: employer.board.boardId,
       careersUrl: employer.careersUrl || '',
       enabled: true,
       tags: employer.industries,
-    }, fetchImpl)).map((job) => ({ ...job, employerId: employer.id }));
-    return result(employer, employer.board.adapter, 'healthy', checkedAt, { jobs });
-  } catch {
+    }, boardFetch)).map((job) => ({ ...job, employerId: employer.id }));
+    const jobs = await publicJobs(returnedJobs, { lookupFn });
+    const unsafeOnly = returnedJobs.length && !jobs.length;
+    return result(employer, employer.board.adapter, unsafeOnly ? 'blocked' : 'healthy', checkedAt, {
+      jobs,
+      returned: returnedJobs.length,
+      parsed: jobs.length,
+      ...(unsafeOnly ? { failureCode: 'unsafe-advert-url' } : {}),
+    });
+  } catch (error) {
     return result(employer, employer.board.adapter, 'degraded', checkedAt, {
-      failureCode: 'request-failed',
+      failureCode: publicFailureCode(error),
     });
   }
 }
@@ -209,7 +289,10 @@ function responseFailure(employer, checkedAt, status) {
   });
 }
 
-async function collectCareersPage(employer, fetchImpl, checkedAt) {
+async function collectCareersPage(employer, fetchImpl, checkedAt, {
+  lookupFn,
+  now,
+}) {
   const policyFailure = careersPolicyFailure(employer, checkedAt);
   if (policyFailure) return policyFailure;
   if (!employer.careersUrl) {
@@ -219,14 +302,22 @@ async function collectCareersPage(employer, fetchImpl, checkedAt) {
   }
   let response;
   try {
-    response = await fetchImpl(employer.careersUrl, {
+    response = await fetchPublicResource(employer.careersUrl, {
       headers: { accept: 'text/html, application/xhtml+xml' },
-      redirect: 'follow',
+      lookupFn,
+      requestImpl: fetchImpl,
+      maxBytes: MAX_PAGE_BYTES,
+      maxRedirects: 4,
+      allowedOrigin: employer.careersUrl,
+      allowedContentTypes: ['text/html', 'application/xhtml+xml'],
     });
-  } catch {
-    return result(employer, 'structured-data', 'degraded', checkedAt, {
-      failureCode: 'request-failed',
-    });
+  } catch (error) {
+    const failureCode = publicFailureCode(error);
+    return result(employer, 'structured-data',
+      ['unsafe-destination', 'external-redirect'].includes(failureCode) ? 'blocked' : 'degraded',
+      checkedAt, {
+        failureCode,
+      });
   }
   if (!response?.ok) return responseFailure(employer, checkedAt, Number(response?.status || 0));
   if (response.url) {
@@ -254,13 +345,30 @@ async function collectCareersPage(employer, fetchImpl, checkedAt) {
       failureCode: 'anti-bot',
     });
   }
-  const postings = parseJobPostingData(html, {
+  const structured = parseJobPostingRecords(html, {
     pageUrl: employer.careersUrl,
     employerName: employer.canonicalName,
     employerId: employer.id,
+    now,
   });
+  const postings = await publicJobs(structured.postings, { lookupFn });
   if (postings.length) {
-    return result(employer, 'structured-data', 'healthy', checkedAt, { jobs: postings });
+    return result(employer, 'structured-data', 'healthy', checkedAt, {
+      jobs: postings,
+      returned: structured.found,
+      parsed: postings.length,
+    });
+  }
+  if (structured.found) {
+    return result(employer, 'structured-data',
+      structured.stale === structured.found
+        ? 'healthy' : 'degraded',
+      checkedAt, {
+        returned: structured.found,
+        parsed: 0,
+        failureCode: structured.stale === structured.found
+          ? 'structured-data-stale' : 'structured-data-invalid',
+      });
   }
   if (!employer.access.genericEnabled) {
     return result(employer, 'structured-data', 'unsupported', checkedAt, {
@@ -282,12 +390,13 @@ async function collectCareersPage(employer, fetchImpl, checkedAt) {
 }
 
 export async function collectEmployer(employer, {
-  fetchImpl = globalThis.fetch,
+  fetchImpl = null,
   now = () => new Date().toISOString(),
+  lookupFn,
 } = {}) {
   const checkedAt = now();
-  if (employer?.board) return collectBoard(employer, fetchImpl, checkedAt);
-  return collectCareersPage(employer, fetchImpl, checkedAt);
+  if (employer?.board) return collectBoard(employer, fetchImpl, checkedAt, { lookupFn });
+  return collectCareersPage(employer, fetchImpl, checkedAt, { lookupFn, now });
 }
 
 export async function collectEmployers(employers, options = {}) {

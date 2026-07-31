@@ -18,6 +18,7 @@ const profile = ({
 const softwareJob = {
   vacancyId: 'vacancy-software', employer: { value: 'Acme', provenance: 'explicit-source' },
   title: { value: 'Software Engineer', provenance: 'explicit-source' },
+  roleFamily: 'Product Engineering',
   employmentType: { value: 'permanent', provenance: 'explicit-source' },
   location: { value: 'London', provenance: 'explicit-source' },
   description: 'Build software systems and perform coding for customers.',
@@ -293,7 +294,7 @@ test('confirmed learned reconsideration is scoped, versioned and preserves exclu
       kind: 'reconsider-rule',
       profileRuleId: 'rule-data-engineer',
       scope: 'role-family',
-      value: 'Software Engineer',
+      value: 'Product Engineering',
     }],
   };
   const result = filterVacancies([softwareJob], rankedProfile, { learningPolicy: policy });
@@ -303,4 +304,39 @@ test('confirmed learned reconsideration is scoped, versioned and preserves exclu
   assert.equal(result.reconsidered[0].profileRuleId, 'rule-data-engineer');
   assert.equal(result.reconsidered[0].learningVersionId, 'learning-reviewed');
   assert.equal(result.reconsidered[0].reconsidered, true);
+});
+
+test('role-family reconsideration does not leak across a matching title or partial family', () => {
+  const rankedProfile = profile({
+    primaryTitles: [rule('Data Engineer', 'mandatory')],
+  });
+  const policy = {
+    id: 'learning-reviewed',
+    changes: [{
+      kind: 'reconsider-rule',
+      profileRuleId: 'rule-data-engineer',
+      scope: 'role-family',
+      value: 'Product Engineering',
+    }],
+  };
+  const result = filterVacancies([
+    { ...softwareJob, vacancyId: 'matching-family' },
+    {
+      ...softwareJob,
+      vacancyId: 'matching-title-only',
+      title: { value: 'Product Engineering', provenance: 'explicit-source' },
+      roleFamily: 'Operations',
+    },
+    {
+      ...softwareJob,
+      vacancyId: 'partial-family',
+      roleFamily: 'Senior Product Engineering',
+    },
+  ], rankedProfile, { learningPolicy: policy });
+
+  assert.deepEqual(result.eligible.map(({ vacancyId }) => vacancyId), ['matching-family']);
+  assert.deepEqual(result.excluded.map(({ vacancyId }) => vacancyId), [
+    'matching-title-only', 'partial-family',
+  ]);
+  assert.deepEqual(result.reconsidered.map(({ vacancyId }) => vacancyId), ['matching-family']);
 });

@@ -6,6 +6,7 @@ import { workspacePaths } from './workspace.mjs';
 export const EMPLOYER_REGISTRY_SCHEMA_VERSION = 1;
 export const MAX_EMPLOYERS = 256;
 export const MAX_EMPLOYER_HISTORY = 20;
+export const MAX_EMPLOYER_REVIEW_HISTORY = 20;
 export const MAX_MONITORED_EMPLOYERS = 32;
 
 const ORIGINS = Object.freeze([
@@ -182,6 +183,7 @@ function makeEmployer(value, now) {
       nextEligibleAt: null,
     },
     history: [],
+    reviewHistory: [],
     createdAt: now,
     updatedAt: now,
   };
@@ -244,6 +246,39 @@ function validateHistory(employer) {
   }
 }
 
+function metadataSnapshot(value) {
+  return {
+    aliases: stringList(value.aliases, 'aliases'),
+    industries: stringList(value.industries, 'industries'),
+    locations: stringList(value.locations, 'locations'),
+  };
+}
+
+function validateReviewHistory(employer) {
+  const history = employer.reviewHistory ?? [];
+  if (!Array.isArray(history) || history.length > MAX_EMPLOYER_REVIEW_HISTORY) {
+    throw new TypeError('employer review history is invalid');
+  }
+  const ids = new Set();
+  for (const event of history) {
+    if (!event || !/^employer-review-[a-f0-9]{16}$/.test(event.id || '')
+      || event.kind !== 'identity-metadata'
+      || (event.undoOf !== null && !/^employer-review-[a-f0-9]{16}$/.test(event.undoOf || ''))) {
+      throw new TypeError('employer review history event is invalid');
+    }
+    if (ids.has(event.id)) throw new TypeError('employer review history ID is duplicated');
+    ids.add(event.id);
+    timestamp(event.recordedAt, 'review history time');
+    metadataSnapshot(event.before);
+    metadataSnapshot(event.after);
+  }
+  for (const event of history) {
+    if (event.undoOf !== null && !ids.has(event.undoOf)) {
+      throw new TypeError('employer review undo target is unavailable');
+    }
+  }
+}
+
 function validateEmployer(value) {
   if (!value || typeof value !== 'object' || Array.isArray(value)) {
     throw new TypeError('employer record is invalid');
@@ -280,6 +315,7 @@ function validateEmployer(value) {
   optionalTimestamp(value.monitoring.lastCheckedAt, 'monitoring check time');
   optionalTimestamp(value.monitoring.nextEligibleAt, 'monitoring eligibility time');
   validateHistory(value);
+  validateReviewHistory(value);
   timestamp(value.createdAt, 'creation time');
   timestamp(value.updatedAt, 'update time');
   return value;
@@ -299,15 +335,30 @@ export function validateEmployerRegistry(registry) {
     throw new TypeError('employer registry capacity is invalid');
   }
   const ids = new Set();
+  const identities = new Map();
   for (const employer of registry.employers) {
     validateEmployer(employer);
     if (ids.has(employer.id)) throw new TypeError('employer ID is duplicated');
     ids.add(employer.id);
+    for (const identity of [employer.canonicalName, ...employer.aliases]) {
+      const key = normalizedName(identity);
+      if (identities.has(key) && identities.get(key) !== employer.id) {
+        throw new TypeError('employer alias is ambiguous');
+      }
+      identities.set(key, employer.id);
+    }
   }
   for (const employer of registry.archivedEmployers) {
     validateEmployer(employer);
     if (ids.has(employer.id)) throw new TypeError('employer ID is duplicated');
     ids.add(employer.id);
+    for (const identity of [employer.canonicalName, ...employer.aliases]) {
+      const key = normalizedName(identity);
+      if (identities.has(key) && identities.get(key) !== employer.id) {
+        throw new TypeError('employer alias is ambiguous');
+      }
+      identities.set(key, employer.id);
+    }
   }
   return registry;
 }
@@ -573,6 +624,37 @@ export function updateEmployerRegistryEntry(registry, value, {
       genericEnabled: value.access.genericEnabled === true,
       minIntervalMinutes: Number(value.access.minIntervalMinutes),
     };
+  const aliases = value.aliases === undefined
+    ? current.aliases
+    : uniqueTexts(stringList(value.aliases, 'aliases'))
+      .filter((item) => normalizedName(item) !== current.normalizedName);
+  const industries = value.industries === undefined
+    ? current.industries : uniqueTexts(stringList(value.industries, 'industries'));
+  const locations = value.locations === undefined
+    ? current.locations : uniqueTexts(stringList(value.locations, 'locations'));
+  const beforeMetadata = metadataSnapshot(current);
+  const afterMetadata = metadataSnapshot({ aliases, industries, locations });
+  const metadataChanged = stableJson(beforeMetadata) !== stableJson(afterMetadata);
+  const reviewHistory = [...(current.reviewHistory || [])];
+  if (metadataChanged) {
+    if (reviewHistory.length >= MAX_EMPLOYER_REVIEW_HISTORY) {
+      throw new TypeError('employer review history is full');
+    }
+    reviewHistory.push({
+      id: `employer-review-${digest({
+        employerId: current.id,
+        generation: working.generation + 1,
+        recordedAt: updatedAt,
+        beforeMetadata,
+        afterMetadata,
+      }).slice(0, 16)}`,
+      kind: 'identity-metadata',
+      recordedAt: updatedAt,
+      before: beforeMetadata,
+      after: afterMetadata,
+      undoOf: null,
+    });
+  }
   const reason = value.reason === undefined || value.reason === null
     ? null : boundedText(value.reason);
   const state = userPriority === 'inactive'
@@ -581,6 +663,9 @@ export function updateEmployerRegistryEntry(registry, value, {
     ...current,
     careersUrl,
     board,
+    aliases,
+    industries,
+    locations,
     userPriority,
     decision: {
       state,
@@ -588,12 +673,60 @@ export function updateEmployerRegistryEntry(registry, value, {
       decidedAt: updatedAt,
     },
     access,
+    reviewHistory,
     updatedAt,
   };
   return validateEmployerRegistry({
     ...working,
     updatedAt,
     generation: working.generation + (created ? 0 : 1),
+  });
+}
+
+export function undoEmployerRegistryReview(registry, value, {
+  now = () => new Date().toISOString(),
+} = {}) {
+  validateEmployerRegistry(registry);
+  const employerId = boundedText(value?.employerId, 80);
+  const reviewId = boundedText(value?.reviewId, 80);
+  const index = registry.employers.findIndex(({ id }) => id === employerId);
+  if (index < 0) throw new TypeError('employer registry entry is unavailable');
+  const current = registry.employers[index];
+  const history = current.reviewHistory || [];
+  if (history.length >= MAX_EMPLOYER_REVIEW_HISTORY) {
+    throw new TypeError('employer review history is full');
+  }
+  const target = history.find(({ id }) => id === reviewId);
+  if (!target || history.some(({ undoOf }) => undoOf === target.id)) {
+    throw new TypeError('employer review is unavailable for undo');
+  }
+  if (stableJson(metadataSnapshot(current)) !== stableJson(target.after)) {
+    throw new TypeError('a newer employer metadata review must be undone first');
+  }
+  const recordedAt = now();
+  timestamp(recordedAt, 'registry update time');
+  const restored = metadataSnapshot(target.before);
+  const undo = {
+    id: `employer-review-${digest({
+      employerId, generation: registry.generation + 1, recordedAt, undoOf: target.id,
+    }).slice(0, 16)}`,
+    kind: 'identity-metadata',
+    recordedAt,
+    before: metadataSnapshot(current),
+    after: restored,
+    undoOf: target.id,
+  };
+  const working = structuredClone(registry);
+  working.employers[index] = {
+    ...current,
+    ...restored,
+    reviewHistory: [...history, undo],
+    updatedAt: recordedAt,
+  };
+  return validateEmployerRegistry({
+    ...working,
+    generation: registry.generation + 1,
+    updatedAt: recordedAt,
   });
 }
 

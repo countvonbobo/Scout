@@ -764,6 +764,9 @@ test('search-profile routes review a complete draft and publish only the current
         id: employerReview.employers[0].id,
         userPriority: 'inactive',
         reason: 'Reviewed pause',
+        aliases: ['Example Research Ltd'],
+        industries: ['Research'],
+        locations: ['London'],
       },
     }),
   });
@@ -771,6 +774,10 @@ test('search-profile routes review a complete draft and publish only the current
   const retiredEmployerRegistry = JSON.parse(retiredEmployerResponse.text).registry;
   assert.equal(retiredEmployerRegistry.employers[0].decision.state, 'inactive');
   assert.equal(retiredEmployerRegistry.employers[0].decision.reason, 'Reviewed pause');
+  assert.deepEqual(retiredEmployerRegistry.employers[0].aliases, ['Example Research Ltd']);
+  assert.deepEqual(retiredEmployerRegistry.employers[0].industries, ['Research']);
+  assert.deepEqual(retiredEmployerRegistry.employers[0].locations, ['London']);
+  assert.equal(retiredEmployerRegistry.employers[0].reviewHistory.length, 1);
   const staleEmployerResponse = await request({
     method: 'PUT', path: '/api/employers', headers: JSON_HEADERS(),
     body: JSON.stringify({
@@ -783,6 +790,22 @@ test('search-profile routes review a complete draft and publish only the current
     }),
   });
   assert.equal(staleEmployerResponse.status, 409);
+  const undoEmployerResponse = await request({
+    method: 'POST', path: '/api/employers/undo', headers: JSON_HEADERS(),
+    body: JSON.stringify({
+      revision: retiredEmployerRegistry.revision,
+      confirmed: true,
+      employerId: retiredEmployerRegistry.employers[0].id,
+      reviewId: retiredEmployerRegistry.employers[0].reviewHistory[0].id,
+    }),
+  });
+  assert.equal(undoEmployerResponse.status, 200);
+  const restoredEmployerRegistry = JSON.parse(undoEmployerResponse.text).registry;
+  assert.deepEqual(restoredEmployerRegistry.employers[0].aliases, []);
+  assert.deepEqual(restoredEmployerRegistry.employers[0].industries, []);
+  assert.deepEqual(restoredEmployerRegistry.employers[0].locations, []);
+  assert.equal(restoredEmployerRegistry.employers[0].reviewHistory[1].undoOf,
+    retiredEmployerRegistry.employers[0].reviewHistory[0].id);
 
   const retireLane = lanePlan.lanes[0];
   let recordedPlan = lanePlan;

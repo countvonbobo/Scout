@@ -77,7 +77,8 @@ import {
 } from './lib/searchLanes.mjs';
 import {
   employerRegistryRevision, loadEmployerRegistry, migrateLegacyPortals,
-  reconcileEmployerDiscoveries, updateEmployerRegistryEntry, writeEmployerRegistry,
+  reconcileEmployerDiscoveries, undoEmployerRegistryReview,
+  updateEmployerRegistryEntry, writeEmployerRegistry,
 } from './lib/employerRegistry.mjs';
 import {
   activeLearningPolicy, createLearningLedger, learningLedgerRevision,
@@ -1484,6 +1485,7 @@ function publicEmployerRegistry(registry) {
       health: employer.health,
       monitoring: employer.monitoring,
       history: employer.history.slice(-10),
+      reviewHistory: (employer.reviewHistory || []).slice(-10),
       createdAt: employer.createdAt,
       updatedAt: employer.updatedAt,
     })),
@@ -1642,6 +1644,40 @@ routes['PUT /api/employers'] = (req, res, body) => {
     });
   } catch {
     return replyJson(res, 400, publicApiError('Employer registry could not be updated.'));
+  }
+};
+
+routes['POST /api/employers/undo'] = (req, res, body) => {
+  const value = parseBody(body);
+  if (!value || value.confirmed !== true
+    || typeof value.revision !== 'string'
+    || typeof value.employerId !== 'string'
+    || typeof value.reviewId !== 'string') {
+    return replyJson(res, 400, {
+      error: 'employer ID, review ID, explicit confirmation and current revision are required',
+    });
+  }
+  try {
+    return withSearchPlanMutation(res, 'employer-registry-undo', () => {
+      const current = currentEmployerRegistry();
+      const currentRevision = employerRegistryRevision(current);
+      if (value.revision !== currentRevision) {
+        return replyJson(res, 409, {
+          conflict: true,
+          currentRevision,
+          ...publicApiError('Employer registry update conflict.'),
+        });
+      }
+      const registry = undoEmployerRegistryReview(current, value);
+      writeEmployerRegistry(WORKSPACE_ROOT, registry);
+      void queueCheckpoint('ui: undo employer metadata review');
+      return replyJson(res, 200, {
+        ok: true,
+        registry: publicEmployerRegistry(registry),
+      });
+    });
+  } catch {
+    return replyJson(res, 400, publicApiError('Employer metadata review could not be undone.'));
   }
 };
 

@@ -374,6 +374,9 @@ export function employerRegistryHtml(registry = null) {
   )).join('');
   const employerCard = (employer) => {
     const id = escapeProfileText(employer.id);
+    const reviews = employer.reviewHistory || [];
+    const lastReview = reviews.at(-1);
+    const undoableReview = lastReview && !lastReview.undoOf ? lastReview : null;
     const recent = (employer.history || []).slice(-5).reverse().map((event) => (
       `<li>${escapeProfileText(String(event.recordedAt || '').slice(0, 10))}: `
       + `${escapeProfileText(event.status)} via ${escapeProfileText(event.adapter)}; `
@@ -394,6 +397,15 @@ export function employerRegistryHtml(registry = null) {
         </label>
         <label class="setup-field wide">Careers URL
           <input data-employer-url="${id}" type="url" value="${escapeProfileText(employer.careersUrl || '')}">
+        </label>
+        <label class="setup-field wide">Reviewed aliases (comma-separated)
+          <input data-employer-aliases="${id}" maxlength="1000" value="${escapeProfileText((employer.aliases || []).join(', '))}">
+        </label>
+        <label class="setup-field">Industries (comma-separated)
+          <input data-employer-industries="${id}" maxlength="1000" value="${escapeProfileText((employer.industries || []).join(', '))}">
+        </label>
+        <label class="setup-field">Locations (comma-separated)
+          <input data-employer-locations="${id}" maxlength="1000" value="${escapeProfileText((employer.locations || []).join(', '))}">
         </label>
         <label class="setup-field">ATS adapter
           <select data-employer-adapter="${id}">${policyOptions(['', 'greenhouse', 'lever', 'ashby'], employer.board?.adapter || '')}</select>
@@ -417,7 +429,8 @@ export function employerRegistryHtml(registry = null) {
         <ul>${recent}</ul>
       </details>
       <label><span><input data-employer-confirm="${id}" type="checkbox"> I reviewed this employer and monitoring policy</span></label>
-      <p><button class="act" type="button" data-employer-save="${id}">Save employer</button></p>
+      <p><button class="act" type="button" data-employer-save="${id}">Save employer</button>
+      ${undoableReview ? `<button class="act" type="button" data-employer-undo="${id}" data-review-id="${escapeProfileText(undoableReview.id)}">Undo latest alias/metadata review</button>` : ''}</p>
     </section>`;
   };
   return `<section id="employer-registry-review">
@@ -428,6 +441,9 @@ export function employerRegistryHtml(registry = null) {
       <div class="setup-grid">
         <label class="setup-field">Canonical employer name<input id="employer-add-name" maxlength="160"></label>
         <label class="setup-field">Careers URL<input id="employer-add-url" type="url"></label>
+        <label class="setup-field wide">Reviewed aliases (comma-separated)<input id="employer-add-aliases" maxlength="1000"></label>
+        <label class="setup-field">Industries (comma-separated)<input id="employer-add-industries" maxlength="1000"></label>
+        <label class="setup-field">Locations (comma-separated)<input id="employer-add-locations" maxlength="1000"></label>
       </div>
       <label><span><input id="employer-add-confirm" type="checkbox"> I want to add this employer to my private registry</span></label>
       <p><button id="employer-add" class="act" type="button">Add employer</button></p>
@@ -1172,6 +1188,12 @@ const Setup = {
     this.el('setup-body').querySelectorAll('[data-employer-save]').forEach((button) => {
       button.addEventListener('click', () => this.saveEmployer(button.dataset.employerSave));
     });
+    this.el('setup-body').querySelectorAll('[data-employer-undo]').forEach((button) => {
+      button.addEventListener('click', () => this.undoEmployerReview(
+        button.dataset.employerUndo,
+        button.dataset.reviewId,
+      ));
+    });
     this.el('employer-add')?.addEventListener('click', () => this.saveEmployer(null));
     if (!this.employerRegistry) void this.loadEmployerRegistry();
   },
@@ -1293,6 +1315,8 @@ const Setup = {
 
   async saveEmployer(id) {
     const read = (name) => this.el('setup-body').querySelector(`[data-employer-${name}="${id}"]`);
+    const list = (value) => [...new Set(String(value || '').split(/,|\n/)
+      .map((item) => item.trim()).filter(Boolean))];
     const confirmed = id
       ? read('confirm')?.checked
       : this.el('employer-add-confirm')?.checked;
@@ -1305,6 +1329,9 @@ const Setup = {
       userPriority: read('priority').value,
       reason: read('reason').value.trim() || null,
       careersUrl: read('url').value.trim() || null,
+      aliases: list(read('aliases').value),
+      industries: list(read('industries').value),
+      locations: list(read('locations').value),
       board: read('adapter').value && read('board').value.trim()
         ? { adapter: read('adapter').value, boardId: read('board').value.trim() }
         : null,
@@ -1317,6 +1344,9 @@ const Setup = {
     } : {
       canonicalName: this.el('employer-add-name').value.trim(),
       careersUrl: this.el('employer-add-url').value.trim() || null,
+      aliases: list(this.el('employer-add-aliases').value),
+      industries: list(this.el('employer-add-industries').value),
+      locations: list(this.el('employer-add-locations').value),
     };
     try {
       const result = await requestJson('/api/employers', {
@@ -1330,6 +1360,32 @@ const Setup = {
       this.employerRegistry = result.registry;
       this.renderEmployerSettings();
       this.setMessage(id ? 'Employer monitoring policy saved.' : 'Employer added for review.', 'good');
+    } catch (error) {
+      this.setMessage(error.message, 'error');
+      await this.loadEmployerRegistry();
+    }
+  },
+
+  async undoEmployerReview(employerId, reviewId) {
+    const confirmed = this.el('setup-body')
+      .querySelector(`[data-employer-confirm="${employerId}"]`)?.checked;
+    if (!confirmed) {
+      this.setMessage('Confirm that you reviewed this employer update.', 'error');
+      return;
+    }
+    try {
+      const result = await requestJson('/api/employers/undo', {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          revision: this.employerRegistry?.revision,
+          confirmed: true,
+          employerId,
+          reviewId,
+        }),
+      });
+      this.employerRegistry = result.registry;
+      this.renderEmployerSettings();
+      this.setMessage('Previous employer aliases and metadata restored.', 'good');
     } catch (error) {
       this.setMessage(error.message, 'error');
       await this.loadEmployerRegistry();

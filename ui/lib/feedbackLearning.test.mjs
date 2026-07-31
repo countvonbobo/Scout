@@ -221,6 +221,84 @@ test('non-global rank adjustments require and enforce an explicit scope value', 
   assert.equal(ranked[1].learningAdjustment, undefined);
 });
 
+test('role-family learning uses preserved canonical families with exact scope and no title leakage', () => {
+  const policy = {
+    id: 'learning-role-family',
+    changes: [{
+      kind: 'rank-adjustment',
+      field: 'location',
+      value: 'Manchester',
+      weight: 5,
+      scope: 'role-family',
+      scopeValue: 'Product Management',
+      proposalId: 'proposal-role-family',
+    }],
+  };
+  const ranked = applyLearningToRankedVacancies([
+    {
+      vacancyId: 'same-title-wrong-family',
+      title: 'Product Management',
+      roleFamily: 'Engineering',
+      location: 'Manchester',
+      preRankScore: 60,
+    },
+    {
+      vacancyId: 'canonical-family',
+      title: 'Delivery Lead',
+      roleFamilies: ['Operations', 'Product-Management'],
+      location: 'Manchester',
+      preRankScore: 60,
+    },
+    {
+      vacancyId: 'partial-family',
+      title: 'Delivery Lead',
+      roleFamily: 'Senior Product Management',
+      location: 'Manchester',
+      preRankScore: 60,
+    },
+  ], policy);
+
+  assert.equal(ranked[0].vacancyId, 'canonical-family');
+  assert.equal(ranked[0].learningAdjustment, 5);
+  assert.equal(ranked.find(({ vacancyId }) => vacancyId === 'same-title-wrong-family').learningAdjustment, undefined);
+  assert.equal(ranked.find(({ vacancyId }) => vacancyId === 'partial-family').learningAdjustment, undefined);
+});
+
+test('role-family learning publication and undo preserve historical decision provenance', () => {
+  const baseline = createLearningLedger({ now: () => AT });
+  const recorded = recordFeedback(baseline, event({
+    learningVersionId: baseline.activeVersionId,
+    reason: 'role-family',
+  }), { now: () => '2026-07-30T10:10:00.000Z' });
+  const proposed = proposeLearningChange(recorded, {
+    sourceEventIds: [recorded.feedbackEvents[0].id],
+    explanation: 'Apply the reviewed preference only to product management.',
+    change: {
+      kind: 'rank-adjustment',
+      field: 'location',
+      value: 'Manchester',
+      weight: 3,
+      scope: 'role-family',
+      scopeValue: 'Product Management',
+    },
+  }, { now: () => '2026-07-30T10:20:00.000Z' });
+  const published = publishLearningProposal(proposed, {
+    proposalId: proposed.proposals[0].id,
+    confirmed: true,
+  }, { now: () => '2026-07-30T10:30:00.000Z' });
+  const undone = undoLearningVersion(published, {
+    versionId: published.activeVersionId,
+    confirmed: true,
+    explanation: 'Restore the prior reviewed behavior.',
+  }, { now: () => '2026-07-30T10:40:00.000Z' });
+
+  assert.equal(published.generation, proposed.generation + 1);
+  assert.equal(activeLearningPolicy(published).changes[0].scopeValue, 'Product Management');
+  assert.deepEqual(activeLearningPolicy(undone).changes, []);
+  assert.equal(undone.feedbackEvents[0].learningVersionId, 'learning-baseline');
+  assert.equal(undone.feedbackEvents[0].reason, 'role-family');
+});
+
 test('one rejection can only propose reconsideration and never creates a hard exclusion', () => {
   const recorded = recordFeedback(createLearningLedger({ now: () => AT }), event({
     decision: 'rejected',

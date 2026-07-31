@@ -66,6 +66,9 @@ test('employer settings expose bounded health, policy and reversible priority co
     employers: [{
       id: 'employer-0123456789abcdef',
       canonicalName: '<script>Example</script>',
+      aliases: ['Example Ltd'],
+      industries: ['Research'],
+      locations: ['London'],
       origins: [{ kind: 'named-profile', recordedAt: '2026-07-30T10:00:00.000Z' }],
       careersUrl: 'https://example.test/careers',
       board: null,
@@ -81,6 +84,11 @@ test('employer settings expose bounded health, policy and reversible priority co
         status: 'blocked', adapter: 'structured-data', parsed: 0,
         failureCode: 'terms-unreviewed',
       }],
+      reviewHistory: [{
+        id: 'employer-review-0123456789abcdef',
+        recordedAt: '2026-07-30T10:00:00.000Z',
+        undoOf: null,
+      }],
     }],
   });
   assert.doesNotMatch(html, /<script>Example/);
@@ -90,6 +98,11 @@ test('employer settings expose bounded health, policy and reversible priority co
   assert.match(html, /irrelevant/);
   assert.match(html, /Terms review/);
   assert.match(html, /Robots review/);
+  assert.match(html, /Reviewed aliases/);
+  assert.match(html, /Example Ltd/);
+  assert.match(html, /Industries/);
+  assert.match(html, /Locations/);
+  assert.match(html, /Undo latest alias\/metadata review/);
   assert.match(html, /data-employer-confirm/);
   assert.match(html, /Add an employer for review/);
 });

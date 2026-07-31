@@ -6,6 +6,7 @@ import {
 import { createEmployerRegistry } from './employerRegistry.mjs';
 
 const AT = '2026-07-30T12:00:00.000Z';
+const publicLookup = async () => [{ address: '1.1.1.1', family: 4 }];
 
 function response(body, { status = 200, type = 'application/json' } = {}) {
   return {
@@ -13,7 +14,7 @@ function response(body, { status = 200, type = 'application/json' } = {}) {
     status,
     headers: { get: (name) => name.toLowerCase() === 'content-type' ? type : null },
     json: async () => body,
-    text: async () => String(body),
+    text: async () => typeof body === 'string' ? body : JSON.stringify(body),
   };
 }
 
@@ -56,6 +57,7 @@ test('public ATS adapters share one bounded employer-monitoring result contract'
     const target = employer({ board: { adapter, boardId } });
     const result = await collectEmployer(target, {
       fetchImpl: async () => response(payload),
+      lookupFn: publicLookup,
       now: () => AT,
     });
     assert.deepEqual(Object.keys(result).sort(), [
@@ -86,6 +88,7 @@ test('validated JobPosting JSON-LD becomes a structured careers result', async (
   const target = employer();
   const result = await collectEmployer(target, {
     fetchImpl: async () => response(html, { type: 'text/html' }),
+    lookupFn: publicLookup,
     now: () => AT,
   });
 
@@ -107,6 +110,107 @@ test('JobPosting parsing rejects malformed and unsafe objects without guessing',
   })}</script>`, {
     pageUrl: 'https://example.test/careers', employerName: 'Example',
   }), []);
+  assert.deepEqual(parseJobPostingData(`<script type="application/ld+json">${JSON.stringify({
+    '@type': 'JobPosting', title: 'Internal', url: 'http://127.0.0.1/admin',
+    hiringOrganization: { name: 'Example' },
+  })}</script>`, {
+    pageUrl: 'https://example.test/careers', employerName: 'Example',
+  }), []);
+});
+
+test('expired and malformed structured adverts are stale evidence, not current vacancies', async () => {
+  for (const [posting, failureCode] of [
+    [{
+      '@type': 'JobPosting',
+      title: 'Expired role',
+      url: 'https://careers.example.test/jobs/expired',
+      hiringOrganization: { name: 'Example Systems' },
+      validThrough: '2026-07-29',
+    }, 'structured-data-stale'],
+    [{
+      '@type': 'JobPosting',
+      title: 'Malformed date',
+      url: 'https://careers.example.test/jobs/malformed',
+      hiringOrganization: { name: 'Example Systems' },
+      datePosted: 'yesterday',
+    }, 'structured-data-invalid'],
+    [{
+      '@type': 'JobPosting',
+      title: 'Impossible date',
+      url: 'https://careers.example.test/jobs/impossible-date',
+      hiringOrganization: { name: 'Example Systems' },
+      datePosted: '2026-02-30',
+    }, 'structured-data-invalid'],
+    [{
+      '@type': 'JobPosting',
+      title: '',
+      url: 'https://careers.example.test/jobs/minimal',
+    }, 'structured-data-invalid'],
+  ]) {
+    const result = await collectEmployer(employer(), {
+      fetchImpl: async () => response(
+        `<script type="application/ld+json">${JSON.stringify(posting)}</script>`,
+        { type: 'text/html' },
+      ),
+      lookupFn: publicLookup,
+      now: () => AT,
+    });
+    assert.equal(result.jobs.length, 0);
+    assert.equal(result.failureCode, failureCode);
+    assert.equal(result.parsed, 0);
+  }
+});
+
+test('a legitimate JobPosting without validThrough remains current when its fields validate', async () => {
+  const posting = {
+    '@type': 'JobPosting',
+    title: 'Open role',
+    url: 'https://careers.example.test/jobs/open',
+    hiringOrganization: { name: 'Example Systems' },
+    datePosted: '2026-07-20T09:00:00Z',
+  };
+  const result = await collectEmployer(employer(), {
+    fetchImpl: async () => response(
+      `<script type="application/ld+json">${JSON.stringify(posting)}</script>`,
+      { type: 'text/html' },
+    ),
+    lookupFn: publicLookup,
+    now: () => AT,
+  });
+  assert.equal(result.status, 'healthy');
+  assert.equal(result.jobs.length, 1);
+  assert.equal(result.jobs[0].validThrough, null);
+});
+
+test('hostname and redirect validation blocks private careers and structured advert targets', async () => {
+  let requests = 0;
+  const privateCareers = await collectEmployer(employer(), {
+    fetchImpl: async () => { requests += 1; return response('', { type: 'text/html' }); },
+    lookupFn: async () => [{ address: '10.0.0.7', family: 4 }],
+    now: () => AT,
+  });
+  assert.equal(privateCareers.status, 'blocked');
+  assert.equal(privateCareers.failureCode, 'unsafe-destination');
+  assert.equal(requests, 0);
+
+  const privateAdvert = await collectEmployer(employer(), {
+    fetchImpl: async (url) => response(
+      `<script type="application/ld+json">${JSON.stringify({
+        '@type': 'JobPosting',
+        title: 'Internal advert',
+        url: 'https://internal.example.test/jobs/1',
+        hiringOrganization: { name: 'Example Systems' },
+      })}</script>`,
+      { type: 'text/html' },
+    ),
+    lookupFn: async (hostname) => [{
+      address: hostname === 'internal.example.test' ? '192.168.1.9' : '1.1.1.1',
+      family: 4,
+    }],
+    now: () => AT,
+  });
+  assert.equal(privateAdvert.jobs.length, 0);
+  assert.equal(privateAdvert.failureCode, 'structured-data-invalid');
 });
 
 test('generic monitoring is opt-in, same-site and bounded', async () => {
@@ -122,6 +226,7 @@ test('generic monitoring is opt-in, same-site and bounded', async () => {
   </body></html>`;
   const result = await collectEmployer(target, {
     fetchImpl: async () => response(html, { type: 'text/html' }),
+    lookupFn: publicLookup,
     now: () => AT,
   });
 
@@ -140,7 +245,9 @@ test('terms, robots, authentication, anti-bot, rate limits and JavaScript shells
     [{ terms: 'allowed', robots: 'unknown', genericEnabled: true, minIntervalMinutes: 60 }, 'robots-unreviewed'],
     [{ terms: 'allowed', robots: 'disallowed', genericEnabled: true, minIntervalMinutes: 60 }, 'robots-disallowed'],
   ]) {
-    const result = await collectEmployer(employer({ access }), { fetchImpl, now: () => AT });
+    const result = await collectEmployer(employer({ access }), {
+      fetchImpl, lookupFn: publicLookup, now: () => AT,
+    });
     assert.equal(result.status, 'blocked');
     assert.equal(result.failureCode, failureCode);
   }
@@ -158,6 +265,7 @@ test('terms, robots, authentication, anti-bot, rate limits and JavaScript shells
       },
     }), {
       fetchImpl: async () => response(page, options),
+      lookupFn: publicLookup,
       now: () => AT,
     });
     assert.equal(result.status, status);
@@ -171,6 +279,7 @@ test('a generic careers request cannot follow monitoring onto another origin', a
       ...response('<html>external</html>', { type: 'text/html' }),
       url: 'https://authentication.example.test/login',
     }),
+    lookupFn: publicLookup,
     now: () => AT,
   });
   assert.equal(result.status, 'blocked');
@@ -191,7 +300,9 @@ test('one employer failure cannot discard healthy siblings', async () => {
       '@type': 'JobPosting',
       title: 'Healthy role',
       url: 'https://careers.example.test/jobs/healthy',
+      hiringOrganization: { name: 'Healthy Example' },
     })}</script>`, { type: 'text/html' }),
+    lookupFn: publicLookup,
     now: () => AT,
   });
 

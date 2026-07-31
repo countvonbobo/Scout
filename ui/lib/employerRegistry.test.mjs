@@ -7,7 +7,7 @@ import {
   canonicalEmployerId, createEmployerRegistry, employerRegistryRevision,
   loadEmployerRegistry, migrateLegacyPortals, reconcileEmployerDiscoveries,
   recordEmployerChecks, selectEmployersForMonitoring, validateEmployerRegistry,
-  updateEmployerRegistryEntry, writeEmployerRegistry,
+  undoEmployerRegistryReview, updateEmployerRegistryEntry, writeEmployerRegistry,
 } from './employerRegistry.mjs';
 
 const AT = '2026-07-30T12:00:00.000Z';
@@ -262,4 +262,83 @@ test('settings updates are narrow, revisioned and make retirement reversible', (
     id: restored.employers[0].id,
     canonicalName: 'Different Identity',
   }), /identity cannot be changed/);
+});
+
+test('reviewed aliases reconcile employer evidence without rewriting canonical history', () => {
+  const initial = createEmployerRegistry([discovery('Acme')], { now: () => AT });
+  const reviewed = updateEmployerRegistryEntry(initial, {
+    id: initial.employers[0].id,
+    aliases: ['Acme Ltd'],
+    industries: ['Public services'],
+    locations: ['London'],
+  }, { now: () => '2026-07-31T09:00:00.000Z' });
+  const reconciled = reconcileEmployerDiscoveries(reviewed, [{
+    canonicalName: 'Acme Ltd',
+    origin: {
+      kind: 'advert-discovered',
+      recordedAt: '2026-07-31T10:00:00.000Z',
+      reference: 'vacancy-acme-ltd',
+    },
+  }], { now: () => '2026-07-31T10:00:00.000Z' });
+
+  assert.equal(reconciled.employers.length, 1);
+  assert.equal(reconciled.employers[0].id, initial.employers[0].id);
+  assert.equal(reconciled.employers[0].canonicalName, 'Acme');
+  assert.deepEqual(reconciled.employers[0].aliases, ['Acme Ltd']);
+  assert.deepEqual(reconciled.employers[0].origins.map(({ kind }) => kind), [
+    'advert-discovered', 'manual',
+  ]);
+  assert.equal(selectEmployersForMonitoring(reconciled, {
+    limit: 12, now: () => '2026-08-01T12:00:00.000Z',
+  }).length, 1);
+});
+
+test('alias and metadata removal is versioned, durable and explicitly undoable', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'scout-employer-aliases-'));
+  fs.mkdirSync(path.join(root, 'data'), { recursive: true });
+  const initial = createEmployerRegistry([discovery('Acme', {
+    aliases: ['Acme Ltd'],
+    industries: ['Technology'],
+    locations: ['Manchester'],
+  })], { now: () => AT });
+  const removed = updateEmployerRegistryEntry(initial, {
+    id: initial.employers[0].id,
+    aliases: [],
+    industries: [],
+    locations: [],
+  }, { now: () => '2026-07-31T09:00:00.000Z' });
+  const review = removed.employers[0].reviewHistory[0];
+
+  assert.deepEqual(review.before.aliases, ['Acme Ltd']);
+  assert.deepEqual(review.after.aliases, []);
+  assert.equal(removed.generation, initial.generation + 1);
+
+  const restored = undoEmployerRegistryReview(removed, {
+    employerId: initial.employers[0].id,
+    reviewId: review.id,
+  }, { now: () => '2026-07-31T10:00:00.000Z' });
+  assert.deepEqual(restored.employers[0].aliases, ['Acme Ltd']);
+  assert.deepEqual(restored.employers[0].industries, ['Technology']);
+  assert.deepEqual(restored.employers[0].locations, ['Manchester']);
+  assert.equal(restored.employers[0].reviewHistory[1].undoOf, review.id);
+  assert.throws(() => undoEmployerRegistryReview(restored, {
+    employerId: initial.employers[0].id,
+    reviewId: review.id,
+  }), /unavailable/);
+
+  writeEmployerRegistry(root, restored);
+  assert.deepEqual(loadEmployerRegistry(root).employers[0].aliases, ['Acme Ltd']);
+  assert.deepEqual(loadEmployerRegistry(root).employers[0].reviewHistory, restored.employers[0].reviewHistory);
+});
+
+test('an alias cannot ambiguously identify two employers', () => {
+  const registry = createEmployerRegistry([
+    discovery('Acme'),
+    discovery('Other Company'),
+  ], { now: () => AT });
+  const other = registry.employers.find(({ canonicalName }) => canonicalName === 'Other Company');
+  assert.throws(() => updateEmployerRegistryEntry(registry, {
+    id: other.id,
+    aliases: ['Acme'],
+  }), /ambiguous/);
 });

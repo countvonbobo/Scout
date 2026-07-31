@@ -320,14 +320,17 @@ test('published learning reranks unassessed jobs, reconsiders scoped exclusions 
   const sources = { ats: { count: 3, jobs: [
     {
       company: 'Reviewed Co', title: 'Data Engineer', location: 'London',
+      roleFamily: 'Data Engineering',
       url: 'https://example.test/reviewed', providerId: 'reviewed',
     },
     {
       company: 'Preferred Co', title: 'Data Engineer', location: 'Manchester',
+      roleFamily: 'Data Engineering',
       url: 'https://example.test/preferred', providerId: 'preferred',
     },
     {
       company: 'Adjacent Co', title: 'Software Engineer', location: 'Bristol',
+      roleFamily: 'Software Engineering',
       url: 'https://example.test/adjacent', providerId: 'adjacent',
     },
   ] } };
@@ -364,7 +367,7 @@ test('published learning reranks unassessed jobs, reconsiders scoped exclusions 
           kind: 'reconsider-rule',
           profileRuleId: 'rule-data-engineer',
           scope: 'role-family',
-          value: 'Software Engineer',
+          value: 'Software Engineering',
           proposalId: 'proposal-adjacent',
         },
         {
@@ -373,7 +376,7 @@ test('published learning reranks unassessed jobs, reconsiders scoped exclusions 
           value: 'Software Engineer',
           weight: 8,
           scope: 'role-family',
-          scopeValue: 'Software Engineer',
+          scopeValue: 'Software Engineering',
           proposalId: 'proposal-adjacent-rank',
         },
       ],

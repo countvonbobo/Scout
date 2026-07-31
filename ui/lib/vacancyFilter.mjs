@@ -193,10 +193,16 @@ function compensationExclusions(vacancy, profile) {
 
 function learningScopeMatches(vacancy, change) {
   if (change.scope === 'profile-wide') return true;
-  const actual = change.scope === 'employer'
-    ? fieldValue(vacancy, 'employer')
-    : fieldValue(vacancy, 'title');
-  return normalise(valueOf(actual)) === normalise(change.value);
+  if (change.scope === 'employer') {
+    return normalise(valueOf(fieldValue(vacancy, 'employer'))) === normalise(change.value);
+  }
+  const roleFamilies = [
+    ...(Array.isArray(vacancy?.roleFamilies) ? vacancy.roleFamilies : []),
+    vacancy?.roleFamilyId,
+    vacancy?.roleFamily,
+    vacancy?.targetRoleFamily,
+  ].map(valueOf).map(normalise).filter(Boolean);
+  return roleFamilies.includes(normalise(change.value));
 }
 
 function reconsideredByLearning(vacancy, match, learningPolicy) {

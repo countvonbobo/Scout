@@ -8,6 +8,7 @@
 // A timeout, DNS failure, block page or unexpected status is `unverified` and
 // the candidate is kept, because an offline host must never mass-close a
 // tracker.
+import { fetchPublicResource, PublicHttpError } from './publicHttp.mjs';
 
 const DEFAULT_TIMEOUT_MS = 8000;
 const DEFAULT_CONCURRENCY = 6;
@@ -74,13 +75,21 @@ export function redirectedToIndex(requestedUrl, finalUrl) {
   } catch { return false; }
 }
 
-async function readBounded(response) {
-  const text = await response.text();
-  return text.length > MAX_BODY_CHARS ? text.slice(0, MAX_BODY_CHARS) : text;
+function publicFailureReason(error) {
+  if (!(error instanceof PublicHttpError)) return 'request failed';
+  if (error.reasonCode === 'request-timeout') return 'timed out';
+  if (['unsafe-destination', 'url-invalid'].includes(error.reasonCode)) {
+    return 'destination is not public';
+  }
+  if (error.reasonCode === 'dns-failed') return 'destination could not be verified';
+  if (error.reasonCode === 'response-too-large') return 'response was too large';
+  if (error.reasonCode === 'content-type-invalid') return 'response was not an advert page';
+  if (error.reasonCode === 'redirect-limit') return 'too many redirects';
+  return 'request failed';
 }
 
 export async function checkAdvert(url, {
-  fetchFn = globalThis.fetch, timeoutMs = DEFAULT_TIMEOUT_MS, now = () => Date.now(),
+  fetchFn = null, lookupFn, timeoutMs = DEFAULT_TIMEOUT_MS, now = () => Date.now(),
 } = {}) {
   const headers = { 'user-agent': USER_AGENT, accept: 'text/html,application/xhtml+xml,*/*;q=0.8' };
   const checkedAt = new Date(now()).toISOString();
@@ -89,7 +98,10 @@ export async function checkAdvert(url, {
   }
   let head;
   try {
-    head = await fetchFn(url, { method: 'HEAD', redirect: 'follow', signal: AbortSignal.timeout(timeoutMs), headers });
+    head = await fetchPublicResource(url, {
+      method: 'HEAD', headers, timeoutMs, lookupFn, requestImpl: fetchFn,
+      maxBytes: 1_024, maxRedirects: 4,
+    });
   } catch {
     head = null;
   }
@@ -104,9 +116,15 @@ export async function checkAdvert(url, {
   // so confirm with a GET whenever HEAD did not prove the advert is gone.
   let response;
   try {
-    response = await fetchFn(url, { method: 'GET', redirect: 'follow', signal: AbortSignal.timeout(timeoutMs), headers });
+    response = await fetchPublicResource(url, {
+      method: 'GET', headers, timeoutMs, lookupFn, requestImpl: fetchFn,
+      maxBytes: MAX_BODY_CHARS, maxRedirects: 4,
+      allowedContentTypes: ['text/html', 'application/xhtml+xml', 'text/plain'],
+    });
   } catch (error) {
-    return { url, state: 'unverified', reason: error?.name === 'TimeoutError' ? 'timed out' : `request failed: ${error?.message || 'unknown'}`, checkedAt };
+    return {
+      url, state: 'unverified', reason: publicFailureReason(error), checkedAt,
+    };
   }
   const state = classifyStatus(response.status);
   if (state !== 'live') {
@@ -116,7 +134,7 @@ export async function checkAdvert(url, {
     return { url, state: 'gone', reason: 'redirected to the board index', checkedAt };
   }
   let body = '';
-  try { body = await readBounded(response); }
+  try { body = await response.text(); }
   catch { return { url, state: 'unverified', reason: 'response body could not be read', checkedAt }; }
   if (looksClosed(body)) return { url, state: 'gone', reason: 'advert says it is closed', checkedAt };
   return { url, state: 'live', reason: null, checkedAt };
@@ -142,7 +160,7 @@ async function runWithConcurrency(items, limit, worker) {
 // `unverified`, so a slow board delays a scan by a known amount instead of
 // stalling it.
 export async function checkAdverts(urls, {
-  fetchFn = globalThis.fetch, timeoutMs = DEFAULT_TIMEOUT_MS, concurrency = DEFAULT_CONCURRENCY,
+  fetchFn = null, lookupFn, timeoutMs = DEFAULT_TIMEOUT_MS, concurrency = DEFAULT_CONCURRENCY,
   budgetMs = DEFAULT_BUDGET_MS, hostDelayMs = DEFAULT_HOST_DELAY_MS, now = () => Date.now(),
   sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
 } = {}) {
@@ -160,7 +178,9 @@ export async function checkAdverts(urls, {
       if (wait > 0) await sleep(wait);
       lastRequestByHost.set(host, now());
     }
-    return checkAdvert(url, { fetchFn, timeoutMs, now });
+    return checkAdvert(url, {
+      fetchFn, lookupFn, timeoutMs, now,
+    });
   });
   return new Map(results.map((result) => [result.url, result]));
 }

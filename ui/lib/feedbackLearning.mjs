@@ -415,10 +415,22 @@ function vacancyField(vacancy, field) {
     .find((value) => value !== undefined && value !== null);
 }
 
+function vacancyRoleFamilies(vacancy) {
+  const values = [
+    ...(Array.isArray(vacancy?.roleFamilies) ? vacancy.roleFamilies : []),
+    vacancy?.roleFamilyId,
+    vacancy?.roleFamily,
+    vacancy?.targetRoleFamily,
+  ].map(valueOf).map(normalise).filter(Boolean);
+  return [...new Set(values)];
+}
+
 function matchesChange(vacancy, change) {
   if (change.scope !== 'profile-wide') {
-    const scopeField = change.scope === 'employer' ? 'employer' : 'title';
-    if (normalise(vacancyField(vacancy, scopeField)) !== normalise(change.scopeValue)) return false;
+    const expectedScope = normalise(change.scopeValue);
+    if (change.scope === 'role-family') {
+      if (!vacancyRoleFamilies(vacancy).includes(expectedScope)) return false;
+    } else if (normalise(vacancyField(vacancy, 'employer')) !== expectedScope) return false;
   }
   const actual = vacancyField(vacancy, change.field);
   const values = Array.isArray(actual) ? actual : [actual];
