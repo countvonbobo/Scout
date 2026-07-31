@@ -627,8 +627,29 @@ test('search-profile routes review a complete draft and publish only the current
   assert.equal(JSON.parse(setupStatus.text).searchProfilePublished, false);
   const migrated = await request({ method: 'GET', path: '/api/search-profile' });
   assert.equal(migrated.status, 200);
-  assert.equal(JSON.parse(migrated.text).draft?.status, 'draft');
+  const migratedState = JSON.parse(migrated.text);
+  assert.equal(migratedState.draft?.status, 'draft');
+  assert.equal(
+    migratedState.draft.target.primaryTitles[0].provenance,
+    'deterministic-derivation',
+  );
   assert.equal(fs.existsSync(paths.searchProfilePublished), false);
+
+  const migratedPublication = await request({
+    method: 'POST', path: '/api/search-profile/publish', headers: JSON_HEADERS(),
+    body: JSON.stringify({ revision: migratedState.draftRevision, confirmed: true }),
+  });
+  assert.equal(migratedPublication.status, 200);
+  const migratedResult = JSON.parse(migratedPublication.text);
+  assert.equal(
+    migratedResult.published.target.primaryTitles[0].provenance,
+    'deterministic-derivation',
+  );
+  assert.equal(migratedResult.lanePlan.profileId, migratedResult.published.id);
+  const migratedLanePlan = JSON.parse(fs.readFileSync(paths.searchLanes, 'utf8'));
+  assert.ok(migratedLanePlan.lanes.some(({ profileFields }) => (
+    profileFields.some(({ provenance }) => provenance === 'deterministic-derivation')
+  )));
 
   const draft = profileDraft();
   fs.mkdirSync(path.dirname(paths.searchProfileDraft), { recursive: true });
@@ -639,12 +660,12 @@ test('search-profile routes review a complete draft and publish only the current
   const reviewed = await request({ method: 'GET', path: '/api/search-profile' });
   assert.equal(reviewed.status, 200);
   assert.deepEqual(JSON.parse(reviewed.text), {
-    rawPresent: true, draft, published: null, draftRevision: revision,
+    rawPresent: true, draft, published: migratedResult.published, draftRevision: revision,
   });
   const adaptive = await request({ method: 'GET', path: '/api/search-profile/adaptive' });
   assert.equal(adaptive.status, 200);
   const adaptiveState = JSON.parse(adaptive.text);
-  assert.equal(adaptiveState.lanePlan, null);
+  assert.equal(adaptiveState.lanePlan.profileId, migratedResult.published.id);
   assert.equal(adaptiveState.questionnaire.questions[0].phase, 'universal');
   assert.ok(adaptiveState.questionnaire.questions.some(({ phase }) => phase === 'specialist'));
 

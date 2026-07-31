@@ -68,6 +68,19 @@ test('lane generation is bounded, linear and traces every supported profile fami
   )));
 });
 
+test('lane generation accepts deterministic derivation from a migrated profile', () => {
+  const migrated = profile({ primaryTitles: ['Research coordinator'] });
+  migrated.target.primaryTitles[0].provenance = 'deterministic-derivation';
+
+  const plan = generateSearchLanePlan(migrated);
+
+  assert.equal(plan.lanes.length, 1);
+  assert.equal(
+    plan.lanes[0].profileFields[0].provenance,
+    'deterministic-derivation',
+  );
+});
+
 test('six materially different domain profiles produce different neutral lane plans', () => {
   const fixtures = [
     profile({ id: 'profile-000000000001', primaryTitles: ['Junior developer'], locations: ['Remote'], skills: ['JavaScript'] }),

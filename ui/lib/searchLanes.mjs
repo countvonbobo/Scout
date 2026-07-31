@@ -2,6 +2,7 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { atomicWriteFile } from './atomicWrite.mjs';
+import { PROVENANCE } from './searchProfile.mjs';
 import { workspacePaths } from './workspace.mjs';
 
 export const SEARCH_LANE_SCHEMA_VERSION = 1;
@@ -343,7 +344,7 @@ function validateProfileField(value) {
     || !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(value.ruleId || '')
     || !text(value.value)
     || !Object.hasOwn(STRENGTH_PRIORITY, value.strength)
-    || !['explicit', 'confirmed-inference', 'unconfirmed-inference'].includes(value.provenance)) {
+    || !PROVENANCE.includes(value.provenance)) {
     throw new TypeError('lane profile-field provenance is invalid');
   }
   return value;
