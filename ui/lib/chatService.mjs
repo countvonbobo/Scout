@@ -35,6 +35,24 @@ export const ENGINES = {
 const running = new Map(); // opportunity id -> { stop() }
 
 export function activeChatTurnCount() { return running.size; }
+export async function shutdownActiveChatTurns({ timeoutMs = 10_000 } = {}) {
+  const turns = [...new Set(running.values())];
+  for (const turn of turns) turn.stop?.();
+  const completions = turns.map((turn) => turn.finished || turn.completion).filter(Boolean);
+  if (!completions.length) return;
+  let timer;
+  try {
+    await Promise.race([
+      Promise.allSettled(completions),
+      new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error('active chat turns did not close before shutdown')), timeoutMs);
+        timer.unref?.();
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
 export const ONBOARDING_CHAT_ID = 'setup-onboarding';
 
 const FIT_SCHEMA = Object.freeze({
@@ -665,7 +683,9 @@ export function registerChatRoutes({
     sseStart(res);
     let operation = null;
     let stopRequested = false;
+    let settleMarker;
     const marker = {
+      completion: new Promise((resolve) => { settleMarker = resolve; }),
       stop() {
         stopRequested = true;
         operation?.stop?.();
@@ -737,6 +757,7 @@ export function registerChatRoutes({
     } finally {
       if (providerWork) await providerWork.release(lifecycleError);
       running.delete(id);
+      settleMarker();
       sseEnd(res);
     }
   }

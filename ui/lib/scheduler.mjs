@@ -170,6 +170,10 @@ export function createProviderHealthMonitor({
       stopped = true;
       cancelInterval(timer);
     },
+    async drain() {
+      this.stop();
+      if (inFlight) await inFlight;
+    },
   };
 }
 

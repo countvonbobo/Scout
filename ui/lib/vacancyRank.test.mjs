@@ -222,6 +222,24 @@ test('unknown location include and penalise policies remain distinct and traceab
   assert.ok(penalised.preRankScore < included.preRankScore);
 });
 
+test('the published employer unknown policy applies to the employer-preference dimension', () => {
+  const job = vacancy({ vacancyId: 'unknown-employer-policy', title: 'Data Analyst', employer: null });
+  const rules = {
+    primaryTitles: [rule('Data Analyst', 'strong-preference')],
+    employers: [rule('Acme', 'strong-preference')],
+  };
+  const included = rankVacancies([job], profile({
+    ...rules, unknownPolicies: { employer: 'include' },
+  }))[0];
+  const penalised = rankVacancies([job], profile({
+    ...rules, unknownPolicies: { employer: 'penalise' },
+  }))[0];
+  const dimension = penalised.dimensions.find(({ name }) => name === 'employerPreference');
+  assert.equal(dimension.evidence[0].comparison, 'unknown');
+  assert.ok(dimension.score < 0);
+  assert.ok(penalised.preRankScore < included.preRankScore);
+});
+
 test('compensation only matches comparable currency, period and rate types', () => {
   const rankedProfile = profile({ compensation: {
     currency: 'GBP', period: 'year', rateType: 'salary', minimum: 60000,

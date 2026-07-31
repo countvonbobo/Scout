@@ -443,7 +443,7 @@ function filesUnder(directory, { includeDependencies = false } = {}) {
   const result = [];
   const visit = (entry) => {
     const stat = fs.lstatSync(entry);
-    if (stat.isSymbolicLink()) return;
+    if (stat.isSymbolicLink()) throw new Error(`release audit refuses symbolic link: ${entry}`);
     if (stat.isFile()) {
       result.push(entry);
       return;
@@ -488,7 +488,12 @@ export function auditRelease({
   const listedTrackedFiles = trackedFiles ?? collectTrackedFiles(absoluteRoot);
   const tracked = listedTrackedFiles
     .map((file) => path.resolve(absoluteRoot, file))
-    .filter((file) => fs.existsSync(file) && fs.statSync(file).isFile());
+    .filter((file) => {
+      if (!fs.existsSync(file)) return false;
+      const stat = fs.lstatSync(file);
+      if (stat.isSymbolicLink()) throw new Error(`release audit refuses symbolic link: ${file}`);
+      return stat.isFile();
+    });
   const built = buildDirs.flatMap((dir) => filesUnder(path.resolve(absoluteRoot, dir)));
   const files = [...new Set([...tracked, ...built])]
     .filter((file) => file !== excluded)

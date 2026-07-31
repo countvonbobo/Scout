@@ -211,6 +211,12 @@ Pushing or merging a branch does not by itself update the live VPS.
 
 Critical mutable workspace records are replaced atomically. Scout writes new contents to a temporary file in the same directory, flushes that file, and then renames it over the canonical path. This covers configuration, tracker state, chats, company timelines, CV-quality records, onboarding state, scan artifacts, recovery metadata, and imported CV text. Code that adds another critical workspace write must use the shared atomic-write helper; temporary files are never a source of truth.
 
+Multi-file onboarding activation additionally writes a prepared intent before
+the first replacement and reconciles it at startup under the shared workspace
+mutation authority. Shutdown and restart drain acknowledged backup batches,
+provider-health probes, managed operations and chat children before process
+handoff; a failed child shutdown leaves the process in place for a safe retry.
+
 Update this file in the same pull request whenever any of these change:
 
 - which host or workspace is authoritative;

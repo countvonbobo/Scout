@@ -19,7 +19,7 @@ const {
   publicApiError, publicCvImportError, publicDeviceSettings, publicProviderStatus,
   publicSetupConfigError, recoverProfilePublicationsAtStartup, requestAccess,
   restartControl, runtimeProviderPreflight, shutdownControl,
-  stageSearchProfileReviewAtStartup,
+  stageSearchProfileReviewAtStartup, scheduleCheckpoint, drainScheduledCheckpoints,
 } = await import('./server.mjs');
 const { seedWorkspace, loadWorkspaceConfig, workspacePaths, writeWorkspaceConfig } = await import('./lib/workspace.mjs');
 const {
@@ -80,6 +80,13 @@ test('server startup and periodic provider health use the configured runtime ent
   ]);
   monitor.stop();
   assert.equal(cleared, true);
+});
+
+test('shutdown drainage starts a queued checkpoint immediately and settles its promise', async () => {
+  const pending = scheduleCheckpoint('test: acknowledged mutation');
+  await drainScheduledCheckpoints();
+  const result = await pending;
+  assert.ok(['success', 'pending', 'partial', 'needs-attention', 'disabled'].includes(result.state));
 });
 
 test('server startup retries a live-fenced profile publication without starting unsafely', () => {
@@ -1331,7 +1338,10 @@ test('restart responds first, then schedules the respawn', async () => {
     assert.equal(response.status, 200);
     assert.deepEqual(JSON.parse(response.text), { ok: true, restarting: true });
     assert.equal(respawned, false, 'respawn must happen after the response is sent');
-    await new Promise((resolve) => setTimeout(resolve, 350));
+    const deadline = Date.now() + 2_000;
+    while (!respawned && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
     assert.equal(respawned, true);
   } finally {
     restartControl.respawn = originalRespawn;

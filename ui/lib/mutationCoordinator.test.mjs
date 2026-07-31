@@ -234,13 +234,20 @@ test('parent death during merge, add, commit and push keeps every live child fen
     roots.push(root);
     const marker = path.join(root, 'child.json');
     const owner = spawn(process.execPath, [fixtureFile, root, phase, marker], {
-      stdio: 'ignore',
+      stdio: ['ignore', 'ignore', 'pipe'],
       windowsHide: true,
     });
+    let ownerStderr = '';
+    owner.stderr.on('data', (chunk) => { ownerStderr = (ownerStderr + chunk).slice(-4_096); });
     let childPid;
     let successor;
     try {
-      await waitUntil(() => fs.existsSync(marker));
+      await Promise.race([
+        waitUntil(() => fs.existsSync(marker), 15_000),
+        new Promise((resolve, reject) => owner.once('exit', (code, signal) => reject(new Error(
+          `mutation child owner exited before readiness (${code ?? signal}): ${ownerStderr.trim() || 'no stderr'}`,
+        )))),
+      ]);
       const fixtureState = JSON.parse(fs.readFileSync(marker, 'utf8'));
       ({ childPid } = fixtureState);
       const guard = JSON.parse(fs.readFileSync(
@@ -259,12 +266,15 @@ test('parent death during merge, add, commit and push keeps every live child fen
       assert.equal(processExists(childPid), true, `${phase} child must be live before parent death`);
       owner.kill('SIGKILL');
       await waitUntil(() => owner.exitCode !== null || owner.signalCode !== null || !processExists(owner.pid));
-      await new Promise((resolve) => setTimeout(resolve, 220));
       successor = acquireScanLease(
         root,
         currentLeaseOwner(),
         { kind: 'backup', runId: `successor-${phase}`, phase: 'checkpoint' },
-        { leaseDurationMs: 5_000, takeoverMarginMs: 0 },
+        {
+          leaseDurationMs: 5_000,
+          takeoverMarginMs: 0,
+          now: Date.parse(fixtureState.leaseExpiresAt) + 1,
+        },
       );
       assert.ok(successor, `${phase} successor lease was not acquired`);
       assert.throws(
@@ -846,6 +856,7 @@ test('run-log recipes project funnel counters without copying nested source pros
     role: 'Safe Role',
     source: 'ats',
     sourceUrl: 'https://example.test/jobs/1',
+    sourceReferences: [],
     contentFingerprint: 'a'.repeat(64),
     profileId: 'profile-safe',
     categoryId: 'general',

@@ -494,16 +494,19 @@ export function assertScanReady(root, provider, {
 
 export async function runScan(root, provider, mode, {
   onProgress = () => {}, model, autoBroaden = false, estimate = null,
+  signal = null,
   requester = 'manual', windowAt = null, scheduleId = null, logicalWindowId = null,
   assertScanReadyFn = assertScanReady,
   runScanWithFn = runScanWith,
   queueWorkspaceSyncFn = queueWorkspaceSync,
 } = {}) {
+  signal?.throwIfAborted();
   onProgress({ phase: 'Validating approved evidence', current: 1, total: 5 });
   assertScanReadyFn(root, provider, { deferProviderHealth: true });
   const initial = await runScanWithFn(root, provider, mode, {
-    onProgress, model, requester, windowAt, scheduleId, logicalWindowId, queueWorkspaceSyncFn,
+    onProgress, model, requester, windowAt, scheduleId, logicalWindowId, queueWorkspaceSyncFn, signal,
   });
+  signal?.throwIfAborted();
   let result = initial;
   if (shouldAutoBroaden(initial, mode, autoBroaden)) {
     const broadenedEstimate = estimate ? {
@@ -520,7 +523,7 @@ export async function runScan(root, provider, mode, {
       current: Number.isFinite(progress.current) ? Math.min(10, 5 + progress.current) : 6,
     });
     const broadened = await runScanWithFn(root, provider, 'broadened', {
-      onProgress: retryProgress, model, queueWorkspaceSyncFn,
+      onProgress: retryProgress, model, queueWorkspaceSyncFn, signal,
     });
     result = { ...broadened, automaticBroadened: true, initialScan: initial.scan };
   }
@@ -772,7 +775,9 @@ export async function runScanWith(root, provider, mode, {
   acquireProviderWorkFn = acquireProviderWork,
   renewProviderWorkFn = renewProviderWork,
   releaseProviderWorkFn = releaseProviderWork,
+  signal = null,
 } = {}) {
+  signal?.throwIfAborted();
   if (!['codex', 'claude'].includes(provider)) throw new Error('provider must be codex or claude');
   if (!['primary', 'second-pass', 'broadened'].includes(mode)) throw new Error('mode must be primary, broadened or second-pass');
   const providerHealthPurpose = requester === 'scheduled' ? 'scheduled-job' : 'manual-run';
@@ -957,6 +962,7 @@ export async function runScanWith(root, provider, mode, {
             acquireProviderWorkFn,
             renewProviderWorkFn,
             releaseProviderWorkFn,
+            signal,
           });
           if (queued.status === 'in-progress'
             && queued.reason === 'operator-intervention-required'
@@ -1134,6 +1140,12 @@ export async function runScanWith(root, provider, mode, {
                     provider, status: trustedProviderStatus, schema: SCAN_ASSESSMENT_SCHEMA, prompt,
                     model, validate: (value) => value, timeoutMs, maxInputTokens,
                   });
+                  const stopForAbort = () => invocation.stop?.();
+                  signal?.addEventListener('abort', stopForAbort, { once: true });
+                  if (signal?.aborted) stopForAbort();
+                  void Promise.resolve(invocation).finally(() => {
+                    signal?.removeEventListener('abort', stopForAbort);
+                  }).catch(() => {});
                   void Promise.resolve(invocation).then(
                     (remoteResult) => recordProviderResultHealthFn(
                       root,

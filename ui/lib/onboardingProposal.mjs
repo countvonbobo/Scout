@@ -90,6 +90,46 @@ function sha256(file) {
   return fs.existsSync(file) ? crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex') : null;
 }
 
+function contentSha256(content) {
+  return crypto.createHash('sha256').update(content).digest('hex');
+}
+
+function activationIntentFile(root) {
+  return path.join(root, '.scout', 'onboarding', 'activation.json');
+}
+
+function readActivationIntent(root) {
+  const file = activationIntentFile(root);
+  if (!fs.existsSync(file)) return null;
+  const intent = JSON.parse(fs.readFileSync(file, 'utf8'));
+  const keys = [
+    'activatedAt', 'backupDir', 'existed', 'expectedHashes', 'intendedHashes',
+    'proposalId', 'provider', 'receipts', 'schemaVersion', 'stagedHashes',
+  ];
+  const exactMap = (value, validate) => value && Object.getPrototypeOf(value) === Object.prototype
+    && Object.keys(value).sort().join('\0') === [...ONBOARDING_FILES].sort().join('\0')
+    && Object.values(value).every(validate);
+  const digest = (value) => typeof value === 'string' && /^[a-f0-9]{64}$/.test(value);
+  const expectedBackup = `.scout/backups/${String(intent?.activatedAt || '').replace(/[:.]/g, '-')}`;
+  if (!intent || Object.getPrototypeOf(intent) !== Object.prototype
+    || Object.keys(intent).sort().join('\0') !== keys.sort().join('\0')
+    || intent.schemaVersion !== 1
+    || typeof intent.proposalId !== 'string' || !/^[A-Za-z0-9-]{1,80}$/.test(intent.proposalId)
+    || !['codex', 'claude'].includes(intent.provider)
+    || Number.isNaN(Date.parse(intent.activatedAt || ''))
+    || intent.backupDir !== expectedBackup
+    || !exactMap(intent.existed, (value) => typeof value === 'boolean')
+    || !exactMap(intent.expectedHashes, (value) => value === null || digest(value))
+    || !exactMap(intent.stagedHashes, digest)
+    || !exactMap(intent.intendedHashes, digest)
+    || !Array.isArray(intent.receipts)
+    || new Set(intent.receipts).size !== intent.receipts.length
+    || intent.receipts.some((relative) => !ONBOARDING_FILES.includes(relative))) {
+    throw new Error('onboarding activation intent is invalid');
+  }
+  return intent;
+}
+
 const MINIMUM_FILE_BYTES = Object.freeze({
   'workspace.json': 100,
   'profile/context.md': 150,
@@ -260,6 +300,7 @@ export async function createOnboardingProposal(root, provider, {
   renewProviderWorkFn = renewProviderWork,
   releaseProviderWorkFn = releaseProviderWork,
   onProgress = () => {},
+  signal = null,
 } = {}) {
   onProgress({ phase: 'Preparing approved evidence', current: 1, total: 4 });
   const config = loadWorkspaceConfig(root);
@@ -296,8 +337,15 @@ export async function createOnboardingProposal(root, provider, {
       model: config.ai?.provider === provider ? config.ai?.model : null,
       validate: (value) => validateOnboardingProposal(value, input.evidence), maxInputTokens: 60_000,
     });
+    const stopForAbort = () => operation.stop?.();
+    signal?.addEventListener('abort', stopForAbort, { once: true });
+    if (signal?.aborted) stopForAbort();
     providerWork.setFailureHandler(() => operation.stop?.());
-    turn = await operation;
+    try {
+      turn = await operation;
+    } finally {
+      signal?.removeEventListener('abort', stopForAbort);
+    }
     providerWork.assertCurrent();
   } catch (error) {
     lifecycleError = error;
@@ -364,68 +412,121 @@ export function activateOnboardingProposal(root, proposalId, confirmed, {
     kind: 'onboarding',
     phase: 'activate',
   }, ({ renew }) => {
-  const proposal = readOnboardingProposal(root);
-  if (!proposal || proposal.proposalId !== proposalId) throw new Error('onboarding proposal is missing or no longer current');
-  if ((proposal.unresolvedQuestions || []).length) throw new Error('resolve the proposal questions before activation');
-  for (const relative of ONBOARDING_FILES) {
-    if (sha256(targetPath(root, relative)) !== proposal.targetHashes[relative]) throw new Error(`active ${relative} changed after proposal generation; regenerate before activation`);
-    if (sha256(stagePath(root, relative)) !== proposal.stagedHashes?.[relative]) throw new Error(`staged ${relative} changed after proposal generation; regenerate before activation`);
-  }
-  const activatedAt = now();
-  const stagedConfig = JSON.parse(fs.readFileSync(stagePath(root, 'workspace.json'), 'utf8'));
-  const stagedFiles = Object.fromEntries(ONBOARDING_FILES.map((relative) => [relative, fs.readFileSync(stagePath(root, relative), 'utf8')]));
-  validateMeaningfulFiles(stagedFiles, 'staged');
-  stagedConfig.setup = { ...stagedConfig.setup, completedAt: activatedAt };
-  validateWorkspaceConfig(stagedConfig);
-  stagedFiles['workspace.json'] = `${JSON.stringify(stagedConfig, null, 2)}\n`;
-  const previous = Object.fromEntries(ONBOARDING_FILES.map((relative) => {
-    const file = targetPath(root, relative);
-    return [relative, fs.existsSync(file) ? fs.readFileSync(file) : null];
-  }));
-  const backupDir = path.join(root, '.scout', 'backups', activatedAt.replace(/[:.]/g, '-'));
-  fs.mkdirSync(backupDir, { recursive: true });
-  for (const [relative, content] of Object.entries(previous)) {
-    if (content != null) {
-      const backup = path.join(backupDir, ...relative.split('/'));
-      fs.mkdirSync(path.dirname(backup), { recursive: true });
-      atomicWriteFile(backup, content);
+    const proposal = readOnboardingProposal(root);
+    const existingIntent = readActivationIntent(root);
+    if (!proposal || proposal.proposalId !== proposalId) throw new Error('onboarding proposal is missing or no longer current');
+    if ((proposal.unresolvedQuestions || []).length) throw new Error('resolve the proposal questions before activation');
+    if (existingIntent && existingIntent.proposalId !== proposalId) {
+      throw new Error('another onboarding activation requires recovery');
     }
-  }
-  try {
-    for (const relative of ONBOARDING_FILES) {
-      renew();
-      _testHooks.beforeWrite?.(relative);
-      atomicWrite(targetPath(root, relative), stagedFiles[relative]);
-    }
-    for (const relative of ONBOARDING_FILES) {
-      const active = fs.readFileSync(targetPath(root, relative), 'utf8');
-      if (!meaningfulContent(relative, active)) throw new Error(`activated ${relative} is empty or incomplete`);
-      if (!activeMatchesReviewedStage(root, relative)) {
-        throw new Error(`activated ${relative} does not match the reviewed proposal`);
+    const activatedAt = existingIntent?.activatedAt || now();
+    const stagedConfig = JSON.parse(fs.readFileSync(stagePath(root, 'workspace.json'), 'utf8'));
+    const stagedFiles = Object.fromEntries(ONBOARDING_FILES.map((relative) => [
+      relative, fs.readFileSync(stagePath(root, relative), 'utf8'),
+    ]));
+    validateMeaningfulFiles(stagedFiles, 'staged');
+    stagedConfig.setup = { ...stagedConfig.setup, completedAt: activatedAt };
+    validateWorkspaceConfig(stagedConfig);
+    stagedFiles['workspace.json'] = `${JSON.stringify(stagedConfig, null, 2)}\n`;
+    let intent = existingIntent;
+    if (!intent) {
+      for (const relative of ONBOARDING_FILES) {
+        if (sha256(targetPath(root, relative)) !== proposal.targetHashes[relative]) throw new Error(`active ${relative} changed after proposal generation; regenerate before activation`);
+        if (sha256(stagePath(root, relative)) !== proposal.stagedHashes?.[relative]) throw new Error(`staged ${relative} changed after proposal generation; regenerate before activation`);
       }
+      const backupDir = path.join(root, '.scout', 'backups', activatedAt.replace(/[:.]/g, '-'));
+      fs.mkdirSync(backupDir, { recursive: true });
+      const existed = {};
+      for (const relative of ONBOARDING_FILES) {
+        const active = targetPath(root, relative);
+        existed[relative] = fs.existsSync(active);
+        if (existed[relative]) {
+          const backup = path.join(backupDir, ...relative.split('/'));
+          fs.mkdirSync(path.dirname(backup), { recursive: true });
+          atomicWriteFile(backup, fs.readFileSync(active));
+        }
+      }
+      intent = {
+        schemaVersion: 1,
+        proposalId,
+        provider: proposal.provider,
+        activatedAt,
+        backupDir: path.relative(root, backupDir).replaceAll('\\', '/'),
+        existed,
+        expectedHashes: proposal.targetHashes,
+        stagedHashes: proposal.stagedHashes,
+        intendedHashes: Object.fromEntries(
+          ONBOARDING_FILES.map((relative) => [relative, contentSha256(stagedFiles[relative])]),
+        ),
+        receipts: [],
+      };
+      atomicWriteFile(activationIntentFile(root), `${JSON.stringify(intent, null, 2)}\n`);
     }
-    const result = doctorFn(root);
-    const activationProvider = result?.checks?.providers?.[proposal.provider];
-    const requiredOk = result?.checks?.config?.ok && result?.checks?.tracker?.ok
-      && activationProvider?.installed && activationProvider?.authenticated
-      && activationProvider?.capabilities?.structuredOutput !== false;
-    if (!requiredOk) throw new Error('Scout doctor rejected the activated workspace');
-    const marker = {
-      activatedAt, provider: proposal.provider, proposalId,
-      stagedHashes: proposal.stagedHashes,
-      activatedHashes: Object.fromEntries(ONBOARDING_FILES.map((relative) => [relative, sha256(targetPath(root, relative))])),
-    };
-    atomicWriteFile(path.join(root, '.scout', 'onboarding', 'activated.json'), `${JSON.stringify(marker, null, 2)}\n`);
-    fs.rmSync(path.join(root, '.scout', 'onboarding', 'proposal.json'), { force: true });
-    return { ok: true, activatedAt, backupDir, files: ONBOARDING_FILES };
-  } catch (error) {
-    for (const [relative, content] of Object.entries(previous)) {
-      const target = targetPath(root, relative);
-      if (content == null) fs.rmSync(target, { force: true });
-      else atomicWrite(target, content);
+    const backupDir = path.join(root, intent.backupDir);
+    try {
+      for (const relative of ONBOARDING_FILES) {
+        renew();
+        if (sha256(stagePath(root, relative)) !== intent.stagedHashes[relative]) {
+          throw new Error(`staged ${relative} changed during onboarding activation`);
+        }
+        const activeHash = sha256(targetPath(root, relative));
+        if (activeHash === intent.intendedHashes[relative]) {
+          if (!intent.receipts.includes(relative)) {
+            intent.receipts.push(relative);
+            atomicWriteFile(activationIntentFile(root), `${JSON.stringify(intent, null, 2)}\n`);
+          }
+          continue;
+        }
+        if (activeHash !== intent.expectedHashes[relative]) {
+          throw new Error(`active ${relative} conflicts with prepared onboarding activation`);
+        }
+        _testHooks.beforeWrite?.(relative);
+        atomicWrite(targetPath(root, relative), stagedFiles[relative]);
+        _testHooks.afterWrite?.(relative);
+        intent.receipts.push(relative);
+        atomicWriteFile(activationIntentFile(root), `${JSON.stringify(intent, null, 2)}\n`);
+      }
+      for (const relative of ONBOARDING_FILES) {
+        const active = fs.readFileSync(targetPath(root, relative), 'utf8');
+        if (!meaningfulContent(relative, active)) throw new Error(`activated ${relative} is empty or incomplete`);
+        if (!activeMatchesReviewedStage(root, relative)) {
+          throw new Error(`activated ${relative} does not match the reviewed proposal`);
+        }
+      }
+      const result = doctorFn(root);
+      const activationProvider = result?.checks?.providers?.[proposal.provider];
+      const requiredOk = result?.checks?.config?.ok && result?.checks?.tracker?.ok
+        && activationProvider?.installed && activationProvider?.authenticated
+        && activationProvider?.capabilities?.structuredOutput !== false;
+      if (!requiredOk) throw new Error('Scout doctor rejected the activated workspace');
+      const marker = {
+        activatedAt, provider: proposal.provider, proposalId,
+        stagedHashes: proposal.stagedHashes,
+        activatedHashes: Object.fromEntries(ONBOARDING_FILES.map((relative) => [relative, sha256(targetPath(root, relative))])),
+      };
+      atomicWriteFile(path.join(root, '.scout', 'onboarding', 'activated.json'), `${JSON.stringify(marker, null, 2)}\n`);
+      fs.rmSync(path.join(root, '.scout', 'onboarding', 'proposal.json'), { force: true });
+      fs.rmSync(activationIntentFile(root), { force: true });
+      return { ok: true, activatedAt, backupDir, files: ONBOARDING_FILES };
+    } catch (error) {
+      if (error?.simulateProcessDeath === true) throw error;
+      for (const relative of ONBOARDING_FILES) {
+        const target = targetPath(root, relative);
+        if (!intent.existed[relative]) fs.rmSync(target, { force: true });
+        else atomicWrite(target, fs.readFileSync(path.join(backupDir, ...relative.split('/')), 'utf8'));
+      }
+      fs.rmSync(activationIntentFile(root), { force: true });
+      throw error;
     }
-    throw error;
-  }
+  });
+}
+
+export function recoverOnboardingActivationAtStartup(root, options = {}) {
+  const intent = readActivationIntent(root);
+  if (!intent) return null;
+  return activateOnboardingProposal(root, intent.proposalId, true, {
+    ...options,
+    now: () => intent.activatedAt,
   });
 }
 
@@ -460,30 +561,36 @@ export function activatedProposalRecovery(root) {
 
 export function recoverActivatedProposal(root, confirmed, { now = () => new Date().toISOString(), doctorFn = doctor } = {}) {
   if (confirmed !== true) throw new Error('explicit recovery confirmation is required');
-  const recovery = activatedProposalRecovery(root);
-  if (!recovery.available) throw new Error(recovery.reason);
-  const relative = recovery.file;
-  const active = targetPath(root, relative);
-  const staged = stagePath(root, relative);
-  const previous = fs.existsSync(active) ? fs.readFileSync(active) : null;
-  const recoveredAt = now();
-  const backupDir = path.join(root, '.scout', 'backups', `${recoveredAt.replace(/[:.]/g, '-')}-recovery`);
-  const backup = path.join(backupDir, ...relative.split('/'));
-  fs.mkdirSync(path.dirname(backup), { recursive: true });
-  atomicWriteFile(backup, previous || Buffer.alloc(0));
-  try {
-    atomicWrite(active, fs.readFileSync(staged, 'utf8'));
-    if (!meaningfulContent(relative, fs.readFileSync(active, 'utf8')) || sha256(active) !== sha256(staged)) {
-      throw new Error('recovered master CV failed integrity validation');
+  return withWorkspaceMutationAuthority(root, {
+    kind: 'onboarding',
+    phase: 'recover-activated-cv',
+  }, ({ renew }) => {
+    const recovery = activatedProposalRecovery(root);
+    if (!recovery.available) throw new Error(recovery.reason);
+    const relative = recovery.file;
+    const active = targetPath(root, relative);
+    const staged = stagePath(root, relative);
+    const previous = fs.existsSync(active) ? fs.readFileSync(active) : null;
+    const recoveredAt = now();
+    const backupDir = path.join(root, '.scout', 'backups', `${recoveredAt.replace(/[:.]/g, '-')}-recovery`);
+    const backup = path.join(backupDir, ...relative.split('/'));
+    fs.mkdirSync(path.dirname(backup), { recursive: true });
+    atomicWriteFile(backup, previous || Buffer.alloc(0));
+    try {
+      renew();
+      atomicWrite(active, fs.readFileSync(staged, 'utf8'));
+      if (!meaningfulContent(relative, fs.readFileSync(active, 'utf8')) || sha256(active) !== sha256(staged)) {
+        throw new Error('recovered master CV failed integrity validation');
+      }
+      const health = doctorFn(root);
+      if (!health?.checks?.config?.ok || !health?.checks?.tracker?.ok) throw new Error('Scout doctor rejected the recovered workspace');
+      return { ok: true, recoveredAt, file: relative, backupDir, restoredBytes: fs.statSync(active).size };
+    } catch (error) {
+      if (previous == null) fs.rmSync(active, { force: true });
+      else atomicWrite(active, previous.toString('utf8'));
+      throw error;
     }
-    const health = doctorFn(root);
-    if (!health?.checks?.config?.ok || !health?.checks?.tracker?.ok) throw new Error('Scout doctor rejected the recovered workspace');
-    return { ok: true, recoveredAt, file: relative, backupDir, restoredBytes: fs.statSync(active).size };
-  } catch (error) {
-    if (previous == null) fs.rmSync(active, { force: true });
-    else atomicWrite(active, previous.toString('utf8'));
-    throw error;
-  }
+  });
 }
 
 export function discardOnboardingProposal(root) {

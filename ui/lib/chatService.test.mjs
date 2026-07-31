@@ -5,7 +5,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { ENGINES, registerChatRoutes } from './chatService.mjs';
+import { ENGINES, registerChatRoutes, shutdownActiveChatTurns } from './chatService.mjs';
 import { parseClaudeLine } from './chatClaude.mjs';
 import { emptyChat, loadChat, saveChat } from './chatStore.mjs';
 import { HANDOFF_SUMMARY_PROMPT } from './chatPrompts.mjs';
@@ -675,6 +675,36 @@ test('durable authentication mutation blocks same-provider chat across tabs but 
   assert.equal(sseEvents(usable.text()).at(-1).event, 'done');
   assert.equal(invocations, 1);
   releaseProviderAuthMutation(root, mutation);
+});
+
+test('runtime shutdown stops and awaits active SSE provider turns', async () => {
+  const root = tmpRoot();
+  let resolveTurn;
+  let stopped = false;
+  const routes = routeFixture(root, {
+    runTurnFn: () => ({
+      stop() {
+        stopped = true;
+        resolveTurn({
+          ok: false, reasonCode: 'stopped', stopped: true,
+          sessionId: null, filesTouched: [],
+        });
+      },
+      finished: new Promise((resolve) => { resolveTurn = resolve; }),
+    }),
+  });
+  const req = new EventEmitter();
+  const res = new MockResponse();
+  routes['POST /api/chat/send'](
+    req,
+    res,
+    JSON.stringify({ id: ID, engine: 'codex', text: 'Stop safely.' }),
+  );
+  await new Promise((resolve) => setImmediate(resolve));
+  await shutdownActiveChatTurns({ timeoutMs: 500 });
+  await res.finished;
+  assert.equal(stopped, true);
+  assert.equal(sseEvents(res.text()).at(-1).data.reasonCode, undefined);
 });
 
 test('a settled late chat result is not resent or allowed to overwrite login-in-progress health', async () => {

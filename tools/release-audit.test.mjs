@@ -38,6 +38,18 @@ test('passes clean tracked files and build output', () => {
   assert.equal(result.filesScanned, 2);
 });
 
+test('refuses tracked and staged symlinks without following their targets', () => {
+  if (process.platform === 'win32') return;
+  const root = fixture();
+  const privateFile = path.join(fixture(), 'private.txt');
+  fs.writeFileSync(privateFile, 'Casey Exampleperson');
+  fs.symlinkSync(privateFile, path.join(root, 'README.md'));
+  assert.throws(
+    () => auditRelease({ root, trackedFiles: ['README.md'], buildDirs: [], markers: ['Casey Exampleperson'] }),
+    /refuses symbolic link/,
+  );
+});
+
 test('reports marker and secret rules without retaining their values', () => {
   const root = fixture();
   const marker = 'Casey Exampleperson';

@@ -339,6 +339,30 @@ test('periodic provider monitor is single-flight, supports runNow and stops clea
   assert.equal(calls, 1);
 });
 
+test('provider monitor drainage waits for in-flight provider work to release', async () => {
+  let release;
+  const pending = new Promise((resolve) => { release = resolve; });
+  const monitor = createProviderHealthMonitor({
+    root: '/synthetic/workspace',
+    getScheduleJobs: () => [{ id: 'codex-primary', enabled: true, provider: 'codex' }],
+    preflight: async () => {
+      await pending;
+      return { ok: true, provider: 'codex', state: 'ready' };
+    },
+    setInterval: () => ({ unref() {} }),
+    clearInterval() {},
+  });
+  const run = monitor.runNow();
+  const drain = monitor.drain();
+  let drained = false;
+  void drain.then(() => { drained = true; });
+  await Promise.resolve();
+  assert.equal(drained, false);
+  release();
+  await Promise.all([run, drain]);
+  assert.equal(drained, true);
+});
+
 test('provider monitor never invokes scan or queue work', async () => {
   const forbidden = () => { throw new Error('scan or queue invocation is forbidden'); };
   const monitor = createProviderHealthMonitor({

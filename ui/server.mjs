@@ -48,7 +48,7 @@ import { setupReadiness } from './lib/setupReadiness.mjs';
 import { OperationConflictError, OperationManager } from './lib/operations.mjs';
 import {
   activateOnboardingProposal, activatedProposalRecovery, createOnboardingProposal, discardOnboardingProposal,
-  readOnboardingProposal, recoverActivatedProposal,
+  readOnboardingProposal, recoverActivatedProposal, recoverOnboardingActivationAtStartup,
 } from './lib/onboardingProposal.mjs';
 import { loadDeviceSettings, pendingDeviceSections, saveDeviceSettings, setWindowsStartup, updateDownloadDirectory, windowsStartupStatus } from './lib/deviceSettings.mjs';
 import { disableRemoteAccess, enableRemoteAccess, remoteAccessStatus } from './lib/remoteAccess.mjs';
@@ -122,6 +122,7 @@ const TRACKER = WORKSPACE.tracker;
 const REPORTS_DIR = WORKSPACE.reports;
 const SCAN_RUNS = WORKSPACE.scanRuns;
 export const operations = new OperationManager();
+let runtimeHttpServer = null;
 
 // Fresh installations remain uninitialised until the person chooses either a
 // new local workspace or Restore. Existing workspaces keep the legacy fast path.
@@ -153,6 +154,27 @@ export function recoverProfilePublicationsAtStartup({
 }
 
 recoverProfilePublicationsAtStartup();
+
+export function recoverOnboardingAtStartup({
+  root = WORKSPACE_ROOT,
+  initialised = workspaceInitialised,
+  recover = recoverOnboardingActivationAtStartup,
+  schedule = setTimeout,
+} = {}) {
+  if (!initialised()) return null;
+  try {
+    return recover(root);
+  } catch (error) {
+    if (!['mutation-busy', 'scan-in-progress'].includes(error?.reasonCode)) throw error;
+    const retry = schedule(() => recoverOnboardingAtStartup({
+      root, initialised, recover, schedule,
+    }), 1_000);
+    retry.unref?.();
+    return null;
+  }
+}
+
+recoverOnboardingAtStartup();
 
 export function stageSearchProfileReviewAtStartup({
   initialised = workspaceInitialised,
@@ -192,7 +214,23 @@ function queueCheckpoint(reason, { includeDevicePreferences = false } = {}) {
 }
 
 let scheduledCheckpointBatch = null;
-function scheduleCheckpoint(reason, { includeDevicePreferences = false } = {}) {
+const activeCheckpointTasks = new Set();
+
+function executeCheckpointBatch(batch) {
+  if (batch.task) return batch.task;
+  clearTimeout(batch.timer);
+  if (scheduledCheckpointBatch === batch) scheduledCheckpointBatch = null;
+  batch.task = queueCheckpoint(batch.reason, {
+    includeDevicePreferences: batch.includeDevicePreferences,
+  }).finally(() => activeCheckpointTasks.delete(batch.task));
+  activeCheckpointTasks.add(batch.task);
+  void batch.task.then((result) => {
+    for (const resolve of batch.waiters) resolve(result);
+  });
+  return batch.task;
+}
+
+export function scheduleCheckpoint(reason, { includeDevicePreferences = false } = {}) {
   if (!scheduledCheckpointBatch) {
     scheduledCheckpointBatch = {
       reason,
@@ -207,16 +245,19 @@ function scheduleCheckpoint(reason, { includeDevicePreferences = false } = {}) {
   }
   const batch = scheduledCheckpointBatch;
   const pending = new Promise((resolve) => batch.waiters.push(resolve));
-  batch.timer = setTimeout(async () => {
+  batch.timer = setTimeout(() => {
     if (scheduledCheckpointBatch !== batch) return;
-    scheduledCheckpointBatch = null;
-    const result = await queueCheckpoint(batch.reason, {
-      includeDevicePreferences: batch.includeDevicePreferences,
-    });
-    for (const resolve of batch.waiters) resolve(result);
+    void executeCheckpointBatch(batch);
   }, 1_000);
   batch.timer.unref?.();
   return pending;
+}
+
+export async function drainScheduledCheckpoints() {
+  while (scheduledCheckpointBatch || activeCheckpointTasks.size) {
+    if (scheduledCheckpointBatch) executeCheckpointBatch(scheduledCheckpointBatch);
+    await Promise.allSettled([...activeCheckpointTasks]);
+  }
 }
 
 export function today() {
@@ -1156,12 +1197,12 @@ export function createServer() {
 }
 
 export async function closeServerSafely(server) {
-  if (server?.listening) {
-    await new Promise((resolve, reject) => {
+  const close = server?.listening
+    ? new Promise((resolve, reject) => {
       server.close((error) => (error ? reject(error) : resolve()));
-    });
-  }
-  await providerLoginControl.shutdown();
+    })
+    : Promise.resolve();
+  await Promise.all([close, drainRuntimeWork()]);
 }
 
 // --- Mutation wiring (Task 5) ---
@@ -2199,15 +2240,18 @@ routes['POST /api/cv/quality/override'] = (req, res, body) => {
   catch { return replyJson(res, 409, publicApiError('CV quality decision could not be saved.')); }
 };
 
-import { activeChatTurnCount, registerChatRoutes } from './lib/chatService.mjs';
+import { activeChatTurnCount, registerChatRoutes, shutdownActiveChatTurns } from './lib/chatService.mjs';
 import { registerCompanyRoutes } from './lib/companyService.mjs';
 routes['POST /api/setup/proposal'] = (req, res, body) => {
   const b = parseBody(body); if (!b) return replyJson(res, 400, { error: 'bad json' });
   const provider = b.provider || loadWorkspaceConfig(WORKSPACE_ROOT).ai?.provider;
   if (!['codex', 'claude'].includes(provider)) return replyJson(res, 400, { error: 'choose an authenticated AI provider first' });
   try {
-    const operation = operations.start('proposal', async (update) => {
-      const result = await createOnboardingProposal(WORKSPACE_ROOT, provider, { onProgress: update });
+    const operation = operations.start('proposal', async (update, { signal }) => {
+      const result = await createOnboardingProposal(WORKSPACE_ROOT, provider, {
+        onProgress: update,
+        signal,
+      });
       void scheduleCheckpoint('stage setup proposal');
       return { ok: true, proposalId: result.proposalId, files: result.files };
     }, { phase: 'Preparing approved evidence', total: 4 });
@@ -2485,8 +2529,10 @@ routes['POST /api/scan'] = (req, res, body) => {
   if (!['codex', 'claude'].includes(provider)) return replyJson(res, 400, { error: 'choose an authenticated AI provider first' });
   try {
     const estimate = scanEstimate(readScanRecords(), provider, 'primary');
-    const operation = operations.start('scan', async (update) => {
-      const result = await runScan(WORKSPACE_ROOT, provider, 'primary', { onProgress: update, model, autoBroaden: true, estimate });
+    const operation = operations.start('scan', async (update, { signal }) => {
+      const result = await runScan(WORKSPACE_ROOT, provider, 'primary', {
+        onProgress: update, model, autoBroaden: true, estimate, signal,
+      });
       if (!result.ok && result.status === 'in-progress'
         && result.reason === 'operator-intervention-required') {
         update({ phase: 'Operator intervention required' });
@@ -2582,14 +2628,20 @@ routes['POST /api/restart'] = (req, res, body) => {
   }
   replyJson(res, 200, { ok: true, restarting: true });
   setTimeout(() => {
-    void providerLoginControl.shutdown().then(() => restartControl.respawn()).catch(() => {});
+    const quiesced = runtimeHttpServer?.listening
+      ? closeServerSafely(runtimeHttpServer)
+      : drainRuntimeWork();
+    void quiesced.then(() => restartControl.respawn()).catch(() => {});
   }, 200);
 };
 
 routes['POST /api/shutdown'] = (req, res) => {
   replyJson(res, 200, { ok: true, shuttingDown: true });
   setTimeout(() => {
-    void providerLoginControl.shutdown().then(() => shutdownControl.exit()).catch(() => {});
+    const quiesced = runtimeHttpServer?.listening
+      ? closeServerSafely(runtimeHttpServer)
+      : drainRuntimeWork();
+    void quiesced.then(() => shutdownControl.exit()).catch(() => {});
   }, 200);
 };
 
@@ -2614,6 +2666,40 @@ export async function runtimeProviderPreflight(root, provider, purpose, {
     return preflightFn(root, provider, purpose, { source });
   } finally {
     if (providerWork) releaseProviderWork(root, providerWork);
+  }
+}
+
+const runtimeBackgroundTasks = new Set();
+let runtimeProviderHealthMonitor = null;
+
+function trackRuntimeBackgroundTask(task) {
+  const pending = Promise.resolve(task);
+  runtimeBackgroundTasks.add(pending);
+  void pending.finally(() => runtimeBackgroundTasks.delete(pending)).catch(() => {});
+  return pending;
+}
+
+export async function drainRuntimeWork({ timeoutMs = 10_000 } = {}) {
+  runtimeProviderHealthMonitor?.stop();
+  const work = [
+    operations.shutdown({ timeoutMs }),
+    shutdownActiveChatTurns({ timeoutMs }),
+    drainScheduledCheckpoints(),
+    runtimeProviderHealthMonitor?.drain?.(),
+    ...runtimeBackgroundTasks,
+  ].filter(Boolean);
+  let timer;
+  try {
+    await Promise.race([
+      Promise.all(work),
+      new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error('Scout runtime work did not close before shutdown')), timeoutMs);
+        timer.unref?.();
+      }),
+    ]);
+    await providerLoginControl.shutdown();
+  } finally {
+    clearTimeout(timer);
   }
 }
 
@@ -2655,6 +2741,7 @@ export function createRuntimeProviderHealthMonitor(root, {
 const isMain = isMainModule(import.meta.url);
 if (isMain) {
   const providerHealthMonitor = createRuntimeProviderHealthMonitor(WORKSPACE_ROOT);
+  runtimeProviderHealthMonitor = providerHealthMonitor;
   if (process.platform === 'win32') {
     try {
       const settings = loadDeviceSettings();
@@ -2669,6 +2756,7 @@ if (isMain) {
     } catch (error) { console.warn(`Scout startup migration needs attention: ${error.message}`); }
   }
   const server = createServer();
+  runtimeHttpServer = server;
   let bindRetries = 0;
   server.on('error', (err) => {
     // After /api/restart the previous process may hold the port briefly.
@@ -2682,26 +2770,24 @@ if (isMain) {
     console.log(`Scout UI on http://127.0.0.1:${PORT}`);
     if (workspaceInitialised()) {
       void scheduleCheckpoint('startup sync');
-      void checkStartupProviderHealth(WORKSPACE_ROOT).catch(() => {});
-      void providerHealthMonitor.runNow().catch(() => {});
+      void trackRuntimeBackgroundTask(checkStartupProviderHealth(WORKSPACE_ROOT)).catch(() => {});
+      void trackRuntimeBackgroundTask(providerHealthMonitor.runNow()).catch(() => {});
     }
   });
   server.listen(PORT, '127.0.0.1');
   const syncTimer = setInterval(() => { if (workspaceInitialised()) void scheduleCheckpoint('periodic sync'); }, 5 * 60 * 1000);
   syncTimer.unref();
-  let signalShutdown = false;
+  let signalShutdown = null;
   const stopForSignal = async () => {
-    if (signalShutdown) return;
-    signalShutdown = true;
+    if (signalShutdown) return signalShutdown;
     clearInterval(syncTimer);
     providerHealthMonitor.stop();
-    try {
+    signalShutdown = (async () => {
       await closeServerSafely(server);
       process.exit(0);
-    } catch {
-      signalShutdown = false;
-    }
+    })();
+    try { await signalShutdown; } finally { signalShutdown = null; }
   };
-  process.once('SIGTERM', () => { void stopForSignal(); });
-  process.once('SIGINT', () => { void stopForSignal(); });
+  process.on('SIGTERM', () => { void stopForSignal().catch(() => {}); });
+  process.on('SIGINT', () => { void stopForSignal().catch(() => {}); });
 }

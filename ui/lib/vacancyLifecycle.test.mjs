@@ -52,6 +52,26 @@ test('an unchanged rejected vacancy is revalidated but does not consume assessme
   );
 });
 
+test('a same-title URL-less opening with a different provider identity never inherits rejection', () => {
+  const previous = {
+    ...vacancy,
+    vacancyId: 'vacancy-ref-semantic',
+    sourceReferences: [{ source: 'ats', providerId: 'opening-1', url: '' }],
+    outcome: 'below_threshold',
+    profileId: 'profile-current',
+  };
+  const current = {
+    ...vacancy,
+    vacancyId: 'vacancy-ref-semantic',
+    sourceReferences: [{ source: 'ats', providerId: 'opening-2', url: '' }],
+  };
+  const result = partitionVacanciesForAssessment([current], [previous], {
+    profileId: 'profile-current',
+  });
+  assert.equal(result.skipped.length, 0);
+  assert.equal(result.eligible[0].lifecycle.reason, 'new-vacancy');
+});
+
 test('profile, scoring and assessment changes have distinct rerank and reassess behaviour', () => {
   const previous = {
     ...vacancy,

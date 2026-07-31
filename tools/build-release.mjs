@@ -166,11 +166,38 @@ export function productionLockfile(lock) {
 }
 
 function writeProductionManifests(root, appDir) {
-  const manifest = JSON.parse(fs.readFileSync(required(root, 'package.json'), 'utf8'));
-  const lock = JSON.parse(fs.readFileSync(required(root, 'package-lock.json'), 'utf8'));
+  const manifest = JSON.parse(readRegularFile(required(root, 'package.json')).toString('utf8'));
+  const lock = JSON.parse(readRegularFile(required(root, 'package-lock.json')).toString('utf8'));
   fs.writeFileSync(path.join(appDir, 'package.json'), `${JSON.stringify(productionPackageManifest(manifest), null, 2)}\n`);
   fs.writeFileSync(path.join(appDir, 'package-lock.json'), `${JSON.stringify(productionLockfile(lock), null, 2)}\n`);
   return lock;
+}
+
+function readRegularFile(source) {
+  const before = fs.lstatSync(source, { bigint: true });
+  if (!before.isFile() || before.isSymbolicLink()) {
+    throw new Error(`release input must be a regular file: ${source}`);
+  }
+  const noFollow = fs.constants.O_NOFOLLOW || 0;
+  const descriptor = fs.openSync(source, fs.constants.O_RDONLY | noFollow);
+  try {
+    const opened = fs.fstatSync(descriptor, { bigint: true });
+    const after = fs.lstatSync(source, { bigint: true });
+    if (!opened.isFile() || after.isSymbolicLink() || !after.isFile()
+      || opened.dev !== before.dev || opened.ino !== before.ino
+      || after.dev !== opened.dev || after.ino !== opened.ino) {
+      throw new Error(`release input identity changed while opening: ${source}`);
+    }
+    return fs.readFileSync(descriptor);
+  } finally {
+    fs.closeSync(descriptor);
+  }
+}
+
+function copyRegularFile(source, target) {
+  const content = readRegularFile(source);
+  fs.mkdirSync(path.dirname(target), { recursive: true });
+  fs.writeFileSync(target, content, { flag: 'wx', mode: fs.statSync(source).mode & 0o777 });
 }
 
 function copyTree(source, target, relative = '', include = includeReleasePath) {
@@ -185,8 +212,7 @@ function copyTree(source, target, relative = '', include = includeReleasePath) {
     }
     return;
   }
-  fs.mkdirSync(path.dirname(target), { recursive: true });
-  fs.copyFileSync(source, target);
+  copyRegularFile(source, target);
 }
 
 export function stagePublicSource({
@@ -200,10 +226,7 @@ export function stagePublicSource({
     const source = required(resolvedRoot, entry.source);
     const target = path.join(resolvedStage, entry.target);
     if (entry.tree) copyTree(source, target, normalise(entry.target), includePublicSourcePath);
-    else {
-      fs.mkdirSync(path.dirname(target), { recursive: true });
-      fs.copyFileSync(source, target);
-    }
+    else copyRegularFile(source, target);
   }
   return { root: resolvedRoot, stageDir: resolvedStage };
 }
@@ -254,10 +277,7 @@ export function stageRelease({
     const source = required(resolvedRoot, entry.source);
     const target = path.join(appDir, entry.target);
     if (entry.tree) copyTree(source, target, normalise(entry.target));
-    else {
-      fs.mkdirSync(path.dirname(target), { recursive: true });
-      fs.copyFileSync(source, target);
-    }
+    else copyRegularFile(source, target);
   }
 
   const lock = writeProductionManifests(resolvedRoot, appDir);
@@ -273,11 +293,11 @@ export function stageRelease({
   const runtimeDir = path.join(resolvedStage, 'runtime');
   fs.mkdirSync(runtimeDir, { recursive: true });
   const runtimeName = platform === 'win32' ? 'ScoutRuntime.exe' : 'node';
-  fs.copyFileSync(required(path.dirname(nodeExecutable), path.basename(nodeExecutable)), path.join(runtimeDir, runtimeName));
+  copyRegularFile(required(path.dirname(nodeExecutable), path.basename(nodeExecutable)), path.join(runtimeDir, runtimeName));
   if (platform !== 'win32') fs.chmodSync(path.join(runtimeDir, runtimeName), 0o755);
   const typstName = platform === 'win32' ? 'typst.exe' : 'typst';
   const typstSource = typstExecutable || path.join(resolvedRoot, '.scout-runtime', typstName);
-  fs.copyFileSync(required(path.dirname(typstSource), path.basename(typstSource)), path.join(runtimeDir, typstName));
+  copyRegularFile(required(path.dirname(typstSource), path.basename(typstSource)), path.join(runtimeDir, typstName));
   if (platform !== 'win32') fs.chmodSync(path.join(runtimeDir, typstName), 0o755);
 
   return { root: resolvedRoot, stageDir: resolvedStage, appDir };

@@ -72,6 +72,11 @@ maintenance. Privileged jobs reject mutable tag references in tests. Updating
 one of those SHAs requires a reviewed dependency change and another
 release-candidate rehearsal.
 
+Release staging refuses symbolic links for both copied trees and individually
+allowlisted inputs. Regular files are opened without following links and their
+opened identity is checked before bytes are copied; the staged-tree privacy
+audit also fails on any symlink.
+
 Attestation establishes build provenance, not software safety. It does not prove that the source or resulting package is free of vulnerabilities or malicious behaviour.
 
 ## Rotation and dependency maintenance

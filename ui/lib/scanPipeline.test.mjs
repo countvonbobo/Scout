@@ -18,6 +18,7 @@ import { applyPreparedMutation, prepareMutation } from './mutationCoordinator.mj
 import { scanReportRecipe } from './scanMutationProjection.mjs';
 import { profileRuleId } from './searchProfile.mjs';
 import { createEmployerRegistry, employerRegistryRevision } from './employerRegistry.mjs';
+import { partitionVacanciesForAssessment } from './vacancyLifecycle.mjs';
 
 const dimensions = [{ name: 'Fit', score: 90, maximum: 100, evidence: 'Advert and profile' }];
 const assessment = (status = 'met') => ({
@@ -928,7 +929,7 @@ test('forty zero-keeper candidates produce a bounded sanitised audit without tra
   assert.equal(artifacts.run.reviewed.length, 40);
   assert.deepEqual(Object.keys(artifacts.run.reviewed[0]).sort(), [
     'categoryId', 'company', 'contentFingerprint', 'learningVersionId', 'outcome', 'profileId', 'reasons',
-    'role', 'score', 'source', 'sourceUrl', 'vacancyId',
+    'role', 'score', 'source', 'sourceReferences', 'sourceUrl', 'vacancyId',
   ].sort());
   assert.doesNotMatch(JSON.stringify(artifacts.run.reviewed), /full advert|profileEvidence|Built systems/);
 
@@ -938,8 +939,58 @@ test('forty zero-keeper candidates produce a bounded sanitised audit without tra
   assert.match(history[0].contentFingerprint, /^[a-f0-9]{64}$/);
   assert.deepEqual(Object.keys(history[0]).sort(), [
     'assessedAt', 'company', 'contentFingerprint', 'learningVersionId', 'outcome', 'profileId',
-    'role', 'source', 'url', 'vacancyId',
+    'role', 'source', 'sourceReferences', 'url', 'vacancyId',
   ].sort());
+});
+
+test('durable URL-less decision history preserves provider identity across changing source coverage', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'scout-url-less-history-'));
+  fs.mkdirSync(path.join(root, 'data'), { recursive: true });
+  fs.writeFileSync(path.join(root, 'data', 'opportunities.json'), '{"updated":"2026-07-01","opportunities":[]}\n');
+  writeScanArtifacts(root, {
+    provider: 'codex',
+    mode: 'primary',
+    sources: { provider_a: { configured: true, status: 'healthy', count: 1 } },
+    candidates: [{
+      candidateId: 'candidate-001',
+      vacancyId: 'vacancy-ref-stable',
+      company: 'Synthetic Company',
+      role: 'Platform Engineer',
+      source: 'provider-a',
+      sourceReferences: [{ source: 'provider-a', providerId: 'opening-1', url: '' }],
+      description: 'Operate reliable services and improve production resilience.',
+    }],
+    assessmentResult: {
+      assessments: [{
+        ...assessment('met'),
+        candidateId: 'candidate-001',
+        recommendation: 'discard',
+      }],
+    },
+    policy: {},
+    startedAt: '2026-07-14T10:00:00Z',
+  });
+  const history = readVacancyDecisionHistory(root);
+  assert.deepEqual(history[0].sourceReferences, [{
+    source: 'provider a', providerId: 'opening-1', url: '',
+  }]);
+  const crossSource = partitionVacanciesForAssessment([{
+    vacancyId: 'vacancy-ref-stable',
+    company: 'Synthetic Company',
+    role: 'Platform Engineer',
+    sourceReferences: [{ source: 'provider-b', providerId: 'other-1', url: '' }],
+    description: 'Operate reliable services and improve production resilience.',
+  }], history);
+  assert.equal(crossSource.skipped[0].lifecycle.reason, 'unchanged-rejection');
+  const distinctOpening = partitionVacanciesForAssessment([{
+    vacancyId: 'vacancy-ref-stable',
+    company: 'Synthetic Company',
+    role: 'Platform Engineer',
+    sourceReferences: [{ source: 'provider-a', providerId: 'opening-2', url: '' }],
+    description: 'Operate reliable services and improve production resilience.',
+  }], history);
+  assert.equal(distinctOpening.skipped.length, 0);
+  assert.equal(distinctOpening.eligible[0].lifecycle.reason, 'new-vacancy');
 });
 
 test('two same-day providers remain visible in one combined report', () => {

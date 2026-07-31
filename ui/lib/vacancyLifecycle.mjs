@@ -104,7 +104,9 @@ export function decideVacancyLifecycle(previous, current, {
 function previousDecision(vacancy, history) {
   return (history || []).find((previous) => (
     previous?.vacancyId && vacancy?.vacancyId && previous.vacancyId === vacancy.vacancyId
-  ) || sameUnderlyingJob(previous, vacancy)) || null;
+      ? sameUnderlyingJob(previous, vacancy)
+      : sameUnderlyingJob(previous, vacancy)
+  )) || null;
 }
 
 export function partitionVacanciesForAssessment(ranked, history, options = {}) {

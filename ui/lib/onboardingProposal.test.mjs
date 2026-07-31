@@ -6,7 +6,7 @@ import { test } from 'node:test';
 import {
   ONBOARDING_FILES, activateOnboardingProposal, buildOnboardingEvidence, createOnboardingProposal,
   activatedProposalRecovery, discardOnboardingProposal, readOnboardingProposal, recoverActivatedProposal,
-  validateOnboardingProposal,
+  recoverOnboardingActivationAtStartup, validateOnboardingProposal,
 } from './onboardingProposal.mjs';
 import { readProviderHealth } from './providerHealth.mjs';
 import { ProviderLifecycleUnclosedError } from './structuredTurn.mjs';
@@ -208,6 +208,32 @@ test('activation rejects stale targets and rolls back every active file if docto
   }
 });
 
+test('startup reconciles a prepared activation after process death at every replacement', async () => {
+  for (const interruptedAfter of ONBOARDING_FILES) {
+    const dir = root();
+    const staged = await createOnboardingProposal(dir, 'codex', {
+      providerStatusFn: status, runStructuredTurnFn: run,
+    });
+    const crash = new Error(`synthetic process death after ${interruptedAfter}`);
+    crash.simulateProcessDeath = true;
+    assert.throws(() => activateOnboardingProposal(dir, staged.proposalId, true, {
+      doctorFn: healthyDoctor,
+      now: () => '2026-07-14T10:05:00.000Z',
+      _testHooks: {
+        afterWrite(relative) {
+          if (relative === interruptedAfter) throw crash;
+        },
+      },
+    }), /synthetic process death/);
+    assert.equal(fs.existsSync(path.join(dir, '.scout', 'onboarding', 'activation.json')), true);
+    const recovered = recoverOnboardingActivationAtStartup(dir, { doctorFn: healthyDoctor });
+    assert.equal(recovered.ok, true);
+    assert.equal(fs.existsSync(path.join(dir, '.scout', 'onboarding', 'activation.json')), false);
+    assert.equal(JSON.parse(fs.readFileSync(path.join(dir, 'workspace.json'))).setup.completedAt,
+      '2026-07-14T10:05:00.000Z');
+  }
+});
+
 test('activated empty master CV recovery is narrow, backed up, and integrity checked', async () => {
   const dir = root();
   const staged = await createOnboardingProposal(dir, 'codex', { providerStatusFn: status, runStructuredTurnFn: run });
@@ -222,6 +248,23 @@ test('activated empty master CV recovery is narrow, backed up, and integrity che
   assert.equal(fs.readFileSync(active, 'utf8'), reviewed);
   assert.equal(fs.statSync(path.join(recovered.backupDir, 'cv', 'master-cv.md')).size, 0);
   assert.equal(activatedProposalRecovery(dir).available, false);
+});
+
+test('activated CV recovery cannot overlap another workspace mutation owner', async () => {
+  const dir = root();
+  const staged = await createOnboardingProposal(dir, 'codex', {
+    providerStatusFn: status, runStructuredTurnFn: run,
+  });
+  activateOnboardingProposal(dir, staged.proposalId, true, { doctorFn: healthyDoctor });
+  fs.writeFileSync(path.join(dir, 'cv', 'master-cv.md'), '');
+  const lease = acquireScanLease(dir, currentLeaseOwner(), {
+    kind: 'backup', runId: 'recovery-overlap', phase: 'checkpoint',
+  });
+  assert.throws(
+    () => recoverActivatedProposal(dir, true, { doctorFn: healthyDoctor }),
+    /mutation|progress|authority|lease/i,
+  );
+  assert.ok(lease);
 });
 
 test('activated master CV recovery refuses unrelated active-file drift', async () => {

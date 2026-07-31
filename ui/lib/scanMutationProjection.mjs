@@ -337,6 +337,7 @@ function safeRunRecord(record) {
       role: boundedLabel(item?.role, 160),
       source: code(item?.source),
       sourceUrl: canonicalUrl(item?.sourceUrl),
+      sourceReferences: safeReferences({ sourceReferences: item?.sourceReferences }),
       contentFingerprint: /^[a-f0-9]{64}$/.test(String(item?.contentFingerprint || ''))
         ? item.contentFingerprint
         : null,

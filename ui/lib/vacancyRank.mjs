@@ -1,4 +1,5 @@
 import { applyLearningToRankedVacancies } from './feedbackLearning.mjs';
+import { sameUnderlyingJob } from './jobIdentity.mjs';
 import { profileRuleId } from './searchProfile.mjs';
 
 export const STRENGTH_WEIGHT = Object.freeze({
@@ -388,10 +389,18 @@ function historyIdentityIndex(history) {
   const index = new Map();
   for (const entry of history || []) {
     for (const key of identityValues(entry)) {
-      if (!index.has(key)) index.set(key, entry);
+      const entries = index.get(key) || [];
+      entries.push(entry);
+      index.set(key, entries);
     }
   }
   return index;
+}
+
+function matchedHistoryKey(vacancy, identities, historyIndex) {
+  return identities.find((key) => (
+    historyIndex.get(key) || []
+  ).some((entry) => key.startsWith('url:') || sameUnderlyingJob(entry, vacancy)));
 }
 
 function noveltyDimension(vacancy, profile, historyIndex) {
@@ -408,7 +417,7 @@ function noveltyDimension(vacancy, profile, historyIndex) {
       profileRuleIds: [profileRuleId], contributions: [],
     };
   }
-  const matchedKey = identities.find((key) => historyIndex.has(key));
+  const matchedKey = matchedHistoryKey(vacancy, identities, historyIndex);
   const comparison = matchedKey ? 'seen-exact' : 'unseen';
   const score = matchedKey ? 0 : behaviour.noveltyMaximum;
   const evidence = {
@@ -429,7 +438,7 @@ export function vacancyNoveltyComparison(vacancy, profile, history = []) {
   const identities = identityValues(vacancy);
   if (!identities.length) return 'unknown';
   const historyIndex = historyIdentityIndex(history);
-  return identities.some((identity) => historyIndex.has(identity)) ? 'seen-exact' : 'unseen';
+  return matchedHistoryKey(vacancy, identities, historyIndex) ? 'seen-exact' : 'unseen';
 }
 
 function dimensionsFor(vacancy, profile, { referenceTimestamp, historyIndex }) {
@@ -440,7 +449,8 @@ function dimensionsFor(vacancy, profile, { referenceTimestamp, historyIndex }) {
       vacancy,
       dimension,
       dimensionRules(profile, dimension),
-      profile?.unknownPolicies?.[dimension.name] || 'include',
+      profile?.unknownPolicies?.[dimension.name === 'employerPreference' ? 'employer' : dimension.name]
+        || 'include',
     ));
   }
   dimensions.push(

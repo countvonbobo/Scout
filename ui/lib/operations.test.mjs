@@ -46,3 +46,19 @@ test('operation records do not expose absolute workspace paths', async () => {
   assert.doesNotMatch(manager.get('op-3').error, /Users|Private Scout|context\.md/);
   assert.match(manager.get('op-3').error, /\[local path\]/);
 });
+
+test('shutdown aborts and awaits every managed background operation', async () => {
+  const manager = new OperationManager({ id: () => 'op-shutdown' });
+  let observedAbort = false;
+  manager.start('scan', async (_update, { signal }) => new Promise((resolve) => {
+    signal.addEventListener('abort', () => {
+      observedAbort = true;
+      resolve({ stopped: true });
+    }, { once: true });
+  }));
+  await tick();
+  await manager.shutdown({ timeoutMs: 500 });
+  assert.equal(observedAbort, true);
+  assert.deepEqual(manager.activeList(), []);
+  assert.equal(manager.get('op-shutdown').status, 'succeeded');
+});

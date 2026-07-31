@@ -218,6 +218,36 @@ test('public source publication refuses to audit without configured personal mar
   );
 });
 
+test('public and release staging refuse allowlisted leaf symlinks', () => {
+  if (process.platform === 'win32') return;
+  const privateFile = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'scout-private-leaf-')), 'private.txt');
+  fs.writeFileSync(privateFile, 'Synthetic private content');
+  for (const stage of [stagePublicSource, stageRelease]) {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'scout-symlink-root-'));
+    const stageDir = path.join(root, 'stage');
+    const entries = stage === stagePublicSource ? PUBLIC_SOURCE_FILES : RELEASE_FILES;
+    for (const entry of entries) {
+      const target = path.join(root, entry.source);
+      if (entry.tree) {
+        fs.mkdirSync(target, { recursive: true });
+        fs.writeFileSync(path.join(target, 'source.mjs'), 'export {};');
+      } else {
+        fs.mkdirSync(path.dirname(target), { recursive: true });
+        fs.writeFileSync(target, entry.source.endsWith('.json') ? '{}' : 'public');
+      }
+    }
+    const leaf = path.join(root, 'README.md');
+    fs.rmSync(leaf);
+    fs.symlinkSync(privateFile, leaf);
+    assert.throws(
+      () => stage === stageRelease
+        ? stage({ root, stageDir, includeDependencies: false, typstExecutable: process.execPath })
+        : stage({ root, stageDir }),
+      /regular file|symbolic link/,
+    );
+  }
+});
+
 test('staging copies only manifest content and bundled runtime', () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'scout-release-root-'));
   const stageDir = fs.mkdtempSync(path.join(os.tmpdir(), 'scout-release-stage-'));

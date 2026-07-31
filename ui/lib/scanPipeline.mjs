@@ -1232,6 +1232,9 @@ export function readVacancyDecisionHistory(root, { limit = VACANCY_DECISION_HIST
         role: boundedText(item.role, 160),
         source: boundedText(item.source, 80),
         url: safeSourceUrl(item.sourceUrl),
+        sourceReferences: sourceReferencesOf({
+          sourceReferences: Array.isArray(item.sourceReferences) ? item.sourceReferences : [],
+        }).slice(0, 8),
         outcome: boundedText(item.outcome, 80),
         contentFingerprint: /^[a-f0-9]{64}$/.test(String(item.contentFingerprint || ''))
           ? item.contentFingerprint
@@ -2121,6 +2124,7 @@ function mergeTracker(
       vacancyId: boundedText(candidate.vacancyId, 160),
       company: boundedText(candidate.company, 120), role: boundedText(candidate.role, 160),
       source: boundedText(candidate.source, 80), sourceUrl: safeSourceUrl(candidate.url),
+      sourceReferences: sourceReferences(candidate).slice(0, 8),
       contentFingerprint: /^[a-f0-9]{64}$/.test(String(candidate.contentFingerprint || ''))
         ? candidate.contentFingerprint
         : vacancyContentFingerprint(candidate),

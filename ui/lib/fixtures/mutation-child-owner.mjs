@@ -9,7 +9,7 @@ const lease = acquireScanLease(
   root,
   currentLeaseOwner(),
   { kind: 'backup', runId: `owner-${phase}`, phase: 'checkpoint' },
-  { leaseDurationMs: 150, takeoverMarginMs: 0 },
+  { leaseDurationMs: 10_000, takeoverMarginMs: 0 },
 );
 if (!lease) throw new Error('fixture could not acquire its scan lease');
 
@@ -28,6 +28,12 @@ await withMutationCoordinator(root, lease, async (coordinator) => {
     leaseId: lease.leaseId,
     operationId,
     ownerPid: process.pid,
+    leaseExpiresAt: lease.expiresAt,
   }), { mode: 0o600 });
-  await new Promise(() => {});
+  const keepAlive = setInterval(() => {}, 1_000);
+  try {
+    await new Promise(() => {});
+  } finally {
+    clearInterval(keepAlive);
+  }
 });
