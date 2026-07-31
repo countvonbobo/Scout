@@ -4,6 +4,7 @@ import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { afterEach, test } from 'node:test';
 import {
   MutationConflictError,
@@ -227,12 +228,12 @@ test('the shared coordinator remains held until the durable receipt is appended'
 });
 
 test('parent death during merge, add, commit and push keeps every live child fenced from a successor', async () => {
-  const fixtureFile = new URL('./fixtures/mutation-child-owner.mjs', import.meta.url);
+  const fixtureFile = fileURLToPath(new URL('./fixtures/mutation-child-owner.mjs', import.meta.url));
   for (const phase of ['merge', 'add', 'commit', 'push']) {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), `scout-orphan-${phase}-`));
     roots.push(root);
     const marker = path.join(root, 'child.json');
-    const owner = spawn(process.execPath, [fixtureFile.pathname, root, phase, marker], {
+    const owner = spawn(process.execPath, [fixtureFile, root, phase, marker], {
       stdio: 'ignore',
       windowsHide: true,
     });

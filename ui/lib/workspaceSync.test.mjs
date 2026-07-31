@@ -3,6 +3,7 @@ import { spawn, spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 import {
   adoptExistingWorkspaceFromGithub, analyseBackupDivergence, confirmRecoveryKey, connectWorkspaceSync,
@@ -529,7 +530,7 @@ test('a stale runtime sync fence prevents the first local mutation', async () =>
 });
 
 test('startup and periodic checkpoints report pending while another process owns every mutation phase', async () => {
-  const holderFixture = new URL('./fixtures/scan-lease-holder.mjs', import.meta.url);
+  const holderFixture = fileURLToPath(new URL('./fixtures/scan-lease-holder.mjs', import.meta.url));
   for (const [phase, reason] of [
     ['collect', 'startup sync'],
     ['profile-publication', 'periodic sync'],
@@ -539,7 +540,7 @@ test('startup and periodic checkpoints report pending while another process owns
     const f = fixture();
     git(f.root, 'init');
     const marker = path.join(f.root, `.holder-${phase}.json`);
-    const holder = spawn(process.execPath, [holderFixture.pathname, f.root, phase, marker], {
+    const holder = spawn(process.execPath, [holderFixture, f.root, phase, marker], {
       stdio: 'ignore',
       windowsHide: true,
     });

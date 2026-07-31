@@ -7,7 +7,10 @@ import { fileURLToPath } from 'node:url';
 import { test } from 'node:test';
 import { artifactNames } from './build-platform.mjs';
 
-const workflow = fs.readFileSync(new URL('../.github/workflows/windows-release.yml', import.meta.url), 'utf8');
+const workflow = fs.readFileSync(
+  new URL('../.github/workflows/windows-release.yml', import.meta.url),
+  'utf8',
+).replaceAll('\r\n', '\n');
 const ci = fs.readFileSync(new URL('../.github/workflows/ci.yml', import.meta.url), 'utf8');
 const workspaceRepair = fs.readFileSync(new URL('../.github/workflows/vps-workspace-repair.yml', import.meta.url), 'utf8');
 const deploy = fs.readFileSync(new URL('./deploy-vps.sh', import.meta.url), 'utf8');
