@@ -40,10 +40,15 @@ export async function shutdownActiveChatTurns({ timeoutMs = 10_000 } = {}) {
   for (const turn of turns) turn.stop?.();
   const completions = turns.map((turn) => turn.finished || turn.completion).filter(Boolean);
   if (!completions.length) return;
+  const settled = Promise.allSettled(completions);
+  if (timeoutMs === null) {
+    await settled;
+    return;
+  }
   let timer;
   try {
     await Promise.race([
-      Promise.allSettled(completions),
+      settled,
       new Promise((_, reject) => {
         timer = setTimeout(() => reject(new Error('active chat turns did not close before shutdown')), timeoutMs);
         timer.unref?.();

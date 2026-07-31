@@ -108,6 +108,41 @@ test('a failed runtime drain leaves the production listener available for a safe
   assert.equal((await request({ path: '/api/app-info' })).status, 200);
 });
 
+test('a real drain timeout keeps admission closed until abandoned work settles, then reopens atomically', async () => {
+  let release;
+  operations.start('shutdown-timeout-test', async () => (
+    new Promise((resolve) => { release = resolve; })
+  ));
+  await new Promise((resolve) => setImmediate(resolve));
+  let providerShutdowns = 0;
+  const originalProviderShutdown = providerLoginControl.shutdown;
+  providerLoginControl.shutdown = async () => { providerShutdowns += 1; };
+  try {
+    await assert.rejects(
+      closeServerSafely(server, { drain: () => drainRuntimeWork({ timeoutMs: 5 }) }),
+      /did not close before shutdown/,
+    );
+    assert.equal(server.listening, true);
+    assert.equal((await request({ path: '/api/app-info' })).status, 503);
+    assert.throws(
+      () => operations.start('late-timeout-work', async () => null),
+      /shutting down/,
+    );
+    release({ stopped: true });
+    let status = 503;
+    for (let attempt = 0; attempt < 50 && status !== 200; attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      status = (await request({ path: '/api/app-info' })).status;
+    }
+    assert.equal(status, 200);
+    assert.equal(providerShutdowns, 0);
+    operations.start('post-timeout-work', async () => null);
+    await new Promise((resolve) => setImmediate(resolve));
+  } finally {
+    providerLoginControl.shutdown = originalProviderShutdown;
+  }
+});
+
 test('server startup retries a live-fenced profile publication without starting unsafely', () => {
   const calls = [];
   let scheduled;

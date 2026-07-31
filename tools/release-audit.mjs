@@ -408,6 +408,7 @@ function privateRuntimeArtifact(relative) {
 
 function allowedReleaseBinary(relative) {
   const value = String(relative).replaceAll('\\', '/').toLocaleLowerCase('en-US');
+  if (value === 'deb/usr/share/icons/hicolor/512x512/apps/scout.png') return true;
   const appIndex = value.lastIndexOf('/app/');
   const packaged = appIndex === -1 ? value : value.slice(appIndex + 1);
   if (packaged.startsWith('app/node_modules/') || packaged.startsWith('node_modules/')) return true;
@@ -424,6 +425,9 @@ function allowedReleaseBinary(relative) {
 
 function reviewedPublicBinaryDigest(relative) {
   const value = String(relative).replaceAll('\\', '/').toLocaleLowerCase('en-US');
+  if (value === 'deb/usr/share/icons/hicolor/512x512/apps/scout.png') {
+    return REVIEWED_PUBLIC_BINARY_DIGESTS.get('ui/assets/scout-icon.png');
+  }
   const appIndex = value.lastIndexOf('/app/');
   const packaged = appIndex === -1 ? value : value.slice(appIndex + 5);
   return REVIEWED_PUBLIC_BINARY_DIGESTS.get(packaged) || null;

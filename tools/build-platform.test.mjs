@@ -26,6 +26,8 @@ test('platform packaging consumes verified staged inputs and audits payloads bef
   assert.match(build, /copyVerifiedReleaseFile/);
   assert.match(build, /auditStageBeforePackaging\(stage\)/);
   assert.doesNotMatch(build, /copy\(path\.join\(ROOT, 'installer\/unix\/ScoutLauncher\.sh'/);
+  assert.doesNotMatch(build, /copy\(path\.join\(ROOT, 'ui\/assets\/scout-icon\.png'/);
+  assert.match(build, /path\.join\(stage, 'app\/ui\/assets\/scout-icon\.png'\)/);
   assert.match(
     build.match(/export function buildMac[\s\S]*?return \{ output/)?.[0] || '',
     /auditStageBeforePackaging\(stage\)[\s\S]*fs\.symlinkSync\('\/Applications'/,

@@ -59,10 +59,15 @@ export class OperationManager {
     const active = [...this.executions.values()];
     for (const execution of active) execution.controller.abort(new Error('operation cancelled for shutdown'));
     if (!active.length) return;
+    const settled = Promise.allSettled(active.map(({ finished }) => finished));
+    if (timeoutMs === null) {
+      await settled;
+      return;
+    }
     let timer;
     try {
       await Promise.race([
-        Promise.allSettled(active.map(({ finished }) => finished)),
+        settled,
         new Promise((_, reject) => {
           timer = setTimeout(() => reject(new Error('active operations did not close before shutdown')), timeoutMs);
           timer.unref?.();

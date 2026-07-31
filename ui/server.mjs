@@ -866,7 +866,17 @@ const runtimeProviderLoginManager = createProviderLoginManager({
 export const providerLoginControl = {
   manager: runtimeProviderLoginManager,
   async shutdown() {
-    await this.manager.shutdown();
+    try {
+      await this.manager.shutdown();
+    } catch (error) {
+      // The production manager enters a terminal shutdown state before it
+      // waits for children. If that wait fails, reopening provider routes
+      // would expose a manager that cannot accept work.
+      if (this.manager === runtimeProviderLoginManager) {
+        error.runtimeAdmissionMayResume = false;
+      }
+      throw error;
+    }
     fs.rmSync(providerLoginWorkingDirectory, { recursive: true, force: true });
   },
 };
@@ -1269,7 +1279,7 @@ export async function closeServerSafely(server, { drain = drainRuntimeWork } = {
   try {
     await drain();
   } catch (error) {
-    resumeRuntimeAdmission();
+    recoverRuntimeAdmissionAfterFailedDrain(error);
     throw error;
   }
   if (!server?.listening) return;
@@ -2710,8 +2720,8 @@ routes['POST /api/restart'] = (req, res, body) => {
     void quiesced.then(() => {
       restartControl.respawn();
       if (!productionServer) resumeRuntimeAdmission();
-    }).catch(() => {
-      if (!productionServer) resumeRuntimeAdmission();
+    }).catch((error) => {
+      if (!productionServer) recoverRuntimeAdmissionAfterFailedDrain(error);
     });
   }, 200);
 };
@@ -2726,8 +2736,8 @@ routes['POST /api/shutdown'] = (req, res) => {
     void quiesced.then(() => {
       shutdownControl.exit();
       if (!productionServer) resumeRuntimeAdmission();
-    }).catch(() => {
-      if (!productionServer) resumeRuntimeAdmission();
+    }).catch((error) => {
+      if (!productionServer) recoverRuntimeAdmissionAfterFailedDrain(error);
     });
   }, 200);
 };
@@ -2738,14 +2748,29 @@ const chatRuntime = registerChatRoutes({
 });
 
 function resumeRuntimeAdmission() {
-  runtimeRequestAdmissionOpen = true;
+  // Manager admission is restored before any externally reachable work. If a
+  // manager rejects the transition, HTTP and recovery admission remain closed.
+  operations.resumeAdmission();
+  chatRuntime.openAdmission();
+  runtimeProviderHealthMonitor?.resume?.();
   runtimeRecoveryAdmissionOpen = true;
   for (const record of pausedRuntimeRecoveries.splice(0)) {
     scheduleRuntimeRecovery(record.callback, record.delay, record.schedule, record.cancel);
   }
-  operations.resumeAdmission();
-  chatRuntime.openAdmission();
+  runtimeRequestAdmissionOpen = true;
   if (runtimeHttpServer?.listening && !runtimeSyncTimer) startRuntimeSyncTimer();
+}
+
+function recoverRuntimeAdmissionAfterFailedDrain(error) {
+  if (error?.runtimeAdmissionMayResume === false) return;
+  const resume = () => {
+    try { resumeRuntimeAdmission(); } catch { /* admission remains externally closed for retry */ }
+  };
+  if (error?.pendingRuntimeQuiescence) {
+    void Promise.resolve(error.pendingRuntimeQuiescence).then(resume, resume);
+    return;
+  }
+  resume();
 }
 
 function closeRuntimeAdmission() {
@@ -2790,27 +2815,50 @@ function trackRuntimeBackgroundTask(task) {
 export async function drainRuntimeWork({ timeoutMs = 10_000 } = {}) {
   runtimeProviderHealthMonitor?.stop();
   closeRuntimeAdmission();
+  const quiescence = (async () => {
+    const managerSettlements = await Promise.allSettled([
+      operations.shutdown({ timeoutMs: null }),
+      chatRuntime.shutdown({ timeoutMs: null }),
+      runtimeProviderHealthMonitor?.drain?.(),
+    ].filter(Boolean));
+    // Work that was already admitted may register a child task while it is
+    // settling. Drain snapshots until both registries remain empty.
+    while (runtimeBackgroundTasks.size || runtimeHttpHandlers.size) {
+      await Promise.allSettled([
+        ...runtimeBackgroundTasks,
+        ...runtimeHttpHandlers,
+      ]);
+    }
+    // Mutations completed during quiescence can enqueue their final durable
+    // checkpoint. It belongs to the reversible quiescence phase, so a timed-
+    // out drain cannot reopen admission ahead of that write.
+    await drainScheduledCheckpoints();
+    const failure = managerSettlements.find(({ status }) => status === 'rejected');
+    if (failure) throw failure.reason;
+  })();
+  void quiescence.catch(() => {});
+  const timeoutError = new Error('Scout runtime work did not close before shutdown');
   let timer;
   try {
     await Promise.race([
-      (async () => {
-        await Promise.all([
-          operations.shutdown({ timeoutMs }),
-          chatRuntime.shutdown({ timeoutMs }),
-          runtimeProviderHealthMonitor?.drain?.(),
-          ...runtimeBackgroundTasks,
-        ].filter(Boolean));
-        await Promise.allSettled([...runtimeHttpHandlers]);
-        await drainScheduledCheckpoints();
-        await providerLoginControl.shutdown();
-      })(),
+      quiescence,
       new Promise((_, reject) => {
-        timer = setTimeout(() => reject(new Error('Scout runtime work did not close before shutdown')), timeoutMs);
+        timer = setTimeout(() => reject(timeoutError), timeoutMs);
         timer.unref?.();
       }),
     ]);
+  } catch (error) {
+    if (error === timeoutError) error.pendingRuntimeQuiescence = quiescence;
+    throw error;
   } finally {
     clearTimeout(timer);
+  }
+  try {
+    await providerLoginControl.shutdown();
+  } catch (error) {
+    // The production provider-login control marks terminal failures as
+    // non-resumable. Injected/test controls may report a reversible failure.
+    throw error;
   }
 }
 

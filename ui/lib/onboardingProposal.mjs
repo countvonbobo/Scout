@@ -658,9 +658,13 @@ export function recoverActivatedProposal(root, confirmed, { now = () => new Date
         throw new Error('recovered master CV failed integrity validation');
       }
       const health = doctorFn(root);
+      renew();
       if (!health?.checks?.config?.ok || !health?.checks?.tracker?.ok) throw new Error('Scout doctor rejected the recovered workspace');
       return { ok: true, recoveredAt, file: relative, backupDir, restoredBytes: fs.statSync(active).size };
     } catch (error) {
+      // Doctor may invoke external probes. Revalidate the mutation fence before
+      // any rollback write so an expired owner can never overwrite a successor.
+      renew();
       if (previous == null) fs.rmSync(active, { force: true });
       else atomicWrite(active, previous.toString('utf8'));
       throw error;

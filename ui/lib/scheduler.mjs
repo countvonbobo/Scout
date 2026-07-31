@@ -161,14 +161,23 @@ export function createProviderHealthMonitor({
     return inFlight;
   };
 
-  const timer = scheduleInterval(() => { void runNow().catch(() => {}); }, intervalMs);
-  timer?.unref?.();
+  let timer;
+  const start = () => {
+    timer = scheduleInterval(() => { void runNow().catch(() => {}); }, intervalMs);
+    timer?.unref?.();
+  };
+  start();
   return {
     runNow,
     stop() {
       if (stopped) return;
       stopped = true;
       cancelInterval(timer);
+    },
+    resume() {
+      if (!stopped) return;
+      stopped = false;
+      start();
     },
     async drain() {
       this.stop();

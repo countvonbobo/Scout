@@ -123,6 +123,7 @@ async function runTypst(command, args, {
     child.stdout?.on('data', (chunk) => { stdout += chunk; });
     child.stderr?.on('data', (chunk) => { stderr += chunk; });
     let settled = false;
+    let terminationError = null;
     let timer;
     const finish = (callback, value) => {
       if (settled) return;
@@ -132,17 +133,24 @@ async function runTypst(command, args, {
       callback(value);
     };
     const abort = () => {
+      if (terminationError) return;
+      terminationError = signal?.reason instanceof Error
+        ? signal.reason
+        : new Error('PDF rendering was cancelled.');
       child.kill('SIGKILL');
-      finish(reject, signal?.reason instanceof Error ? signal.reason : new Error('PDF rendering was cancelled.'));
     };
     timer = setTimeout(() => {
+      if (terminationError) return;
+      terminationError = new Error(`PDF rendering timed out after ${Math.round(timeoutMs / 1000)} seconds. The previous PDF was kept.`);
       child.kill('SIGKILL');
-      finish(reject, new Error(`PDF rendering timed out after ${Math.round(timeoutMs / 1000)} seconds. The previous PDF was kept.`));
     }, timeoutMs);
     signal?.addEventListener('abort', abort, { once: true });
-    child.once('error', (error) => finish(reject, error));
+    child.once('error', (error) => {
+      if (!terminationError) finish(reject, error);
+    });
     child.once('close', (code) => {
-      if (code === 0) finish(resolve);
+      if (terminationError) finish(reject, terminationError);
+      else if (code === 0) finish(resolve);
       else finish(reject, new Error((stderr || stdout || `Typst exited with code ${code}`).trim()));
     });
   });

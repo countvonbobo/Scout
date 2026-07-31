@@ -642,6 +642,7 @@ test('ignores credential variable expressions and exact allowlisted binary asset
   fs.writeFileSync(path.join(root, 'source.mjs'), "const apiKey = String(env.ADZUNA_API_KEY || '').trim();\nconst token = crypto.randomUUID();\n");
   const binaries = [
     'ui/assets/scout-icon.png',
+    'deb/usr/share/icons/hicolor/512x512/apps/scout.png',
     'runtime/ScoutRuntime.exe',
     'Scout.exe',
     'dmg-root/Scout.app/Contents/MacOS/Scout',
@@ -649,13 +650,28 @@ test('ignores credential variable expressions and exact allowlisted binary asset
   for (const relative of binaries) {
     const binary = path.join(root, relative);
     fs.mkdirSync(path.dirname(binary), { recursive: true });
-    fs.writeFileSync(binary, relative === 'ui/assets/scout-icon.png'
+    fs.writeFileSync(binary, relative.endsWith('/scout-icon.png') || relative.endsWith('/scout.png')
       ? fs.readFileSync(new URL('../ui/assets/scout-icon.png', import.meta.url))
       : Buffer.from([137, 80, 78, 71, 0, 1, 2, 3]));
   }
   const result = auditRelease({ root, trackedFiles: ['source.mjs', ...binaries], buildDirs: [] });
   assert.equal(result.ok, true);
-  assert.equal(result.filesScanned, 5);
+  assert.equal(result.filesScanned, 6);
+});
+
+test('rejects replacement content at the exact installed Linux icon path', () => {
+  const root = fixture();
+  const relative = 'deb/usr/share/icons/hicolor/512x512/apps/scout.png';
+  const file = path.join(root, relative);
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file, Buffer.from([137, 80, 78, 71, 0, 1, 2, 3]));
+
+  const result = auditRelease({ root, trackedFiles: [relative], buildDirs: [] });
+
+  assert.equal(result.ok, false);
+  assert.deepEqual(result.findings, [{
+    file: relative, line: 1, rule: 'reviewed-binary-digest-mismatch',
+  }]);
 });
 
 test('rejects replacement content at an exact allowlisted public screenshot path', () => {

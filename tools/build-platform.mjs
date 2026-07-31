@@ -69,7 +69,11 @@ export function buildLinux({ nodeExecutable = process.execPath } = {}) {
   fs.mkdirSync(path.join(pkg, 'usr/bin'), { recursive: true }); fs.writeFileSync(path.join(pkg, 'usr/bin/scout-dashboard'), launcher('/opt/scout')); executable(path.join(pkg, 'usr/bin/scout-dashboard'));
   fs.writeFileSync(path.join(pkg, 'usr/bin/scout'), '#!/bin/sh\nexec /opt/scout/runtime/node /opt/scout/app/tools/scout.mjs "$@"\n'); executable(path.join(pkg, 'usr/bin/scout'));
   fs.mkdirSync(path.join(pkg, 'usr/share/applications'), { recursive: true }); fs.writeFileSync(path.join(pkg, 'usr/share/applications/scout.desktop'), '[Desktop Entry]\nName=Scout\nExec=scout-dashboard\nIcon=scout\nType=Application\nCategories=Office;\n');
-  copy(path.join(ROOT, 'ui/assets/scout-icon.png'), path.join(pkg, 'usr/share/icons/hicolor/512x512/apps/scout.png'));
+  copyVerifiedReleaseFile(
+    path.join(stage, 'app/ui/assets/scout-icon.png'),
+    path.join(pkg, 'usr/share/icons/hicolor/512x512/apps/scout.png'),
+    { verifiedRoot: stage },
+  );
   fs.mkdirSync(path.join(pkg, 'DEBIAN'), { recursive: true }); fs.writeFileSync(path.join(pkg, 'DEBIAN/control'), `Package: scout\nVersion: ${VERSION.replace(/-/g, '~')}\nArchitecture: amd64\nMaintainer: Scout contributors\nDescription: Local-first AI-assisted opportunity finder\n`);
   const deb = path.join(output, artifactNames().linuxDeb);
   const portable = path.join(stage, `Scout-${VERSION}-linux-x64`); reset(portable); copy(path.join(stage, 'app'), path.join(portable, 'app')); copy(path.join(stage, 'runtime'), path.join(portable, 'runtime')); copy(launcherSource, path.join(portable, 'launcher/ScoutLauncher.sh')); executable(path.join(portable, 'launcher/ScoutLauncher.sh')); fs.writeFileSync(path.join(portable, 'scout-dashboard'), launcher('"$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"')); executable(path.join(portable, 'scout-dashboard'));

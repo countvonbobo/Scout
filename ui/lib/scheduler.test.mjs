@@ -304,6 +304,7 @@ test('periodic provider monitor is single-flight, supports runNow and stops clea
   let calls = 0;
   let release;
   let scheduledTick;
+  let scheduledCount = 0;
   let cleared = false;
   const pending = new Promise((resolve) => { release = resolve; });
   const monitor = createProviderHealthMonitor({
@@ -317,6 +318,7 @@ test('periodic provider monitor is single-flight, supports runNow and stops clea
     intervalMs: 60_000,
     setInterval: (callback, interval) => {
       assert.equal(interval, 60_000);
+      scheduledCount += 1;
       scheduledTick = callback;
       return { unref() {} };
     },
@@ -337,6 +339,13 @@ test('periodic provider monitor is single-flight, supports runNow and stops clea
   assert.equal(cleared, true);
   assert.deepEqual(await monitor.runNow(), []);
   assert.equal(calls, 1);
+  monitor.resume();
+  assert.equal(scheduledCount, 2);
+  assert.deepEqual(await monitor.runNow(), [{
+    ok: true, provider: 'codex', purpose: 'periodic', state: 'ready',
+  }]);
+  assert.equal(calls, 2);
+  monitor.stop();
 });
 
 test('provider monitor drainage waits for in-flight provider work to release', async () => {

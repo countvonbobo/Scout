@@ -110,37 +110,100 @@ function metadataValues(observations, name) {
     .filter(Boolean))].sort(compareStable);
 }
 
-function canonicalVacancyId(canonicalUrl, identity) {
-  if (canonicalUrl) return canonicalUrl;
+function hashedVacancyId(identity) {
   return `vacancy-ref-${crypto.createHash('sha256')
     .update(stableJson(identity))
     .digest('hex').slice(0, 24)}`;
 }
 
-function disambiguateVacancyIds(vacancies) {
-  const byBaseId = new Map();
-  for (const vacancy of vacancies) {
-    const candidates = byBaseId.get(vacancy.vacancyId) || [];
-    candidates.push(vacancy);
-    byBaseId.set(vacancy.vacancyId, candidates);
+function canonicalVacancyId(canonicalUrl, identity, sourceReferences) {
+  if (canonicalUrl) return canonicalUrl;
+  const references = [...sourceReferences].sort((left, right) => (
+    compareStable(stableJson(left), stableJson(right))
+  ));
+  // A provider reference distinguishes two otherwise identical openings on
+  // their first scan. Durable history, reconciled below, keeps this identifier
+  // when cross-provider coverage later grows or shrinks.
+  if (references.length) {
+    return hashedVacancyId({
+      company: identity.company,
+      title: identity.title,
+      sourceReference: references[0],
+    });
   }
+  // Reference-free records have no external anchor. Include the remaining
+  // stable semantic fields so distinct locations do not collide, then let
+  // durable-history reconciliation absorb later enrichment.
+  return hashedVacancyId({
+    company: identity.company,
+    title: identity.title,
+    location: identity.location,
+    seniority: identity.seniority,
+  });
+}
+
+function sharedReferenceCount(left, right) {
+  const rightReferences = new Set((right?.sourceReferences || []).map(stableJson));
+  return (left?.sourceReferences || []).filter((reference) => rightReferences.has(stableJson(reference))).length;
+}
+
+function referenceDisambiguatedId(vacancy) {
+  const references = [...(vacancy?.sourceReferences || [])].sort((left, right) => (
+    compareStable(stableJson(left), stableJson(right))
+  ));
+  return hashedVacancyId({
+    baseId: vacancy.vacancyId,
+    sourceReference: references[0] || null,
+    company: jobIdentity(vacancy).company,
+    title: jobIdentity(vacancy).title,
+    location: jobIdentity(vacancy).location,
+  });
+}
+
+function disambiguateCurrentVacancyIds(vacancies) {
+  const counts = new Map();
+  for (const { vacancyId } of vacancies) counts.set(vacancyId, (counts.get(vacancyId) || 0) + 1);
+  // Every member receives a reference-derived ID. Keeping the first member's
+  // base URL would make that opening change identity whenever a peer enters or
+  // leaves the same scan.
+  return vacancies.map((vacancy) => (
+    counts.get(vacancy.vacancyId) > 1
+      ? { ...vacancy, vacancyId: referenceDisambiguatedId(vacancy) }
+      : vacancy
+  ));
+}
+
+function reconcileDurableVacancyIds(vacancies, priorVacancies) {
+  const priors = (priorVacancies || []).filter((prior) => (
+    prior && typeof prior === 'object' && typeof prior.vacancyId === 'string' && prior.vacancyId
+  ));
+  const claimed = new Set();
+  const reservedPriorIds = new Set(priors.map(({ vacancyId }) => vacancyId));
+  const usedIds = new Set();
   return vacancies.map((vacancy) => {
-    const collisions = byBaseId.get(vacancy.vacancyId);
-    if (collisions.length === 1) return vacancy;
-    const ordered = [...collisions].sort((left, right) => compareStable(
-      stableJson(left.sourceReferences),
-      stableJson(right.sourceReferences),
-    ));
-    if (ordered[0] === vacancy) return vacancy;
-    return {
-      ...vacancy,
-      vacancyId: `vacancy-ref-${crypto.createHash('sha256')
-        .update(stableJson({
-          baseId: vacancy.vacancyId,
-          sourceReferences: vacancy.sourceReferences,
-        }))
-        .digest('hex').slice(0, 24)}`,
-    };
+    const match = priors
+      .map((prior, index) => ({ prior, index, shared: sharedReferenceCount(prior, vacancy) }))
+      .filter(({ prior }) => {
+        if (sameUnderlyingJob(prior, vacancy)) return true;
+        const identity = jobIdentity(prior);
+        const sparseLegacyIdentity = !identity.company && !identity.title && !identity.references.length;
+        return sparseLegacyIdentity && prior.vacancyId === vacancy.vacancyId;
+      })
+      .sort((left, right) => (
+        right.shared - left.shared
+        || compareStable(left.prior.vacancyId, right.prior.vacancyId)
+        || left.index - right.index
+      ))
+      .find(({ index }) => !claimed.has(index));
+    let vacancyId = vacancy.vacancyId;
+    if (match) {
+      claimed.add(match.index);
+      vacancyId = match.prior.vacancyId;
+    } else if (reservedPriorIds.has(vacancyId) || usedIds.has(vacancyId)) {
+      vacancyId = referenceDisambiguatedId(vacancy);
+    }
+    usedIds.add(vacancyId);
+    return vacancyId === vacancy.vacancyId ? vacancy : { ...vacancy, vacancyId };
   });
 }
 
@@ -255,13 +318,12 @@ function canonicalVacancy(observations) {
     location: fields.location,
     seniority: fields.seniority,
   });
-  // Provider coverage can grow or shrink between scans, so no member of the
-  // reference set is a stable canonical anchor. References still disambiguate
-  // same-scan collisions; the base identifier remains semantic.
   const vacancyId = canonicalVacancyId(canonicalUrl, {
     company: identity.company,
     title: identity.title,
-  });
+    location: identity.location,
+    seniority: identity.seniority,
+  }, sourceReferences);
   const collectionSources = metadataValues(orderedObservations, 'collectionSource');
   const laneIds = [...new Set([
     ...metadataValues(orderedObservations, 'laneId'),
@@ -290,7 +352,7 @@ function canonicalVacancy(observations) {
   };
 }
 
-export function canonicaliseObservations(observations) {
+export function canonicaliseObservations(observations, { priorVacancies = [] } = {}) {
   const groups = [];
   const orderedObservations = sortObservations(observations || []);
   for (const observation of orderedObservations) {
@@ -298,8 +360,11 @@ export function canonicaliseObservations(observations) {
     if (group) group.push(observation);
     else groups.push([observation]);
   }
-  const vacancies = disambiguateVacancyIds(
-    groups.sort((left, right) => compareStable(groupKey(left), groupKey(right))).map(canonicalVacancy),
+  const vacancies = reconcileDurableVacancyIds(
+    disambiguateCurrentVacancyIds(
+      groups.sort((left, right) => compareStable(groupKey(left), groupKey(right))).map(canonicalVacancy),
+    ),
+    priorVacancies,
   );
   return {
     vacancies,

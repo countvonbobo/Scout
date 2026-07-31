@@ -175,6 +175,46 @@ test('URL-less provider vacancies retain distinct stable identities through sele
     reverse.ranked.map(({ vacancyId }) => vacancyId),
   );
   assert.ok(forward.selection.reasons.every(({ vacancyId }) => vacancyId !== 'unknown-vacancy'));
+
+  const firstScan = prepareRankedDiscovery({
+    sources: { provider: { count: 1, jobs: [sources.provider.jobs[0]] } },
+    profile, runId: 'url-less-first-scan', relevanceThreshold: 0,
+  }).ranked[0];
+  const distinctLaterScan = prepareRankedDiscovery({
+    sources: { provider: { count: 1, jobs: [sources.provider.jobs[1]] } },
+    profile,
+    decisionHistory: [{
+      ...firstScan,
+      outcome: 'below_threshold',
+      profileId: profile.id,
+    }],
+    runId: 'url-less-distinct-later',
+    relevanceThreshold: 0,
+  }).ranked[0];
+  assert.notEqual(distinctLaterScan.vacancyId, firstScan.vacancyId);
+
+  const coverageLaterScan = prepareRankedDiscovery({
+    sources: {
+      provider: { count: 1, jobs: [sources.provider.jobs[0]] },
+      other: {
+        count: 1,
+        jobs: [{
+          ...sources.provider.jobs[0],
+          source: 'other',
+          providerId: 'other-provider-reference',
+        }],
+      },
+    },
+    profile,
+    decisionHistory: [{
+      ...firstScan,
+      outcome: 'below_threshold',
+      profileId: profile.id,
+    }],
+    runId: 'url-less-coverage-later',
+    relevanceThreshold: 0,
+  }).ranked[0];
+  assert.equal(coverageLaterScan.vacancyId, firstScan.vacancyId);
 });
 
 test('durable reviewed rejections are seen for novelty and lane productivity', () => {
@@ -1038,6 +1078,33 @@ test('forty zero-keeper candidates produce a bounded sanitised audit without tra
     'assessedAt', 'company', 'contentFingerprint', 'learningVersionId', 'outcome', 'profileId',
     'role', 'source', 'sourceReferences', 'url', 'vacancyId',
   ].sort());
+});
+
+test('bounded decision history always preserves reviewed outcomes ahead of pre-assessment explanations', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'scout-reviewed-history-priority-'));
+  fs.mkdirSync(path.join(root, 'data'), { recursive: true });
+  const run = {
+    timestamp: '2026-07-31T10:00:00.000Z',
+    profile_id: 'profile-current',
+    reviewed: [{
+      vacancyId: 'reviewed-vacancy',
+      company: 'Reviewed Company',
+      role: 'Reviewed Role',
+      outcome: 'provider_discarded',
+    }],
+    explanations: Array.from({ length: 512 }, (_, index) => ({
+      vacancy_id: `pre-${index}`,
+      company: `Pre Company ${index}`,
+      role: `Pre Role ${index}`,
+      reason_code: 'below-threshold',
+      stages: { assessed: false },
+    })),
+  };
+  fs.writeFileSync(path.join(root, 'data', 'scan-runs.jsonl'), `${JSON.stringify(run)}\n`);
+  const history = readVacancyDecisionHistory(root);
+  assert.equal(history.length, 512);
+  assert.equal(history[0].vacancyId, 'reviewed-vacancy');
+  assert.equal(history.some(({ vacancyId }) => vacancyId === 'reviewed-vacancy'), true);
 });
 
 test('durable URL-less decision history preserves provider identity across changing source coverage', () => {

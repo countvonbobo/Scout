@@ -347,6 +347,28 @@ test('activated CV recovery cannot overlap another workspace mutation owner', as
   assert.ok(lease);
 });
 
+test('activated CV recovery never rolls back after its mutation fence is lost during doctor', async () => {
+  const dir = root();
+  const staged = await createOnboardingProposal(dir, 'codex', {
+    providerStatusFn: status, runStructuredTurnFn: run,
+  });
+  activateOnboardingProposal(dir, staged.proposalId, true, { doctorFn: healthyDoctor });
+  const active = path.join(dir, 'cv', 'master-cv.md');
+  fs.writeFileSync(active, '');
+  const successorContent = '# Successor-owned master CV\n\nThis content belongs to the new mutation owner.\n';
+  assert.throws(
+    () => recoverActivatedProposal(dir, true, {
+      doctorFn: () => {
+        fs.rmSync(path.join(dir, '.scout', 'scan-lease.json'), { force: true });
+        fs.writeFileSync(active, successorContent);
+        return healthyDoctor();
+      },
+    }),
+    /mutation|progress|authority|lease/i,
+  );
+  assert.equal(fs.readFileSync(active, 'utf8'), successorContent);
+});
+
 test('activated master CV recovery refuses unrelated active-file drift', async () => {
   const dir = root();
   const staged = await createOnboardingProposal(dir, 'codex', { providerStatusFn: status, runStructuredTurnFn: run });

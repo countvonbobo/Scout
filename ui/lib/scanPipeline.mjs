@@ -1215,7 +1215,8 @@ export function readVacancyDecisionHistory(root, { limit = VACANCY_DECISION_HIST
   if (!fs.existsSync(file)) return [];
   const boundedLimit = Math.max(0, Math.min(VACANCY_DECISION_HISTORY_LIMIT, Math.floor(Number(limit) || 0)));
   if (!boundedLimit) return [];
-  const records = [];
+  const reviewedRecords = [];
+  const preAssessmentRecords = [];
   const lines = fs.readFileSync(file, 'utf8').split(/\r?\n/).filter(Boolean).reverse();
   for (const line of lines) {
     let run;
@@ -1236,8 +1237,9 @@ export function readVacancyDecisionHistory(root, { limit = VACANCY_DECISION_HIST
         sourceReferences: item.sourceReferences,
         outcome: item.reason_code || item.assessment_status,
       }));
-    for (const item of [...assessed, ...preAssessment].reverse()) {
-      if (!item?.company || !item?.role || !item?.outcome) continue;
+    const append = (item, records) => {
+      if (!item?.company || !item?.role || !item?.outcome) return;
+      if (records.length >= boundedLimit) return;
       records.push({
         vacancyId: boundedText(item.vacancyId, 160) || null,
         company: boundedText(item.company, 120),
@@ -1258,10 +1260,11 @@ export function readVacancyDecisionHistory(root, { limit = VACANCY_DECISION_HIST
         ),
         assessedAt: boundedText(run.timestamp, 80),
       });
-      if (records.length >= boundedLimit) return records;
-    }
+    };
+    for (const item of [...assessed].reverse()) append(item, reviewedRecords);
+    for (const item of [...preAssessment].reverse()) append(item, preAssessmentRecords);
   }
-  return records;
+  return [...reviewedRecords, ...preAssessmentRecords].slice(0, boundedLimit);
 }
 
 function observationInputs(sources) {
@@ -1312,9 +1315,9 @@ export function prepareRankedDiscovery({
   const input = observationInputs(sources);
   const observations = input.observations;
   const initialFunnel = createDiscoveryFunnel(input.funnelSources);
-  const canonical = canonicaliseObservations(observations);
-  const vacancies = canonical.vacancies.map(assessmentVacancy);
   const reviewedHistory = [...(tracker?.opportunities || []), ...(decisionHistory || [])];
+  const canonical = canonicaliseObservations(observations, { priorVacancies: reviewedHistory });
+  const vacancies = canonical.vacancies.map(assessmentVacancy);
   const discoveryCounts = laneDiscoveryCounts(vacancies, profile, reviewedHistory);
   const filtered = filterVacancies(vacancies, profile, { learningPolicy });
   const ranked = rankVacancies(filtered.eligible, profile, reviewedHistory, { learningPolicy });

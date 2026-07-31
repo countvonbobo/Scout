@@ -195,16 +195,17 @@ test('URL-less canonical identities are stable, collision-free and source-order 
     description: 'Build stable services.',
   });
   const separate = canonicaliseObservations([first, second]).vacancies;
-  const firstAloneId = canonicaliseObservations([first]).vacancies[0].vacancyId;
+  const firstAlone = canonicaliseObservations([first]).vacancies[0];
+  const firstAloneId = firstAlone.vacancyId;
   const secondAloneId = canonicaliseObservations([second]).vacancies[0].vacancyId;
 
   assert.equal(separate.length, 2);
-  assert.equal(firstAloneId, secondAloneId);
+  assert.notEqual(firstAloneId, secondAloneId);
   assert.equal(new Set(separate.map(({ vacancyId }) => vacancyId)).size, 2);
   assert.ok(separate.every(({ vacancyId }) => /^vacancy-ref-[a-f0-9]{24}$/.test(vacancyId)));
-  assert.equal(
-    separate.find(({ sourceReferences }) => sourceReferences[0].providerId === 'reference-1').vacancyId,
-    firstAloneId,
+  assert.deepEqual(
+    separate.map(({ vacancyId }) => vacancyId).sort(),
+    [firstAloneId, secondAloneId].sort(),
   );
 
   const crossSource = [
@@ -216,8 +217,8 @@ test('URL-less canonical identities are stable, collision-free and source-order 
       description: 'Build stable services.',
     }),
   ];
-  const forward = canonicaliseObservations(crossSource);
-  const reverse = canonicaliseObservations([...crossSource].reverse());
+  const forward = canonicaliseObservations(crossSource, { priorVacancies: [firstAlone] });
+  const reverse = canonicaliseObservations([...crossSource].reverse(), { priorVacancies: [firstAlone] });
   assert.equal(forward.vacancies.length, 1);
   assert.deepEqual(forward, reverse);
   assert.equal(forward.vacancies[0].vacancyId, firstAloneId);
@@ -232,7 +233,10 @@ test('URL-less canonical identities are stable, collision-free and source-order 
     url: null,
     description: 'Build stable services.',
   });
-  const firstWithEarlier = canonicaliseObservations([first, laterEarlierSource]).vacancies;
+  const firstWithEarlier = canonicaliseObservations(
+    [first, laterEarlierSource],
+    { priorVacancies: [firstAlone] },
+  ).vacancies;
   assert.equal(firstWithEarlier.length, 1);
   assert.equal(
     firstWithEarlier[0].vacancyId,
@@ -245,7 +249,10 @@ test('URL-less canonical identities are stable, collision-free and source-order 
     url: null,
     description: 'Build stable services.',
   });
-  const firstWithGreater = canonicaliseObservations([first, laterGreaterSource]).vacancies;
+  const firstWithGreater = canonicaliseObservations(
+    [first, laterGreaterSource],
+    { priorVacancies: [firstAlone] },
+  ).vacancies;
   assert.equal(firstWithGreater.length, 1);
   assert.equal(
     firstWithGreater[0].vacancyId,
@@ -260,7 +267,10 @@ test('URL-less canonical identities are stable, collision-free and source-order 
     seniority: 'senior',
     description: 'Build stable services.',
   });
-  assert.equal(canonicaliseObservations([enriched]).vacancies[0].vacancyId, firstAloneId);
+  assert.equal(
+    canonicaliseObservations([enriched], { priorVacancies: [firstAlone] }).vacancies[0].vacancyId,
+    firstAloneId,
+  );
 });
 
 test('privacy-canonical URLs remain unique for distinct same-source provider vacancies', () => {
@@ -280,7 +290,20 @@ test('privacy-canonical URLs remain unique for distinct same-source provider vac
   ]).vacancies;
   assert.equal(vacancies.length, 2);
   assert.equal(new Set(vacancies.map(({ vacancyId }) => vacancyId)).size, 2);
-  assert.ok(vacancies.some(({ vacancyId }) => vacancyId === 'https://jobs.example.test/apply'));
+  assert.ok(vacancies.every(({ vacancyId }) => /^vacancy-ref-[a-f0-9]{24}$/.test(vacancyId)));
+
+  const first = canonicaliseObservations([observation({
+    source: 'provider-a',
+    providerId: 'query-job-one',
+    url: 'https://jobs.example.test/apply',
+  })]).vacancies[0];
+  const laterDistinct = canonicaliseObservations([observation({
+    source: 'provider-a',
+    providerId: 'query-job-two',
+    url: 'https://jobs.example.test/apply',
+  })], { priorVacancies: [first] }).vacancies[0];
+  assert.equal(first.vacancyId, 'https://jobs.example.test/apply');
+  assert.notEqual(laterDistinct.vacancyId, first.vacancyId);
 });
 
 test('canonicalisation rejects semantic responsibility overflow instead of truncating evidence', () => {
