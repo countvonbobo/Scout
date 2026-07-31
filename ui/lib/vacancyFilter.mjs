@@ -1,4 +1,5 @@
 import { compareCompensation } from './vacancyRank.mjs';
+import { profileRuleId } from './searchProfile.mjs';
 
 function valueOf(value) {
   return value && typeof value === 'object' && Object.hasOwn(value, 'value') ? value.value : value;
@@ -7,10 +8,6 @@ function valueOf(value) {
 function normalise(value) {
   return String(value || '').normalize('NFKD').replace(/[\u0300-\u036f]/g, '')
     .toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
-}
-
-function ruleId(rule) {
-  return `rule-${normalise(rule?.value).replace(/\s+/g, '-')}`;
 }
 
 function profileVersion(profile) {
@@ -41,11 +38,11 @@ function blockingStructuredRule(rule) {
   return hardRule(rule);
 }
 
-function exclusion(vacancy, profile, code, rule, evidence, sourceConfidence, overrideable) {
+function exclusion(vacancy, profile, code, rule, evidence, sourceConfidence, overrideable, exactRuleId = null) {
   return {
     vacancyId: vacancy?.vacancyId || vacancy?.candidateId || vacancy?.canonicalUrl || 'unknown-vacancy',
     code,
-    profileRuleId: rule ? ruleId(rule) : 'policy-compensation-unknown',
+    profileRuleId: rule ? exactRuleId : 'policy-compensation-unknown',
     profileVersion: profileVersion(profile),
     evidence,
     confidence: sourceConfidence,
@@ -76,9 +73,10 @@ function fieldValue(vacancy, field) {
   return (aliases[field] || [field]).map((name) => vacancy?.[name]).find((value) => value !== undefined && value !== null && value !== '');
 }
 
-function semanticMatch(vacancy, rule) {
+function semanticMatch(vacancy, rule, section, field) {
+  const id = profileRuleId(section, field, rule);
   return (vacancy?.semanticEvidence?.profileRuleMatches || []).find((item) => (
-    (typeof item === 'string' ? item : item?.id) === ruleId(rule)
+    (typeof item === 'string' ? item : item?.id) === id
   )) || null;
 }
 
@@ -96,11 +94,11 @@ function knownSource(source) {
   return actual !== null && actual !== undefined && actual !== '';
 }
 
-function ruleEvidence(vacancy, source, rule, semantic) {
+function ruleEvidence(vacancy, source, rule, semantic, exactRuleId) {
   if (semantic) {
     return {
       vacancy: {
-        matchedRule: ruleId(rule),
+        matchedRule: exactRuleId,
         sources: (typeof semantic === 'object' ? semantic.evidence || [] : []).slice(0, 8),
       },
       rule: rule.value,
@@ -112,13 +110,14 @@ function ruleEvidence(vacancy, source, rule, semantic) {
 function structuredExclusions(vacancy, profile) {
   const found = [];
   for (const support of PROFILE_RULE_SUPPORT) {
-    const rules = support.target.flatMap((name) => profile?.target?.[name] || [])
-      .filter(blockingStructuredRule);
+    const rules = support.target.flatMap((field) => (profile?.target?.[field] || [])
+      .map((rule) => ({ field, rule })))
+      .filter(({ rule }) => blockingStructuredRule(rule));
     if (!rules.length) continue;
     const source = fieldValue(vacancy, support.field);
-    const matched = rules.find((rule) => (
+    const matched = rules.find(({ field, rule }) => (
       structuredMatch(source, rule, support.mode)
-      || (support.semantic && semanticMatch(vacancy, rule))
+      || (support.semantic && semanticMatch(vacancy, rule, 'target', field))
     ));
     if (matched) continue;
     if (!knownSource(source)) {
@@ -139,29 +138,34 @@ function structuredExclusions(vacancy, profile) {
       }
       continue;
     }
-    for (const rule of rules) {
+    for (const { field, rule } of rules) {
       found.push(exclusion(vacancy, profile, `mandatory-${support.code}-unmet`, rule,
-        { vacancy: valueOf(source), rule: rule.value }, confidence(source), true));
+        { vacancy: valueOf(source), rule: rule.value }, confidence(source), true,
+        profileRuleId('target', field, rule)));
     }
   }
   for (const support of PROFILE_RULE_SUPPORT) {
     const source = fieldValue(vacancy, support.field);
-    for (const rule of support.negative.flatMap((name) => profile?.negative?.[name] || [])) {
-      if (!hardRule(rule)) continue;
-      const semantic = support.semantic ? semanticMatch(vacancy, rule) : null;
-      const rawDescriptionMatch = support.semantic
-        && !vacancy?.semanticEvidence
-        && phraseMatches(vacancy?.description, rule.value);
-      if (!structuredMatch(source, rule, support.mode) && !semantic && !rawDescriptionMatch) continue;
-      found.push(exclusion(
-        vacancy,
-        profile,
-        `excluded-${support.code}`,
-        rule,
-        ruleEvidence(vacancy, source, rule, semantic),
-        confidence(source),
-        support.dimension !== 'responsibilities',
-      ));
+    for (const field of support.negative) {
+      for (const rule of profile?.negative?.[field] || []) {
+        if (!hardRule(rule)) continue;
+        const exactRuleId = profileRuleId('negative', field, rule);
+        const semantic = support.semantic ? semanticMatch(vacancy, rule, 'negative', field) : null;
+        const rawDescriptionMatch = support.semantic
+          && !vacancy?.semanticEvidence
+          && phraseMatches(vacancy?.description, rule.value);
+        if (!structuredMatch(source, rule, support.mode) && !semantic && !rawDescriptionMatch) continue;
+        found.push(exclusion(
+          vacancy,
+          profile,
+          `excluded-${support.code}`,
+          rule,
+          ruleEvidence(vacancy, source, rule, semantic, exactRuleId),
+          confidence(source),
+          support.dimension !== 'responsibilities',
+          exactRuleId,
+        ));
+      }
     }
   }
   return found;

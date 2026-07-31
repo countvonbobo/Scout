@@ -53,6 +53,7 @@ import {
   canonicalEmployerId, employerRegistryRevision, loadEmployerRegistry,
   reconcileEmployerDiscoveries, recordEmployerChecks, validateEmployerRegistry,
 } from './employerRegistry.mjs';
+import { profileRuleId } from './searchProfile.mjs';
 export { filterVacancies } from './vacancyFilter.mjs';
 
 const EMPTY_DISCARDED = Object.freeze({ hard_exclusion: 0, mandatory_unmet: 0, below_threshold: 0, provider_discarded: 0 });
@@ -535,6 +536,7 @@ export async function runScanPipeline({
       leaseOptions,
   );
   let durableQueueSubmission = false;
+  let queueCoveragePending = false;
   for (let attempt = 0; !lease && attempt < 64; attempt += 1) {
     const observed = readScanLease(root);
     if (observed?.operation?.kind === 'provider-health') {
@@ -818,9 +820,15 @@ export async function runScanPipeline({
       manifest = validateManifestAgreement(run, lease).manifest;
       terminal = true;
       if (typeof queue?.cover === 'function') {
-        try {
-          await queue.cover({ run, lease, manifest, mutationReceipt });
-        } catch {
+        let covered = false;
+        for (let attempt = 0; attempt < 3 && !covered; attempt += 1) {
+          try {
+            await queue.cover({ run, lease, manifest, mutationReceipt });
+            covered = true;
+          } catch { /* retry the idempotent durable coverage append */ }
+        }
+        if (!covered) {
+          queueCoveragePending = true;
           failures.push(Object.freeze({
             code: 'queue-coverage-pending',
             stage: 'post-success',
@@ -968,7 +976,7 @@ export async function runScanPipeline({
     }
   }
 
-  if (terminal && ownsLease) {
+  if (terminal && ownsLease && !queueCoveragePending) {
     const postTerminalDrain = await drainScanQueue(root, queue, compatibility, leaseOptions);
     if (postTerminalDrain.paused) {
       const pausedRun = openRunJournal(root, postTerminalDrain.paused.runId);
@@ -1393,6 +1401,8 @@ const SEMANTIC_FACT_STOPWORDS = new Set([
   'legacy', 'password', 'private', 'secret', 'session', 'signature', 'token',
 ]);
 const CREDENTIAL_ASSIGNMENT = /(?:^|[^a-z0-9])(?:(?:api|private|secret|session|access|client|refresh|auth)[\s._-]*(?:key|token|id|secret)|authorization|cookie|credential|jwt|password|secret|session|token|key)(?![a-z0-9])\s*[:=]\s*\S+/i;
+const CREDENTIAL_LABEL_VALUE = /(?:^|[^a-z0-9])(?:(?:api|private|secret|session|access|client|refresh|auth)[\s._-]*(?:key|token|secret)|authorization|cookie|credential|jwt|password)(?![a-z0-9])\s+(?:sk-(?:proj-)?[a-z0-9_-]{8,}|[a-z0-9._~+/=-]{16,})/i;
+const HIGH_SIGNAL_CREDENTIAL = /\b(?:sk-(?:proj-)?[a-z0-9_-]{8,}|gh[opsu]_[a-z0-9]{20,}|xox[baprs]-[a-z0-9-]{16,})\b/i;
 const AUTHORIZATION_VALUE = /\b(?:authorization\s*:?\s*)?(?:basic|bearer)\s+[a-z0-9._~+/=-]+/i;
 const JWT_VALUE = /\beyj[a-z0-9_-]*\.[a-z0-9_-]+\.[a-z0-9_-]+\b/i;
 const URL_USERINFO_VALUE = /https?:\/\/[^/\s:@]+:[^/\s@]+@/i;
@@ -1400,6 +1410,8 @@ const URL_USERINFO_VALUE = /https?:\/\/[^/\s:@]+:[^/\s@]+@/i;
 function credentialShapedSemanticText(value) {
   const text = String(value || '');
   return CREDENTIAL_ASSIGNMENT.test(text)
+    || CREDENTIAL_LABEL_VALUE.test(text)
+    || HIGH_SIGNAL_CREDENTIAL.test(text)
     || AUTHORIZATION_VALUE.test(text)
     || JWT_VALUE.test(text)
     || URL_USERINFO_VALUE.test(text);
@@ -1419,10 +1431,6 @@ function responsibilityFacts(description) {
     .filter(Boolean)
     .map(semanticFact)
     .filter(Boolean))].slice(0, 6);
-}
-
-function semanticRuleId(rule) {
-  return `rule-${semanticText(rule?.value).replace(/\s+/g, '-')}`;
 }
 
 function semanticPhraseMatches(value, phrase) {
@@ -1450,15 +1458,17 @@ function semanticObservation(job, sourceName, source, profile, { durableUrls = t
   const identity = jobIdentity(observation);
   const descriptionRules = [
     ...['responsibilities', 'skills', 'qualifications', 'eligibility', 'mobility', 'industries', 'sectors']
-      .flatMap((field) => profile?.target?.[field] || []),
+      .flatMap((field) => (profile?.target?.[field] || [])
+        .map((rule) => ({ section: 'target', field, rule }))),
     ...[
       'excludedResponsibilities', 'excludedSkills', 'excludedQualifications',
       'excludedEligibility', 'excludedMobility', 'excludedIndustries', 'excludedSectors',
-    ].flatMap((field) => profile?.negative?.[field] || []),
+    ].flatMap((field) => (profile?.negative?.[field] || [])
+      .map((rule) => ({ section: 'negative', field, rule }))),
   ];
   const descriptionDigest = digestText(description);
-  const profileRuleEvidence = [...new Map(descriptionRules.map((rule) => {
-    const id = semanticRuleId(rule);
+  const profileRuleEvidence = [...new Map(descriptionRules.map(({ section, field, rule }) => {
+    const id = profileRuleId(section, field, rule);
     const matched = semanticPhraseMatches(description, rule?.value);
     return [id, {
       id,
@@ -1517,6 +1527,14 @@ function semanticCollectedSource(source, sourceName, profile, options = {}) {
     .map((job) => semanticObservation(job, sourceName, source, profile, options))
     .filter(Boolean);
   const status = ['healthy', 'degraded', 'unavailable'].includes(source?.status) ? source.status : 'unavailable';
+  const employerMonitoring = sourceName === 'employer_registry'
+    && source?.registrySnapshot && Array.isArray(source?.checks)
+    ? {
+      registrySnapshot: structuredClone(validateEmployerRegistry(source.registrySnapshot)),
+      registryRevision: String(source.registryRevision || '').slice(0, 128),
+      checks: structuredClone(source.checks.slice(0, 24)),
+    }
+    : {};
   return {
     configured: Boolean(source?.configured),
     status,
@@ -1536,6 +1554,7 @@ function semanticCollectedSource(source, sourceName, profile, options = {}) {
     failedRecords: Math.max(0, Number(source?.failedRecords || 0) + jobs.length - observations.length),
     sourceErrorCount: Array.isArray(source?.errors) ? source.errors.length : 0,
     observations,
+    ...employerMonitoring,
   };
 }
 

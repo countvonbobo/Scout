@@ -16,6 +16,8 @@ import {
 import { ProviderLifecycleUnclosedError } from './structuredTurn.mjs';
 import { applyPreparedMutation, prepareMutation } from './mutationCoordinator.mjs';
 import { scanReportRecipe } from './scanMutationProjection.mjs';
+import { profileRuleId } from './searchProfile.mjs';
+import { createEmployerRegistry, employerRegistryRevision } from './employerRegistry.mjs';
 
 const dimensions = [{ name: 'Fit', score: 90, maximum: 100, evidence: 'Advert and profile' }];
 const assessment = (status = 'met') => ({
@@ -217,6 +219,48 @@ test('durable ranked stages preserve the established ranked discovery result', a
   });
 });
 
+test('durable collection preserves bounded employer monitoring evidence for finalisation', async () => {
+  const registry = createEmployerRegistry([], { now: () => '2026-07-31T09:00:00.000Z' });
+  const stages = createRankedDiscoveryStages({
+    collect: async () => ({
+      generatedAt: '2026-07-31T09:30:00.000Z',
+      queries: [],
+      sources: {
+        employer_registry: {
+          configured: true,
+          status: 'healthy',
+          count: 0,
+          jobs: [],
+          checks: [],
+          registryRevision: employerRegistryRevision(registry),
+          registrySnapshot: registry,
+        },
+      },
+    }),
+    profile: {
+      version: 1, status: 'published', id: 'profile-monitoring',
+      target: {}, negative: {},
+      compensation: {
+        currency: null, period: 'year', minimum: null,
+        minimumStrength: 'neutral', unknownPolicy: 'include',
+      },
+    },
+    tracker: { opportunities: [] },
+  });
+
+  const collected = await stages.collect({
+    run: { runId: 'monitoring-run' },
+    lease: { runId: 'monitoring-run' },
+    priorArtifact: null,
+  });
+  assert.deepEqual(collected.sources.employer_registry.registrySnapshot, registry);
+  assert.equal(
+    collected.sources.employer_registry.registryRevision,
+    employerRegistryRevision(registry),
+  );
+  assert.deepEqual(collected.sources.employer_registry.checks, []);
+});
+
 test('ranked discovery excludes zero-score unrelated vacancies below the configured relevance threshold', () => {
   const profile = {
     version: 1, status: 'published', id: 'profile-123456789abc',
@@ -365,7 +409,7 @@ test('published learning reranks unassessed jobs, reconsiders scoped exclusions 
         },
         {
           kind: 'reconsider-rule',
-          profileRuleId: 'rule-data-engineer',
+          profileRuleId: profileRuleId('target', 'primaryTitles', profile.target.primaryTitles[0]),
           scope: 'role-family',
           value: 'Software Engineering',
           proposalId: 'proposal-adjacent',
@@ -1403,6 +1447,59 @@ test('terminal release drains the next queued request under a newer genuine fenc
   }
 });
 
+test('failed scheduled coverage never drains an equivalent queued request', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'scout-pipeline-coverage-failure-'));
+  const queueCompatibility = {
+    profileFingerprint: 'b'.repeat(64),
+    configFingerprint: 'c'.repeat(64),
+    schemaVersion: 1,
+  };
+  let coverCalls = 0;
+  let runCalls = 0;
+  try {
+    const result = await runScanPipeline({
+      root,
+      compatibility: RECOVERY_COMPATIBILITY,
+      stages: {
+        ...durableStageHarness(new Map()),
+        collect: async ({ lease }) => {
+          enqueueScanRequest(root, {
+            id: 'scheduled-equivalent',
+            key: 'scheduled-equivalent-key',
+            requestedAt: '2026-07-31T08:00:00.000Z',
+            expiresAt: '2026-07-31T20:00:00.000Z',
+            requester: 'scheduled',
+            windowAt: '2026-07-31T20:00:00.000Z',
+            purpose: 'scheduled-discovery',
+            compatibility: queueCompatibility,
+            lease,
+          });
+          return { stageId: 'collect', stableIds: ['collect-coverage'] };
+        },
+      },
+      queue: {
+        compatibility: queueCompatibility,
+        async cover() {
+          coverCalls += 1;
+          throw new Error('synthetic durable coverage failure');
+        },
+        async run() {
+          runCalls += 1;
+          throw new Error('covered scheduled work must not rerun');
+        },
+      },
+    });
+
+    assert.equal(result.outcome, 'complete', JSON.stringify(result));
+    assert.equal(coverCalls, 3);
+    assert.equal(runCalls, 0);
+    assert.ok(result.failures.some(({ code }) => code === 'queue-coverage-pending'));
+    assert.equal(projectScanQueue(root).requests[0].status, 'queued');
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test('a blocked queued provider is skipped while the next healthy provider still runs', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'scout-provider-health-queue-isolation-'));
   const queueCompatibility = {
@@ -2230,7 +2327,7 @@ test('credential-shaped semantic values are redacted while operators and account
     'PRIVATE_DASH_KEY_VALUE',
     'PRIVATE_SPACE_KEY_VALUE',
     'SESSION_UNDERSCORE_VALUE',
-    'SESSION_DASH_VALUE',
+    ['sk', 'proj', 'PRIVATEWHITESPACEVALUE'].join('-'),
   ];
   try {
     const result = await runScanPipeline({
@@ -2261,7 +2358,7 @@ test('credential-shaped semantic values are redacted while operators and account
                   `${['private', 'key'].join('-')}: ${['PRIVATE', 'DASH', 'KEY', 'VALUE'].join('_')}`,
                   'Private Key = PRIVATE_SPACE_KEY_VALUE',
                   'session_id=SESSION_UNDERSCORE_VALUE',
-                  'SESSION-ID: SESSION_DASH_VALUE',
+                  `API token ${['sk', 'proj', 'PRIVATEWHITESPACEVALUE'].join('-')}`,
                 ].join('; '),
               }],
             },

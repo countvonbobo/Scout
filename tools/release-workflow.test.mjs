@@ -160,7 +160,7 @@ test('VPS dirty check permits only Scout managed Typst files', () => {
 test('workspace repair is protected, local-only and verifies backup plus rendered CVs', () => {
   assert.match(workspaceRepair, /environment: beta-vps/);
   assert.match(workspaceRepair, /concurrency:[\s\S]*group: scout-beta-vps/);
-  assert.match(workspaceRepair, /actions\/checkout@11d5960a8842f3f29f17d4e3b5fc8b5fd0948060 # v4/);
+  assert.match(workspaceRepair, /actions\/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4/);
   assert.match(workspaceRepair, /tailscale\/github-action@306e68a486fd2350f2bfc3b19fcd143891a4a2d8 # v4/);
   assert.match(workspaceRepair, /StrictHostKeyChecking=yes/);
   assert.match(workspaceRepair, /127\.0\.0\.1:8459\/api\/sync\/deploy-key/);

@@ -11,7 +11,9 @@ import {
   MAX_SEMANTIC_PROFILE_RULES,
   NEGATIVE_RULE_FIELDS,
   profileFingerprint,
+  profileRuleId,
   publishSearchProfile,
+  searchProfileRuleIds,
   TARGET_RULE_FIELDS,
 } from './searchProfile.mjs';
 import { PROFILE_RULE_SUPPORT } from './vacancyFilter.mjs';
@@ -67,6 +69,24 @@ test('published profile preserves strengths, provenance and unknown policies', (
   assert.equal(profile.compensation.unknownPolicy, 'include');
   assert.equal(profile.unknownPolicies.location, 'penalise');
   assert.match(profile.id, /^profile-[a-f0-9]{12}$/);
+});
+
+test('profile rule IDs are field-scoped, bounded and enumerate only published rules', () => {
+  const sameText = { value: 'Shared phrase', strength: 'strong-preference', provenance: 'explicit' };
+  const draft = genericProfileDraft({ primaryTitles: [sameText] });
+  draft.target.skills = [sameText];
+  draft.negative.excludedResponsibilities = [{
+    ...sameText, strength: 'hard-exclusion',
+  }];
+  const profile = publishSearchProfile(draft, { publishedAt: NOW });
+  const ids = [
+    profileRuleId('target', 'primaryTitles', sameText),
+    profileRuleId('target', 'skills', sameText),
+    profileRuleId('negative', 'excludedResponsibilities', sameText),
+  ];
+  assert.equal(new Set(ids).size, 3);
+  assert.ok(ids.every((id) => id.length <= 80));
+  assert.deepEqual(searchProfileRuleIds(profile), new Set(ids));
 });
 
 test('published profile supports the complete domain-neutral preference foundation', () => {

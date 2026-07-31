@@ -191,6 +191,32 @@ export function profileFingerprint(profile) {
   return crypto.createHash('sha256').update(canonicalJson(profile)).digest('hex');
 }
 
+export function profileRuleId(section, field, rule) {
+  if (!['target', 'negative'].includes(section)) throw new TypeError('profile rule section is invalid');
+  const supported = section === 'target' ? TARGET_RULE_FIELDS : NEGATIVE_RULE_FIELDS;
+  if (!supported.includes(field)) throw new TypeError('profile rule field is invalid');
+  const value = String(rule?.value ?? '').normalize('NFKC').trim().toLocaleLowerCase('en');
+  if (!value) throw new TypeError('profile rule value is required');
+  const fieldSlug = field.replace(/([a-z0-9])([A-Z])/g, '$1-$2').toLowerCase();
+  const fingerprint = crypto.createHash('sha256')
+    .update(canonicalJson({ section, field, value }))
+    .digest('hex')
+    .slice(0, 16);
+  return `rule-${section}-${fieldSlug}-${fingerprint}`;
+}
+
+export function searchProfileRuleIds(profile) {
+  validateSearchProfile(profile);
+  return new Set([
+    ...TARGET_RULE_FIELDS.flatMap((field) => (
+      (profile.target[field] || []).map((rule) => profileRuleId('target', field, rule))
+    )),
+    ...NEGATIVE_RULE_FIELDS.flatMap((field) => (
+      (profile.negative[field] || []).map((rule) => profileRuleId('negative', field, rule))
+    )),
+  ]);
+}
+
 function derivedRules(values, strength) {
   return (Array.isArray(values) ? values : [])
     .filter((value) => typeof value === 'string' && value.trim())

@@ -3,6 +3,7 @@ import { test } from 'node:test';
 import { canonicaliseObservations } from './vacancyCanonical.mjs';
 import { PROFILE_RULE_SUPPORT, filterVacancies } from './vacancyFilter.mjs';
 import { normaliseObservation } from './vacancyObservation.mjs';
+import { profileRuleId } from './searchProfile.mjs';
 
 const rule = (value, strength, provenance = 'explicit') => ({ value, strength, provenance });
 const profile = ({
@@ -34,7 +35,11 @@ test('only confirmed hard rules deterministically exclude', () => {
     ],
   }));
   assert.equal(result.excluded[0].code, 'excluded-responsibility');
-  assert.equal(result.excluded[0].profileRuleId, 'rule-coding');
+  assert.equal(result.excluded[0].profileRuleId, profileRuleId(
+    'negative',
+    'excludedResponsibilities',
+    rule('coding', 'hard-exclusion', 'confirmed-inference'),
+  ));
   assert.equal(result.excluded[0].profileVersion, 'profile-test000001');
   assert.equal(result.excluded[0].overrideable, false);
 });
@@ -75,7 +80,8 @@ test('mandatory structured title mismatch is overrideable and preserves source e
     primaryTitles: [rule('Data Engineer', 'mandatory')],
   }));
   assert.deepEqual(result.excluded[0], {
-    vacancyId: 'vacancy-software', code: 'mandatory-title-unmet', profileRuleId: 'rule-data-engineer',
+    vacancyId: 'vacancy-software', code: 'mandatory-title-unmet',
+    profileRuleId: profileRuleId('target', 'primaryTitles', rule('Data Engineer', 'mandatory')),
     profileVersion: 'profile-test000001', evidence: { vacancy: 'Software Engineer', rule: 'Data Engineer' },
     confidence: 'explicit-source', overrideable: true,
   });
@@ -168,7 +174,11 @@ test('confirmed duplicate-source responsibility evidence blocks without hardenin
         descriptionDigest: 'a'.repeat(64),
         descriptionLength: 27,
         profileRuleMatches: [{
-          id: 'rule-operate-gambling-products',
+          id: profileRuleId(
+            'negative',
+            'excludedResponsibilities',
+            rule('operate gambling products', 'hard-exclusion', 'confirmed-inference'),
+          ),
           fact: 'operate gambling products',
         }],
         responsibilityFacts: ['operate gambling products'],
@@ -324,11 +334,12 @@ test('confirmed learned reconsideration is scoped, versioned and preserves exclu
   const rankedProfile = profile({
     primaryTitles: [rule('Data Engineer', 'mandatory')],
   });
+  const reconsideredRuleId = profileRuleId('target', 'primaryTitles', rankedProfile.target.primaryTitles[0]);
   const policy = {
     id: 'learning-reviewed',
     changes: [{
       kind: 'reconsider-rule',
-      profileRuleId: 'rule-data-engineer',
+      profileRuleId: reconsideredRuleId,
       scope: 'role-family',
       value: 'Product Engineering',
     }],
@@ -337,7 +348,7 @@ test('confirmed learned reconsideration is scoped, versioned and preserves exclu
 
   assert.deepEqual(result.eligible, [softwareJob]);
   assert.deepEqual(result.excluded, []);
-  assert.equal(result.reconsidered[0].profileRuleId, 'rule-data-engineer');
+  assert.equal(result.reconsidered[0].profileRuleId, reconsideredRuleId);
   assert.equal(result.reconsidered[0].learningVersionId, 'learning-reviewed');
   assert.equal(result.reconsidered[0].reconsidered, true);
 });
@@ -346,11 +357,12 @@ test('role-family reconsideration does not leak across a matching title or parti
   const rankedProfile = profile({
     primaryTitles: [rule('Data Engineer', 'mandatory')],
   });
+  const reconsideredRuleId = profileRuleId('target', 'primaryTitles', rankedProfile.target.primaryTitles[0]);
   const policy = {
     id: 'learning-reviewed',
     changes: [{
       kind: 'reconsider-rule',
-      profileRuleId: 'rule-data-engineer',
+      profileRuleId: reconsideredRuleId,
       scope: 'role-family',
       value: 'Product Engineering',
     }],

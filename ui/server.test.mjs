@@ -21,7 +21,7 @@ const {
 } = await import('./server.mjs');
 const { seedWorkspace, loadWorkspaceConfig, workspacePaths, writeWorkspaceConfig } = await import('./lib/workspace.mjs');
 const {
-  loadPublishedSearchProfile, profileFingerprint,
+  loadPublishedSearchProfile, profileFingerprint, profileRuleId, publishSearchProfile,
 } = await import('./lib/searchProfile.mjs');
 const {
   recordSearchLaneRun, searchLanePlanRevision, writeSearchLanePlan,
@@ -1787,6 +1787,143 @@ test('feedback, proposal, publication and undo remain separate revisioned mutati
   });
   assert.equal(stale.status, 409);
   assert.equal(JSON.parse(stale.text).conflict, true);
+});
+
+test('reconsideration proposals and publication reference a current exact profile rule', { concurrency: false }, async () => {
+  seedWorkspace(APP_ROOT, testWorkspace);
+  const searchDirectory = path.join(testWorkspace, 'profile', 'search');
+  fs.mkdirSync(searchDirectory, { recursive: true });
+  const rule = { value: 'Platform Engineer', strength: 'mandatory', provenance: 'explicit' };
+  const publishedProfile = publishSearchProfile({
+    version: 1,
+    status: 'draft',
+    target: { primaryTitles: [rule] },
+    negative: {},
+    compensation: {
+      currency: null, period: 'year', minimum: null,
+      minimumStrength: 'neutral', unknownPolicy: 'include',
+    },
+  }, { publishedAt: '2026-07-31T10:00:00.000Z' });
+  fs.writeFileSync(
+    path.join(searchDirectory, 'published.json'),
+    `${JSON.stringify(publishedProfile)}\n`,
+  );
+  const trackerFile = path.join(testWorkspace, 'data', 'opportunities.json');
+  fs.writeFileSync(trackerFile, `${JSON.stringify({
+    updated: '2026-07-31',
+    opportunities: [{
+      id: 'exact-rule-feedback',
+      company: 'Rule Test',
+      role: 'Platform Engineer',
+      status: 'new',
+      score: 70,
+      profileId: publishedProfile.id,
+      jobIdentity: { providerId: 'exact-rule-feedback' },
+    }],
+  })}\n`);
+  const initial = JSON.parse((await request({ path: '/api/feedback-learning' })).text);
+  const feedbackResponse = await request({
+    method: 'POST',
+    path: '/api/feedback',
+    headers: JSON_HEADERS(),
+    body: JSON.stringify({
+      revision: initial.revision,
+      opportunityId: 'exact-rule-feedback',
+      decision: 'not-interested',
+      reason: 'role-family',
+      explanation: 'Review this exact title gate.',
+    }),
+  });
+  assert.equal(feedbackResponse.status, 200, feedbackResponse.text);
+  const ledger = JSON.parse(feedbackResponse.text).ledger;
+  const sourceEventId = ledger.feedbackEvents.at(-1)?.id;
+  assert.ok(sourceEventId);
+
+  const unknown = await request({
+    method: 'POST',
+    path: '/api/learning/proposals',
+    headers: JSON_HEADERS(),
+    body: JSON.stringify({
+      revision: ledger.revision,
+      sourceEventIds: [sourceEventId],
+      explanation: 'Invalid reconsideration.',
+      change: {
+        kind: 'reconsider-rule',
+        profileRuleId: 'rule-nonexistent',
+        scope: 'profile-wide',
+      },
+    }),
+  });
+  assert.equal(unknown.status, 400, unknown.text);
+
+  const current = JSON.parse((await request({ path: '/api/feedback-learning' })).text);
+  const exactId = profileRuleId('target', 'primaryTitles', rule);
+  const proposedResponse = await request({
+    method: 'POST',
+    path: '/api/learning/proposals',
+    headers: JSON_HEADERS(),
+    body: JSON.stringify({
+      revision: current.revision,
+      sourceEventIds: [sourceEventId],
+      explanation: 'Review the exact title gate.',
+      change: {
+        kind: 'reconsider-rule',
+        profileRuleId: exactId,
+        scope: 'profile-wide',
+      },
+    }),
+  });
+  assert.equal(proposedResponse.status, 200, proposedResponse.text);
+  const proposed = JSON.parse(proposedResponse.text).ledger;
+
+  const replacement = publishSearchProfile({
+    version: 1,
+    status: 'draft',
+    target: {
+      primaryTitles: [{
+        value: 'Data Engineer', strength: 'mandatory', provenance: 'explicit',
+      }],
+    },
+    negative: {},
+    compensation: {
+      currency: null, period: 'year', minimum: null,
+      minimumStrength: 'neutral', unknownPolicy: 'include',
+    },
+  }, { publishedAt: '2026-07-31T10:05:00.000Z' });
+  fs.writeFileSync(
+    path.join(searchDirectory, 'published.json'),
+    `${JSON.stringify(replacement)}\n`,
+  );
+  const stalePublish = await request({
+    method: 'POST',
+    path: '/api/learning/publish',
+    headers: JSON_HEADERS(),
+    body: JSON.stringify({
+      revision: proposed.revision,
+      proposalId: proposed.proposals.at(-1).id,
+      confirmed: true,
+    }),
+  });
+  assert.equal(stalePublish.status, 400, stalePublish.text);
+});
+
+test('source preview refuses loopback destinations before network access', { concurrency: false }, async () => {
+  seedWorkspace(APP_ROOT, testWorkspace);
+  const trackerFile = path.join(testWorkspace, 'data', 'opportunities.json');
+  fs.writeFileSync(trackerFile, `${JSON.stringify({
+    updated: '2026-07-31',
+    opportunities: [{
+      id: 'unsafe-source-preview',
+      company: 'Unsafe Source',
+      role: 'Engineer',
+      status: 'new',
+      score: 70,
+      sources: ['http://127.0.0.1:9/private'],
+    }],
+  })}\n`);
+  const response = await request({ path: '/api/source?id=unsafe-source-preview' });
+  assert.equal(response.status, 502, response.text);
+  assert.equal(JSON.parse(response.text).reasonCode, 'unsafe-destination');
 });
 
 test('a UI mutation racing scan completion preserves every tracked user field', { concurrency: false }, async () => {

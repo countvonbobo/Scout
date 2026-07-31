@@ -58,6 +58,9 @@ import {
 import {
   activeLearningPolicy, createLearningLedger, loadLearningLedger,
 } from '../ui/lib/feedbackLearning.mjs';
+import {
+  acquireProviderWork, releaseProviderWork,
+} from '../ui/lib/providerAuthMutation.mjs';
 
 const APP_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const MAX_SCAN_FILE_CHARS = 100_000;
@@ -753,6 +756,8 @@ export async function runScanWith(root, provider, mode, {
   mutationHooks = {},
   providerPreflightFn = providerPreflight,
   recordProviderResultHealthFn = recordProviderResultHealth,
+  acquireProviderWorkFn = acquireProviderWork,
+  releaseProviderWorkFn = releaseProviderWork,
 } = {}) {
   if (!['codex', 'claude'].includes(provider)) throw new Error('provider must be codex or claude');
   if (!['primary', 'second-pass', 'broadened'].includes(mode)) throw new Error('mode must be primary, broadened or second-pass');
@@ -935,6 +940,8 @@ export async function runScanWith(root, provider, mode, {
             mutationHooks,
             providerPreflightFn,
             recordProviderResultHealthFn,
+            acquireProviderWorkFn,
+            releaseProviderWorkFn,
           });
           if (queued.status === 'in-progress'
             && queued.reason === 'operator-intervention-required'
@@ -1082,38 +1089,44 @@ export async function runScanWith(root, provider, mode, {
             const paths = workspacePaths(root);
             const emptyContext = buildScanContext(paths, config, []);
             const contextDigests = assessmentContextDigests(paths, config);
-            const assessed = await assessScanCandidates({
-              run,
-              lease,
-              candidates,
-              compatibility,
-              contextBudgetCharacters: MAX_SCAN_CONTEXT_CHARS,
-              contextOverheadCharacters: JSON.stringify(emptyContext).length,
-              contextDigests,
-              invokeProvider({ kind, jobs, validationFailures, timeoutMs, maxInputTokens }) {
-                const context = buildScanContext(paths, config, jobs.map(promptCandidate));
-                const prompt = buildAssessmentPrompt(context, { kind, validationFailures });
-                const invocation = runStructuredTurnFn({
-                  provider, status: trustedProviderStatus, schema: SCAN_ASSESSMENT_SCHEMA, prompt,
-                  model, validate: (value) => value, timeoutMs, maxInputTokens,
-                });
-                void Promise.resolve(invocation).then(
-                  (remoteResult) => recordProviderResultHealthFn(
-                    root,
-                    provider,
-                    remoteResult,
-                    { lease, purpose: providerHealthPurpose },
-                  ),
-                  (error) => recordProviderResultHealthFn(
-                    root,
-                    provider,
-                    error,
-                    { lease, purpose: providerHealthPurpose },
-                  ),
-                ).catch(() => {});
-                return invocation;
-              },
-            });
+            const providerWork = acquireProviderWorkFn(root, provider);
+            let assessed;
+            try {
+              assessed = await assessScanCandidates({
+                run,
+                lease,
+                candidates,
+                compatibility,
+                contextBudgetCharacters: MAX_SCAN_CONTEXT_CHARS,
+                contextOverheadCharacters: JSON.stringify(emptyContext).length,
+                contextDigests,
+                invokeProvider({ kind, jobs, validationFailures, timeoutMs, maxInputTokens }) {
+                  const context = buildScanContext(paths, config, jobs.map(promptCandidate));
+                  const prompt = buildAssessmentPrompt(context, { kind, validationFailures });
+                  const invocation = runStructuredTurnFn({
+                    provider, status: trustedProviderStatus, schema: SCAN_ASSESSMENT_SCHEMA, prompt,
+                    model, validate: (value) => value, timeoutMs, maxInputTokens,
+                  });
+                  void Promise.resolve(invocation).then(
+                    (remoteResult) => recordProviderResultHealthFn(
+                      root,
+                      provider,
+                      remoteResult,
+                      { lease, purpose: providerHealthPurpose },
+                    ),
+                    (error) => recordProviderResultHealthFn(
+                      root,
+                      provider,
+                      error,
+                      { lease, purpose: providerHealthPurpose },
+                    ),
+                  ).catch(() => {});
+                  return invocation;
+                },
+              });
+            } finally {
+              releaseProviderWorkFn(root, providerWork);
+            }
             assessmentFailures = assessed.failures;
             if (!assessed.assessments.length && assessmentFailures.length) {
               throw new Error('all candidate assessments exhausted their bounded provider retries');

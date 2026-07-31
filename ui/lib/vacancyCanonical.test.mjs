@@ -195,10 +195,15 @@ test('URL-less canonical identities are stable, collision-free and source-order 
     description: 'Build stable services.',
   });
   const separate = canonicaliseObservations([first, second]).vacancies;
+  const firstAloneId = canonicaliseObservations([first]).vacancies[0].vacancyId;
 
   assert.equal(separate.length, 2);
   assert.equal(new Set(separate.map(({ vacancyId }) => vacancyId)).size, 2);
   assert.ok(separate.every(({ vacancyId }) => /^vacancy-ref-[a-f0-9]{24}$/.test(vacancyId)));
+  assert.equal(
+    separate.find(({ sourceReferences }) => sourceReferences[0].providerId === 'reference-1').vacancyId,
+    firstAloneId,
+  );
 
   const crossSource = [
     first,

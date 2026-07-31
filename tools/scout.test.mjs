@@ -21,6 +21,9 @@ import {
 import {
   createEmployerRegistry, writeEmployerRegistry,
 } from '../ui/lib/employerRegistry.mjs';
+import {
+  acquireProviderAuthMutation, releaseProviderAuthMutation,
+} from '../ui/lib/providerAuthMutation.mjs';
 
 function scanRoot() {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'scout-runtime-scan-'));
@@ -648,6 +651,61 @@ test('direct scan uses the same freshly signed-in provider status detected after
     assert.equal(projectScanQueue(root).requests.length, 3);
     assert.ok(projectScanQueue(root).requests.every(({ status }) => status === 'succeeded'));
   } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('candidate assessment holds provider-work authority across every provider retry', async () => {
+  const root = scanRoot();
+  enableRankedDiscovery(root);
+  const events = [];
+  let postRunAuth = null;
+  try {
+    const result = await runScanWith(root, 'codex', 'primary', {
+      providerStatusFn: authenticated,
+      collectSourcesFn: async () => ({
+        generatedAt: '2026-07-31T10:00:00.000Z',
+        queries: [],
+        sources: {
+          ats: {
+            configured: true,
+            status: 'healthy',
+            count: 1,
+            jobs: [{
+              company: 'Authority Co',
+              title: 'Ideal Role',
+              url: 'https://example.test/provider-authority',
+              providerId: 'provider-authority',
+            }],
+          },
+        },
+      }),
+      checkLivenessFn: async (candidates) => ({
+        live: candidates,
+        removed: [],
+        summary: { checked: candidates.length, gone: 0, unverified: 0 },
+      }),
+      runStructuredTurnFn: async ({ validate }) => {
+        events.push('provider');
+        assert.equal(acquireProviderAuthMutation(root, 'codex', {
+          mutationId: 'auth-during-assessment',
+        }), null);
+        const value = assessmentFor([{ candidateId: 'candidate-001' }]);
+        validate(value);
+        return { value, usage: {} };
+      },
+      acquireLockFn: () => ({ ok: true, lock: { token: fixtureToken('provider-authority-test') } }),
+      releaseLockFn: () => ({ ok: true }),
+    });
+
+    assert.equal(result.ok, true, result.error);
+    assert.deepEqual(events, ['provider']);
+    postRunAuth = acquireProviderAuthMutation(root, 'codex', {
+      mutationId: 'auth-after-assessment',
+    });
+    assert.ok(postRunAuth);
+  } finally {
+    if (postRunAuth) releaseProviderAuthMutation(root, postRunAuth);
     fs.rmSync(root, { recursive: true, force: true });
   }
 });

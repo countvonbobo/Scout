@@ -277,7 +277,13 @@ export function canonicaliseObservations(observations) {
   }
   for (const peers of collisions.values()) {
     if (peers.length < 2) continue;
-    for (const vacancy of peers) {
+    const orderedPeers = [...peers].sort((left, right) => compareStable(
+      stableJson(left.sourceReferences),
+      stableJson(right.sourceReferences),
+    ));
+    // Keep the deterministic first peer on the intrinsic identity. Adding or
+    // removing later distinct references must not rewrite an existing vacancy.
+    for (const vacancy of orderedPeers.slice(1)) {
       vacancy.vacancyId = `vacancy-ref-${crypto.createHash('sha256')
         .update(stableJson({
           identity: vacancy._fallbackIdentity,

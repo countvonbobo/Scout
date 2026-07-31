@@ -102,6 +102,7 @@ function canonicalUrl(value) {
     throw new TypeError('employer careers URL is invalid');
   }
   url.hash = '';
+  url.search = '';
   return url.toString();
 }
 

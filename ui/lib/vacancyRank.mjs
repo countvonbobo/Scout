@@ -1,4 +1,5 @@
 import { applyLearningToRankedVacancies } from './feedbackLearning.mjs';
+import { profileRuleId } from './searchProfile.mjs';
 
 export const STRENGTH_WEIGHT = Object.freeze({
   mandatory: 1,
@@ -81,7 +82,7 @@ function normalise(value) {
 }
 
 function ruleId(rule) {
-  return `rule-${normalise(rule?.value).replace(/\s+/g, '-')}`;
+  return rule?._profileRuleId || 'policy-unidentified-profile-rule';
 }
 
 function vacancyIdentifier(vacancy) {
@@ -276,18 +277,20 @@ function compensationDimension(vacancy, profile) {
   const unknownPenalty = !knownComparable && preference.unknownPolicy === 'penalise' ? maximum * 0.25 : 0;
   const rawScore = weight > 0 ? (meetsMinimum ? weight : -unknownPenalty) : (belowMinimum ? weight : -unknownPenalty);
   const score = Object.is(rawScore, -0) ? 0 : rawScore;
-  const rule = { value: `${preference.currency || 'unknown'} ${preference.period || 'unknown'} ${preference.rateType || 'unknown'} ${preference.minimum}`, strength: preference.minimumStrength };
+  const compensationRuleId = 'policy-compensation-minimum';
   return {
     name: 'compensation', score, maximum, confidence: knownComparable ? 1 : 0, confidenceWeight: Math.abs(weight),
     evidence: [{ vacancy: amount || null, rule: preference.minimum, comparison }],
-    profileRuleIds: [ruleId(rule)],
-    contributions: score ? [{ name: 'compensation', profileRuleId: ruleId(rule), score, evidence: { vacancy: amount || null, rule: preference.minimum, comparison } }] : [],
+    profileRuleIds: [compensationRuleId],
+    contributions: score ? [{ name: 'compensation', profileRuleId: compensationRuleId, score, evidence: { vacancy: amount || null, rule: preference.minimum, comparison } }] : [],
   };
 }
 
 function dimensionRules(profile, dimension) {
-  const positive = dimension.positive.flatMap((name) => profile?.target?.[name] || []);
-  const negative = dimension.negative.flatMap((name) => profile?.negative?.[name] || [])
+  const positive = dimension.positive.flatMap((field) => (profile?.target?.[field] || [])
+    .map((rule) => ({ ...rule, _profileRuleId: profileRuleId('target', field, rule) })));
+  const negative = dimension.negative.flatMap((field) => (profile?.negative?.[field] || [])
+    .map((rule) => ({ ...rule, _profileRuleId: profileRuleId('negative', field, rule) })))
     .filter((rule) => (STRENGTH_WEIGHT[rule?.strength] || 0) < 0);
   return [...positive, ...negative];
 }

@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { rankVacancies } from './vacancyRank.mjs';
+import { profileRuleId } from './searchProfile.mjs';
 
 function rule(value, strength = 'strong-preference') {
   return { value, strength, provenance: 'explicit' };
@@ -181,7 +182,9 @@ test('ranked vacancies expose weighted dimensions and contribution evidence', ()
   assert.ok(result.dimensions.every(({ name, score, maximum, confidence, evidence, profileRuleIds }) =>
     typeof name === 'string' && Number.isFinite(score) && Number.isFinite(maximum) && Number.isFinite(confidence)
       && Array.isArray(evidence) && Array.isArray(profileRuleIds)));
-  assert.ok(result.contributions.some((item) => item.profileRuleId === 'rule-data-analyst' && item.score > 0));
+  assert.ok(result.contributions.some((item) => item.profileRuleId === profileRuleId(
+    'target', 'primaryTitles', rule('Data Analyst', 'mandatory'),
+  ) && item.score > 0));
   assert.deepEqual(result.stableTieBreak, {
     postedAt: '2026-07-20T00:00:00.000Z', employer: 'example ltd', title: 'data analyst', vacancyId: 'explained',
   });
@@ -306,14 +309,15 @@ test('a semantic artifact with no description preserves unknown ranking evidence
 
 test('semantic ranking uses per-rule matches and keeps unevidenced description rules unknown', () => {
   const semanticRules = [
-    ['rule-design-services', 'design services', 'unknown'],
-    ['rule-typescript', 'typescript', 'matched'],
-    ['rule-cloud-certification', 'cloud certification', 'unknown'],
-    ['rule-public-health', 'public health', 'matched'],
-    ['rule-work-authorisation', 'work authorisation', 'unknown'],
-    ['rule-regional-travel', 'regional travel', 'matched'],
-  ].map(([id, fact, status]) => ({
-    id, fact, status,
+    ['target', 'responsibilities', 'design services', 'unknown'],
+    ['target', 'skills', 'typescript', 'matched'],
+    ['target', 'qualifications', 'cloud certification', 'unknown'],
+    ['target', 'sectors', 'public health', 'matched'],
+    ['target', 'eligibility', 'work authorisation', 'unknown'],
+    ['target', 'mobility', 'regional travel', 'matched'],
+  ].map(([section, field, fact, status]) => ({
+    id: profileRuleId(section, field, rule(fact)),
+    fact, status,
     evidence: [{
       source: 'fixture',
       providerId: 'semantic-1',

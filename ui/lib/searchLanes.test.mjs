@@ -16,7 +16,7 @@ function rule(value, strength = 'strong-preference') {
 
 function profile({
   id = 'profile-aaaaaaaaaaaa',
-  primaryTitles = [], titles = [], locations = [], industries = [], skills = [],
+  primaryTitles = [], adjacentTitles = [], titles = [], locations = [], industries = [], skills = [],
   workingPatterns = [], employers = [], exploration = 0.1,
 } = {}) {
   return {
@@ -26,6 +26,7 @@ function profile({
     publishedAt: '2026-07-30T12:00:00.000Z',
     target: {
       primaryTitles: primaryTitles.map((value) => rule(value)),
+      adjacentTitles: adjacentTitles.map((value) => rule(value, 'nice-to-have')),
       titles: titles.map((value) => rule(value, 'nice-to-have')),
       locations: locations.map((value) => rule(value)),
       industries: industries.map((value) => rule(value)),
@@ -79,6 +80,21 @@ test('lane generation accepts deterministic derivation from a migrated profile',
     plan.lanes[0].profileFields[0].provenance,
     'deterministic-derivation',
   );
+});
+
+test('adjacent titles create traceable exploration lanes even without legacy titles', () => {
+  const plan = generateSearchLanePlan(profile({
+    primaryTitles: ['Platform engineer'],
+    adjacentTitles: ['Technical programme manager'],
+    titles: [],
+    exploration: 0.2,
+  }));
+
+  const adjacent = plan.lanes.find(({ query }) => query === 'Technical programme manager');
+  assert.ok(adjacent);
+  assert.equal(adjacent.kind, 'exploration');
+  assert.ok(adjacent.profileFields.some(({ path }) => path === 'target.adjacentTitles'));
+  assert.equal(plan.omissions.some(({ reason }) => reason === 'no-adjacent-title'), false);
 });
 
 test('six materially different domain profiles produce different neutral lane plans', () => {

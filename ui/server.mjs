@@ -29,6 +29,7 @@ import { createProviderHealthMonitor, scheduleStatus, scheduleSummary } from './
 import { loadPortals, portalSummary } from './lib/ats.mjs';
 import { JOB_CATEGORIES } from './lib/filters.mjs';
 import { buildSourcePayload, sourceUrlOf, SourceCache } from './lib/source.mjs';
+import { fetchPublicResource, PublicHttpError } from './lib/publicHttp.mjs';
 import {
   assertSafeModel, detectProvidersAsync, providerLocalHealthSignal, runProviderCommand,
 } from './lib/providers.mjs';
@@ -66,7 +67,8 @@ import {
 } from './lib/trackerPersistence.mjs';
 import { loadEnv, saveEnv } from './lib/env.mjs';
 import {
-  loadPublishedSearchProfile, migrateSearchProfile, profileFingerprint, publishSearchProfile, validateSearchProfile,
+  loadPublishedSearchProfile, migrateSearchProfile, profileFingerprint, publishSearchProfile,
+  searchProfileRuleIds, validateSearchProfile,
 } from './lib/searchProfile.mjs';
 import {
   applyAdaptiveAnswers, buildAdaptiveQuestionnaire,
@@ -1046,9 +1048,11 @@ async function handleSource(res, id) {
   if (cached) return sendJson(res, 200, cached);
   let html;
   try {
-    const r = await fetch(target, {
-      redirect: 'follow',
-      signal: AbortSignal.timeout(10000),
+    const r = await fetchPublicResource(target, {
+      timeoutMs: 10000,
+      maxBytes: 1_000_000,
+      maxRedirects: 4,
+      allowedContentTypes: ['text/html', 'application/xhtml+xml', 'application/xml', 'text/plain'],
       headers: {
         'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36',
         accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
@@ -1059,9 +1063,12 @@ async function handleSource(res, id) {
   } catch (e) {
     return sendJson(res, 502, {
       ok: false,
-      ...(e.name === 'TimeoutError'
+      ...(e instanceof PublicHttpError && e.reasonCode === 'request-timeout'
         ? { error: 'Source request timed out.', reasonCode: 'source-timeout' }
-        : { error: 'Source could not be fetched.', reasonCode: 'source-fetch-failed' }),
+        : {
+          error: 'Source could not be fetched.',
+          reasonCode: e instanceof PublicHttpError ? e.reasonCode : 'source-fetch-failed',
+        }),
     });
   }
   const payload = buildSourcePayload(html, target, new Date().toISOString());
@@ -1384,6 +1391,14 @@ function publicLearningLedger(ledger) {
   };
 }
 
+function assertCurrentProfileRule(change) {
+  if (change?.kind !== 'reconsider-rule') return;
+  const profile = loadPublishedSearchProfile(WORKSPACE_ROOT);
+  if (!profile || !searchProfileRuleIds(profile).has(change.profileRuleId)) {
+    throw new TypeError('learning reconsideration must reference a current published profile rule');
+  }
+}
+
 routes['GET /api/feedback-learning'] = (req, res) => {
   try {
     return replyJson(res, 200, publicLearningLedger(currentLearningLedger()));
@@ -1437,6 +1452,7 @@ routes['POST /api/learning/proposals'] = (req, res, body) => {
   try {
     return withSearchPlanMutation(res, 'learning-proposal', () => {
       const ledger = learningLedgerForRevision(value.revision);
+      assertCurrentProfileRule(value.change);
       const next = proposeLearningChange(ledger, value);
       writeLearningLedger(WORKSPACE_ROOT, next);
       void scheduleCheckpoint('ui: propose learned preference');
@@ -1459,6 +1475,8 @@ routes['POST /api/learning/publish'] = (req, res, body) => {
   try {
     return withSearchPlanMutation(res, 'learning-publish', () => {
       const ledger = learningLedgerForRevision(value.revision);
+      const proposal = ledger.proposals.find(({ id }) => id === value.proposalId);
+      assertCurrentProfileRule(proposal?.change);
       const next = publishLearningProposal(ledger, value);
       writeLearningLedger(WORKSPACE_ROOT, next);
       void scheduleCheckpoint('ui: publish learned preference');

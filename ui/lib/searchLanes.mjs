@@ -2,7 +2,7 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { atomicWriteFile } from './atomicWrite.mjs';
-import { PROVENANCE } from './searchProfile.mjs';
+import { profileRuleId, PROVENANCE } from './searchProfile.mjs';
 import { workspacePaths } from './workspace.mjs';
 
 export const SEARCH_LANE_SCHEMA_VERSION = 1;
@@ -70,14 +70,11 @@ function compareText(left, right) {
   return String(left) < String(right) ? -1 : String(left) > String(right) ? 1 : 0;
 }
 
-function ruleId(path, rule) {
-  return `rule-${digest({ path, value: text(rule?.value), strength: rule?.strength }).slice(0, 16)}`;
-}
-
 function profileField(path, rule) {
+  const [section, field] = path.split('.');
   return Object.freeze({
     path,
-    ruleId: ruleId(path, rule),
+    ruleId: profileRuleId(section, field, rule),
     value: text(rule?.value),
     strength: rule?.strength || 'neutral',
     provenance: rule?.provenance || 'unconfirmed-inference',
@@ -236,7 +233,7 @@ function withOverlaps(lanes) {
 }
 
 function anchorRule(profile) {
-  return usableRules(profile, ['target.primaryTitles', 'target.titles'])[0] || null;
+  return usableRules(profile, ['target.primaryTitles', 'target.adjacentTitles', 'target.titles'])[0] || null;
 }
 
 function createCandidates(profile, now) {
@@ -250,7 +247,7 @@ function createCandidates(profile, now) {
     addCandidate(candidates, omissions, 'title', item.rule.value, [profileField(item.path, item.rule)], now);
   }
   const exploration = Number(profile?.selection?.exploration || 0);
-  for (const item of usableRules(profile, ['target.titles'])) {
+  for (const item of usableRules(profile, ['target.adjacentTitles', 'target.titles'])) {
     const fields = [profileField(item.path, item.rule)];
     if (exploration > 0) {
       fields.push({
@@ -289,7 +286,7 @@ function createCandidates(profile, now) {
       addCandidate(candidates, omissions, kind, query, fields, now);
     }
   }
-  if (exploration > 0 && !usableRules(profile, ['target.titles']).length) {
+  if (exploration > 0 && !usableRules(profile, ['target.adjacentTitles', 'target.titles']).length) {
     omissions.push({
       kind: 'exploration',
       profileFields: [{

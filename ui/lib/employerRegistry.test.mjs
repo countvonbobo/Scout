@@ -26,6 +26,13 @@ test('stable canonical identity is domain-neutral and independent of case or spa
   assert.notEqual(canonicalEmployerId('Example Health'), canonicalEmployerId('Example Legal'));
 });
 
+test('careers URLs discard search and fragment data before private persistence', () => {
+  const registry = createEmployerRegistry([discovery('Query Example', {
+    careersUrl: 'https://example.test/careers?candidate=private-value#openings',
+  })], { now: () => AT });
+  assert.equal(registry.employers[0].careersUrl, 'https://example.test/careers');
+});
+
 test('registry accepts all four discovery origins without inventing priority', () => {
   const registry = createEmployerRegistry([
     discovery('Named Example', {
