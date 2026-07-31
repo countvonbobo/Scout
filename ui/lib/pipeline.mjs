@@ -12,6 +12,9 @@ const BASE_RECOVERY_REQUIREMENTS = Object.freeze([
   'artifactSchemaVersion',
   'stageArtifactSchemaVersion',
   'pipelineVersion',
+  'lanePlanGeneration',
+  'lanePlanRevision',
+  'laneSelectionFingerprint',
   'scheduleJobId',
   'logicalWindowId',
 ]);

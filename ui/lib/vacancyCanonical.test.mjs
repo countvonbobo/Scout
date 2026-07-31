@@ -180,3 +180,38 @@ test('canonical vacancies preserve structured evidence and observed lifecycle bo
   assert.deepEqual(vacancy.roleFamilies, ['platform', 'site-reliability']);
   assert.equal(vacancy.roleFamily, 'platform');
 });
+
+test('URL-less canonical identities are stable, collision-free and source-order independent', () => {
+  const first = observation({
+    source: 'provider-a',
+    providerId: 'reference-1',
+    url: null,
+    description: 'Build stable services.',
+  });
+  const second = observation({
+    source: 'provider-a',
+    providerId: 'reference-2',
+    url: null,
+    description: 'Build stable services.',
+  });
+  const separate = canonicaliseObservations([first, second]).vacancies;
+
+  assert.equal(separate.length, 2);
+  assert.equal(new Set(separate.map(({ vacancyId }) => vacancyId)).size, 2);
+  assert.ok(separate.every(({ vacancyId }) => /^vacancy-ref-[a-f0-9]{24}$/.test(vacancyId)));
+
+  const crossSource = [
+    first,
+    observation({
+      source: 'provider-b',
+      providerId: 'other-reference',
+      url: null,
+      description: 'Build stable services.',
+    }),
+  ];
+  const forward = canonicaliseObservations(crossSource);
+  const reverse = canonicaliseObservations([...crossSource].reverse());
+  assert.equal(forward.vacancies.length, 1);
+  assert.deepEqual(forward, reverse);
+  assert.match(forward.vacancies[0].vacancyId, /^vacancy-ref-[a-f0-9]{24}$/);
+});

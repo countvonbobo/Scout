@@ -221,7 +221,9 @@ export function loadWorkspaceConfig(root, { allowMissing = true } = {}) {
     if (!allowMissing) throw new Error(`workspace config missing: ${file}`);
     return cloneDefaults();
   }
-  return validateWorkspaceConfig(mergeWorkspaceDefaults(JSON.parse(fs.readFileSync(file, 'utf8'))));
+  const value = JSON.parse(fs.readFileSync(file, 'utf8'));
+  delete value._scoutMutation;
+  return validateWorkspaceConfig(mergeWorkspaceDefaults(value));
 }
 
 export function writeWorkspaceConfig(root, config) {

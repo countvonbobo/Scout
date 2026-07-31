@@ -309,6 +309,47 @@ test('compatibility schema two negotiates storage envelope and stage data versio
   assert.ok(stageChanged.reasons.includes('stage-artifact-schema-mismatch'));
 });
 
+test('compatibility schema three binds the lane-plan generation, revision and selected queries', () => {
+  const versioned = compatibility({
+    schemaVersion: 3,
+    stageArtifactSchemaVersion: 1,
+    scheduleJobId: 'none',
+    logicalWindowId: 'none',
+    lanePlanGeneration: 'generation-4',
+    lanePlanRevision: digest('d'),
+    laneSelectionFingerprint: digest('e'),
+  });
+  assert.match(compatibilityFingerprint(versioned), /^[a-f0-9]{64}$/);
+
+  const compatible = new RecoveryCompatibilityDecision(
+    candidate('lane-compatible-run', '2026-07-27T08:00:00.000Z', {
+      compatibility: versioned,
+    }),
+    versioned,
+  );
+  assert.equal(compatible.recoverable, true);
+  assert.ok(compatible.stages.every(({ action }) => action === 'reuse'));
+
+  const changed = new RecoveryCompatibilityDecision(
+    candidate('lane-stale-run', '2026-07-27T08:00:00.000Z', {
+      compatibility: versioned,
+    }),
+    {
+      ...versioned,
+      lanePlanGeneration: 'generation-5',
+      lanePlanRevision: digest('f'),
+      laneSelectionFingerprint: digest('9'),
+    },
+  );
+  assert.equal(changed.recoverable, false);
+  assert.deepEqual(changed.reasons, [
+    'lane-plan-generation-mismatch',
+    'lane-plan-revision-mismatch',
+    'lane-selection-mismatch',
+  ]);
+  assert.ok(changed.stages.every(({ action }) => action === 'restart'));
+});
+
 test('selects the newest recoverable run and records why newer incomplete runs were skipped', () => {
   const candidates = [
     candidate('run-old', '2026-07-27T08:00:00.000Z'),

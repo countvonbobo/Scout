@@ -53,15 +53,20 @@ function exclusion(vacancy, profile, code, rule, evidence, sourceConfidence, ove
   };
 }
 
-const POSITIVE_FIELDS = Object.freeze({
-  primaryTitles: ['title', 'title'], titles: ['title', 'title'], locations: ['location', 'location', 'location'],
-  employmentTypes: ['employmentType', 'employment-type'], employers: ['employer', 'employer'],
-});
-
-const NEGATIVE_FIELDS = Object.freeze({
-  excludedTitles: ['title', 'excluded-title'], excludedEmployers: ['employer', 'excluded-employer'],
-  excludedEmploymentTypes: ['employmentType', 'excluded-employment-type'], excludedLocations: ['location', 'excluded-location'],
-});
+export const PROFILE_RULE_SUPPORT = Object.freeze([
+  { dimension: 'title', code: 'title', target: ['primaryTitles', 'adjacentTitles', 'titles'], negative: ['excludedTitles'], field: 'title', mode: 'exact' },
+  { dimension: 'responsibilities', code: 'responsibility', target: ['responsibilities'], negative: ['excludedResponsibilities'], field: 'responsibilities', mode: 'phrase', semantic: true },
+  { dimension: 'skills', code: 'skill', target: ['skills'], negative: ['excludedSkills'], field: 'skills', mode: 'phrase', semantic: true },
+  { dimension: 'qualifications', code: 'qualification', target: ['qualifications'], negative: ['excludedQualifications'], field: 'qualifications', mode: 'phrase', semantic: true },
+  { dimension: 'eligibility', code: 'eligibility', target: ['eligibility'], negative: ['excludedEligibility'], field: 'eligibility', mode: 'phrase', semantic: true },
+  { dimension: 'industry', code: 'industry', target: ['industries', 'sectors'], negative: ['excludedIndustries', 'excludedSectors'], field: 'industry', mode: 'phrase', semantic: true },
+  { dimension: 'location', code: 'location', target: ['locations'], negative: ['excludedLocations'], field: 'location', mode: 'exact' },
+  { dimension: 'mobility', code: 'mobility', target: ['mobility'], negative: ['excludedMobility'], field: 'location', mode: 'phrase', semantic: true },
+  { dimension: 'workingPattern', code: 'working-pattern', target: ['workingPatterns'], negative: ['excludedWorkingPatterns'], field: 'workingPattern', mode: 'exact' },
+  { dimension: 'employmentType', code: 'employment-type', target: ['employmentTypes'], negative: ['excludedEmploymentTypes'], field: 'employmentType', mode: 'exact' },
+  { dimension: 'seniority', code: 'seniority', target: ['seniority'], negative: ['excludedSeniority'], field: 'seniority', mode: 'exact' },
+  { dimension: 'employer', code: 'employer', target: ['employers'], negative: ['excludedEmployers'], field: 'employer', mode: 'exact' },
+]);
 
 function fieldValue(vacancy, field) {
   const aliases = {
@@ -71,23 +76,61 @@ function fieldValue(vacancy, field) {
   return (aliases[field] || [field]).map((name) => vacancy?.[name]).find((value) => value !== undefined && value !== null && value !== '');
 }
 
+function semanticMatch(vacancy, rule) {
+  return (vacancy?.semanticEvidence?.profileRuleMatches || []).find((item) => (
+    (typeof item === 'string' ? item : item?.id) === ruleId(rule)
+  )) || null;
+}
+
+function structuredMatch(source, rule, mode) {
+  const actual = valueOf(source);
+  const values = Array.isArray(actual) ? actual : [actual];
+  return values.some((value) => (
+    mode === 'exact' ? exactMatches(value, rule.value) : phraseMatches(value, rule.value)
+  ));
+}
+
+function knownSource(source) {
+  const actual = valueOf(source);
+  if (Array.isArray(actual)) return actual.some((value) => normalise(value));
+  return actual !== null && actual !== undefined && actual !== '';
+}
+
+function ruleEvidence(vacancy, source, rule, semantic) {
+  if (semantic) {
+    return {
+      vacancy: {
+        matchedRule: ruleId(rule),
+        sources: (typeof semantic === 'object' ? semantic.evidence || [] : []).slice(0, 8),
+      },
+      rule: rule.value,
+    };
+  }
+  return { vacancy: valueOf(source), rule: rule.value };
+}
+
 function structuredExclusions(vacancy, profile) {
   const found = [];
-  for (const [listName, [field, name, unknownPolicyField]] of Object.entries(POSITIVE_FIELDS)) {
-    const rules = (profile?.target?.[listName] || []).filter(blockingStructuredRule);
+  for (const support of PROFILE_RULE_SUPPORT) {
+    const rules = support.target.flatMap((name) => profile?.target?.[name] || [])
+      .filter(blockingStructuredRule);
     if (!rules.length) continue;
-    const source = fieldValue(vacancy, field);
-    const actual = valueOf(source);
-    if (actual === null || actual === undefined || actual === '') {
-      if (unknownPolicyField && profile?.unknownPolicies?.[unknownPolicyField] === 'exclude') {
+    const source = fieldValue(vacancy, support.field);
+    const matched = rules.find((rule) => (
+      structuredMatch(source, rule, support.mode)
+      || (support.semantic && semanticMatch(vacancy, rule))
+    ));
+    if (matched) continue;
+    if (!knownSource(source)) {
+      if (profile?.unknownPolicies?.[support.dimension] === 'exclude') {
         found.push({
           vacancyId: vacancy?.vacancyId || vacancy?.candidateId || vacancy?.canonicalUrl || 'unknown-vacancy',
-          code: `${unknownPolicyField}-unknown`,
-          profileRuleId: `policy-${unknownPolicyField}-unknown`,
+          code: `${support.code}-unknown`,
+          profileRuleId: `policy-${support.code}-unknown`,
           profileVersion: profileVersion(profile),
           evidence: {
             vacancy: null,
-            rule: `unknown ${unknownPolicyField} policy: exclude`,
+            rule: `unknown ${support.dimension} policy: exclude`,
             comparison: 'unknown',
           },
           confidence: confidence(source),
@@ -96,45 +139,32 @@ function structuredExclusions(vacancy, profile) {
       }
       continue;
     }
-    if (rules.some((rule) => exactMatches(actual, rule.value))) continue;
     for (const rule of rules) {
-      found.push(exclusion(vacancy, profile, `mandatory-${name}-unmet`, rule,
-        { vacancy: actual, rule: rule.value }, confidence(source), true));
+      found.push(exclusion(vacancy, profile, `mandatory-${support.code}-unmet`, rule,
+        { vacancy: valueOf(source), rule: rule.value }, confidence(source), true));
     }
   }
-  for (const [listName, [field, code]] of Object.entries(NEGATIVE_FIELDS)) {
-    for (const rule of profile?.negative?.[listName] || []) {
+  for (const support of PROFILE_RULE_SUPPORT) {
+    const source = fieldValue(vacancy, support.field);
+    for (const rule of support.negative.flatMap((name) => profile?.negative?.[name] || [])) {
       if (!hardRule(rule)) continue;
-      const source = fieldValue(vacancy, field);
-      const actual = valueOf(source);
-      if (actual && exactMatches(actual, rule.value)) {
-        found.push(exclusion(vacancy, profile, code, rule, { vacancy: actual, rule: rule.value }, confidence(source), true));
-      }
+      const semantic = support.semantic ? semanticMatch(vacancy, rule) : null;
+      const rawDescriptionMatch = support.semantic
+        && !vacancy?.semanticEvidence
+        && phraseMatches(vacancy?.description, rule.value);
+      if (!structuredMatch(source, rule, support.mode) && !semantic && !rawDescriptionMatch) continue;
+      found.push(exclusion(
+        vacancy,
+        profile,
+        `excluded-${support.code}`,
+        rule,
+        ruleEvidence(vacancy, source, rule, semantic),
+        confidence(source),
+        support.dimension !== 'responsibilities',
+      ));
     }
   }
   return found;
-}
-
-function responsibilityExclusions(vacancy, profile) {
-  const description = String(vacancy?.description || '');
-  const semanticMatches = new Map((vacancy?.semanticEvidence?.profileRuleMatches || []).map((item) => (
-    typeof item === 'string' ? [item, { id: item, evidence: [] }] : [item.id, item]
-  )));
-  return (profile?.negative?.excludedResponsibilities || []).flatMap((rule) => {
-    const matchedRule = semanticMatches.get(ruleId(rule));
-    const matched = Boolean(matchedRule) || phraseMatches(description, rule.value);
-    if (!hardRule(rule) || !matched) return [];
-    return [exclusion(vacancy, profile, 'excluded-responsibility', rule,
-      {
-        vacancy: vacancy?.semanticEvidence
-          ? {
-            matchedRule: ruleId(rule),
-            sources: (matchedRule?.evidence || []).slice(0, 8),
-          }
-          : description,
-        rule: rule.value,
-      }, 'explicit-source', false)];
-  });
 }
 
 function compensationExclusions(vacancy, profile) {
@@ -185,7 +215,6 @@ export function filterVacancies(vacancies, profile, {
   const reconsidered = [];
   for (const vacancy of vacancies || []) {
     const matches = [
-      ...responsibilityExclusions(vacancy, profile),
       ...structuredExclusions(vacancy, profile),
       ...compensationExclusions(vacancy, profile),
     ];

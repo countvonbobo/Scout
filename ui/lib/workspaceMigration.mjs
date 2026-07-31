@@ -209,7 +209,6 @@ export function latestBeta22WorkspaceSnapshot(root) {
 export function createBeta22WorkspaceSnapshot(root, { now = () => new Date().toISOString() } = {}) {
   const workspaceRoot = path.resolve(root);
   const existing = latestBeta22WorkspaceSnapshot(workspaceRoot);
-  if (existing) return { ...existing, created: false };
   const configFile = path.join(workspaceRoot, 'workspace.json');
   if (!fs.existsSync(configFile)) throw new Error('workspace config is required for beta.22 snapshot');
   const parent = snapshotsDirectory(workspaceRoot);
@@ -219,9 +218,6 @@ export function createBeta22WorkspaceSnapshot(root, { now = () => new Date().toI
   const name = `${safeTimestamp(createdAt)}-beta22-compatible`;
   const directory = path.join(parent, name);
   const staging = path.join(parent, `.${name}.${crypto.randomUUID()}.tmp`);
-  if (fs.existsSync(directory) || fs.existsSync(manifestPath(directory))) {
-    throw new Error('beta.22 snapshot destination already exists without a valid manifest');
-  }
   try {
     fs.mkdirSync(staging, { recursive: false, mode: 0o700 });
     for (const relative of SNAPSHOT_PATHS) {
@@ -234,12 +230,22 @@ export function createBeta22WorkspaceSnapshot(root, { now = () => new Date().toI
       }
     }
     const entries = snapshotEntries(staging);
+    const currentTreeDigest = treeDigest(entries);
+    if (existing
+      && JSON.stringify(entries) === JSON.stringify(existing.entries)
+      && currentTreeDigest === existing.treeDigest) {
+      fs.rmSync(staging, { recursive: true, force: true });
+      return { ...existing, created: false };
+    }
+    if (fs.existsSync(directory) || fs.existsSync(manifestPath(directory))) {
+      throw new Error('beta.22 snapshot destination already exists without an equivalent valid manifest');
+    }
     const manifest = {
       schemaVersion: SNAPSHOT_SCHEMA_VERSION,
       compatibleVersion: BETA22_COMPATIBLE_VERSION,
       createdAt,
       entries,
-      treeDigest: treeDigest(entries),
+      treeDigest: currentTreeDigest,
     };
     fs.renameSync(staging, directory);
     atomicWriteFile(manifestPath(directory), `${JSON.stringify(manifest, null, 2)}\n`, { mode: 0o600 });

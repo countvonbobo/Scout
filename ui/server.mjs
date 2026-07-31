@@ -7,6 +7,10 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { isMainModule } from './lib/mainModule.mjs';
 import { atomicWriteFile } from './lib/atomicWrite.mjs';
+import {
+  PROFILE_PUBLICATION_RUN_PREFIX, publishProfileGeneration,
+  recoverPendingProfilePublications,
+} from './lib/profilePublication.mjs';
 import { rerankHistoricalVacancies } from './lib/workspaceMigration.mjs';
 import { codexDeepLinkCapability } from './lib/codexDeepLink.mjs';
 import { triage } from './lib/derive.mjs';
@@ -123,6 +127,8 @@ if (fs.existsSync(TRACKER) && path.resolve(APP_ROOT) !== path.resolve(WORKSPACE_
 }
 
 function workspaceInitialised() { return fs.existsSync(TRACKER) && fs.existsSync(WORKSPACE.config); }
+
+if (workspaceInitialised()) recoverPendingProfilePublications(WORKSPACE_ROOT);
 
 function stageSearchProfileReview() {
   if (!workspaceInitialised()) return null;
@@ -1523,12 +1529,15 @@ function withSearchPlanMutation(res, phase, action) {
   let lease;
   let heartbeat;
   try {
+    const runId = phase === 'publish'
+      ? `${PROFILE_PUBLICATION_RUN_PREFIX}${randomUUID()}`
+      : `search-plan-${phase}-${randomUUID()}`;
     lease = acquireScanLease(
       WORKSPACE_ROOT,
       currentLeaseOwner(),
       {
         kind: 'search-plan-mutation',
-        runId: `search-plan-${randomUUID()}`,
+        runId,
         phase,
       },
     );
@@ -1538,7 +1547,7 @@ function withSearchPlanMutation(res, phase, action) {
       });
     }
     heartbeat = startLeaseHeartbeat(lease);
-    return action();
+    return action({ lease, runId });
   } finally {
     heartbeat?.stop();
     if (lease) {
@@ -1678,11 +1687,6 @@ routes['PUT /api/search-profile/adaptive'] = (req, res, body) => {
   }
 };
 
-function restorePublishedArtifact(file, previous) {
-  if (previous === null) fs.rmSync(file, { force: true });
-  else atomicWriteFile(file, previous);
-}
-
 function employerRegistryForPublishedProfile(published) {
   const migrated = migrateLegacyPortals(
     loadEmployerRegistry(WORKSPACE_ROOT),
@@ -1705,37 +1709,30 @@ function employerRegistryForPublishedProfile(published) {
   });
 }
 
-function publishProfileAndLanePlan(published, lanePlan, employerRegistry, config) {
-  const previous = new Map([
-    [WORKSPACE.searchProfilePublished, fs.existsSync(WORKSPACE.searchProfilePublished)
-      ? fs.readFileSync(WORKSPACE.searchProfilePublished)
-      : null],
-    [WORKSPACE.searchLanes, fs.existsSync(WORKSPACE.searchLanes)
-      ? fs.readFileSync(WORKSPACE.searchLanes)
-      : null],
-    [WORKSPACE.employers, fs.existsSync(WORKSPACE.employers)
-      ? fs.readFileSync(WORKSPACE.employers)
-      : null],
-    [WORKSPACE.config, fs.existsSync(WORKSPACE.config)
-      ? fs.readFileSync(WORKSPACE.config)
-      : null],
-  ]);
-  try {
-    atomicWriteFile(WORKSPACE.searchProfilePublished, `${JSON.stringify(published, null, 2)}\n`);
-    writeSearchLanePlan(WORKSPACE_ROOT, lanePlan);
-    writeEmployerRegistry(WORKSPACE_ROOT, employerRegistry);
-    writeWorkspaceConfig(WORKSPACE_ROOT, config);
-  } catch (error) {
-    for (const [file, content] of previous) restorePublishedArtifact(file, content);
-    throw error;
-  }
+function publishProfileAndLanePlan(
+  published,
+  lanePlan,
+  employerRegistry,
+  config,
+  { lease, runId, hooks } = {},
+) {
+  return publishProfileGeneration(
+    { root: WORKSPACE_ROOT, runId, lease },
+    {
+      profile: published,
+      lanes: lanePlan,
+      employers: employerRegistry,
+      config,
+    },
+    hooks,
+  );
 }
 
 routes['POST /api/search-profile/publish'] = (req, res, body) => {
   const value = parseBody(body);
   if (!value) return replyJson(res, 400, { error: 'bad json' });
   try {
-    return withSearchPlanMutation(res, 'publish', () => {
+    return withSearchPlanMutation(res, 'publish', ({ lease, runId }) => {
       const draft = currentDraftForRevision(value.revision);
       if (value.confirmed !== true) {
         const error = new Error('Explicit confirmation is required before publishing this search profile.');
@@ -1751,7 +1748,13 @@ routes['POST /api/search-profile/publish'] = (req, res, body) => {
         ...config,
         searchProfile: { ...(config.searchProfile || {}), publishedId: published.id },
       };
-      publishProfileAndLanePlan(published, lanePlan, employerRegistry, nextConfig);
+      publishProfileAndLanePlan(
+        published,
+        lanePlan,
+        employerRegistry,
+        nextConfig,
+        { lease, runId },
+      );
       void queueCheckpoint('ui: publish search profile');
       return replyJson(res, 200, {
         ok: true,

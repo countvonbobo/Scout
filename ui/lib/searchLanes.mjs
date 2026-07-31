@@ -654,7 +654,8 @@ function noveltyIsUnseen(vacancy) {
 }
 
 export function deriveSearchLaneResults({
-  lanes = [], sources = {}, ranked = [], candidates = [], reviewed = [],
+  lanes = [], sources = {}, discoveryCounts = null, discovered = null, ranked = [],
+  candidates = [], reviewed = [],
   scanFailureCode = null,
 } = {}) {
   if (!Array.isArray(lanes) || lanes.length > MAX_SEARCH_LANES) {
@@ -696,13 +697,20 @@ export function deriveSearchLaneResults({
     if (scanFailureCode) {
       failures.push({ source: 'scan', code: scanFailureCode });
     }
-    return eventResult({
+    const precomputedNew = Array.isArray(discoveryCounts)
+      ? discoveryCounts.find((item) => item?.laneId === lane.id)?.new
+      : undefined;
+    const result = eventResult({
       laneId: lane.id,
       returned,
       parsed: parsed.size,
-      new: uniqueLaneCount((ranked || []).filter(noveltyIsUnseen), lane.id, (item) => (
-        String(item?.vacancyId || item?.canonicalUrl || '')
-      )),
+      new: precomputedNew === undefined
+        ? uniqueLaneCount((discovered ?? ranked).filter((item) => (
+          item?.novelty === 'unseen' || noveltyIsUnseen(item)
+        )), lane.id, (item) => (
+          String(item?.vacancyId || item?.canonicalUrl || '')
+        ))
+        : requireCounter(precomputedNew, 'new'),
       eligible: uniqueLaneCount(ranked, lane.id, (item) => (
         String(item?.vacancyId || item?.canonicalUrl || '')
       )),
@@ -710,6 +718,18 @@ export function deriveSearchLaneResults({
       promising,
       failures,
     });
+    const equations = [
+      ['parsed', 'returned'],
+      ['new', 'parsed'],
+      ['eligible', 'parsed'],
+      ['selected', 'eligible'],
+      ['promising', 'selected'],
+    ];
+    const invalid = equations.find(([left, right]) => result[left] > result[right]);
+    if (invalid) {
+      throw new TypeError(`lane metric equation is invalid: ${invalid[0]} cannot exceed ${invalid[1]}`);
+    }
+    return result;
   });
 }
 

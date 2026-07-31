@@ -3,7 +3,9 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { atomicWriteFile } from './atomicWrite.mjs';
 import { backupWorkspace, workspacePaths } from './workspace.mjs';
-import { createBeta22WorkspaceSnapshot } from './workspaceMigration.mjs';
+import {
+  createBeta22WorkspaceSnapshot, latestBeta22WorkspaceSnapshot,
+} from './workspaceMigration.mjs';
 
 export const PREFERENCE_STRENGTHS = Object.freeze([
   'mandatory', 'strong-preference', 'nice-to-have',
@@ -15,7 +17,11 @@ export const PROVENANCE = Object.freeze([
 ]);
 
 export const UNKNOWN_POLICIES = Object.freeze(['include', 'penalise', 'exclude']);
-export const UNKNOWN_POLICY_FIELDS = Object.freeze(['location']);
+export const UNKNOWN_POLICY_FIELDS = Object.freeze([
+  'title', 'responsibilities', 'skills', 'qualifications', 'eligibility',
+  'industry', 'location', 'mobility', 'workingPattern', 'employmentType',
+  'seniority', 'employer',
+]);
 export const COMPENSATION_AMOUNT_TYPES = Object.freeze(['base', 'total', 'rate', 'unknown']);
 export const COMPENSATION_CERTAINTIES = Object.freeze(['exact', 'range', 'estimated', 'unknown']);
 export const SEARCH_BREADTHS = Object.freeze(['focused', 'balanced', 'broad']);
@@ -199,7 +205,9 @@ export function publishSearchProfile(draft, { publishedAt = new Date().toISOStri
 export function loadPublishedSearchProfile(root) {
   const file = workspacePaths(root).searchProfilePublished;
   if (!fs.existsSync(file)) return null;
-  const profile = validateSearchProfile(JSON.parse(fs.readFileSync(file, 'utf8')));
+  const value = JSON.parse(fs.readFileSync(file, 'utf8'));
+  delete value._scoutMutation;
+  const profile = validateSearchProfile(value);
   if (profile.status !== 'published') throw new Error(`published search profile is not published: ${file}`);
   const expectedId = `profile-${profileFingerprint({ ...profile, id: undefined }).slice(0, 12)}`;
   if (profile.id !== expectedId) throw new Error(`published search profile fingerprint does not match: ${file}`);
@@ -208,8 +216,12 @@ export function loadPublishedSearchProfile(root) {
 
 export function migrateSearchProfile(root, { fileSystem = fs } = {}) {
   const paths = workspacePaths(root);
-  const rollback = createBeta22WorkspaceSnapshot(root);
   if (fileSystem.existsSync(paths.searchProfileDraft) || fileSystem.existsSync(paths.searchProfilePublished)) {
+    // No migration boundary remains once a draft or publication exists. Keep
+    // the rollback that authorised that boundary; re-snapshotting the migrated
+    // live tree would manufacture a different historical pre-migration state.
+    const rollback = latestBeta22WorkspaceSnapshot(root)
+      || createBeta22WorkspaceSnapshot(root);
     return {
       migrated: false,
       draftPath: paths.searchProfileDraft,
@@ -217,6 +229,7 @@ export function migrateSearchProfile(root, { fileSystem = fs } = {}) {
       rollbackSnapshotPath: rollback.directory,
     };
   }
+  const rollback = createBeta22WorkspaceSnapshot(root);
   if (!fileSystem.existsSync(paths.config)) throw new Error(`workspace config missing: ${paths.config}`);
 
   // Retain the legacy source text itself as evidence, rather than reserialising

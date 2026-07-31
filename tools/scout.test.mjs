@@ -15,7 +15,8 @@ import { acquireScanLease, currentLeaseOwner, readScanLease, releaseScanLease } 
 import { ProviderLifecycleUnclosedError } from '../ui/lib/structuredTurn.mjs';
 import { loadPreparedMutation, reconcileMutation } from '../ui/lib/mutationCoordinator.mjs';
 import {
-  generateSearchLanePlan, loadSearchLanePlan, writeSearchLanePlan,
+  generateSearchLanePlan, loadSearchLanePlan, recordSearchLaneRun,
+  retireUnproductiveSearchLanes, writeSearchLanePlan,
 } from '../ui/lib/searchLanes.mjs';
 import {
   createEmployerRegistry, writeEmployerRegistry,
@@ -192,6 +193,10 @@ test('published search lanes replace legacy categories and annotate collected jo
   assert.ok(queryPlan.queries.includes('Research coordinator'));
   assert.equal(queryPlan.queries.includes('Legacy query must not run'), false);
   assert.equal(queryPlan.queries.includes('Legacy category must not run'), false);
+  assert.equal(queryPlan.generation, 1);
+  assert.match(queryPlan.revision, /^[a-f0-9]{64}$/);
+  assert.match(queryPlan.selectionFingerprint, /^[a-f0-9]{64}$/);
+  assert.ok(queryPlan.lanes.every(({ queryFingerprint }) => /^[a-f0-9]{64}$/.test(queryFingerprint)));
 
   let seenQueries;
   const collected = await collectScanSources(root, config, {
@@ -221,6 +226,96 @@ test('published search lanes replace legacy categories and annotate collected jo
   assert.deepEqual(collected.lanes.map(({ id }) => id), queryPlan.lanes.map(({ id }) => id));
   assert.deepEqual(collected.sources.hiring_cafe.jobs[0].laneIds, [queryPlan.lanes[0].id]);
   assert.deepEqual(collected.sources.hiring_cafe.queryCounts, { [queryPlan.queries[0]]: 1 });
+});
+
+test('a lane retirement racing scan start stales queued work and binds collection to the fenced plan', async () => {
+  const root = scanRoot();
+  const profile = publishedRankingProfile();
+  fs.mkdirSync(path.join(root, 'profile', 'search'), { recursive: true });
+  fs.writeFileSync(
+    path.join(root, 'profile', 'search', 'published.json'),
+    `${JSON.stringify(profile)}\n`,
+  );
+  let plan = generateSearchLanePlan(profile);
+  writeSearchLanePlan(root, plan);
+  const retiredLane = plan.lanes[0];
+  const blocker = acquireScanLease(root, currentLeaseOwner(), {
+    kind: 'scan',
+    runId: 'lane-retirement-race',
+    provider: 'claude',
+    mode: 'primary',
+    phase: 'collect',
+  });
+  assert.ok(blocker);
+  try {
+    const queued = await runScanWith(root, 'codex', 'primary', {
+      providerStatusFn: authenticated,
+      collectSourcesFn: async () => assert.fail('queued stale plan must not collect'),
+    });
+    assert.equal(queued.status, 'queued');
+
+    for (let attempt = 1; attempt <= 3; attempt += 1) {
+      plan = recordSearchLaneRun(plan, {
+        runId: `lane-retirement-${attempt}`,
+        recordedAt: `2026-07-${String(26 + attempt).padStart(2, '0')}T10:00:00.000Z`,
+        results: [{
+          laneId: retiredLane.id,
+          returned: 0,
+          parsed: 0,
+          new: 0,
+          eligible: 0,
+          selected: 0,
+          promising: 0,
+        }],
+      });
+    }
+    plan = retireUnproductiveSearchLanes(plan, {
+      now: () => '2026-07-30T10:00:00.000Z',
+    });
+    writeSearchLanePlan(root, plan);
+  } finally {
+    releaseScanLease(blocker);
+  }
+
+  const collectedPlans = [];
+  try {
+    const result = await runScanWith(root, 'codex', 'primary', {
+      providerStatusFn: authenticated,
+      collectSourcesFn: async (_root, _config, { queryPlan }) => {
+        collectedPlans.push(queryPlan);
+        return {
+          generatedAt: '2026-07-30T10:05:00.000Z',
+          queries: queryPlan.queries,
+          lanes: queryPlan.lanes,
+          sources: {
+            hiring_cafe: {
+              configured: true,
+              status: 'healthy',
+              count: 0,
+              queryCounts: Object.fromEntries(queryPlan.queries.map((query) => [query, 0])),
+              jobs: [],
+            },
+          },
+        };
+      },
+      queueWorkspaceSyncFn: async () => ({ state: 'disabled', enabled: false }),
+    });
+
+    assert.equal(result.ok, true, result.error);
+    assert.equal(collectedPlans.length, 1);
+    assert.equal(collectedPlans[0].lanes.some(({ id }) => id === retiredLane.id), false);
+    assert.equal(projectScanQueue(root).requests[0].status, 'stale');
+    const started = replayRunJournal(path.join(
+      root, '.scout', 'runs', result.runId, 'journal.jsonl',
+    )).find(({ type }) => type === 'run.started');
+    assert.equal(started.payload.compatibility.lanePlanRevision, collectedPlans[0].revision);
+    assert.equal(
+      started.payload.compatibility.laneSelectionFingerprint,
+      collectedPlans[0].selectionFingerprint,
+    );
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test('employer monitoring is selected fairly at collection but remains a durable write intent', async () => {

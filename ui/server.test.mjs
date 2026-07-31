@@ -20,7 +20,9 @@ const {
   publicSetupConfigError, requestAccess, restartControl, shutdownControl,
 } = await import('./server.mjs');
 const { seedWorkspace, loadWorkspaceConfig, workspacePaths, writeWorkspaceConfig } = await import('./lib/workspace.mjs');
-const { profileFingerprint } = await import('./lib/searchProfile.mjs');
+const {
+  loadPublishedSearchProfile, profileFingerprint,
+} = await import('./lib/searchProfile.mjs');
 const {
   recordSearchLaneRun, searchLanePlanRevision, writeSearchLanePlan,
 } = await import('./lib/searchLanes.mjs');
@@ -724,7 +726,10 @@ test('search-profile routes review a complete draft and publish only the current
     fs.existsSync(path.join(paths.profile, 'search', 'rankings', `${result.published.id}.json`)),
     true,
   );
-  assert.deepEqual(JSON.parse(fs.readFileSync(paths.searchProfilePublished, 'utf8')), result.published);
+  const publishedArtifact = JSON.parse(fs.readFileSync(paths.searchProfilePublished, 'utf8'));
+  assert.equal(publishedArtifact._scoutMutation?.schemaVersion, 1);
+  assert.match(publishedArtifact._scoutMutation?.mutationId || '', /^mutation-[a-f0-9]{40}$/);
+  assert.deepEqual(loadPublishedSearchProfile(WORKSPACE_ROOT), result.published);
   const publishedStatus = await request({ method: 'GET', path: '/api/setup/status' });
   assert.equal(publishedStatus.status, 200);
   assert.equal(JSON.parse(publishedStatus.text).searchProfilePublished, true);

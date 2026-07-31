@@ -9,14 +9,15 @@ function rule(value, strength = 'strong-preference') {
 function profile({
   primaryTitles = [], locations = [], workingPatterns = [], employmentTypes = [],
   responsibilities = [], skills = [], qualifications = [], industries = [], sectors = [],
-  seniority = [], employers = [], excludedResponsibilities = [], compensation = {},
+  eligibility = [], mobility = [], seniority = [], employers = [],
+  excludedResponsibilities = [], compensation = {},
   unknownPolicies, selection,
 } = {}) {
   return {
     id: 'profile-ranked-fixture', version: 1,
     target: {
       primaryTitles, locations, workingPatterns, employmentTypes, responsibilities,
-      skills, qualifications, industries, sectors, seniority, employers,
+      skills, qualifications, eligibility, mobility, industries, sectors, seniority, employers,
     },
     negative: { excludedTitles: [], excludedResponsibilities },
     compensation: {
@@ -301,6 +302,58 @@ test('a semantic artifact with no description preserves unknown ranking evidence
   assert.equal(sector.score, 0);
   assert.equal(sector.confidence, 0);
   assert.ok(result.preRankConfidence < 100);
+});
+
+test('semantic ranking uses per-rule matches and keeps unevidenced description rules unknown', () => {
+  const semanticRules = [
+    ['rule-design-services', 'design services', 'unknown'],
+    ['rule-typescript', 'typescript', 'matched'],
+    ['rule-cloud-certification', 'cloud certification', 'unknown'],
+    ['rule-public-health', 'public health', 'matched'],
+    ['rule-work-authorisation', 'work authorisation', 'unknown'],
+    ['rule-regional-travel', 'regional travel', 'matched'],
+  ].map(([id, fact, status]) => ({
+    id, fact, status,
+    evidence: [{
+      source: 'fixture',
+      providerId: 'semantic-1',
+      descriptionDigest: 'a'.repeat(64),
+      provenance: 'deterministic-extraction',
+    }],
+  }));
+  const result = rankVacancies([vacancy({
+    vacancyId: 'semantic-per-rule',
+    title: 'Platform Engineer',
+    location: null,
+    description: '',
+    semanticEvidence: {
+      descriptionPresent: true,
+      descriptionDigest: 'a'.repeat(64),
+      descriptionLength: 120,
+      profileRuleEvidence: semanticRules,
+      profileRuleMatches: semanticRules.filter(({ status }) => status === 'matched'),
+      mandatorySignals: [],
+    },
+  })], profile({
+    responsibilities: [rule('design services')],
+    skills: [rule('TypeScript')],
+    qualifications: [rule('cloud certification')],
+    sectors: [rule('public health')],
+    eligibility: [rule('work authorisation')],
+    mobility: [rule('regional travel')],
+  }))[0];
+
+  for (const name of ['skills', 'industry', 'mobility']) {
+    const dimension = result.dimensions.find((item) => item.name === name);
+    assert.ok(dimension.score > 0, name);
+    assert.equal(dimension.confidence, 1, name);
+  }
+  for (const name of ['responsibilities', 'qualifications', 'eligibility']) {
+    const dimension = result.dimensions.find((item) => item.name === name);
+    assert.equal(dimension.score, 0, name);
+    assert.equal(dimension.confidence, 0, name);
+    assert.equal(dimension.evidence[0].comparison, 'unknown', name);
+  }
 });
 
 test('the generic ranker gives six distinct profile fixtures their matching vacancy first', () => {

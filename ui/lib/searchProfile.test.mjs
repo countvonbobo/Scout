@@ -104,6 +104,11 @@ test('published profile supports the complete domain-neutral preference foundati
     excludedEmployers: [preference('Unregulated broker', 'hard-exclusion')],
   };
   draft.selection = { breadth: 'balanced', relevanceThreshold: 45, exploration: 0.1 };
+  draft.unknownPolicies = {
+    location: 'penalise',
+    workingPattern: 'exclude',
+    seniority: 'include',
+  };
 
   const profile = publishSearchProfile(draft, { publishedAt: NOW });
 
@@ -116,6 +121,7 @@ test('published profile supports the complete domain-neutral preference foundati
   assert.deepEqual(profile.selection, {
     breadth: 'balanced', relevanceThreshold: 45, exploration: 0.1,
   });
+  assert.equal(profile.unknownPolicies.workingPattern, 'exclude');
 });
 
 test('profile publication rejects invalid compensation and unbounded search behaviour', () => {

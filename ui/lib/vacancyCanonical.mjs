@@ -110,6 +110,16 @@ function metadataValues(observations, name) {
     .filter(Boolean))].sort(compareStable);
 }
 
+function canonicalVacancyId(canonicalUrl, sourceReferences) {
+  if (canonicalUrl) return canonicalUrl;
+  const references = sourceReferences.map((reference) => ({
+    source: boundedSemanticText(reference?.source, 80),
+    providerId: boundedSemanticText(reference?.providerId, 160),
+  })).filter(({ source, providerId }) => source || providerId)
+    .sort((left, right) => compareStable(stableJson(left), stableJson(right)));
+  return `vacancy-ref-${crypto.createHash('sha256').update(stableJson(references)).digest('hex').slice(0, 24)}`;
+}
+
 function boundedSemanticText(value, maximum) {
   return String(value || '').normalize('NFKC').replace(/[\r\n\t]+/g, ' ')
     .replace(/\s{2,}/g, ' ').trim().slice(0, maximum);
@@ -137,6 +147,7 @@ function semanticMatchEvidence(observation, match) {
     provenance: ['explicit-source', 'deterministic-extraction'].includes(item?.provenance)
       ? item.provenance
       : fallback.provenance,
+    status: match?.status === 'unknown' ? 'unknown' : 'matched',
   })).filter(({ source, providerId, descriptionDigest }) => (
     source || providerId || descriptionDigest
   ));
@@ -149,20 +160,29 @@ function mergedSemanticEvidence(observations) {
     Number(right.semanticEvidence.descriptionLength || 0) - Number(left.semanticEvidence.descriptionLength || 0)
     || compareStable(left.semanticEvidence.descriptionDigest, right.semanticEvidence.descriptionDigest)
   ))[0];
-  const matches = new Map();
+  const ruleEvidence = new Map();
   for (const observation of semanticObservations) {
-    for (const rawMatch of observation.semanticEvidence.profileRuleMatches || []) {
-      const match = typeof rawMatch === 'string' ? { id: rawMatch, fact: '' } : rawMatch;
-      const id = boundedSemanticText(match?.id, 160);
+    const entries = observation.semanticEvidence.profileRuleEvidence
+      || (observation.semanticEvidence.profileRuleMatches || []).map((match) => (
+        typeof match === 'string' ? { id: match, status: 'matched' } : { ...match, status: 'matched' }
+      ));
+    for (const rawEntry of entries) {
+      const entry = typeof rawEntry === 'string'
+        ? { id: rawEntry, fact: '', status: 'matched' }
+        : rawEntry;
+      const id = boundedSemanticText(entry?.id, 160);
       if (!id) continue;
-      const current = matches.get(id) || { id, fact: '', evidence: [] };
-      const fact = boundedSemanticText(match?.fact, 160);
+      const current = ruleEvidence.get(id) || {
+        id, fact: '', status: 'unknown', evidence: [],
+      };
+      const fact = boundedSemanticText(entry?.fact, 160);
       if (fact && (!current.fact || compareStable(fact, current.fact) < 0)) current.fact = fact;
-      const evidence = [...current.evidence, ...semanticMatchEvidence(observation, match)];
+      if (entry?.status === 'matched') current.status = 'matched';
+      const evidence = [...current.evidence, ...semanticMatchEvidence(observation, entry)];
       current.evidence = [...new Map(evidence.map((item) => [stableJson(item), item])).values()]
         .sort((left, right) => compareStable(stableJson(left), stableJson(right)))
         .slice(0, MAX_SEMANTIC_MATCH_SOURCES);
-      matches.set(id, current);
+      ruleEvidence.set(id, current);
     }
   }
   const responsibilityFacts = [...new Set(semanticObservations.flatMap(({ semanticEvidence }) => (
@@ -175,7 +195,17 @@ function mergedSemanticEvidence(observations) {
     descriptionPresent: semanticObservations.some(({ semanticEvidence }) => (
       semanticEvidence.descriptionPresent === true
     )),
-    profileRuleMatches: [...matches.values()]
+    profileRuleEvidence: [...ruleEvidence.values()]
+      .sort((left, right) => compareStable(left.id, right.id))
+      .slice(0, MAX_SEMANTIC_RULE_MATCHES),
+    profileRuleMatches: [...ruleEvidence.values()]
+      .filter(({ status }) => status === 'matched')
+      .map(({ status, ...match }) => ({
+        ...match,
+        evidence: match.evidence
+          .filter((item) => item.status === 'matched')
+          .map(({ status: evidenceStatus, ...item }) => item),
+      }))
       .sort((left, right) => compareStable(left.id, right.id))
       .slice(0, MAX_SEMANTIC_RULE_MATCHES),
     responsibilityFacts,
@@ -192,6 +222,7 @@ function canonicalVacancy(observations) {
   const fields = Object.fromEntries(DISPLAY_FIELDS.map((name) => [name, displayField(orderedObservations, name)]));
   const canonicalUrl = orderedObservations.map((observation) => observation?.canonicalUrl).find(Boolean) || null;
   const sourceReferences = mergeSourceReferences(...orderedObservations);
+  const vacancyId = canonicalVacancyId(canonicalUrl, sourceReferences);
   const collectionSources = metadataValues(orderedObservations, 'collectionSource');
   const laneIds = [...new Set([
     ...metadataValues(orderedObservations, 'laneId'),
@@ -200,6 +231,7 @@ function canonicalVacancy(observations) {
   const roleFamilies = metadataValues(orderedObservations, 'roleFamily');
   return {
     observations: orderedObservations,
+    vacancyId,
     canonicalUrl,
     sourceReferences,
     collectionSources,

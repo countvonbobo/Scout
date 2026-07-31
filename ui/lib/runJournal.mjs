@@ -130,6 +130,9 @@ const RECOVERY_REASONS = new Set([
   'stage-artifact-schema-mismatch',
   'schedule-job-mismatch',
   'logical-window-mismatch',
+  'lane-plan-generation-mismatch',
+  'lane-plan-revision-mismatch',
+  'lane-selection-mismatch',
 ]);
 const RECOVERY_COMPATIBILITY_FIELDS = Object.freeze([
   'artifactSchemaVersion',
@@ -153,6 +156,12 @@ const RECOVERY_COMPATIBILITY_FIELDS_V2 = Object.freeze([
   'logicalWindowId',
   'scheduleJobId',
   'stageArtifactSchemaVersion',
+]);
+const RECOVERY_COMPATIBILITY_FIELDS_V3 = Object.freeze([
+  ...RECOVERY_COMPATIBILITY_FIELDS_V2,
+  'lanePlanGeneration',
+  'lanePlanRevision',
+  'laneSelectionFingerprint',
 ]);
 
 export class JournalCorruptionError extends Error {
@@ -240,14 +249,16 @@ function validateArtifactReference(value, ErrorType) {
 function validateRecoveryCompatibility(value, ErrorType) {
   const compatibility = requireExactKeys(
     value,
-    value?.schemaVersion === 2 ? RECOVERY_COMPATIBILITY_FIELDS_V2 : RECOVERY_COMPATIBILITY_FIELDS,
+    value?.schemaVersion === 3
+      ? RECOVERY_COMPATIBILITY_FIELDS_V3
+      : value?.schemaVersion === 2 ? RECOVERY_COMPATIBILITY_FIELDS_V2 : RECOVERY_COMPATIBILITY_FIELDS,
     'compatibility',
     ErrorType,
   );
-  if (![1, 2].includes(compatibility.schemaVersion)) throw new ErrorType('unsupported journal recovery compatibility schema');
+  if (![1, 2, 3].includes(compatibility.schemaVersion)) throw new ErrorType('unsupported journal recovery compatibility schema');
   for (const key of [
     'artifactSchemaVersion', 'assessmentSchemaVersion', 'journalSchemaVersion', 'mutationSchemaVersion',
-    ...(compatibility.schemaVersion === 2 ? ['stageArtifactSchemaVersion'] : []),
+    ...(compatibility.schemaVersion >= 2 ? ['stageArtifactSchemaVersion'] : []),
   ]) {
     if (!Number.isSafeInteger(compatibility[key]) || compatibility[key] < 1) {
       throw new ErrorType(`journal recovery compatibility ${key} is invalid`);
@@ -256,12 +267,19 @@ function validateRecoveryCompatibility(value, ErrorType) {
   for (const key of [
     'mode', 'model', 'pipelineVersion', 'profileVersion', 'promptVersion',
     'provider', 'purpose', 'rankingVersion', 'targetRevision',
-    ...(compatibility.schemaVersion === 2 ? ['scheduleJobId', 'logicalWindowId'] : []),
+    ...(compatibility.schemaVersion >= 2 ? ['scheduleJobId', 'logicalWindowId'] : []),
+    ...(compatibility.schemaVersion >= 3 ? ['lanePlanGeneration'] : []),
   ]) {
     requireSafeToken(compatibility[key], `recovery compatibility ${key}`, ErrorType);
   }
   if (typeof compatibility.sourceConfigFingerprint !== 'string' || !SHA256.test(compatibility.sourceConfigFingerprint)) {
     throw new ErrorType('journal recovery compatibility source/config fingerprint is invalid');
+  }
+  for (const key of compatibility.schemaVersion >= 3
+    ? ['lanePlanRevision', 'laneSelectionFingerprint'] : []) {
+    if (typeof compatibility[key] !== 'string' || !SHA256.test(compatibility[key])) {
+      throw new ErrorType(`journal recovery compatibility ${key} is invalid`);
+    }
   }
 }
 

@@ -160,45 +160,69 @@ function scoreRules(vacancy, dimension, rules, unknownPolicy = 'include') {
       ?? Number(suppliedSemanticEvidence.descriptionLength || 0) > 0)
     ? suppliedSemanticEvidence
     : null;
+  const semanticRuleEvidence = semanticEvidence
+    ? new Map((semanticEvidence.profileRuleEvidence || []).map((item) => [item.id, item]))
+    : null;
   const semanticMatches = semanticEvidence
-    ? new Set((semanticEvidence.profileRuleMatches || []).map((item) => (
-      typeof item === 'string' ? item : item.id
+    ? new Map((semanticEvidence.profileRuleMatches || []).map((item) => (
+      typeof item === 'string' ? [item, { id: item }] : [item.id, item]
     )))
     : null;
-  const unknown = semanticMatches ? false : !hasValue(actual);
+  const structuredUnknown = !hasValue(actual);
+  const semanticStatus = (rule) => {
+    const evidence = semanticRuleEvidence?.get(ruleId(rule));
+    if (evidence?.status === 'matched') return 'matched';
+    if (evidence?.status === 'unknown') return 'unknown';
+    return semanticMatches?.has(ruleId(rule)) ? 'matched' : 'unknown';
+  };
   const positiveRules = rules.filter((rule) => (STRENGTH_WEIGHT[rule?.strength] || 0) > 0);
   const maximum = positiveRules.reduce((total, rule) => total + STRENGTH_WEIGHT[rule.strength], 0);
   const confidenceWeight = rules.reduce((total, rule) => total + Math.abs(STRENGTH_WEIGHT[rule?.strength] || 0), 0);
   const matched = rules.filter((rule) => (
-    semanticMatches
-      ? semanticMatches.has(ruleId(rule))
-      : !unknown && sourceMatches(source, rule.value, dimension.mode)
+    semanticEvidence
+      ? semanticStatus(rule) === 'matched'
+      : !structuredUnknown && sourceMatches(source, rule.value, dimension.mode)
   ));
-  const unknownPenalty = unknown && unknownPolicy === 'penalise' ? maximum * 0.25 : 0;
+  const unknownRules = rules.filter((rule) => (
+    semanticEvidence ? semanticStatus(rule) === 'unknown' : structuredUnknown
+  ));
+  const unknownPositiveWeight = unknownRules.reduce((total, rule) => (
+    total + Math.max(0, STRENGTH_WEIGHT[rule?.strength] || 0)
+  ), 0);
+  const knownConfidenceWeight = rules.reduce((total, rule) => (
+    total + (unknownRules.includes(rule) ? 0 : Math.abs(STRENGTH_WEIGHT[rule?.strength] || 0))
+  ), 0);
+  const unknownPenalty = unknownPolicy === 'penalise' ? unknownPositiveWeight * 0.25 : 0;
   const score = matched.reduce((total, rule) => total + STRENGTH_WEIGHT[rule.strength], 0)
     - unknownPenalty;
+  const semanticEvidenceFor = (rule) => {
+    const item = semanticRuleEvidence?.get(ruleId(rule)) || semanticMatches?.get(ruleId(rule));
+    const isMatched = matched.includes(rule);
+    return {
+      vacancy: {
+        matchedRule: isMatched ? ruleId(rule) : null,
+        sources: (item?.evidence || []).slice(0, 8),
+      },
+      rule: rule.value,
+      matched: isMatched,
+      ...(!isMatched ? { comparison: 'unknown' } : {}),
+    };
+  };
   return {
     name: dimension.name,
     score,
     maximum,
-    confidence: confidenceWeight ? (unknown ? 0 : 1) : 1,
+    confidence: confidenceWeight ? knownConfidenceWeight / confidenceWeight : 1,
     confidenceWeight,
-    evidence: rules.map((rule) => semanticMatches
-      ? {
-        vacancy: {
-          digest: semanticEvidence.descriptionDigest,
-          matchedRule: matched.includes(rule) ? ruleId(rule) : null,
-        },
-        rule: rule.value,
-        matched: matched.includes(rule),
-      }
-      : evidenceFor(source, rule, matched.includes(rule), unknown, dimension.mode)),
+    evidence: rules.map((rule) => semanticEvidence
+      ? semanticEvidenceFor(rule)
+      : evidenceFor(source, rule, matched.includes(rule), structuredUnknown, dimension.mode)),
     profileRuleIds: rules.map(ruleId),
     contributions: [
       ...matched.map((rule) => ({
         name: dimension.name, profileRuleId: ruleId(rule), score: STRENGTH_WEIGHT[rule.strength],
-        evidence: semanticMatches
-          ? { vacancy: { digest: semanticEvidence.descriptionDigest, matchedRule: ruleId(rule) }, rule: rule.value, matched: true }
+        evidence: semanticEvidence
+          ? semanticEvidenceFor(rule)
           : evidenceFor(source, rule, true, false, dimension.mode),
       })),
       ...(unknownPenalty ? [{
@@ -395,6 +419,14 @@ function noveltyDimension(vacancy, profile, historyIndex) {
     evidence: [evidence], profileRuleIds: [profileRuleId],
     contributions: score ? [{ name: 'novelty', profileRuleId, score, evidence }] : [],
   };
+}
+
+export function vacancyNoveltyComparison(vacancy, profile, history = []) {
+  void profile;
+  const identities = identityValues(vacancy);
+  if (!identities.length) return 'unknown';
+  const historyIndex = historyIdentityIndex(history);
+  return identities.some((identity) => historyIndex.has(identity)) ? 'seen-exact' : 'unseen';
 }
 
 function dimensionsFor(vacancy, profile, { referenceTimestamp, historyIndex }) {

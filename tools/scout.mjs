@@ -49,7 +49,7 @@ import {
   materializeBeta22Rollback,
 } from '../ui/lib/workspaceMigration.mjs';
 import {
-  loadSearchLanePlan, selectSearchLanes,
+  loadSearchLanePlan, searchLanePlanRevision, selectSearchLanes,
 } from '../ui/lib/searchLanes.mjs';
 import {
   employerRegistryRevision, loadEmployerRegistry, migrateLegacyPortals,
@@ -127,11 +127,12 @@ function readScanTracker(root) {
 
 function scanCompatibility({
   config, learningPolicy, mode, model, profile, provider, root, tracker,
+  queryPlan,
   requester = 'manual', scheduleId = null, logicalWindowId = null,
 }) {
   const contextDigests = assessmentContextDigests(workspacePaths(root), config);
   return {
-    schemaVersion: 2,
+    schemaVersion: 3,
     mode,
     purpose: 'manual-discovery',
     profileVersion: profile?.id || 'legacy-profile',
@@ -139,7 +140,7 @@ function scanCompatibility({
     journalSchemaVersion: 1,
     artifactSchemaVersion: RUN_ARTIFACT_SCHEMA_VERSION,
     stageArtifactSchemaVersion: PIPELINE_STAGE_ARTIFACT_SCHEMA_VERSION,
-    pipelineVersion: 'scan-pipeline-v4-reconciled-coverage',
+    pipelineVersion: 'scan-pipeline-v5-lane-bound',
     rankingVersion: `ranked-discovery-v1-${scanDigest({
       tracker,
       learningVersionId: learningPolicy?.id || 'learning-baseline',
@@ -152,6 +153,12 @@ function scanCompatibility({
     targetRevision: `tracker-${scanDigest(tracker).slice(0, 32)}`,
     scheduleJobId: requester === 'scheduled' ? scheduleId : 'none',
     logicalWindowId: requester === 'scheduled' ? logicalWindowId : 'none',
+    lanePlanGeneration: queryPlan?.generation === null || queryPlan?.generation === undefined
+      ? 'legacy'
+      : `generation-${queryPlan.generation}`,
+    lanePlanRevision: queryPlan?.revision || scanDigest({ source: 'legacy', queries: [] }),
+    laneSelectionFingerprint: queryPlan?.selectionFingerprint
+      || scanDigest({ source: 'legacy', queries: [] }),
   };
 }
 
@@ -214,6 +221,7 @@ function verifyQueuedScanCompatibility(root, request, manifest = null) {
     requester: request.requester,
     scheduleId: execution.scheduleId,
     logicalWindowId: execution.logicalWindowId,
+    queryPlan: workspaceQueryPlan(root, { broadened: execution.mode === 'broadened' }),
   });
   if (compatibilityFingerprint(currentRun) !== execution.compatibilityFingerprint) return false;
   return true;
@@ -234,6 +242,7 @@ function scanQueueRequest(compatibility, profile, {
       mode, model: model || 'provider-default', profile: compatibility.profileVersion, provider,
       sourceConfigFingerprint: compatibility.sourceConfigFingerprint,
       rankingVersion: compatibility.rankingVersion,
+      laneSelectionFingerprint: compatibility.laneSelectionFingerprint,
     }).slice(0, 40)}`,
     requester,
     purpose: compatibility.purpose,
@@ -300,19 +309,30 @@ export function workspaceQueryPlan(root, { broadened = false } = {}) {
     const selected = selectSearchLanes(lanePlan, {
       limit: broadened ? Math.min(24, lanePlan.lanes.length) : DEFAULT_LANES_PER_SCAN,
     });
+    const lanes = selected.map((lane) => ({
+      id: lane.id,
+      query: lane.query,
+      queryFingerprint: scanDigest(lane.query),
+      source: lane.source,
+      priority: lane.priority,
+      priorityBand: lane.priorityBand,
+      roleFamily: lane.profileFields.find(({ path: field }) => (
+        field === 'target.primaryTitles' || field === 'target.titles'
+      ))?.value || null,
+    }));
+    const revision = searchLanePlanRevision(lanePlan);
     return {
       source: 'published-search-lanes',
       profileId: lanePlan.profileId,
-      lanes: selected.map((lane) => ({
-        id: lane.id,
-        query: lane.query,
-        source: lane.source,
-        priority: lane.priority,
-        priorityBand: lane.priorityBand,
-        roleFamily: lane.profileFields.find(({ path: field }) => (
-          field === 'target.primaryTitles' || field === 'target.titles'
-        ))?.value || null,
-      })),
+      generation: lanePlan.generation,
+      revision,
+      selectionFingerprint: scanDigest({
+        profileId: lanePlan.profileId,
+        generation: lanePlan.generation,
+        revision,
+        lanes: lanes.map(({ id, queryFingerprint }) => ({ id, queryFingerprint })),
+      }),
+      lanes,
       queries: [...new Set(selected.map(({ query }) => query))],
     };
   }
@@ -324,11 +344,24 @@ export function workspaceQueryPlan(root, { broadened = false } = {}) {
       for (const category of parsed.categories || []) for (const query of category.queries || []) if (String(query).trim()) queries.add(String(query).trim());
     } catch { /* doctor reports malformed configuration separately */ }
   }
+  const plannedQueries = broadened ? broadenSearchQueries(config, [...queries]) : [...queries];
+  const revision = scanDigest({
+    source: 'legacy-search-categories',
+    config: sourceConfigFingerprint(config),
+    queries: plannedQueries,
+  });
   return {
     source: 'legacy-search-categories',
     profileId: null,
+    generation: null,
+    revision,
+    selectionFingerprint: scanDigest({
+      source: 'legacy-search-categories',
+      revision,
+      queries: plannedQueries.map((query) => scanDigest(query)),
+    }),
     lanes: [],
-    queries: broadened ? broadenSearchQueries(config, [...queries]) : [...queries],
+    queries: plannedQueries,
   };
 }
 
@@ -758,10 +791,11 @@ export async function runScanWith(root, provider, mode, {
   const learningPolicyAtStart = activeLearningPolicy(
     loadLearningLedger(root) || createLearningLedger({ now: () => '2000-01-01T00:00:00.000Z' }),
   );
-  const plannedQueryPlan = workspaceQueryPlan(root, { broadened: mode === 'broadened' });
-  const compatibility = scanCompatibility({
+  let plannedQueryPlan = workspaceQueryPlan(root, { broadened: mode === 'broadened' });
+  let compatibility = scanCompatibility({
     config, learningPolicy: learningPolicyAtStart, mode, model,
     profile: publishedAtStart, provider, root, tracker: trackerAtStart,
+    queryPlan: plannedQueryPlan,
     requester, scheduleId, logicalWindowId,
   });
   const request = claimedLease === null
@@ -805,6 +839,45 @@ export async function runScanWith(root, provider, mode, {
       compatibility,
       stages,
       claimedLease,
+      bindAuthority({ lease }) {
+        return assertCurrentFence(lease, synchronousFenceCallback(() => {
+          const currentConfig = loadWorkspaceConfig(root);
+          const currentProfile = loadPublishedSearchProfile(root);
+          const currentTracker = readScanTracker(root);
+          const currentLearning = activeLearningPolicy(
+            loadLearningLedger(root) || createLearningLedger({
+              now: () => '2000-01-01T00:00:00.000Z',
+            }),
+          );
+          const currentQueryPlan = workspaceQueryPlan(root, {
+            broadened: mode === 'broadened',
+          });
+          const current = scanCompatibility({
+            config: currentConfig,
+            learningPolicy: currentLearning,
+            mode,
+            model,
+            profile: currentProfile,
+            provider,
+            root,
+            tracker: currentTracker,
+            queryPlan: currentQueryPlan,
+            requester,
+            scheduleId,
+            logicalWindowId,
+          });
+          const unchangedInputs = [
+            'profileVersion', 'sourceConfigFingerprint', 'rankingVersion',
+            'promptVersion', 'targetRevision',
+          ].every((field) => current[field] === compatibility[field]);
+          if (!unchangedInputs) {
+            throw new Error('scan inputs changed before fenced start; retry with current workspace state');
+          }
+          plannedQueryPlan = currentQueryPlan;
+          compatibility = current;
+          return current;
+        }));
+      },
       heartbeatOptions,
       healthPreflight({ root: workspaceRoot, provider: selectedProvider, lease }) {
         const source = requester === 'scheduled' ? 'scheduled-preflight' : 'manual-preflight';
@@ -901,6 +974,7 @@ export async function runScanWith(root, provider, mode, {
           verificationScoped,
           funnel,
           selection,
+          discoveryCounts: discovery?.discoveryCounts || [],
           ranked: discovery?.ranked || [],
           selectionDecision: discovery?.selection || null,
           runId: run.runId,
@@ -1064,6 +1138,7 @@ export async function runScanWith(root, provider, mode, {
             assessmentFailures,
             dropped, hardExcluded, closedAdverts, exclusions: discovery?.exclusions || [],
             livenessSummary, verificationScoped, funnel, selection,
+            discoveryCounts: discovery?.discoveryCounts || [],
             ranked: discovery?.ranked || [],
             selectionDecision: discovery?.selection || null,
             runId: run.runId,

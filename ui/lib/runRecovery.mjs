@@ -25,7 +25,7 @@ import {
 } from './scanLease.mjs';
 
 const COMPATIBILITY_SCHEMA_VERSION = 1;
-const COMPATIBILITY_SCHEMA_VERSIONS = new Set([1, 2]);
+const COMPATIBILITY_SCHEMA_VERSIONS = new Set([1, 2, 3]);
 const SAFE_TOKEN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 const SAFE_RUN_ID = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
 const SHA256 = /^[a-f0-9]{64}$/;
@@ -53,6 +53,12 @@ const COMPATIBILITY_FIELDS_V2 = Object.freeze([
   'scheduleJobId',
   'stageArtifactSchemaVersion',
 ]);
+const COMPATIBILITY_FIELDS_V3 = Object.freeze([
+  ...COMPATIBILITY_FIELDS_V2,
+  'lanePlanGeneration',
+  'lanePlanRevision',
+  'laneSelectionFingerprint',
+]);
 const HARD_REQUIREMENTS = Object.freeze([
   'mode',
   'purpose',
@@ -62,6 +68,9 @@ const HARD_REQUIREMENTS = Object.freeze([
   'artifactSchemaVersion',
   'stageArtifactSchemaVersion',
   'pipelineVersion',
+  'lanePlanGeneration',
+  'lanePlanRevision',
+  'laneSelectionFingerprint',
   'scheduleJobId',
   'logicalWindowId',
 ]);
@@ -74,6 +83,9 @@ const REASON_FOR_FIELD = Object.freeze({
   artifactSchemaVersion: 'artifact-schema-mismatch',
   stageArtifactSchemaVersion: 'stage-artifact-schema-mismatch',
   pipelineVersion: 'pipeline-version-mismatch',
+  lanePlanGeneration: 'lane-plan-generation-mismatch',
+  lanePlanRevision: 'lane-plan-revision-mismatch',
+  laneSelectionFingerprint: 'lane-selection-mismatch',
   scheduleJobId: 'schedule-job-mismatch',
   logicalWindowId: 'logical-window-mismatch',
   rankingVersion: 'ranking-version-mismatch',
@@ -147,7 +159,9 @@ function checkedCompatibility(input, { candidate = false } = {}) {
   try {
     exactKeys(
       input,
-      input?.schemaVersion === 2 ? COMPATIBILITY_FIELDS_V2 : COMPATIBILITY_FIELDS,
+      input?.schemaVersion === 3
+        ? COMPATIBILITY_FIELDS_V3
+        : input?.schemaVersion === 2 ? COMPATIBILITY_FIELDS_V2 : COMPATIBILITY_FIELDS,
       'recovery compatibility schema',
     );
   } catch (error) {
@@ -163,7 +177,7 @@ function checkedCompatibility(input, { candidate = false } = {}) {
   }
   for (const field of [
     'artifactSchemaVersion', 'assessmentSchemaVersion', 'journalSchemaVersion', 'mutationSchemaVersion',
-    ...(input.schemaVersion === 2 ? ['stageArtifactSchemaVersion'] : []),
+    ...(input.schemaVersion >= 2 ? ['stageArtifactSchemaVersion'] : []),
   ]) {
     if (!Number.isSafeInteger(input[field]) || input[field] < 1) {
       throw new TypeError(`recovery compatibility ${field} is invalid`);
@@ -172,10 +186,17 @@ function checkedCompatibility(input, { candidate = false } = {}) {
   for (const field of [
     'mode', 'model', 'pipelineVersion', 'profileVersion', 'promptVersion',
     'provider', 'purpose', 'rankingVersion', 'targetRevision',
-    ...(input.schemaVersion === 2 ? ['scheduleJobId', 'logicalWindowId'] : []),
+    ...(input.schemaVersion >= 2 ? ['scheduleJobId', 'logicalWindowId'] : []),
+    ...(input.schemaVersion >= 3 ? ['lanePlanGeneration'] : []),
   ]) token(input[field], `recovery compatibility ${field}`);
   if (typeof input.sourceConfigFingerprint !== 'string' || !SHA256.test(input.sourceConfigFingerprint)) {
     throw new TypeError('recovery compatibility source/config fingerprint is invalid');
+  }
+  for (const field of input.schemaVersion >= 3
+    ? ['lanePlanRevision', 'laneSelectionFingerprint'] : []) {
+    if (typeof input[field] !== 'string' || !SHA256.test(input[field])) {
+      throw new TypeError(`recovery compatibility ${field} is invalid`);
+    }
   }
   if (input.journalSchemaVersion !== RUN_JOURNAL_SCHEMA_VERSION) {
     if (candidate) throw new CandidateSkipError('journal-schema-unsupported', 'candidate journal schema is unsupported');

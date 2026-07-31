@@ -142,6 +142,7 @@ test('published unknown-compensation policies change end-to-end discovery decisi
   })], excludeProfile);
   assert.equal(excluded.exclusions[0].code, 'compensation-unknown');
   assert.equal(excluded.funnel.eligible, 0);
+  assert.equal(excluded.discoveryCounts[0].new, 1);
 
   const penaliseProfile = hospitalAdministratorProfile();
   const job = sourceJob({
@@ -176,6 +177,43 @@ test('published unknown-compensation policies change end-to-end discovery decisi
   assert.equal(nonComparableCompensation.evidence[0].comparison, 'unknown');
   assert.ok(nonComparableCompensation.score < 0);
   assert.ok(nonComparablePenalised.ranked[0].preRankScore < nonComparableIncluded.ranked[0].preRankScore);
+});
+
+test('mandatory working pattern and seniority rules reject explicit cross-domain contradictions', () => {
+  const base = softwareDeveloperProfile();
+  const profile = {
+    ...base,
+    target: {
+      ...base.target,
+      workingPatterns: [{
+        value: 'remote', strength: 'mandatory', provenance: 'explicit',
+      }],
+      seniority: [{
+        value: 'junior', strength: 'mandatory', provenance: 'explicit',
+      }],
+    },
+    unknownPolicies: {
+      ...base.unknownPolicies,
+      workingPattern: 'include',
+      seniority: 'include',
+    },
+  };
+  const result = discover([
+    {
+      ...sourceJob({
+        vacancyId: 'explicitly-onsite-senior',
+        title: 'Software Developer',
+        arrangement: 'on-site',
+      }),
+      seniority: 'senior',
+    },
+  ], profile);
+
+  assert.deepEqual(result.exclusions.map(({ code }) => code), [
+    'mandatory-working-pattern-unmet',
+    'mandatory-seniority-unmet',
+  ]);
+  assert.equal(result.funnel.eligible, 0);
 });
 
 test('production-shaped legacy migration preserves unrelated private artifacts byte-for-byte', () => {

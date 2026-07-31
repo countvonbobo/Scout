@@ -179,6 +179,35 @@ test('snapshot verification rejects tampering before creating a rollback workspa
   assert.equal(fs.existsSync(destination), false);
 });
 
+test('migration snapshots current protected content instead of reusing an older valid rollback', () => {
+  const root = productionShapedWorkspace();
+  const older = createBeta22WorkspaceSnapshot(root, { now: () => NOW });
+  write(root, 'data/opportunities.json', '{"updated":"newer","opportunities":[{"id":"newer-role"}]}\n');
+  write(root, 'reports/2026-07-31.md', '# New pre-migration report\n');
+  write(root, 'cv/master-cv.md', '# New pre-migration CV\n');
+
+  const current = createBeta22WorkspaceSnapshot(root, {
+    now: () => '2026-07-31T09:00:00.000Z',
+  });
+  assert.equal(current.created, true);
+  assert.notEqual(current.directory, older.directory);
+
+  const identical = createBeta22WorkspaceSnapshot(root, {
+    now: () => '2026-07-31T09:01:00.000Z',
+  });
+  assert.equal(identical.created, false);
+  assert.equal(identical.directory, current.directory);
+
+  const destination = temporaryRoot('scout-current-beta22-rollback-');
+  fs.rmSync(destination, { recursive: true });
+  materializeBeta22Rollback(root, destination, {
+    snapshotDirectory: current.directory,
+  });
+  assert.match(fs.readFileSync(path.join(destination, 'data', 'opportunities.json'), 'utf8'), /newer-role/);
+  assert.equal(fs.readFileSync(path.join(destination, 'reports', '2026-07-31.md'), 'utf8'), '# New pre-migration report\n');
+  assert.equal(fs.readFileSync(path.join(destination, 'cv', 'master-cv.md'), 'utf8'), '# New pre-migration CV\n');
+});
+
 test('historical vacancies are re-ranked in an immutable profile artifact without rewriting decisions', () => {
   const root = productionShapedWorkspace();
   const profile = publishedProfile();

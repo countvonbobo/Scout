@@ -129,6 +129,51 @@ test('ranked discovery preserves role-family and location metadata for soft dive
   assert.equal(locationResult.selection.constraintsRelaxed.includes('location'), false);
 });
 
+test('URL-less provider vacancies retain distinct stable identities through selection', () => {
+  const profile = {
+    version: 1, status: 'published', id: 'profile-url-less-identities',
+    target: {},
+    negative: {},
+    compensation: {
+      currency: null, period: 'year', minimum: null,
+      minimumStrength: 'neutral', unknownPolicy: 'include',
+    },
+  };
+  const sources = {
+    provider: {
+      count: 2,
+      jobs: [
+        {
+          company: 'Example Co', title: 'Engineer',
+          providerId: 'provider-reference-1', description: 'Build service one.',
+        },
+        {
+          company: 'Example Co', title: 'Engineer',
+          providerId: 'provider-reference-2', description: 'Build service two.',
+        },
+      ],
+    },
+  };
+  const forward = prepareRankedDiscovery({
+    sources, profile, runId: 'url-less-forward', relevanceThreshold: 0,
+  });
+  const reverse = prepareRankedDiscovery({
+    sources: { provider: { ...sources.provider, jobs: [...sources.provider.jobs].reverse() } },
+    profile,
+    runId: 'url-less-reverse',
+    relevanceThreshold: 0,
+  });
+
+  assert.equal(forward.ranked.length, 2);
+  assert.equal(new Set(forward.ranked.map(({ vacancyId }) => vacancyId)).size, 2);
+  assert.ok(forward.ranked.every(({ vacancyId }) => /^vacancy-ref-[a-f0-9]{24}$/.test(vacancyId)));
+  assert.deepEqual(
+    forward.ranked.map(({ vacancyId }) => vacancyId),
+    reverse.ranked.map(({ vacancyId }) => vacancyId),
+  );
+  assert.ok(forward.selection.reasons.every(({ vacancyId }) => vacancyId !== 'unknown-vacancy'));
+});
+
 test('durable ranked stages preserve the established ranked discovery result', async () => {
   const profile = {
     version: 1, status: 'published', id: 'profile-durable',
@@ -162,6 +207,7 @@ test('durable ranked stages preserve the established ranked discovery result', a
   }
 
   assert.deepEqual(priorArtifact, {
+    discoveryCounts: expected.discoveryCounts,
     exclusions: expected.exclusions,
     reconsidered: expected.reconsidered,
     ranked: expected.ranked,

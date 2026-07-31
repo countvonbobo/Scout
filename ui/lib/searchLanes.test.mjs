@@ -262,6 +262,61 @@ test('lane metrics reconcile exact query returns with persisted discovery and as
   ]);
 });
 
+test('lane new counts unseen canonical vacancies before deterministic exclusion', () => {
+  const generated = generateSearchLanePlan(profile({ primaryTitles: ['Platform engineer'] }));
+  const lane = generated.lanes.find(({ kind }) => kind === 'title');
+  const results = deriveSearchLaneResults({
+    lanes: [lane],
+    sources: {
+      source: {
+        queryCounts: { [lane.query]: 2 },
+        observations: [
+          { observationId: 'observation-eligible', laneIds: [lane.id] },
+          { observationId: 'observation-excluded', laneIds: [lane.id] },
+        ],
+      },
+    },
+    discovered: [
+      { vacancyId: 'vacancy-eligible', laneIds: [lane.id], novelty: 'unseen' },
+      { vacancyId: 'vacancy-excluded', laneIds: [lane.id], novelty: 'unseen' },
+    ],
+    ranked: [{
+      vacancyId: 'vacancy-eligible',
+      laneIds: [lane.id],
+      dimensions: [{ name: 'novelty', evidence: [{ comparison: 'unseen' }] }],
+    }],
+    candidates: [{ vacancyId: 'vacancy-eligible', laneIds: [lane.id] }],
+    reviewed: [{ vacancyId: 'vacancy-eligible', outcome: 'kept' }],
+  });
+
+  assert.deepEqual(results, [{
+    laneId: lane.id,
+    returned: 2,
+    parsed: 2,
+    new: 2,
+    eligible: 1,
+    selected: 1,
+    promising: 1,
+  }]);
+});
+
+test('derived lane counters reject an impossible funnel equation', () => {
+  const generated = generateSearchLanePlan(profile({ primaryTitles: ['Platform engineer'] }));
+  const lane = generated.lanes.find(({ kind }) => kind === 'title');
+  assert.throws(() => deriveSearchLaneResults({
+    lanes: [lane],
+    sources: {
+      source: {
+        queryCounts: { [lane.query]: 1 },
+        observations: [{ observationId: 'observation-one', laneIds: [lane.id] }],
+      },
+    },
+    discovered: [{ vacancyId: 'vacancy-one', laneIds: [lane.id], novelty: 'unseen' }],
+    ranked: [],
+    candidates: [{ vacancyId: 'vacancy-one', laneIds: [lane.id] }],
+  }), /selected.*eligible|lane metric equation/i);
+});
+
 test('one lane can have only one result per run', () => {
   const generated = generateSearchLanePlan(profile({ primaryTitles: ['Archivist'] }));
   const laneId = generated.lanes[0].id;

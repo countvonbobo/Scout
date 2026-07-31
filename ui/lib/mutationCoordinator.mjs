@@ -121,6 +121,8 @@ function resolveTarget(root, key, kind) {
   else if (key === 'scan-log' && kind === 'run-log') file = paths.scanRuns;
   else if (key === 'search-lanes' && kind === 'json') file = paths.searchLanes;
   else if (key === 'employers' && kind === 'json') file = paths.employers;
+  else if (key === 'search-profile' && kind === 'json') file = paths.searchProfilePublished;
+  else if (key === 'workspace-config' && kind === 'json') file = paths.config;
   else {
     const report = typeof key === 'string' ? key.match(/^report:(\d{4}-\d{2}-\d{2})$/) : null;
     if (!report || kind !== 'report') throw new TypeError('mutation target key is not supported');
@@ -187,6 +189,7 @@ function runLogMarker(content) {
 }
 
 function markerFor(kind, content) {
+  if (kind === 'json' && content === '') return null;
   if (kind === 'tracker' || kind === 'json') return readTrackerMutationMarker(content);
   if (kind === 'report') return reportMarker(content);
   if (kind === 'run-log') return runLogMarker(content);
@@ -196,6 +199,7 @@ function markerFor(kind, content) {
 function markerSyntaxPresent(kind, content) {
   if (kind === 'report') return content.includes('<!-- scout-mutation:');
   if (kind === 'tracker' || kind === 'json') {
+    if (kind === 'json' && content === '') return false;
     const value = JSON.parse(content);
     return Boolean(value && typeof value === 'object' && Object.hasOwn(value, '_scoutMutation'));
   }

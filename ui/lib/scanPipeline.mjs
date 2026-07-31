@@ -12,7 +12,7 @@ import { canonicaliseObservations, vacancyContentFingerprint } from './vacancyCa
 import { createDiscoveryFunnel, advanceDiscoveryFunnel, assertDiscoveryFunnel } from './discoveryFunnel.mjs';
 import { filterVacancies } from './vacancyFilter.mjs';
 import { normaliseObservation } from './vacancyObservation.mjs';
-import { rankVacancies } from './vacancyRank.mjs';
+import { rankVacancies, vacancyNoveltyComparison } from './vacancyRank.mjs';
 import { selectVacancies } from './vacancySelect.mjs';
 import { partitionVacanciesForAssessment } from './vacancyLifecycle.mjs';
 import {
@@ -485,6 +485,7 @@ export async function runScanPipeline({
   finalize = null,
   postTerminalSuccess = null,
   recordFailure = null,
+  bindAuthority = null,
   queue = null,
   claimedLease = null,
   storagePolicy = {},
@@ -497,6 +498,9 @@ export async function runScanPipeline({
   assertRunStorageWritable(root, storagePolicy);
   if (recordFailure !== null && typeof recordFailure !== 'function') {
     throw new TypeError('scan pipeline failure recorder must be a function');
+  }
+  if (bindAuthority !== null && typeof bindAuthority !== 'function') {
+    throw new TypeError('scan pipeline authority binder must be a function');
   }
   if (prepare !== null && typeof prepare !== 'function') {
     throw new TypeError('scan pipeline prepare callback must be a function');
@@ -630,6 +634,13 @@ export async function runScanPipeline({
   let mutationReceipt = null;
   let receiptIssue = 'mutation-receipt-missing';
   try {
+    if (bindAuthority !== null) {
+      const bound = await bindAuthority({ root, runId: provisionalRunId, lease, compatibility });
+      if (!bound || Object.getPrototypeOf(bound) !== Object.prototype) {
+        throw new TypeError('scan pipeline authority binder returned no compatibility contract');
+      }
+      compatibility = bound;
+    }
     if (healthPreflight !== null) {
       heartbeat = startLeaseHeartbeat(lease, effectiveHeartbeatOptions);
       let health;
@@ -952,7 +963,7 @@ export async function runScanPipeline({
     }
   } finally {
     if (!retainUnclosedAuthority) heartbeat?.stop();
-    if (ownsLease && !released && !retainInterruptedLease && terminal) {
+    if (ownsLease && !released && !retainInterruptedLease && (terminal || !run)) {
       try { releaseScanLease(lease); released = true; } catch { /* lease loss is already reflected above */ }
     }
   }
@@ -1138,6 +1149,21 @@ function assessmentVacancy(vacancy) {
   };
 }
 
+function laneDiscoveryCounts(vacancies, profile, history) {
+  const unseenByLane = new Map();
+  for (const vacancy of vacancies || []) {
+    if (vacancyNoveltyComparison(vacancy, profile, history) !== 'unseen') continue;
+    const identity = String(vacancy?.vacancyId || vacancy?.canonicalUrl || '');
+    if (!identity) continue;
+    for (const laneId of [...new Set(vacancy?.laneIds || [])]) {
+      if (!unseenByLane.has(laneId)) unseenByLane.set(laneId, new Set());
+      unseenByLane.get(laneId).add(identity);
+    }
+  }
+  return [...unseenByLane].sort(([left], [right]) => compareText(left, right))
+    .map(([laneId, identities]) => ({ laneId, new: identities.size }));
+}
+
 function candidateFromSelected(vacancy, index) {
   const candidate = assessmentVacancy(vacancy);
   const semantic = candidate.semanticEvidence || null;
@@ -1260,6 +1286,7 @@ export function prepareRankedDiscovery({
   const initialFunnel = createDiscoveryFunnel(input.funnelSources);
   const canonical = canonicaliseObservations(observations);
   const vacancies = canonical.vacancies.map(assessmentVacancy);
+  const discoveryCounts = laneDiscoveryCounts(vacancies, profile, tracker?.opportunities || []);
   const filtered = filterVacancies(vacancies, profile, { learningPolicy });
   const ranked = rankVacancies(filtered.eligible, profile, tracker?.opportunities || [], { learningPolicy });
   const lifecycle = partitionVacanciesForAssessment(ranked, decisionHistory, { profileId: profile.id });
@@ -1296,6 +1323,7 @@ export function prepareRankedDiscovery({
   return {
     observations,
     vacancies,
+    discoveryCounts,
     exclusions,
     reconsidered: filtered.reconsidered || [],
     ranked,
@@ -1309,9 +1337,9 @@ const RANKED_STAGE_ARTIFACT_FIELDS = Object.freeze({
   collect: Object.freeze(['generatedAt', 'lanes', 'queries', 'sources']),
   normalise: Object.freeze(['generatedAt', 'initialFunnel', 'observations', 'queries']),
   deduplicate: Object.freeze(['duplicateObservations', 'initialFunnel', 'normalisedCount', 'vacancies']),
-  filter: Object.freeze(['duplicateObservations', 'eligible', 'exclusions', 'initialFunnel', 'normalisedCount', 'reconsidered', 'uniqueVacancies']),
-  rank: Object.freeze(['duplicateObservations', 'exclusions', 'initialFunnel', 'normalisedCount', 'ranked', 'reconsidered', 'uniqueVacancies']),
-  select: Object.freeze(['candidates', 'exclusions', 'funnel', 'ranked', 'reconsidered', 'selection']),
+  filter: Object.freeze(['discoveryCounts', 'duplicateObservations', 'eligible', 'exclusions', 'initialFunnel', 'normalisedCount', 'reconsidered', 'uniqueVacancies']),
+  rank: Object.freeze(['discoveryCounts', 'duplicateObservations', 'exclusions', 'initialFunnel', 'normalisedCount', 'ranked', 'reconsidered', 'uniqueVacancies']),
+  select: Object.freeze(['candidates', 'discoveryCounts', 'exclusions', 'funnel', 'ranked', 'reconsidered', 'selection']),
 });
 const OMIT_PRIVATE_STAGE_KEY = /^(?:access[-_]?token|advert[-_]?body|api[-_]?(?:key|token)|auth(?:orization)?|body|cookies?|credentials?|cv|description|headers?|html|master[-_]?cv|password|payload|profile[-_]?evidence|prompt|raw[-_]?(?:html|response)|requirements|response|secret(?:[-_]?(?:key|token))?|token|transcript)$/i;
 const URL_STAGE_KEY = /(?:^url$|url$)/i;
@@ -1421,12 +1449,32 @@ function semanticObservation(job, sourceName, source, profile, { durableUrls = t
   const requirements = String(job?.requirements || '');
   const identity = jobIdentity(observation);
   const descriptionRules = [
-    ...(profile?.target?.sectors || []),
-    ...(profile?.negative?.excludedResponsibilities || []),
-  ];
-  const profileRuleMatches = descriptionRules
-    .filter((rule) => semanticPhraseMatches(description, rule?.value))
-    .map((rule) => ({ id: semanticRuleId(rule), fact: semanticFact(rule.value) }));
+    ...['responsibilities', 'skills', 'qualifications', 'eligibility', 'mobility', 'industries', 'sectors']
+      .flatMap((field) => profile?.target?.[field] || []),
+    ...[
+      'excludedResponsibilities', 'excludedSkills', 'excludedQualifications',
+      'excludedEligibility', 'excludedMobility', 'excludedIndustries', 'excludedSectors',
+    ].flatMap((field) => profile?.negative?.[field] || []),
+  ].slice(0, 128);
+  const descriptionDigest = digestText(description);
+  const profileRuleEvidence = [...new Map(descriptionRules.map((rule) => {
+    const id = semanticRuleId(rule);
+    const matched = semanticPhraseMatches(description, rule?.value);
+    return [id, {
+      id,
+      fact: semanticFact(rule.value),
+      status: matched ? 'matched' : 'unknown',
+      evidence: [{
+        source: String(observation.source || '').slice(0, 80),
+        providerId: String(observation.sourceRecordId || '').slice(0, 160),
+        descriptionDigest,
+        provenance: 'deterministic-extraction',
+      }],
+    }];
+  })).values()];
+  const profileRuleMatches = profileRuleEvidence
+    .filter(({ status }) => status === 'matched')
+    .map(({ status, ...evidence }) => evidence);
   const signals = mandatorySignals(description, requirements).map((signal) => ({
     id: signal.id,
     digest: digestText(signal.text),
@@ -1453,8 +1501,9 @@ function semanticObservation(job, sourceName, source, profile, { durableUrls = t
     },
     semanticEvidence: {
       descriptionPresent: Boolean(description.trim()),
-      descriptionDigest: digestText(description),
+      descriptionDigest,
       descriptionLength: description.length,
+      profileRuleEvidence,
       profileRuleMatches,
       responsibilityFacts: responsibilityFacts(description),
       mandatorySignals: signals,
@@ -1558,6 +1607,7 @@ function encodePipelineStageValue(stageId, value, profile = null, { durableUrls 
     lanes: (Array.isArray(value?.lanes) ? value.lanes : []).slice(0, 32).map((lane) => ({
       id: String(lane?.id || '').slice(0, 80),
       query: String(lane?.query || '').slice(0, 300),
+      queryFingerprint: String(lane?.queryFingerprint || '').slice(0, 64),
       source: String(lane?.source || '').slice(0, 80),
       priority: Number.isFinite(Number(lane?.priority)) ? Number(lane.priority) : 0,
       priorityBand: String(lane?.priorityBand || '').slice(0, 40),
@@ -1665,6 +1715,11 @@ export function createRankedDiscoveryStages({
         normalisedCount: priorArtifact.normalisedCount,
         duplicateObservations: priorArtifact.duplicateObservations,
         uniqueVacancies: priorArtifact.vacancies.length,
+        discoveryCounts: laneDiscoveryCounts(
+          priorArtifact.vacancies,
+          profile,
+          tracker?.opportunities || [],
+        ),
         eligible: filtered.eligible,
         reconsidered: filtered.reconsidered || [],
         exclusions: filtered.excluded.map((item) => {
@@ -1680,6 +1735,7 @@ export function createRankedDiscoveryStages({
     }),
     rank: withRankedArtifactCodec('rank', function rankStage({ priorArtifact }) {
       return {
+        discoveryCounts: priorArtifact.discoveryCounts,
         initialFunnel: priorArtifact.initialFunnel,
         normalisedCount: priorArtifact.normalisedCount,
         duplicateObservations: priorArtifact.duplicateObservations,
@@ -1722,6 +1778,7 @@ export function createRankedDiscoveryStages({
         selected: selection.selected.length,
       }));
       return {
+        discoveryCounts: priorArtifact.discoveryCounts,
         exclusions: priorArtifact.exclusions,
         reconsidered: priorArtifact.reconsidered,
         ranked: priorArtifact.ranked,
@@ -2371,6 +2428,7 @@ export function coordinateScanArtifacts(root, input, { run, lease, hooks = {} })
       results: deriveSearchLaneResults({
         lanes: selectedLanes,
         sources: input.sources,
+        discoveryCounts: input.discoveryCounts,
         ranked: input.ranked,
         candidates: input.candidates,
         reviewed: artifacts.run.reviewed,

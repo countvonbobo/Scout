@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { canonicaliseObservations } from './vacancyCanonical.mjs';
-import { filterVacancies } from './vacancyFilter.mjs';
+import { PROFILE_RULE_SUPPORT, filterVacancies } from './vacancyFilter.mjs';
 import { normaliseObservation } from './vacancyObservation.mjs';
 
 const rule = (value, strength, provenance = 'explicit') => ({ value, strength, provenance });
@@ -78,6 +78,68 @@ test('mandatory structured title mismatch is overrideable and preserves source e
     profileVersion: 'profile-test000001', evidence: { vacancy: 'Software Engineer', rule: 'Data Engineer' },
     confidence: 'explicit-source', overrideable: true,
   });
+});
+
+test('every published structured rule family has an explicit filter support contract', () => {
+  assert.deepEqual(
+    PROFILE_RULE_SUPPORT.map(({ dimension }) => dimension),
+    [
+      'title', 'responsibilities', 'skills', 'qualifications', 'eligibility',
+      'industry', 'location', 'mobility', 'workingPattern', 'employmentType',
+      'seniority', 'employer',
+    ],
+  );
+});
+
+test('mandatory working pattern and seniority contradictions exclude deterministically', () => {
+  const vacancy = {
+    ...softwareJob,
+    workingPattern: { value: 'on-site', provenance: 'explicit-source' },
+    seniority: { value: 'senior', provenance: 'explicit-source' },
+  };
+  const result = filterVacancies([vacancy], {
+    ...profile(),
+    target: {
+      workingPatterns: [rule('remote', 'mandatory')],
+      seniority: [rule('junior', 'mandatory')],
+    },
+    unknownPolicies: {
+      workingPattern: 'include',
+      seniority: 'include',
+    },
+  });
+
+  assert.deepEqual(result.excluded.map(({ code }) => code), [
+    'mandatory-working-pattern-unmet',
+    'mandatory-seniority-unmet',
+  ]);
+});
+
+test('mandatory structured unknowns follow policy while preferences remain ranking-only', () => {
+  const vacancy = {
+    ...softwareJob,
+    workingPattern: { value: null, provenance: 'unknown' },
+    skills: { value: ['JavaScript'], provenance: 'explicit-source' },
+  };
+  const base = {
+    ...profile(),
+    target: {
+      workingPatterns: [rule('remote', 'mandatory')],
+      skills: [
+        rule('Rust', 'strong-preference'),
+        rule('TypeScript', 'mandatory', 'unconfirmed-inference'),
+      ],
+    },
+    unknownPolicies: { workingPattern: 'include' },
+  };
+  assert.deepEqual(filterVacancies([vacancy], base), { eligible: [vacancy], excluded: [] });
+
+  const excluded = filterVacancies([vacancy], {
+    ...base,
+    unknownPolicies: { workingPattern: 'exclude' },
+  });
+  assert.equal(excluded.excluded[0].code, 'working-pattern-unknown');
+  assert.equal(excluded.excluded[0].evidence.comparison, 'unknown');
 });
 
 test('strong negatives and unconfirmed hard rules do not exclude', () => {
