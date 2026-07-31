@@ -1,7 +1,7 @@
 import crypto from 'node:crypto';
 
-const TRACKING_PARAMETERS = /^(?:utm_[^=]+|gclid|fbclid|mc_[^=]+)$/i;
-const CREDENTIAL_PARAMETERS = /^(?:access[-_]?token|api[-_]?(?:key|token)|auth(?:orization)?|key|password|secret|session[-_]?id|sig(?:nature)?|token)$/i;
+const TRACKING_PARAMETERS = /^(?:utm_[^=]+|gclid|fbclid|mc_[^=]+|gh_src|ref(?:errer)?|source|tracking|trk)$/i;
+const CREDENTIAL_PARAMETERS = /^(?:access[-_]?token|api[-_]?(?:key|token)|auth(?:orization)?|code|cookie|credential|jwt|key|password|redirect|secret|session(?:[-_]?id)?|sig(?:nature)?|state|token)$/i;
 const CREDENTIAL_VALUE = /(?:\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b)|(?:\b(?:access[-_ ]?token|api[-_ ]?(?:key|token)|authorization|password|secret|session[-_ ]?id|token)\s*[:=]\s*\S+)|(?:\bbearer\s+[A-Za-z0-9._~+/-]{8,})|(?:\bsk-[A-Za-z0-9_-]{16,})|(?:\bgh[pousr]_[A-Za-z0-9]{20,})|(?:\bxox[baprs]-[A-Za-z0-9-]{10,})|(?:\bAKIA[0-9A-Z]{16}\b)/i;
 const MAX_SOURCE_RECORD_ID_LENGTH = 160;
 
@@ -66,12 +66,13 @@ export function canonicaliseUrl(value) {
   }
 }
 
-function urlIdentityDigest(canonicalUrl, supplied) {
+export function queryAddressedUrlIdentityDigest(value, supplied) {
   const provided = String(supplied || '');
-  if (/^[a-f0-9]{64}$/.test(provided)) return provided;
+  const canonicalUrl = canonicaliseUrl(value);
   try {
     const parsed = new URL(String(canonicalUrl || ''));
-    return parsed.search ? fingerprint(canonicalUrl) : null;
+    if (parsed.search) return fingerprint(canonicalUrl);
+    return /^[a-f0-9]{64}$/.test(provided) ? provided : null;
   } catch {
     return null;
   }
@@ -146,7 +147,7 @@ export function normaliseObservation(job, {
   const source = metadataText(sourceName) || metadataText(job?.source);
   if (!job || !source) return null;
   const canonicalUrl = canonicaliseUrl(job.url || job.sourceUrl);
-  const identityDigest = urlIdentityDigest(canonicalUrl, job.urlIdentityDigest);
+  const identityDigest = queryAddressedUrlIdentityDigest(canonicalUrl, job.urlIdentityDigest);
   const title = text(job.title);
   const recordId = sourceRecordId(job, canonicalUrl);
   if (!title || !recordId) return null;
@@ -208,7 +209,7 @@ export function normaliseObservation(job, {
     sourceRecordId: recordId,
     sourceUrl: canonicalUrl,
     canonicalUrl,
-    urlIdentityDigest: identityDigest,
+    ...(identityDigest ? { urlIdentityDigest: identityDigest } : {}),
     employer: field(text(job.company || job.employer), 'explicit-source'),
     employerReference: field(text(job.employerReference || job.companyReference || job.employerId), 'explicit-source'),
     title: field(title, 'explicit-source'),

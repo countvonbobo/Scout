@@ -11,7 +11,9 @@ import { isVerifiable } from './statusGroups.mjs';
 import { canonicaliseObservations, vacancyContentFingerprint } from './vacancyCanonical.mjs';
 import { createDiscoveryFunnel, advanceDiscoveryFunnel, assertDiscoveryFunnel } from './discoveryFunnel.mjs';
 import { filterVacancies } from './vacancyFilter.mjs';
-import { normaliseObservation } from './vacancyObservation.mjs';
+import {
+  normaliseObservation, queryAddressedUrlIdentityDigest,
+} from './vacancyObservation.mjs';
 import { rankVacancies, vacancyNoveltyComparison } from './vacancyRank.mjs';
 import { selectVacancies } from './vacancySelect.mjs';
 import { partitionVacanciesForAssessment } from './vacancyLifecycle.mjs';
@@ -1484,6 +1486,7 @@ function digestText(value) {
 function semanticObservation(job, sourceName, source, profile, { durableUrls = true } = {}) {
   const observation = normaliseObservation(job, {
     sourceName: job?.source || sourceName,
+    collectionSource: sourceName,
     fetchedAt: source?.fetchedAt || source?.generatedAt || null,
     laneId: job?.laneId || job?.source || source?.laneId || sourceName,
     laneIds: job?.laneIds || source?.laneIds || null,
@@ -1601,11 +1604,10 @@ function legacySemanticJob(job, sourceName, { durableUrls = true } = {}) {
   if (!candidate) return null;
   const description = String(job?.description || '');
   const requirements = String(job?.requirements || '');
-  let urlIdentityDigest = null;
-  try {
-    const parsed = new URL(String(candidate.url || ''));
-    if (parsed.search) urlIdentityDigest = digestText(candidate.url);
-  } catch {}
+  const urlIdentityDigest = queryAddressedUrlIdentityDigest(
+    candidate.url,
+    candidate.urlIdentityDigest,
+  );
   return {
     company: candidate.company,
     title: candidate.role,
@@ -1616,7 +1618,7 @@ function legacySemanticJob(job, sourceName, { durableUrls = true } = {}) {
     postedDate: candidate.postedDate,
     source: candidate.source || sourceName,
     providerId: candidate.providerId,
-    urlIdentityDigest,
+    ...(urlIdentityDigest ? { urlIdentityDigest } : {}),
     sourceReferences: candidate.sourceReferences.map((reference) => ({
       ...reference,
       url: durableUrls ? privacySafeStageUrl(reference.url) : reference.url,
@@ -1974,6 +1976,7 @@ function normaliseJob(job) {
   if ((job?.semanticEvidence?.responsibilityFacts || []).length > 64) {
     throw new Error('advert responsibility evidence exceeds the supported limit');
   }
+  const urlIdentityDigest = queryAddressedUrlIdentityDigest(job.url, job.urlIdentityDigest);
   return {
     company, role, url, location: String(job?.location || ''), salary: job?.salary || null,
     workingType: String(job?.workingType || ''), postedDate: job?.postedDate || null,
@@ -1981,7 +1984,35 @@ function normaliseJob(job) {
     description: String(job?.description || ''), requirements: String(job?.requirements || ''),
     tags: Array.isArray(job?.tags) ? job.tags : [], sourceReferences: sourceReferencesOf(job), duplicateCount: 1,
     semanticEvidence: job?.semanticEvidence || null,
+    ...(urlIdentityDigest ? { urlIdentityDigest } : {}),
   };
+}
+
+function legacyCandidateIdentityKeys(candidate) {
+  if (candidate?.urlIdentityDigest) return [`query:${candidate.urlIdentityDigest}`];
+  return [...new Set([
+    candidate?.url,
+    ...(candidate?.sourceReferences || []).map((reference) => reference?.url),
+  ].filter(Boolean).map((url) => `url:${url}`))];
+}
+
+function sameLegacyCandidate(left, right) {
+  if (left?.urlIdentityDigest && right?.urlIdentityDigest) {
+    return Boolean(
+      left.urlIdentityDigest === right.urlIdentityDigest,
+    );
+  }
+  if (left?.urlIdentityDigest || right?.urlIdentityDigest) {
+    const rightReferences = new Set((right?.sourceReferences || []).map((reference) => (
+      `${reference.source}|${reference.providerId}`
+    )));
+    return (left?.sourceReferences || []).some((reference) => (
+      reference.source
+      && reference.providerId
+      && rightReferences.has(`${reference.source}|${reference.providerId}`)
+    ));
+  }
+  return sameUnderlyingJob(left, right);
 }
 
 function absorbDuplicate(existing, incoming) {
@@ -2016,17 +2047,22 @@ export function compactCandidates(sources, maximum = DEFAULT_CANDIDATE_LIMIT) {
       if (!incoming) continue;
       const key = jobIdentity(incoming).company || '';
       const bucket = byCompany.get(key) || [];
-      const duplicate = byUrl.get(incoming.url)
-        || bucket.find((candidate) => sameUnderlyingJob(candidate, incoming));
+      const duplicate = legacyCandidateIdentityKeys(incoming)
+        .map((identityKey) => byUrl.get(identityKey))
+        .find(Boolean)
+        || bucket.find((candidate) => sameLegacyCandidate(candidate, incoming));
       if (duplicate) {
         absorbDuplicate(duplicate, incoming);
-        for (const reference of duplicate.sourceReferences) if (reference.url) byUrl.set(reference.url, duplicate);
+        for (const identityKey of legacyCandidateIdentityKeys(duplicate)) {
+          byUrl.set(identityKey, duplicate);
+        }
         continue;
       }
       bucket.push(incoming);
       byCompany.set(key, bucket);
-      for (const reference of incoming.sourceReferences) if (reference.url) byUrl.set(reference.url, incoming);
-      byUrl.set(incoming.url, incoming);
+      for (const identityKey of legacyCandidateIdentityKeys(incoming)) {
+        byUrl.set(identityKey, incoming);
+      }
       pool.push(incoming);
     }
     if (pool.length) pools.set(name, pool);

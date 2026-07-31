@@ -1,6 +1,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { normaliseObservation } from './vacancyObservation.mjs';
+import {
+  normaliseObservation, queryAddressedUrlIdentityDigest,
+} from './vacancyObservation.mjs';
 
 const NOW = '2026-07-26T20:00:00.000Z';
 
@@ -264,4 +266,26 @@ test('query-bearing URL provider identities are fingerprinted before durable obs
   });
   assert.match(observation.sourceRecordId, /^provider-[a-f0-9]{32}$/);
   assert.equal(JSON.stringify(observation).includes('PRIVATE123'), false);
+});
+
+test('query identity ignores tracking and credential churn but distinguishes meaningful job keys', () => {
+  const first = queryAddressedUrlIdentityDigest(
+    'https://jobs.example.test/apply?utm_source=one&job=42&session=secret-one&ref=board',
+  );
+  const same = queryAddressedUrlIdentityDigest(
+    'https://jobs.example.test/apply?code=secret-two&job=42&utm_medium=two',
+  );
+  const different = queryAddressedUrlIdentityDigest(
+    'https://jobs.example.test/apply?job=43&token=secret-three',
+  );
+  assert.match(first, /^[a-f0-9]{64}$/);
+  assert.equal(first, same);
+  assert.notEqual(first, different);
+  assert.equal(
+    queryAddressedUrlIdentityDigest(
+      'https://jobs.example.test/apply?job=42',
+      'f'.repeat(64),
+    ),
+    first,
+  );
 });

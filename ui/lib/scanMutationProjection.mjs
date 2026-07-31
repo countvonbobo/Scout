@@ -1,5 +1,7 @@
 import { createHash } from 'node:crypto';
+import { normaliseIdentityText } from './jobIdentity.mjs';
 import { serializeTracker } from './tracker.mjs';
+import { queryAddressedUrlIdentityDigest } from './vacancyObservation.mjs';
 
 const RECIPE_VERSION = 1;
 const SAFE_CODE = /^[a-z0-9]+(?:[-_:][a-z0-9]+)*$/;
@@ -32,6 +34,7 @@ const SELECTION_COUNTERS = ['selected', 'assessed', 'assessmentFailed'];
 const COVERAGE_COUNTERS = ['found', 'ranked', 'selected', 'excluded', 'assessed', 'assessmentFailed'];
 const COVERAGE_DIMENSIONS = ['source', 'employer', 'lane', 'roleFamily', 'location', 'provider', 'run', 'date'];
 const MAX_EXPLANATIONS = 10_000;
+const PRIVATE_SOURCE_TOKEN = /^(?:access|api|auth|authorization|bearer|code|cookie|credential|jwt|key|password|secret|session|signature|state|token)$/;
 
 function boundedLabel(value, maximum) {
   const text = String(value || '').replace(/[\r\n\t]+/g, ' ').replace(/\s{2,}/g, ' ').trim();
@@ -54,6 +57,13 @@ function providerIdentifier(value) {
   if (!text) return null;
   if (SAFE_PROVIDER_IDENTIFIER.test(text)) return text;
   return `provider-${digest(text).slice(0, 32)}`;
+}
+
+function sourceIdentityLabel(value) {
+  const label = boundedLabel(normaliseIdentityText(value), 80);
+  const words = label?.split(' ') || [];
+  if (!label || words.length > 4 || words.some((word) => PRIVATE_SOURCE_TOKEN.test(word))) return null;
+  return label;
 }
 
 function number(value, fallback = 0) {
@@ -132,6 +142,8 @@ function canonicalUrl(value) {
 }
 
 function durableVacancyId(value) {
+  const urlIdentityDigest = queryAddressedUrlIdentityDigest(value);
+  if (urlIdentityDigest) return `vacancy-url-${urlIdentityDigest.slice(0, 24)}`;
   return canonicalUrl(value) || identifier(value);
 }
 
@@ -179,7 +191,7 @@ function safeReferences(entry) {
     ? entry.sourceReferences
     : (entry?.sources || []).map((url) => ({ url }));
   return values.map((reference) => ({
-    source: code(reference?.source),
+    source: sourceIdentityLabel(reference?.source),
     providerId: providerIdentifier(reference?.providerId),
     url: canonicalUrl(reference?.url),
   })).filter((reference) => reference.source || reference.providerId || reference.url).slice(0, 8);
@@ -354,7 +366,7 @@ function safeRunRecord(record) {
       reason_code: code(item?.reason_code, 'unknown'),
       assessment_status: code(item?.assessment_status, 'unknown'),
       outcome: code(item?.outcome),
-      source: code(item?.source),
+      source: sourceIdentityLabel(item?.source),
       sourceUrl: canonicalUrl(item?.sourceUrl),
       sourceReferences: safeReferences({ sourceReferences: item?.sourceReferences }),
     })),
@@ -362,7 +374,7 @@ function safeRunRecord(record) {
       vacancyId: durableVacancyId(item?.vacancyId),
       company: boundedLabel(item?.company, 120),
       role: boundedLabel(item?.role, 160),
-      source: code(item?.source),
+      source: sourceIdentityLabel(item?.source),
       sourceUrl: canonicalUrl(item?.sourceUrl),
       sourceReferences: safeReferences({ sourceReferences: item?.sourceReferences }),
       contentFingerprint: /^[a-f0-9]{64}$/.test(String(item?.contentFingerprint || ''))

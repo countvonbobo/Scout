@@ -356,7 +356,7 @@ function canonicalVacancy(observations) {
     observations: orderedObservations,
     vacancyId,
     canonicalUrl,
-    urlIdentityDigest,
+    ...(urlIdentityDigest ? { urlIdentityDigest } : {}),
     sourceReferences,
     collectionSources,
     collectionSource: collectionSources[0] || null,

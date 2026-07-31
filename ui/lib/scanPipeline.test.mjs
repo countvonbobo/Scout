@@ -15,7 +15,9 @@ import {
 } from './runJournal.mjs';
 import { ProviderLifecycleUnclosedError } from './structuredTurn.mjs';
 import { applyPreparedMutation, prepareMutation } from './mutationCoordinator.mjs';
-import { runLogAppendRecipe, scanReportRecipe } from './scanMutationProjection.mjs';
+import {
+  runLogAppendRecipe, scanReportRecipe, trackerMergeRecipe,
+} from './scanMutationProjection.mjs';
 import { profileRuleId } from './searchProfile.mjs';
 import { createEmployerRegistry, employerRegistryRevision } from './employerRegistry.mjs';
 import { partitionVacanciesForAssessment } from './vacancyLifecycle.mjs';
@@ -503,6 +505,46 @@ test('query-addressed vacancy identity is identical live and after collect or no
     JSON.stringify(stages.collect.artifactCodec.encode(collected)),
     /job=one/,
   );
+});
+
+test('ranked collect replay preserves configured collection source separately from vendor source', async () => {
+  const stages = createRankedDiscoveryStages({
+    collect: async () => ({
+      generatedAt: '2026-07-31T10:00:00.000Z',
+      queries: ['platform engineer'],
+      sources: {
+        adzuna: {
+          configured: true,
+          status: 'healthy',
+          jobs: [{
+            company: 'Example Co',
+            title: 'Platform Engineer',
+            source: 'greenhouse',
+            providerId: 'query-opening-one',
+            url: 'https://jobs.example.test/apply?job=one',
+          }],
+        },
+      },
+    }),
+    profile: {
+      version: 1, status: 'published', id: 'profile-collection-source-recovery',
+      target: {}, negative: {},
+      compensation: {
+        currency: null, period: 'year', minimum: null,
+        minimumStrength: 'neutral', unknownPolicy: 'include',
+      },
+    },
+  });
+  const collected = await stages.collect({ run: { runId: 'collection-source-recovery' } });
+  for (const priorArtifact of [
+    stages.collect.artifactCodec.transient(collected),
+    stages.collect.artifactCodec.decode(stages.collect.artifactCodec.encode(collected)),
+  ]) {
+    const normalised = stages.normalise({ priorArtifact });
+    const vacancy = stages.deduplicate({ priorArtifact: normalised }).vacancies[0];
+    assert.equal(vacancy.sourceReferences[0].source, 'greenhouse');
+    assert.deepEqual(vacancy.collectionSources, ['adzuna']);
+  }
 });
 
 test('durable collection preserves bounded employer monitoring evidence for finalisation', async () => {
@@ -1241,40 +1283,110 @@ test('bounded decision history reserves space for a newest pre-assessment outcom
   assert.equal(history.some(({ vacancyId }) => vacancyId === 'newest-pre-assessment'), true);
 });
 
-test('projected 129-character provider references keep distinct openings assessable', () => {
+test('collect-to-history projection keeps distinct 129-character provider openings assessable', () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'scout-provider-reference-history-'));
   fs.mkdirSync(path.join(root, 'data'), { recursive: true });
   const firstProviderId = 'a'.repeat(129);
   const nextProviderId = 'b'.repeat(129);
+  const profile = {
+    version: 1, status: 'published', id: 'profile-provider-reference-history',
+    target: {
+      primaryTitles: [{
+        value: 'Platform Engineer',
+        strength: 'strong-preference',
+        provenance: 'explicit',
+      }],
+    },
+    negative: {},
+    compensation: {
+      currency: null, period: 'year', minimum: null,
+      minimumStrength: 'neutral', unknownPolicy: 'include',
+    },
+  };
+  const first = prepareRankedDiscovery({
+    sources: {
+      provider_z: {
+        configured: true,
+        status: 'healthy',
+        jobs: [{
+          company: 'Synthetic Company',
+          title: 'Platform Engineer',
+          providerId: firstProviderId,
+        }],
+      },
+    },
+    profile,
+    tracker: { opportunities: [] },
+  }).selection.selected[0];
   const projected = runLogAppendRecipe({
     timestamp: '2026-07-31T10:00:00.000Z',
     reviewed: [{
-      vacancyId: 'vacancy-ref-prior',
-      company: 'Synthetic Company',
-      role: 'Platform Engineer',
-      source: 'provider-z',
-      sourceReferences: [{
-        source: 'provider-z',
-        providerId: firstProviderId,
-      }],
+      vacancyId: first.vacancyId,
+      company: first.company,
+      role: first.role,
+      source: first.source,
+      sourceReferences: first.sourceReferences,
       outcome: 'provider_discarded',
     }],
   }).record;
   fs.writeFileSync(path.join(root, 'data', 'scan-runs.jsonl'), `${JSON.stringify(projected)}\n`);
   const history = readVacancyDecisionHistory(root);
+  assert.equal(history[0].sourceReferences[0].source, 'provider z');
   assert.equal(history[0].sourceReferences[0].providerId, firstProviderId);
-  const lifecycle = partitionVacanciesForAssessment([{
-    vacancyId: 'vacancy-ref-current',
+  const next = prepareRankedDiscovery({
+    sources: {
+      provider_z: {
+        configured: true,
+        status: 'healthy',
+        jobs: [{
+          company: 'Synthetic Company',
+          title: 'Platform Engineer',
+          providerId: nextProviderId,
+        }],
+      },
+    },
+    profile,
+    tracker: { opportunities: [] },
+    decisionHistory: history,
+  });
+  assert.equal(next.selection.assessmentSkipped.length, 0);
+  assert.equal(next.candidates.length, 1);
+});
+
+test('tracker and run-log projection preserve distinct legacy query-addressed vacancy IDs', () => {
+  const vacancyIds = [
+    'https://jobs.example.test/apply?utm_source=first&job=one&token=secret-one',
+    'https://jobs.example.test/apply?token=secret-two&job=two&utm_source=second',
+  ];
+  const reviewed = vacancyIds.map((vacancyId, index) => ({
+    vacancyId,
     company: 'Synthetic Company',
     role: 'Platform Engineer',
-    source: 'provider-z',
-    sourceReferences: [{
-      source: 'provider-z',
-      providerId: nextProviderId,
-    }],
-  }], history);
-  assert.equal(lifecycle.skipped.length, 0);
-  assert.equal(lifecycle.eligible.length, 1);
+    outcome: 'provider_discarded',
+    sourceReferences: [],
+    index,
+  }));
+  const runIds = runLogAppendRecipe({
+    timestamp: '2026-07-31T10:00:00.000Z',
+    reviewed,
+  }).record.reviewed.map((item) => item.vacancyId);
+  const trackerIds = trackerMergeRecipe(
+    '{"updated":"2026-07-30","opportunities":[]}',
+    JSON.stringify({
+      updated: '2026-07-31',
+      opportunities: reviewed.map((item, index) => ({
+        id: `legacy-query-${index}`,
+        company: item.company,
+        role: item.role,
+        vacancyId: item.vacancyId,
+        status: 'new',
+      })),
+    }),
+  ).upserts.map((item) => item.vacancyId);
+  assert.deepEqual(runIds, trackerIds);
+  assert.equal(new Set(runIds).size, 2);
+  assert.equal(runIds.every((value) => /^vacancy-url-[a-f0-9]{24}$/.test(value)), true);
+  assert.doesNotMatch(JSON.stringify({ runIds, trackerIds }), /secret|utm_source|job=/);
 });
 
 test('durable URL-less decision history preserves provider identity across changing source coverage', () => {
@@ -1553,6 +1665,104 @@ function durableStageHarness(calls) {
     };
   }]));
 }
+
+test('legacy collect recovery preserves distinct sanitized query-addressed vacancies', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'scout-legacy-query-recovery-'));
+  let now = Date.parse('2026-07-31T10:00:00.000Z');
+  let collectCalls = 0;
+  const collected = {
+    generatedAt: '2026-07-31T10:00:00.000Z',
+    queries: ['platform engineer'],
+    sources: {
+      provider_z: {
+        configured: true,
+        status: 'healthy',
+        jobs: [
+          {
+            company: 'Synthetic Company',
+            title: 'Platform Engineer',
+            providerId: 'query-opening-one',
+            url: 'https://jobs.example.test/apply?utm_source=first&job=one&token=secret-one',
+          },
+          {
+            company: 'Synthetic Company',
+            title: 'Platform Engineer',
+            providerId: 'query-opening-two',
+            url: 'https://jobs.example.test/apply?token=secret-two&job=two&utm_source=second',
+          },
+        ],
+      },
+    },
+  };
+  const normalise = ({ priorArtifact }) => compactCandidates(
+    priorArtifact.sources,
+    DEFAULT_CANDIDATE_LIMIT,
+  );
+  const stages = {
+    collect: async () => {
+      collectCalls += 1;
+      return collected;
+    },
+    normalise,
+    deduplicate: ({ priorArtifact }) => priorArtifact,
+    filter: ({ priorArtifact }) => priorArtifact,
+    rank: ({ priorArtifact }) => priorArtifact,
+    select: ({ priorArtifact }) => priorArtifact,
+  };
+  const leaseOptions = {
+    wallNow: () => now,
+    monotonicNow: () => now,
+    leaseDurationMs: 1_000,
+    takeoverMarginMs: 0,
+  };
+  try {
+    assert.equal(normalise({ priorArtifact: collected }).candidates.length, 2);
+    await assert.rejects(
+      runScanPipeline({
+        root,
+        compatibility: RECOVERY_COMPATIBILITY,
+        stages,
+        leaseOptions,
+        onStageCommitted({ stageId }) {
+          if (stageId !== 'collect') return;
+          now += 1_001;
+          throw new PipelineInterruptedError('synthetic stop after durable legacy collect');
+        },
+      }),
+      PipelineInterruptedError,
+    );
+    const recovered = await runScanPipeline({
+      root,
+      compatibility: RECOVERY_COMPATIBILITY,
+      stages,
+      leaseOptions,
+    });
+    assert.equal(collectCalls, 1);
+    assert.equal(recovered.outcome, 'complete');
+    assert.equal(recovered.stageOutputs.normalise.candidates.length, 2);
+    assert.equal(
+      new Set(recovered.stageOutputs.normalise.candidates.map((item) => item.urlIdentityDigest)).size,
+      2,
+    );
+    const persisted = fs.readdirSync(path.join(
+      root,
+      '.scout',
+      'runs',
+      recovered.runId,
+      'artifacts',
+    )).map((name) => fs.readFileSync(path.join(
+      root,
+      '.scout',
+      'runs',
+      recovered.runId,
+      'artifacts',
+      name,
+    ), 'utf8')).join('\n');
+    assert.doesNotMatch(persisted, /secret-one|secret-two|utm_source|job=one|job=two/);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
 
 test('committed durable stage boundaries let the existing heartbeat run between synchronous stages', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'scout-stage-boundary-heartbeat-'));
