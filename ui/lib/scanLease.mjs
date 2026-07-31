@@ -296,15 +296,26 @@ export function currentLeaseOwner() {
   return cachedCurrentOwner;
 }
 
-function ownerIsLive(owner) {
+export function observeProcessOwner(pid) {
+  if (!Number.isSafeInteger(pid) || pid < 1) throw new TypeError('process owner PID is invalid');
+  return Object.freeze({
+    host: os.hostname(),
+    pid,
+    processStart: processStartIdentity(pid),
+  });
+}
+
+export function processOwnerIsLiveOrAmbiguous(owner) {
   // A different host is unverifiable, not dead. Preserving its guard is the
   // only safe choice for a workspace unexpectedly shared across hosts.
-  if (owner?.host !== os.hostname()) return true;
+  if (!owner || typeof owner.host !== 'string' || !Number.isSafeInteger(owner.pid)
+    || owner.pid < 1 || owner.host !== os.hostname()) return true;
   try {
     process.kill(owner.pid, 0);
   } catch (error) {
-    return error?.code === 'EPERM';
+    return error?.code !== 'ESRCH';
   }
+  if (typeof owner.processStart !== 'string' || !owner.processStart) return true;
   const currentStart = processStartIdentity(owner.pid);
   if (currentStart) {
     const recordedDarwin = darwinIdentity(owner.processStart);
@@ -331,6 +342,10 @@ function ownerIsLive(owner) {
   // guard. A false live result delays recovery; a false dead result permits
   // simultaneous writers.
   return true;
+}
+
+function ownerIsLive(owner) {
+  return processOwnerIsLiveOrAmbiguous(owner);
 }
 
 function wallMilliseconds(options) {
@@ -1417,6 +1432,9 @@ export function appendObservedScanQueueEvent(root, observed, input, inputOptions
       const digest = createHash('sha256').update(contents).digest('hex');
       if (digest !== input.expectedDigest) {
         return Object.freeze({ active: true, appended: false });
+      }
+      if (contents.length && contents[contents.length - 1] !== 0x0a) {
+        return Object.freeze({ active: true, appended: false, needsRecovery: true });
       }
       fs.mkdirSync(path.dirname(file), { recursive: true });
       const descriptor = fs.openSync(file, 'a');

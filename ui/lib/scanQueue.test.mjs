@@ -10,6 +10,7 @@ import {
   claimNextScanRequest, completeScanRequest, coverScheduledScanWindow, enqueueOverlappingScanRequest, enqueueScanRequest,
   projectScanQueue, recoverOrphanedScanRequest,
 } from './scanQueue.mjs';
+import { compactScanQueue } from './runRetention.mjs';
 
 function workspace() {
   return fs.mkdtempSync(path.join(os.tmpdir(), 'scout-scan-queue-'));
@@ -47,6 +48,148 @@ function stableJson(value) {
 }
 
 function digest(value) { return createHash('sha256').update(stableJson(value)).digest('hex'); }
+
+test('a genuinely torn final queue append is quarantined and later lifecycle work continues', () => {
+  const root = workspace();
+  const activeLease = lease(root, 'torn-queue-tail');
+  const file = path.join(root, '.scout', 'scan-queue.jsonl');
+  try {
+    enqueueScanRequest(root, request({ id: 'before-torn-tail', lease: activeLease }));
+    fs.appendFileSync(file, '{"schemaVersion":4,"eventId":', 'utf8');
+
+    assert.deepEqual(projectScanQueue(root).ready.map((item) => item.id), ['before-torn-tail']);
+    enqueueScanRequest(root, request({
+      id: 'after-torn-tail',
+      key: 'after-torn-tail',
+      requestedAt: '2026-07-27T08:01:00.000Z',
+      expiresAt: '2026-07-28T08:01:00.000Z',
+      lease: activeLease,
+    }));
+
+    const recoveryRoot = path.join(root, '.scout', 'scan-queue-tail-recoveries');
+    const recoveryIds = fs.readdirSync(recoveryRoot);
+    assert.equal(recoveryIds.length, 1);
+    const recovery = path.join(recoveryRoot, recoveryIds[0]);
+    assert.equal(fs.readFileSync(path.join(recovery, 'tail.json.part'), 'utf8'), '{"schemaVersion":4,"eventId":');
+    assert.equal(JSON.parse(fs.readFileSync(path.join(recovery, 'receipt.json'), 'utf8')).tailBytes > 0, true);
+    assert.doesNotMatch(fs.readFileSync(file, 'utf8'), /"eventId":$/);
+
+    const first = claimNextScanRequest(root, compatibility, activeLease, new Date('2026-07-27T08:02:00.000Z'));
+    completeScanRequest(root, first.id, 'succeeded', activeLease, first.claim);
+    const second = claimNextScanRequest(root, compatibility, activeLease, new Date('2026-07-27T08:03:00.000Z'));
+    completeScanRequest(root, second.id, 'succeeded', activeLease, second.claim);
+    assert.deepEqual(projectScanQueue(root).requests.map((item) => item.status), ['succeeded', 'succeeded']);
+
+    compactScanQueue(root, activeLease, { now: new Date('2026-07-27T08:04:00.000Z') });
+    assert.equal(fs.existsSync(path.join(recovery, 'receipt.json')), true);
+    assert.equal(fs.existsSync(path.join(recovery, 'tail.json.part')), true);
+  } finally {
+    releaseScanLease(activeLease);
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('a complete final queue record without a delimiter is authoritative and normalises before append', () => {
+  const root = workspace();
+  const activeLease = lease(root, 'complete-queue-tail');
+  const file = path.join(root, '.scout', 'scan-queue.jsonl');
+  try {
+    enqueueScanRequest(root, request({ id: 'complete-tail-first', lease: activeLease }));
+    const complete = fs.readFileSync(file, 'utf8').trimEnd();
+    fs.writeFileSync(file, complete, 'utf8');
+    assert.deepEqual(projectScanQueue(root).ready.map((item) => item.id), ['complete-tail-first']);
+    enqueueScanRequest(root, request({
+      id: 'complete-tail-second',
+      key: 'complete-tail-second',
+      requestedAt: '2026-07-27T08:01:00.000Z',
+      expiresAt: '2026-07-28T08:01:00.000Z',
+      lease: activeLease,
+    }));
+    assert.equal(fs.readFileSync(file, 'utf8').endsWith('\n'), true);
+    assert.deepEqual(projectScanQueue(root).ready.map((item) => item.id), [
+      'complete-tail-first', 'complete-tail-second',
+    ]);
+  } finally {
+    releaseScanLease(activeLease);
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('syntactically complete invalid final queue evidence fails closed even without a delimiter', () => {
+  const root = workspace();
+  const activeLease = lease(root, 'invalid-complete-queue-tail');
+  const file = path.join(root, '.scout', 'scan-queue.jsonl');
+  try {
+    enqueueScanRequest(root, request({ id: 'valid-authoritative-prefix', lease: activeLease }));
+    const invalid = JSON.stringify({
+      schemaVersion: 4,
+      eventId: '11111111-1111-4111-8111-111111111111',
+      type: 'completed',
+      at: '2026-07-27T08:01:00.000Z',
+      requestId: 'valid-authoritative-prefix',
+      claimId: 'forged-claim',
+      outcome: 'succeeded',
+    });
+    fs.appendFileSync(file, invalid, 'utf8');
+    const damaged = fs.readFileSync(file, 'utf8');
+    assert.throws(() => projectScanQueue(root), /completion|claim|invalid/i);
+    assert.throws(
+      () => enqueueScanRequest(root, request({
+        id: 'must-not-append',
+        key: 'must-not-append',
+        lease: activeLease,
+      })),
+      /completion|claim|invalid/i,
+    );
+    assert.equal(fs.readFileSync(file, 'utf8'), damaged);
+    assert.equal(fs.existsSync(path.join(root, '.scout', 'scan-queue-tail-recoveries')), false);
+  } finally {
+    releaseScanLease(activeLease);
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('complete final queue schema, digest and identity violations are never treated as torn writes', () => {
+  for (const violation of ['schema', 'digest', 'identity']) {
+    const root = workspace();
+    const activeLease = lease(root, `invalid-${violation}-queue-tail`);
+    const file = path.join(root, '.scout', 'scan-queue.jsonl');
+    try {
+      enqueueScanRequest(root, request({ id: `prefix-${violation}`, key: 'shared-key', lease: activeLease }));
+      const prefix = JSON.parse(fs.readFileSync(file, 'utf8').trim());
+      let invalid;
+      if (violation === 'schema') {
+        invalid = { ...prefix, schemaVersion: 99, eventId: '11111111-1111-4111-8111-111111111111' };
+      } else if (violation === 'digest') {
+        const { lease: ignored, ...incoming } = request({
+          id: 'digest-incoming',
+          key: 'shared-key',
+          lease: activeLease,
+        });
+        void ignored;
+        invalid = {
+          schemaVersion: 4,
+          eventId: '22222222-2222-4222-8222-222222222222',
+          type: 'deduplicated',
+          at: '2026-07-27T08:01:00.000Z',
+          request: incoming,
+          requestDigest: '0'.repeat(64),
+          requestId: `prefix-${violation}`,
+        };
+      } else {
+        invalid = prefix;
+      }
+      fs.appendFileSync(file, JSON.stringify(invalid), 'utf8');
+      const damaged = fs.readFileSync(file, 'utf8');
+      assert.throws(() => projectScanQueue(root), /schema|digest|repeats|invalid/i);
+      assert.equal(fs.readFileSync(file, 'utf8'), damaged);
+      assert.equal(fs.existsSync(path.join(root, '.scout', 'scan-queue-tail-recoveries')), false);
+    } finally {
+      releaseScanLease(activeLease);
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  }
+});
 
 test('an overlap enqueue requires the same still-active observed scan and is idempotent after a lost response', () => {
   const root = workspace();

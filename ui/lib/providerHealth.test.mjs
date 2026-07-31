@@ -479,6 +479,20 @@ test('authentication mutation authority blocks only same-provider preflight and 
     { purpose: 'periodic', _leaseAuthority: immediateLeaseAuthority() },
   );
   assert.equal(overwritten.state, 'login-in-progress');
+  const lateSuccess = await recordProviderResultHealth(root, 'codex', { ok: true }, {
+    now: () => new Date(base + 3),
+    _leaseAuthority: immediateLeaseAuthority(),
+    _retryDelaysMs: [0],
+  });
+  assert.equal(lateSuccess.state, 'login-in-progress');
+
+  const verified = await providerPreflight(root, 'codex', 'post-auth', {
+    now: () => new Date(base + 4),
+    source: 'post-auth',
+    probe: async () => signal('remote-success', 4, 'post-auth'),
+    _leaseAuthority: immediateLeaseAuthority(),
+  });
+  assert.equal(verified.state, 'ready');
 
   const claude = await providerPreflight(root, 'claude', 'manual-run', {
     probe: async () => ({ kind: 'remote-success', source: 'manual-preflight' }),

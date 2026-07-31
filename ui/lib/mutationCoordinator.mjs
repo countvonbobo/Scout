@@ -7,14 +7,15 @@ import {
 } from './trackerPersistence.mjs';
 import { appendRunEvent, replayRunJournal } from './runJournal.mjs';
 import {
-  LeaseLostError, assertCurrentFence, assertScanLeaseScope, isScanLease,
-  synchronousFenceCallback,
+  LeaseLostError, assertCurrentFence, assertScanLeaseScope, currentLeaseOwner,
+  isScanLease, observeProcessOwner, processOwnerIsLiveOrAmbiguous, synchronousFenceCallback,
 } from './scanLease.mjs';
 import { workspacePaths } from './workspace.mjs';
 import { canonicalMutationRecipe, renderMutationRecipe } from './scanMutationProjection.mjs';
 
 export const MUTATION_SCHEMA_VERSION = 1;
 const MUTATION_GUARD = 'mutation.guard';
+const MUTATION_GUARD_SCHEMA_VERSION = 2;
 const MAX_MUTATION_BYTES = 16 * 1024 * 1024;
 const SAFE_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 const SHA256 = /^[a-f0-9]{64}$/;
@@ -483,13 +484,39 @@ function readGuard(directory) {
   try {
     const value = JSON.parse(fs.readFileSync(path.join(directory, 'owner.json'), 'utf8'));
     if (!value || Object.getPrototypeOf(value) !== Object.prototype
-      || Object.keys(value).sort().join(',') !== 'coordinatorId,fencingGeneration,leaseId,schemaVersion'
-      || value.schemaVersion !== MUTATION_SCHEMA_VERSION
+      || Object.keys(value).sort().join(',') !== 'childOperation,coordinatorId,fencingGeneration,leaseId,owner,schemaVersion'
+      || value.schemaVersion !== MUTATION_GUARD_SCHEMA_VERSION
       || !SAFE_ID.test(value.coordinatorId || '')
       || !SAFE_ID.test(value.leaseId || '')
       || !Number.isSafeInteger(value.fencingGeneration)
-      || value.fencingGeneration < 1) {
+      || value.fencingGeneration < 1
+      || !value.owner || Object.getPrototypeOf(value.owner) !== Object.prototype
+      || Object.keys(value.owner).sort().join(',') !== 'host,pid,processStart'
+      || typeof value.owner.host !== 'string' || !value.owner.host || value.owner.host.length > 255
+      || !Number.isSafeInteger(value.owner.pid) || value.owner.pid < 1
+      || !SAFE_ID.test(value.owner.processStart || '')) {
       throw new Error('invalid coordinator metadata');
+    }
+    if (value.childOperation !== null) {
+      const child = value.childOperation;
+      if (!child || Object.getPrototypeOf(child) !== Object.prototype
+        || Object.keys(child).sort().join(',') !== 'operationId,owner,phase,state'
+        || !SAFE_ID.test(child.operationId || '')
+        || !SAFE_ID.test(child.phase || '')
+        || !['starting', 'running'].includes(child.state)
+        || (child.state === 'starting' && child.owner !== null)) {
+        throw new Error('invalid coordinator child-operation metadata');
+      }
+      if (child.state === 'running') {
+        const owner = child.owner;
+        if (!owner || Object.getPrototypeOf(owner) !== Object.prototype
+          || Object.keys(owner).sort().join(',') !== 'host,pid,processStart'
+          || typeof owner.host !== 'string' || !owner.host || owner.host.length > 255
+          || !Number.isSafeInteger(owner.pid) || owner.pid < 1
+          || (owner.processStart !== null && !SAFE_ID.test(owner.processStart || ''))) {
+          throw new Error('invalid coordinator child owner metadata');
+        }
+      }
     }
     return value;
   } catch (error) {
@@ -497,15 +524,24 @@ function readGuard(directory) {
   }
 }
 
+function existingGuardMayStillMutate(existing) {
+  if (processOwnerIsLiveOrAmbiguous(existing.owner)) return true;
+  if (existing.childOperation === null) return false;
+  if (existing.childOperation.state === 'starting' || existing.childOperation.owner === null) return true;
+  return processOwnerIsLiveOrAmbiguous(existing.childOperation.owner);
+}
+
 function createGuard(root, lease) {
   const directory = guardDirectory(root);
   fs.mkdirSync(path.dirname(directory), { recursive: true });
   const coordinatorId = randomUUID();
   const metadata = {
-    schemaVersion: MUTATION_SCHEMA_VERSION,
+    schemaVersion: MUTATION_GUARD_SCHEMA_VERSION,
     coordinatorId,
     leaseId: lease.leaseId,
     fencingGeneration: lease.generation,
+    owner: currentLeaseOwner(),
+    childOperation: null,
   };
   const acquire = () => {
     fs.mkdirSync(directory);
@@ -517,7 +553,8 @@ function createGuard(root, lease) {
     if (error?.code !== 'EEXIST') throw error;
     const existing = readGuard(directory);
     if (Number.isSafeInteger(existing?.fencingGeneration)
-      && existing.fencingGeneration < lease.generation) {
+      && existing.fencingGeneration < lease.generation
+      && !existingGuardMayStillMutate(existing)) {
       fs.renameSync(directory, `${directory}.quarantine.${randomUUID()}`);
       acquire();
     } else {
@@ -527,10 +564,59 @@ function createGuard(root, lease) {
   return { directory, metadata };
 }
 
+function replaceGuard(guard, next) {
+  const current = readGuard(guard.directory);
+  if (stableJson(current) !== stableJson(guard.metadata)) {
+    throw new MutationCoordinatorBusyError('workspace mutation coordinator ownership changed');
+  }
+  atomicWriteFile(path.join(guard.directory, 'owner.json'), `${stableJson(next)}\n`, { mode: 0o600 });
+  guard.metadata = next;
+}
+
+function guardController(guard) {
+  return Object.freeze({
+    beginChild(phase) {
+      requireId(phase, 'workspace mutation child phase');
+      if (guard.metadata.childOperation !== null) {
+        throw new MutationCoordinatorBusyError('workspace mutation child operation is already active');
+      }
+      const operationId = randomUUID();
+      replaceGuard(guard, {
+        ...guard.metadata,
+        childOperation: { operationId, phase, state: 'starting', owner: null },
+      });
+      return operationId;
+    },
+    attachChild(operationId, pid) {
+      const child = guard.metadata.childOperation;
+      if (child?.operationId !== operationId || child.state !== 'starting') {
+        throw new MutationCoordinatorBusyError('workspace mutation child operation ownership changed');
+      }
+      replaceGuard(guard, {
+        ...guard.metadata,
+        childOperation: {
+          ...child,
+          state: 'running',
+          owner: observeProcessOwner(pid),
+        },
+      });
+    },
+    finishChild(operationId) {
+      if (guard.metadata.childOperation?.operationId !== operationId) {
+        throw new MutationCoordinatorBusyError('workspace mutation child operation ownership changed');
+      }
+      replaceGuard(guard, { ...guard.metadata, childOperation: null });
+    },
+  });
+}
+
 function releaseGuard(guard) {
   const current = readGuard(guard.directory);
   if (stableJson(current) !== stableJson(guard.metadata)) {
     throw new MutationCoordinatorBusyError('workspace mutation coordinator ownership changed');
+  }
+  if (current.childOperation !== null) {
+    throw new MutationCoordinatorBusyError('workspace mutation child operation has not closed');
   }
   fs.unlinkSync(path.join(guard.directory, 'owner.json'));
   fs.rmdirSync(guard.directory);
@@ -545,9 +631,10 @@ export function withMutationCoordinator(root, lease, commit) {
   assertScanLeaseScope(lease, root, lease?.runId);
   assertFence(lease);
   const guard = createGuard(root, lease);
+  const controller = guardController(guard);
   try {
     assertFence(lease);
-    const result = commit();
+    const result = commit(controller);
     if (result && typeof result.then === 'function') {
       return Promise.resolve(result).finally(() => releaseGuard(guard));
     }

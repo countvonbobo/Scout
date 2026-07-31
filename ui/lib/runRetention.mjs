@@ -7,7 +7,7 @@ import { validateRunJournal } from './runJournal.mjs';
 import {
   assertCurrentFence, assertScanLeaseScope, synchronousFenceCallback,
 } from './scanLease.mjs';
-import { projectScanQueue } from './scanQueue.mjs';
+import { projectScanQueue, recoverScanQueueTail } from './scanQueue.mjs';
 import {
   assertPersistedRecoveryDataKey, verifyReviewedRunArchive, writeReviewedRunArchive,
 } from './recoveryBackup.mjs';
@@ -982,7 +982,10 @@ export function compactScanQueue(root, lease, {
     throw new TypeError('queue summary retention must be a non-negative whole number');
   }
   assertScanLeaseScope(lease, root, lease?.runId);
-  currentFence(lease, () => reduceCompletedQueueOperations(root));
+  currentFence(lease, () => {
+    recoverScanQueueTail(root);
+    reduceCompletedQueueOperations(root);
+  });
   const snapshot = currentFence(lease, () => queueEvents(root));
   const projection = projectScanQueue(root, now);
   const cutoff = now.getTime() - summaryDays * DAY_MS;

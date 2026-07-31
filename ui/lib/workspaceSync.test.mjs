@@ -73,6 +73,15 @@ function backupLease(root, runId = 'backup-resolution-test') {
   return lease;
 }
 
+async function waitUntil(predicate, timeoutMs = 5_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (predicate()) return;
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  throw new Error('timed out waiting for backup coordination fixture');
+}
+
 function commitRawIndexEntry(root, relative, mode, contentOrOid, message) {
   let oid = contentOrOid;
   if (mode !== '160000') {
@@ -517,6 +526,80 @@ test('a stale runtime sync fence prevents the first local mutation', async () =>
   assert.equal(git(f.root, 'log', '--all', '--oneline'), '');
   assert.match(git(f.root, 'status', '--porcelain'), /workspace\.json/);
   fs.rmSync(f.base, { recursive: true, force: true });
+});
+
+test('startup and periodic checkpoints report pending while another process owns every mutation phase', async () => {
+  const holderFixture = new URL('./fixtures/scan-lease-holder.mjs', import.meta.url);
+  for (const [phase, reason] of [
+    ['collect', 'startup sync'],
+    ['profile-publication', 'periodic sync'],
+    ['tracker-report', 'periodic sync'],
+    ['finalise', 'periodic sync'],
+  ]) {
+    const f = fixture();
+    git(f.root, 'init');
+    const marker = path.join(f.root, `.holder-${phase}.json`);
+    const holder = spawn(process.execPath, [holderFixture.pathname, f.root, phase, marker], {
+      stdio: 'ignore',
+      windowsHide: true,
+    });
+    let spawnCalls = 0;
+    try {
+      await waitUntil(() => fs.existsSync(marker));
+      const result = await queueWorkspaceSync(f.root, reason, {
+        spawn(command, args, options) {
+          spawnCalls += 1;
+          return spawnSync(command, args, options);
+        },
+      });
+      assert.equal(result.state, 'pending');
+      assert.equal(result.pending, true);
+      assert.equal(result.reasonCode, 'mutation-busy');
+      assert.equal(spawnCalls, 0, `${reason} must not start Git during ${phase}`);
+    } finally {
+      holder.kill('SIGKILL');
+      await waitUntil(() => holder.exitCode !== null || holder.signalCode !== null);
+      fs.rmSync(f.base, { recursive: true, force: true });
+    }
+  }
+});
+
+test('a backup that loses its lease starts no mutation and is never retried unfenced', async () => {
+  const f = fixture();
+  git(f.root, 'init');
+  const lease = backupLease(f.root, 'backup-fence-loss');
+  let successor;
+  const commands = [];
+  let revoked = false;
+  try {
+    const result = await runWorkspaceSync(f.root, 'lease-loss checkpoint', {
+      lease,
+      spawn(command, args, options) {
+        commands.push(args.join(' '));
+        const response = spawnSync(command, args, options);
+        if (!revoked) {
+          revoked = true;
+          releaseScanLease(lease);
+          successor = backupLease(f.root, 'backup-fence-successor');
+        }
+        return response;
+      },
+    });
+    assert.equal(result.state, 'pending');
+    assert.equal(result.reasonCode, 'mutation-busy');
+    assert.equal(commands.every((command) => (
+      command === 'rev-parse --show-toplevel'
+      || command === 'config --get user.name'
+      || command === 'config --get user.email'
+    )), true);
+    assert.equal(commands.some((command) => /^(?:init|add|commit|merge|push|rm|update-index)\b/.test(command)), false);
+    assert.equal(git(f.root, 'log', '--all', '--oneline'), '');
+    assert.match(git(f.root, 'status', '--porcelain'), /workspace\.json/);
+  } finally {
+    if (successor) releaseScanLease(successor);
+    else if (!revoked) releaseScanLease(lease);
+    fs.rmSync(f.base, { recursive: true, force: true });
+  }
 });
 
 test('a workspace nested under another checkout never checkpoints the parent repository', async () => {

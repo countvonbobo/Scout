@@ -8,8 +8,13 @@ import {
   initializeRecoveryBackup, loadRecoveryHeader, RECOVERY_DIR, restoreRecoveryBackup, restoreRecoveryBackupWithKey,
   restoreRecoveryBackupWithKeyAsync, rotateRecoveryPassphrase, writeRecoveryBackup, writeRecoveryBackupAsync,
 } from './recoveryBackup.mjs';
-import { withMutationCoordinator } from './mutationCoordinator.mjs';
-import { assertCurrentFence, synchronousFenceCallback } from './scanLease.mjs';
+import {
+  MutationCoordinatorBusyError, withMutationCoordinator,
+} from './mutationCoordinator.mjs';
+import {
+  LeaseLostError, acquireScanLease, assertCurrentFence, currentLeaseOwner,
+  releaseScanLease, startLeaseHeartbeat, synchronousFenceCallback,
+} from './scanLease.mjs';
 
 const SETTINGS = '.scout/sync.json';
 const STATUS = new Map();
@@ -42,10 +47,16 @@ const PUBLIC_SYNC_ERRORS = new Set([
 class RuntimeCommandTimeoutError extends Error {}
 
 function runGit(cwd, args, options = {}) {
-  const result = (options.spawn || spawnSync)('git', args, {
-    cwd, encoding: 'utf8', windowsHide: true,
-    env: { ...process.env, ...(options.env || {}), GIT_TERMINAL_PROMPT: options.allowPrompt ? '1' : '0' },
-  });
+  const childOperation = options.mutationCoordinator?.beginChild(args[0]);
+  let result;
+  try {
+    result = (options.spawn || spawnSync)('git', args, {
+      cwd, encoding: 'utf8', windowsHide: true,
+      env: { ...process.env, ...(options.env || {}), GIT_TERMINAL_PROMPT: options.allowPrompt ? '1' : '0' },
+    });
+  } finally {
+    if (childOperation !== undefined) options.mutationCoordinator.finishChild(childOperation);
+  }
   return {
     ok: result.status === 0,
     status: result.status,
@@ -162,17 +173,18 @@ function collectChildProcess(child, timeoutMs) {
   });
 }
 
-function defaultSpawnAsync(command, args, spawnOptions, timeoutMs) {
+function defaultSpawnAsync(command, args, spawnOptions, timeoutMs, onSpawn) {
   const child = spawn(command, args, {
     ...spawnOptions,
     detached: process.platform !== 'win32',
     encoding: undefined,
     stdio: ['ignore', 'pipe', 'pipe'],
   });
+  onSpawn?.(child);
   return collectChildProcess(child, timeoutMs);
 }
 
-async function adapterSpawnAsync(spawnAdapter, command, args, spawnOptions, timeoutMs) {
+async function adapterSpawnAsync(spawnAdapter, command, args, spawnOptions, timeoutMs, onSpawn) {
   const startedAt = Date.now();
   let timer;
   let value;
@@ -199,6 +211,7 @@ async function adapterSpawnAsync(spawnAdapter, command, args, spawnOptions, time
     clearTimeout(timer);
   }
   if (!isChildProcess(value)) return value;
+  onSpawn?.(value);
   return collectChildProcess(value, Math.max(1, timeoutMs - (Date.now() - startedAt)));
 }
 
@@ -213,16 +226,25 @@ async function runGitAsync(cwd, args, options = {}) {
     env: { ...process.env, ...(options.env || {}), GIT_TERMINAL_PROMPT: options.allowPrompt ? '1' : '0' },
   };
   let result;
-  if (options.spawnAsync || options.spawn) {
-    result = await adapterSpawnAsync(
-      options.spawnAsync || options.spawn,
-      'git',
-      args,
-      spawnOptions,
-      timeoutMs,
-    );
-  } else {
-    result = await defaultSpawnAsync('git', args, spawnOptions, timeoutMs);
+  const childOperation = options.mutationCoordinator?.beginChild(args[0]);
+  const onSpawn = childOperation === undefined
+    ? undefined
+    : (child) => options.mutationCoordinator.attachChild(childOperation, child.pid);
+  try {
+    if (options.spawnAsync || options.spawn) {
+      result = await adapterSpawnAsync(
+        options.spawnAsync || options.spawn,
+        'git',
+        args,
+        spawnOptions,
+        timeoutMs,
+        onSpawn,
+      );
+    } else {
+      result = await defaultSpawnAsync('git', args, spawnOptions, timeoutMs, onSpawn);
+    }
+  } finally {
+    if (childOperation !== undefined) options.mutationCoordinator.finishChild(childOperation);
   }
   const stdout = boundedOutput(result?.stdout).trim();
   const stderr = boundedOutput(result?.stderr).trim();
@@ -874,7 +896,7 @@ function checkpointLocally(root, settings, options, reason) {
   commitAll(root, `scout: ${reason}`, options);
 }
 
-export async function runWorkspaceSync(root, reason = 'workspace update', options = {}) {
+async function runWorkspaceSyncUncoordinated(root, reason = 'workspace update', options = {}) {
   try {
     const settings = loadSyncSettings(root);
     if (!await repoReadyAsync(root, options)) return setState(root, 'disabled', { enabled: false });
@@ -1047,6 +1069,68 @@ export async function runWorkspaceSync(root, reason = 'workspace update', option
   }
 }
 
+function fencedSyncOptions(lease, options) {
+  const callerFence = options.assertFence;
+  return {
+    ...options,
+    assertFence: () => {
+      assertCurrentFence(lease, synchronousFenceCallback(() => true));
+      callerFence?.();
+    },
+  };
+}
+
+function pendingCheckpoint(root) {
+  let enabled = false;
+  try { enabled = loadSyncSettings(root).enabled; } catch {}
+  return {
+    state: 'pending',
+    enabled,
+    pending: true,
+    error: 'Private backup is waiting for another workspace update',
+    reasonCode: 'mutation-busy',
+  };
+}
+
+export async function runWorkspaceSync(root, reason = 'workspace update', options = {}) {
+  const suppliedLease = options.lease;
+  const lease = suppliedLease || acquireScanLease(
+    root,
+    currentLeaseOwner(),
+    {
+      kind: 'backup',
+      runId: `backup-${crypto.randomUUID()}`,
+      phase: 'checkpoint',
+    },
+  );
+  if (!lease) return pendingCheckpoint(root);
+  const heartbeat = suppliedLease ? null : startLeaseHeartbeat(lease);
+  try {
+    return await withMutationCoordinator(root, lease, (mutationCoordinator) => (
+      runWorkspaceSyncUncoordinated(
+        root,
+        reason,
+        {
+          ...fencedSyncOptions(lease, options),
+          mutationCoordinator,
+        },
+      )
+    ));
+  } catch (error) {
+    if (error instanceof LeaseLostError || error instanceof MutationCoordinatorBusyError) {
+      return pendingCheckpoint(root);
+    }
+    throw error;
+  } finally {
+    heartbeat?.stop();
+    if (!suppliedLease) {
+      try { releaseScanLease(lease); } catch (error) {
+        if (!(error instanceof LeaseLostError)) throw error;
+      }
+    }
+  }
+}
+
 const QUEUES = new Map();
 export function queueWorkspaceSync(root, reason, options = {}) {
   const key = path.resolve(root);
@@ -1057,16 +1141,6 @@ export function queueWorkspaceSync(root, reason, options = {}) {
   return next;
 }
 
-function fencedSyncOptions(lease, options) {
-  return {
-    ...options,
-    assertFence: () => assertCurrentFence(
-      lease,
-      synchronousFenceCallback(() => true),
-    ),
-  };
-}
-
 export async function resolveBackupDivergence(root, analysisToken, lease, options = {}) {
   if (!/^[a-f0-9]{64}$/.test(String(analysisToken || ''))) {
     throw new Error('Backup history changed; review the refreshed diagnosis before fixing it');
@@ -1075,7 +1149,8 @@ export async function resolveBackupDivergence(root, analysisToken, lease, option
   if (!settings.enabled) throw new Error('Private backup is not enabled');
   const fenced = fencedSyncOptions(lease, options);
 
-  return withMutationCoordinator(root, lease, async () => {
+  return withMutationCoordinator(root, lease, async (mutationCoordinator) => {
+    Object.assign(fenced, { mutationCoordinator });
     const fetch = await runtimeGit(root, ['fetch', 'origin'], fenced, { mutation: true });
     if (!fetch.ok) {
       return setState(root, 'offline', { enabled: true, pending: true, error: fetch.error });
@@ -1150,7 +1225,7 @@ export async function resolveBackupDivergence(root, analysisToken, lease, option
       });
     }
 
-    const status = await runWorkspaceSync(root, 'resolve backup divergence', fenced);
+    const status = await runWorkspaceSyncUncoordinated(root, 'resolve backup divergence', fenced);
     return {
       ...status,
       resolved: status.state === 'synced',

@@ -19,6 +19,7 @@ import { loadWorkspaceConfig, modelForProvider } from './workspace.mjs';
 import { detectProviderModelCataloguesAsync, providerStatus } from './providers.mjs';
 import { runStructuredTurn } from './structuredTurn.mjs';
 import { recordProviderResultHealth } from './providerHealth.mjs';
+import { assertProviderAuthIdle } from './providerAuthMutation.mjs';
 import {
   interviewPrepAgentPrompt, interviewPrepPrefills, readInterviewPrep,
 } from './interviewPrep.mjs';
@@ -126,6 +127,7 @@ export function registerChatRoutes({
   providerCataloguesFn = detectProviderModelCataloguesAsync,
   runCvQualityFn = runCvQuality, runStructuredTurnFn = runStructuredTurn,
   recordProviderResultHealthFn = recordProviderResultHealth, onCheckpoint = () => {},
+  assertProviderAuthIdleFn = assertProviderAuthIdle,
 }) {
   const catalogueReasonCodes = new Set([
     'catalogue-check-failed',
@@ -162,6 +164,7 @@ export function registerChatRoutes({
   // default from settings, so existing chats keep working unchanged.
   function engineStatus(engine, modelOverride = null) {
     const config = loadWorkspaceConfig(repoRoot);
+    assertProviderAuthIdleFn(repoRoot, engine);
     const status = providerStatusFn(engine);
     if (!status.installed || !status.authenticated) throw new Error(`${engine} CLI is not installed and signed in`);
     return { config, status, model: modelOverride || modelForProvider(config, engine) };
@@ -173,6 +176,11 @@ export function registerChatRoutes({
       model, command: status.executable, env: status.env,
       ...(engine === 'codex' ? { reasoningEffort: 'medium' } : {}),
     });
+  }
+  function turnStartMessage(error, fallback) {
+    return error?.reasonCode === 'provider-auth-in-progress'
+      ? 'Provider sign-in is being updated. Wait for it to finish, then retry.'
+      : fallback;
   }
   function entryOf(id) {
     if (id === ONBOARDING_CHAT_ID) {
@@ -396,7 +404,9 @@ export function registerChatRoutes({
         onEvent: () => {},
       });
     } catch (e) {
-      sseSend(res, 'error', { message: 'Handoff summary could not start.' });
+      sseSend(res, 'error', {
+        message: turnStartMessage(e, 'Handoff summary could not start.'),
+      });
       return sseEnd(res);
     }
     running.set(id, t1);
@@ -450,7 +460,7 @@ export function registerChatRoutes({
         onEvent: (ev) => { if (ev.kind === 'delta') sseSend(res, 'delta', { text: ev.text }); },
       });
     } catch (e) {
-      const message = 'Handoff provider turn could not start.';
+      const message = turnStartMessage(e, 'Handoff provider turn could not start.');
       appendMessage(chat, 'system', message, nowIso());
       try { saveChatFn(repoRoot, id, chat, purpose); } catch { /* the earlier handoff state is already persisted */ }
       sseSend(res, 'error', { message, engine: to, sessionId: chat.cliSessionId });
@@ -526,7 +536,11 @@ export function registerChatRoutes({
     sseStart(res);
     let built;
     try { built = engineBuild(engine, chat.cliSessionId, model); } catch (e) {
-      sseSend(res, 'error', { message: 'Provider turn could not start.' });
+      sseSend(res, 'error', {
+        message: turnStartMessage(e, 'Provider turn could not start.'),
+        reasonCode: e?.reasonCode === 'provider-auth-in-progress'
+          ? 'provider-auth-in-progress' : 'provider-unavailable',
+      });
       return sseEnd(res);
     }
     const attemptedModel = model || modelForProvider(loadWorkspaceConfig(repoRoot), engine);
@@ -634,11 +648,20 @@ export function registerChatRoutes({
       sseSend(res, 'delta', { text: answer });
       sseSend(res, 'done', { text: answer, engine, usage: result.usage, filesTouched: chat.filesTouched });
     } catch (error) {
-      appendMessage(chat, 'user', text, nowIso());
-      appendMessage(chat, 'system', 'Fit assessment failed.', nowIso());
+      const message = turnStartMessage(error, 'Fit assessment failed.');
+      if (error?.reasonCode !== 'provider-auth-in-progress') {
+        appendMessage(chat, 'user', text, nowIso());
+        appendMessage(chat, 'system', message, nowIso());
+      }
       try { saveChatFn(repoRoot, id, chat); } catch { /* preserve the primary provider error */ }
       checkpoint(`save failed chat - ${id}`);
-      sseSend(res, 'error', { message: 'Fit assessment failed.', engine, filesTouched: chat.filesTouched });
+      sseSend(res, 'error', {
+        message,
+        reasonCode: error?.reasonCode === 'provider-auth-in-progress'
+          ? 'provider-auth-in-progress' : 'provider-error',
+        engine,
+        filesTouched: chat.filesTouched,
+      });
     } finally {
       running.delete(id);
       sseEnd(res);

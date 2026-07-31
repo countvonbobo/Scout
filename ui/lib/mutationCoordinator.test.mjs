@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
+import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -52,6 +53,24 @@ function fixture() {
   const lease = acquireScanLease(root, currentLeaseOwner(), { kind: 'scan', runId: 'run-task-8' });
   const handle = openRunJournal(root, 'run-task-8');
   return { root, lease, handle };
+}
+
+async function waitUntil(predicate, timeoutMs = 5_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (predicate()) return;
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  throw new Error('timed out waiting for mutation child fixture');
+}
+
+function processExists(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return error?.code === 'EPERM';
+  }
 }
 
 function mutationInput(root) {
@@ -205,6 +224,79 @@ test('the shared coordinator remains held until the durable receipt is appended'
     },
   });
   assert.equal(reconcileMutation(plan).status, 'receipted');
+});
+
+test('parent death during merge, add, commit and push keeps every live child fenced from a successor', async () => {
+  const fixtureFile = new URL('./fixtures/mutation-child-owner.mjs', import.meta.url);
+  for (const phase of ['merge', 'add', 'commit', 'push']) {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), `scout-orphan-${phase}-`));
+    roots.push(root);
+    const marker = path.join(root, 'child.json');
+    const owner = spawn(process.execPath, [fixtureFile.pathname, root, phase, marker], {
+      stdio: 'ignore',
+      windowsHide: true,
+    });
+    let childPid;
+    let successor;
+    try {
+      await waitUntil(() => fs.existsSync(marker));
+      const fixtureState = JSON.parse(fs.readFileSync(marker, 'utf8'));
+      ({ childPid } = fixtureState);
+      const guard = JSON.parse(fs.readFileSync(
+        path.join(root, '.scout', 'mutation.guard', 'owner.json'),
+        'utf8',
+      ));
+      assert.deepEqual(
+        Object.keys(guard.owner).sort(),
+        ['host', 'pid', 'processStart'],
+      );
+      assert.equal(guard.owner.pid, fixtureState.ownerPid);
+      assert.equal(guard.childOperation.operationId, fixtureState.operationId);
+      assert.equal(guard.childOperation.phase, phase);
+      assert.equal(guard.childOperation.owner.pid, childPid);
+      assert.match(guard.childOperation.owner.processStart, /^[A-Za-z0-9][A-Za-z0-9._:-]+$/);
+      assert.equal(processExists(childPid), true, `${phase} child must be live before parent death`);
+      owner.kill('SIGKILL');
+      await waitUntil(() => owner.exitCode !== null || owner.signalCode !== null || !processExists(owner.pid));
+      await new Promise((resolve) => setTimeout(resolve, 220));
+      successor = acquireScanLease(
+        root,
+        currentLeaseOwner(),
+        { kind: 'backup', runId: `successor-${phase}`, phase: 'checkpoint' },
+        { leaseDurationMs: 5_000, takeoverMarginMs: 0 },
+      );
+      assert.ok(successor, `${phase} successor lease was not acquired`);
+      assert.throws(
+        () => withMutationCoordinator(root, successor, () => assert.fail(`${phase} successor overlapped child`)),
+        /another workspace mutation is in progress/i,
+      );
+
+      if (process.platform === 'win32') {
+        spawn('taskkill.exe', ['/pid', String(childPid), '/T', '/F'], {
+          windowsHide: true,
+          stdio: 'ignore',
+        });
+      } else {
+        try { process.kill(-childPid, 'SIGKILL'); } catch { process.kill(childPid, 'SIGKILL'); }
+      }
+      await waitUntil(() => !processExists(childPid));
+      assert.equal(withMutationCoordinator(root, successor, () => `${phase}-recovered`), `${phase}-recovered`);
+      assert.equal(
+        fs.readdirSync(path.join(root, '.scout'))
+          .some((name) => name.startsWith('mutation.guard.quarantine.')),
+        true,
+      );
+    } finally {
+      if (processExists(owner.pid)) owner.kill('SIGKILL');
+      if (childPid && processExists(childPid)) {
+        try {
+          if (process.platform === 'win32') process.kill(childPid, 'SIGKILL');
+          else process.kill(-childPid, 'SIGKILL');
+        } catch {}
+      }
+      if (successor) releaseScanLease(successor);
+    }
+  }
 });
 
 test('the canonical run, target revision and intended content produce one stable prepared plan', () => {

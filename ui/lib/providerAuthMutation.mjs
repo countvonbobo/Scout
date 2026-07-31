@@ -10,6 +10,16 @@ const SCHEMA_VERSION = 1;
 const DEFAULT_DURATION_MS = 11 * 60 * 1000;
 const GUARD_STALE_MS = 15_000;
 
+export class ProviderAuthMutationActiveError extends Error {
+  constructor(provider, phase) {
+    super(`${provider} authentication is being updated`);
+    this.name = 'ProviderAuthMutationActiveError';
+    this.reasonCode = 'provider-auth-in-progress';
+    this.provider = provider;
+    this.phase = phase;
+  }
+}
+
 function checkedProvider(provider) {
   if (!PROVIDERS.has(provider)) throw new TypeError('provider authentication mutation provider is unsupported');
   return provider;
@@ -105,6 +115,12 @@ export function readProviderAuthMutation(root, provider, { now } = {}) {
   if (bytes.length > 4_096) throw new Error('provider authentication mutation record is oversized');
   const record = validate(JSON.parse(bytes.toString('utf8')), provider);
   return record.expiresAt > at ? structuredClone(record) : null;
+}
+
+export function assertProviderAuthIdle(root, provider, options = {}) {
+  const mutation = readProviderAuthMutation(root, provider, options);
+  if (mutation) throw new ProviderAuthMutationActiveError(provider, mutation.phase);
+  return true;
 }
 
 export function acquireProviderAuthMutation(root, provider, {

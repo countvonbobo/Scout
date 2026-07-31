@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
+import { atomicWriteFile } from './atomicWrite.mjs';
 import {
   appendObservedScanQueueEvent, assertCurrentFence, assertScanLeaseScope, synchronousFenceCallback,
 } from './scanLease.mjs';
@@ -14,6 +15,7 @@ const REQUEST_ID = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
 const REQUEST_KEY = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 const PURPOSE = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
 const FINGERPRINT = /^[a-f0-9]{64}$/;
+const MAX_TORN_TAIL_BYTES = 1024 * 1024;
 
 function queueFile(root) { return path.join(path.resolve(root), '.scout', 'scan-queue.jsonl'); }
 
@@ -203,24 +205,123 @@ function checkedLegacyEvent(record) {
 }
 
 function appendEvent(root, record) {
+  recoverScanQueueTail(root);
   const file = queueFile(root); fs.mkdirSync(path.dirname(file), { recursive: true });
   const descriptor = fs.openSync(file, 'a');
   try { fs.writeSync(descriptor, `${JSON.stringify(record)}\n`, undefined, 'utf8'); fs.fsyncSync(descriptor); } finally { fs.closeSync(descriptor); }
 }
 
+function jsonErrorPosition(message) {
+  const match = /\bposition (\d+)\b/.exec(message || '');
+  return match ? Number(match[1]) : null;
+}
+
+function genuinelyIncompleteJson(line, error) {
+  const message = String(error?.message || '');
+  if (/unexpected end|unterminated string/i.test(message)) return true;
+  const position = jsonErrorPosition(message);
+  return Number.isSafeInteger(position) && position >= line.length;
+}
+
+function checkedLine(line) {
+  try {
+    return checkedEvent(JSON.parse(line));
+  } catch (error) {
+    throw new Error(`scan queue journal is invalid: ${error.message}`);
+  }
+}
+
 function eventsFromContents(contents) {
   if (!contents) return [];
-  if (!contents.endsWith('\n')) throw new Error('scan queue journal is truncated');
-  return contents.slice(0, -1).split('\n').map((line) => { try { return checkedEvent(JSON.parse(line)); } catch (error) { throw new Error(`scan queue journal is invalid: ${error.message}`); } });
+  const complete = contents.endsWith('\n');
+  const lines = (complete ? contents.slice(0, -1) : contents).split('\n');
+  const tail = complete ? null : lines.pop();
+  const events = lines.map(checkedLine);
+  if (tail === null || tail === '') return events;
+  try {
+    events.push(checkedLine(tail));
+  } catch (error) {
+    let parseError;
+    try { JSON.parse(tail); } catch (caught) { parseError = caught; }
+    if (!parseError || !genuinelyIncompleteJson(tail, parseError)) throw error;
+  }
+  return events;
 }
 
 function queueSnapshot(root) {
   const file = queueFile(root);
   const contents = fs.existsSync(file) ? fs.readFileSync(file, 'utf8') : '';
+  let validContents = contents;
+  let truncatedTail = null;
+  if (contents && !contents.endsWith('\n')) {
+    const delimiter = contents.lastIndexOf('\n');
+    const tail = contents.slice(delimiter + 1);
+    try {
+      checkedLine(tail);
+    } catch (error) {
+      let parseError;
+      try { JSON.parse(tail); } catch (caught) { parseError = caught; }
+      if (!parseError || !genuinelyIncompleteJson(tail, parseError)) throw error;
+      validContents = delimiter < 0 ? '' : contents.slice(0, delimiter + 1);
+      truncatedTail = tail;
+    }
+  }
   return {
     digest: createHash('sha256').update(contents).digest('hex'),
     events: eventsFromContents(contents),
+    contents,
+    validContents,
+    truncatedTail,
   };
+}
+
+export function recoverScanQueueTail(root) {
+  const snapshot = queueSnapshot(root);
+  if (!snapshot.contents || snapshot.contents.endsWith('\n')) return { recovered: false };
+  const file = queueFile(root);
+  if (snapshot.truncatedTail === null) {
+    atomicWriteFile(file, `${snapshot.contents}\n`, { mode: 0o600 });
+    return { recovered: false, normalised: true };
+  }
+  const bytes = Buffer.byteLength(snapshot.truncatedTail, 'utf8');
+  if (bytes < 1 || bytes > MAX_TORN_TAIL_BYTES) {
+    throw new Error('scan queue truncated tail is outside the recovery bound');
+  }
+  const prefixDigest = createHash('sha256').update(snapshot.validContents).digest('hex');
+  const tailDigest = createHash('sha256').update(snapshot.truncatedTail).digest('hex');
+  const recoveryId = createHash('sha256')
+    .update(`scan-queue-tail\0${prefixDigest}\0${tailDigest}`)
+    .digest('hex');
+  const directory = path.join(path.resolve(root), '.scout', 'scan-queue-tail-recoveries', recoveryId);
+  const tailFile = path.join(directory, 'tail.json.part');
+  const receiptFile = path.join(directory, 'receipt.json');
+  fs.mkdirSync(directory, { recursive: true });
+  if (fs.existsSync(tailFile) && fs.readFileSync(tailFile, 'utf8') !== snapshot.truncatedTail) {
+    throw new Error('scan queue tail quarantine conflicts with its durable evidence');
+  }
+  if (!fs.existsSync(tailFile)) atomicWriteFile(tailFile, snapshot.truncatedTail, { mode: 0o600 });
+  const receipt = {
+    schemaVersion: 1,
+    recoveryId,
+    prefixDigest,
+    tailDigest,
+    tailBytes: bytes,
+  };
+  if (fs.existsSync(receiptFile)) {
+    let durable;
+    try { durable = JSON.parse(fs.readFileSync(receiptFile, 'utf8')); } catch {}
+    if (stableJson(durable) !== stableJson(receipt)) {
+      throw new Error('scan queue tail recovery receipt conflicts with its durable evidence');
+    }
+  } else {
+    atomicWriteFile(receiptFile, `${stableJson(receipt)}\n`, { mode: 0o600 });
+  }
+  const current = fs.readFileSync(file, 'utf8');
+  if (createHash('sha256').update(current).digest('hex') !== snapshot.digest) {
+    throw new Error('scan queue changed during torn-tail recovery');
+  }
+  atomicWriteFile(file, snapshot.validContents, { mode: 0o600 });
+  return { recovered: true, recoveryId, tailBytes: bytes };
 }
 
 function readEvents(root) {
@@ -407,6 +508,9 @@ export function enqueueOverlappingScanRequest(root, input, options = {}) {
       record: transition.record,
     }, options);
     if (!committed.active) return Object.freeze({ status: 'not-active', request: null });
+    if (committed.needsRecovery) {
+      return Object.freeze({ status: 'pending-recovery', request: null });
+    }
     if (committed.appended) return transition.result;
   }
   throw new Error('scan queue changed repeatedly during overlap append');

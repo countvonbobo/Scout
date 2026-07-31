@@ -7,6 +7,7 @@ import { loadWorkspaceConfig, validateWorkspaceConfig, workspacePaths } from './
 import { providerStatus } from './providers.mjs';
 import { runStructuredTurn } from './structuredTurn.mjs';
 import { recordProviderResultHealth } from './providerHealth.mjs';
+import { assertProviderAuthIdle } from './providerAuthMutation.mjs';
 
 export const ONBOARDING_INPUT_LIMIT = 80_000;
 export const ONBOARDING_FILES = Object.freeze([
@@ -250,6 +251,7 @@ function writeStaged(root, files) {
 export async function createOnboardingProposal(root, provider, {
   providerStatusFn = providerStatus, runStructuredTurnFn = runStructuredTurn, now = () => new Date().toISOString(),
   recordProviderResultHealthFn = recordProviderResultHealth,
+  assertProviderAuthIdleFn = assertProviderAuthIdle,
   onProgress = () => {},
 } = {}) {
   onProgress({ phase: 'Preparing approved evidence', current: 1, total: 4 });
@@ -274,6 +276,7 @@ export async function createOnboardingProposal(root, provider, {
   };
   let turn;
   try {
+    assertProviderAuthIdleFn(root, provider);
     turn = await runStructuredTurnFn({
       provider, status, schema: ONBOARDING_SCHEMA, prompt,
       model: config.ai?.provider === provider ? config.ai?.model : null,

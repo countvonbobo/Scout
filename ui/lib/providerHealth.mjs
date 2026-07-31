@@ -444,7 +444,8 @@ export function recordProviderHealth(root, provider, signal, {
   const checkedPurpose = purposeName(purpose);
   const mutation = readProviderAuthMutation(root, provider, { now });
   const authoritativeSignal = mutation
-    && ['check-started', 'local-credentials-present'].includes(signal?.kind)
+    && source !== 'post-auth'
+    && signal?.source !== 'post-auth'
     ? { kind: 'login-started', source: signal.source ?? source ?? inferredSource(checkedPurpose) }
     : signal;
   const evidence = {
@@ -565,7 +566,7 @@ export async function providerPreflight(root, provider, purpose, {
   providerName(provider);
   const checkedPurpose = purposeName(purpose);
   const mutation = readProviderAuthMutation(root, provider, { now });
-  if (mutation) {
+  if (mutation && !['post-auth', 'post-auth-failure'].includes(checkedPurpose)) {
     return {
       ok: false,
       provider,

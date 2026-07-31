@@ -11,6 +11,9 @@ import { emptyChat, loadChat, saveChat } from './chatStore.mjs';
 import { HANDOFF_SUMMARY_PROMPT } from './chatPrompts.mjs';
 import { interviewPrepPath } from './interviewPrep.mjs';
 import { readProviderHealth } from './providerHealth.mjs';
+import {
+  acquireProviderAuthMutation, releaseProviderAuthMutation,
+} from './providerAuthMutation.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const FAKE = path.join(HERE, 'fixtures', 'fake-cli.mjs');
@@ -630,6 +633,84 @@ test('ordinary chat records remote-auth failure without resending and preserves 
   assert.equal(sseEvents(retried.text()).at(-1).event, 'done');
   assert.equal(readProviderHealth(root, 'codex').state, 'ready');
   assert.equal(readProviderHealth(root, 'codex').remoteAuthBarrier, false);
+});
+
+test('durable authentication mutation blocks same-provider chat across tabs but not another provider', async () => {
+  const root = tmpRoot();
+  const mutation = acquireProviderAuthMutation(root, 'codex', {
+    owner: { host: 'synthetic-host', pid: 42, processStart: 'synthetic-start' },
+    mutationId: 'chat-auth-mutation-0001',
+  });
+  let invocations = 0;
+  const runTurnFn = () => {
+    invocations += 1;
+    return {
+      stop() {},
+      finished: Promise.resolve({
+        ok: true, text: 'Claude remains usable.', updates: ['Claude remains usable.'],
+        sessionId: 'claude-session', filesTouched: [], usage: {},
+      }),
+    };
+  };
+  const firstTab = routeFixture(root, { runTurnFn });
+  const secondTab = routeFixture(root, { runTurnFn });
+
+  for (const routes of [firstTab, secondTab]) {
+    const blocked = await callRoute(
+      routes['POST /api/chat/send'],
+      JSON.stringify({ id: ID, engine: 'codex', text: 'Do not spawn this.' }),
+    );
+    const error = sseEvents(blocked.text()).at(-1);
+    assert.equal(error.event, 'error');
+    assert.equal(error.data.reasonCode, 'provider-auth-in-progress');
+    assert.match(error.data.message, /sign-in is being updated/i);
+  }
+  assert.equal(invocations, 0);
+
+  const usable = await callRoute(
+    firstTab['POST /api/chat/send'],
+    JSON.stringify({ id: ID, engine: 'claude', text: 'Use the other provider.' }),
+  );
+  assert.equal(sseEvents(usable.text()).at(-1).event, 'done');
+  assert.equal(invocations, 1);
+  releaseProviderAuthMutation(root, mutation);
+});
+
+test('a settled late chat result is not resent or allowed to overwrite login-in-progress health', async () => {
+  const root = tmpRoot();
+  let resolveTurn;
+  let invocations = 0;
+  const routes = routeFixture(root, {
+    runTurnFn: () => {
+      invocations += 1;
+      return {
+        stop() {},
+        finished: new Promise((resolve) => { resolveTurn = resolve; }),
+      };
+    },
+  });
+  const req = new EventEmitter();
+  const res = new MockResponse();
+  routes['POST /api/chat/send'](
+    req,
+    res,
+    JSON.stringify({ id: ID, engine: 'codex', text: 'Finish exactly once.' }),
+  );
+  const mutation = acquireProviderAuthMutation(root, 'codex', {
+    owner: { host: 'synthetic-host', pid: 43, processStart: 'synthetic-start-2' },
+    mutationId: 'chat-auth-mutation-0002',
+  });
+  resolveTurn({
+    ok: true, text: 'Settled result.', updates: ['Settled result.'],
+    sessionId: 'settled-session', filesTouched: [], usage: {},
+  });
+  await res.finished;
+
+  assert.equal(invocations, 1);
+  assert.equal(sseEvents(res.text()).at(-1).event, 'done');
+  assert.equal(readProviderHealth(root, 'codex').state, 'login-in-progress');
+  assert.equal(loadChat(root, ID).messages.filter(({ role }) => role === 'assistant').length, 1);
+  releaseProviderAuthMutation(root, mutation);
 });
 
 test('bounded fit assessment records remote-auth failure without automatically retrying provider work', async () => {

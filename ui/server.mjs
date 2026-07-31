@@ -153,6 +153,34 @@ function queueCheckpoint(reason, { includeDevicePreferences = false } = {}) {
     }));
 }
 
+let scheduledCheckpointBatch = null;
+function scheduleCheckpoint(reason, { includeDevicePreferences = false } = {}) {
+  if (!scheduledCheckpointBatch) {
+    scheduledCheckpointBatch = {
+      reason,
+      includeDevicePreferences,
+      timer: null,
+      waiters: [],
+    };
+  } else {
+    scheduledCheckpointBatch.reason = reason;
+    scheduledCheckpointBatch.includeDevicePreferences ||= includeDevicePreferences;
+    clearTimeout(scheduledCheckpointBatch.timer);
+  }
+  const batch = scheduledCheckpointBatch;
+  const pending = new Promise((resolve) => batch.waiters.push(resolve));
+  batch.timer = setTimeout(async () => {
+    if (scheduledCheckpointBatch !== batch) return;
+    scheduledCheckpointBatch = null;
+    const result = await queueCheckpoint(batch.reason, {
+      includeDevicePreferences: batch.includeDevicePreferences,
+    });
+    for (const resolve of batch.waiters) resolve(result);
+  }, 1_000);
+  batch.timer.unref?.();
+  return pending;
+}
+
 export function today() {
   return new Date().toISOString().slice(0, 10);
 }
@@ -1390,7 +1418,7 @@ routes['POST /api/feedback'] = (req, res, body) => {
         learningVersionId: opportunity.learningVersionId || ledger.activeVersionId,
       });
       writeLearningLedger(WORKSPACE_ROOT, next);
-      void queueCheckpoint('ui: record job feedback');
+      void scheduleCheckpoint('ui: record job feedback');
       return replyJson(res, 200, { ok: true, ledger: publicLearningLedger(next) });
     });
   } catch (error) {
@@ -1411,7 +1439,7 @@ routes['POST /api/learning/proposals'] = (req, res, body) => {
       const ledger = learningLedgerForRevision(value.revision);
       const next = proposeLearningChange(ledger, value);
       writeLearningLedger(WORKSPACE_ROOT, next);
-      void queueCheckpoint('ui: propose learned preference');
+      void scheduleCheckpoint('ui: propose learned preference');
       return replyJson(res, 200, { ok: true, ledger: publicLearningLedger(next) });
     });
   } catch (error) {
@@ -1433,7 +1461,7 @@ routes['POST /api/learning/publish'] = (req, res, body) => {
       const ledger = learningLedgerForRevision(value.revision);
       const next = publishLearningProposal(ledger, value);
       writeLearningLedger(WORKSPACE_ROOT, next);
-      void queueCheckpoint('ui: publish learned preference');
+      void scheduleCheckpoint('ui: publish learned preference');
       return replyJson(res, 200, { ok: true, ledger: publicLearningLedger(next) });
     });
   } catch (error) {
@@ -1455,7 +1483,7 @@ routes['POST /api/learning/undo'] = (req, res, body) => {
       const ledger = learningLedgerForRevision(value.revision);
       const next = undoLearningVersion(ledger, value);
       writeLearningLedger(WORKSPACE_ROOT, next);
-      void queueCheckpoint('ui: undo learned preference');
+      void scheduleCheckpoint('ui: undo learned preference');
       return replyJson(res, 200, { ok: true, ledger: publicLearningLedger(next) });
     });
   } catch (error) {
@@ -1575,7 +1603,7 @@ routes['POST /api/search-lanes/retire-unproductive'] = (req, res, body) => {
         });
       }
       writeSearchLanePlan(WORKSPACE_ROOT, plan);
-      void queueCheckpoint('ui: retire unproductive search lanes');
+      void scheduleCheckpoint('ui: retire unproductive search lanes');
       return replyJson(res, 200, {
         ok: true,
         lanePlan: plan,
@@ -1601,7 +1629,7 @@ routes['POST /api/search-lanes/restore'] = (req, res, body) => {
       const current = currentLanePlanForRevision(value.revision);
       const plan = restoreSearchLane(current, value.laneId);
       writeSearchLanePlan(WORKSPACE_ROOT, plan);
-      void queueCheckpoint('ui: restore search lane');
+      void scheduleCheckpoint('ui: restore search lane');
       return replyJson(res, 200, {
         ok: true,
         lanePlan: plan,
@@ -1636,7 +1664,7 @@ routes['PUT /api/employers'] = (req, res, body) => {
       }
       const registry = updateEmployerRegistryEntry(current, value.employer);
       writeEmployerRegistry(WORKSPACE_ROOT, registry);
-      void queueCheckpoint('ui: update employer registry');
+      void scheduleCheckpoint('ui: update employer registry');
       return replyJson(res, 200, {
         ok: true,
         registry: publicEmployerRegistry(registry),
@@ -1670,7 +1698,7 @@ routes['POST /api/employers/undo'] = (req, res, body) => {
       }
       const registry = undoEmployerRegistryReview(current, value);
       writeEmployerRegistry(WORKSPACE_ROOT, registry);
-      void queueCheckpoint('ui: undo employer metadata review');
+      void scheduleCheckpoint('ui: undo employer metadata review');
       return replyJson(res, 200, {
         ok: true,
         registry: publicEmployerRegistry(registry),
@@ -1692,7 +1720,7 @@ routes['PUT /api/search-profile/draft'] = (req, res, body) => {
     if (draft.status !== 'draft') throw new Error('search profile draft must have draft status');
     atomicWriteFile(WORKSPACE.searchProfileDraft, `${JSON.stringify(draft, null, 2)}\n`);
     const state = readSearchProfileState();
-    void queueCheckpoint('ui: save search profile draft');
+    void scheduleCheckpoint('ui: save search profile draft');
     return replyJson(res, 200, { ok: true, draft: state.draft, draftRevision: state.draftRevision });
   } catch (e) {
     if (Object.hasOwn(e, 'currentRevision')) return replySearchProfileConflict(res, e);
@@ -1710,7 +1738,7 @@ routes['PUT /api/search-profile/adaptive'] = (req, res, body) => {
     const draft = applyAdaptiveAnswers(current, value.answers);
     atomicWriteFile(WORKSPACE.searchProfileDraft, `${JSON.stringify(draft, null, 2)}\n`);
     const draftRevision = profileFingerprint(draft);
-    void queueCheckpoint('ui: save adaptive search profile answers');
+    void scheduleCheckpoint('ui: save adaptive search profile answers');
     return replyJson(res, 200, {
       ok: true,
       draft,
@@ -1791,7 +1819,7 @@ routes['POST /api/search-profile/publish'] = (req, res, body) => {
         nextConfig,
         { lease, runId },
       );
-      void queueCheckpoint('ui: publish search profile');
+      void scheduleCheckpoint('ui: publish search profile');
       return replyJson(res, 200, {
         ok: true,
         published,
@@ -1965,7 +1993,7 @@ async function applyTrackerMutation(res, mutate, commitMessage, expectedRevision
   try {
     const result = mutateTrackerSnapshot(TRACKER_FILE, mutate, serializeTracker, { expectedRevision });
     const reason = typeof commitMessage === 'function' ? commitMessage(result.data) : commitMessage;
-    void queueCheckpoint(reason);
+    void scheduleCheckpoint(reason);
     return replyJson(res, 200, {
       ok: true, savedLocally: true, syncQueued: true, trackerRevision: result.revision,
     });
@@ -2058,7 +2086,7 @@ routes['POST /api/cv/save'] = (req, res, body) => {
     return replyJson(res, 409, { error: 'The master CV is empty or incomplete. Scout kept the existing file; restore the reviewed proposal or enter at least 500 bytes before saving.' });
   }
   try { atomicWriteFile(abs, b.content); } catch { return replyJson(res, 500, publicApiError('CV file could not be saved.')); }
-  void queueCheckpoint(`edit cv - ${b.path}`);
+  void scheduleCheckpoint(`edit cv - ${b.path}`);
   replyJson(res, 200, { ok: true, savedLocally: true, syncQueued: true });
 };
 
@@ -2071,7 +2099,7 @@ routes['POST /api/cv/render'] = (req, res, body) => {
       update({ phase: target === 'master' ? 'Preparing master reference PDF' : 'Preparing tailored PDF', current: 1, total: 3 });
       const result = await renderCvTarget(WORKSPACE_ROOT, { target, slug }, { appRoot: APP_ROOT });
       update({ phase: 'Validating PDF', current: 2, total: 3 });
-      void queueCheckpoint(target === 'application' ? `render cv - ${slug}` : 'render master cv');
+      void scheduleCheckpoint(target === 'application' ? `render cv - ${slug}` : 'render master cv');
       update({ phase: 'PDF ready', current: 3, total: 3 });
       return result;
     }, { phase: 'Queued for rendering', total: 3 });
@@ -2087,7 +2115,7 @@ routes['POST /api/cv/quality'] = (req, res, body) => {
   try {
     const config = loadWorkspaceConfig(WORKSPACE_ROOT);
     const result = runCvQuality(WORKSPACE_ROOT, b.slug || '', { locale: config.locale, appRoot: APP_ROOT, compile: false });
-    void queueCheckpoint(`review cv quality - ${b.slug || 'application'}`);
+    void scheduleCheckpoint(`review cv quality - ${b.slug || 'application'}`);
     return replyJson(res, 200, result);
   } catch { return replyJson(res, 400, publicApiError('CV quality check could not be completed.')); }
 };
@@ -2096,7 +2124,7 @@ routes['POST /api/cv/quality/override'] = (req, res, body) => {
   const b = parseBody(body); if (!b) return replyJson(res, 400, { error: 'bad json' });
   try {
     const result = overrideCvQuality(WORKSPACE_ROOT, b.slug || '', b.cvSha256 || '');
-    void queueCheckpoint(`accept cv draft - ${b.slug || 'application'}`);
+    void scheduleCheckpoint(`accept cv draft - ${b.slug || 'application'}`);
     return replyJson(res, 200, result);
   }
   catch { return replyJson(res, 409, publicApiError('CV quality decision could not be saved.')); }
@@ -2111,7 +2139,7 @@ routes['POST /api/setup/proposal'] = (req, res, body) => {
   try {
     const operation = operations.start('proposal', async (update) => {
       const result = await createOnboardingProposal(WORKSPACE_ROOT, provider, { onProgress: update });
-      void queueCheckpoint('stage setup proposal');
+      void scheduleCheckpoint('stage setup proposal');
       return { ok: true, proposalId: result.proposalId, files: result.files };
     }, { phase: 'Preparing approved evidence', total: 4 });
     return replyJson(res, 202, { operation });
@@ -2126,7 +2154,7 @@ routes['POST /api/setup/activate'] = (req, res, body) => {
   const b = parseBody(body); if (!b) return replyJson(res, 400, { error: 'bad json' });
   try {
     const result = activateOnboardingProposal(WORKSPACE_ROOT, b.proposalId || '', b.confirmed);
-    void queueCheckpoint('activate setup proposal');
+    void scheduleCheckpoint('activate setup proposal');
     return replyJson(res, 200, result);
   }
   catch { return replyJson(res, 409, publicApiError('Setup proposal could not be activated.')); }
@@ -2136,14 +2164,14 @@ routes['POST /api/setup/recovery'] = (req, res, body) => {
   const b = parseBody(body); if (!b) return replyJson(res, 400, { error: 'bad json' });
   try {
     const result = recoverActivatedProposal(WORKSPACE_ROOT, b.confirmed);
-    void queueCheckpoint('recover activated master cv');
+    void scheduleCheckpoint('recover activated master cv');
     return replyJson(res, 200, result);
   } catch { return replyJson(res, 409, publicApiError('Setup recovery could not be completed.')); }
 };
 
 routes['DELETE /api/setup/proposal'] = (req, res) => {
   const result = discardOnboardingProposal(WORKSPACE_ROOT);
-  void queueCheckpoint('discard setup proposal');
+  void scheduleCheckpoint('discard setup proposal');
   return replyJson(res, 200, result);
 };
 
@@ -2170,7 +2198,7 @@ routes['POST /api/setup/config'] = (req, res, body) => {
       setup: { ...current.setup, ...(b.setup || {}) },
     };
     writeWorkspaceConfig(WORKSPACE_ROOT, next);
-    void queueCheckpoint('update setup');
+    void scheduleCheckpoint('update setup');
     return replyJson(res, 200, { ok: true, config: next });
   } catch (error) { return replyJson(res, 400, publicSetupConfigError(error)); }
 };
@@ -2191,7 +2219,7 @@ routes['POST /api/setup/complete'] = async (req, res, body) => {
       device.completedSections['windows-startup'] = 1;
       saveDeviceSettings(device);
     }
-    void queueCheckpoint('complete setup', { includeDevicePreferences: true });
+    void scheduleCheckpoint('complete setup', { includeDevicePreferences: true });
     return replyJson(res, 200, { ok: true, completedAt: config.setup.completedAt });
   } catch { return replyJson(res, 400, publicApiError('Setup could not be completed.')); }
 };
@@ -2217,7 +2245,7 @@ routes['POST /api/device/settings'] = (req, res, body) => {
       settings.updates = { ...settings.updates, policy: b.updatePolicy };
     }
     saveDeviceSettings(settings);
-    void queueCheckpoint('update device settings', { includeDevicePreferences: true });
+    void scheduleCheckpoint('update device settings', { includeDevicePreferences: true });
     return replyJson(res, 200, {
       ok: true,
       settings: publicDeviceSettings(
@@ -2276,7 +2304,7 @@ routes['POST /api/setup/section'] = (req, res, body) => {
     settings.deferredSections[b.id] = new Date(Date.now() + 7 * 86400000).toISOString();
   } else return replyJson(res, 400, { error: 'action must be complete or defer' });
   saveDeviceSettings(settings);
-  void queueCheckpoint('update device setup', { includeDevicePreferences: true });
+  void scheduleCheckpoint('update device setup', { includeDevicePreferences: true });
   return replyJson(res, 200, { ok: true, pendingSetupSections: pendingDeviceSections(settings) });
 };
 
@@ -2346,7 +2374,7 @@ routes['POST /api/setup/credentials'] = (req, res, body) => {
       ADZUNA_APP_ID: typeof b.appId === 'string' ? b.appId.trim() : '',
       ADZUNA_API_KEY: typeof b.apiKey === 'string' ? b.apiKey.trim() : '',
     });
-    void queueCheckpoint('update source credentials');
+    void scheduleCheckpoint('update source credentials');
     return replyJson(res, 200, { ok: true, configured: !!(b.appId && b.apiKey) });
   } catch { return replyJson(res, 400, publicApiError('Source credentials could not be saved.')); }
 };
@@ -2368,7 +2396,7 @@ routes['POST /api/setup/import-cv'] = (req, res, body) => {
   extractCvText(imported).then((text) => {
     const extracted = path.join(WORKSPACE.imports, `${name}.txt`);
     atomicWriteFile(extracted, `${text}\n`, { mode: 0o600 });
-    void queueCheckpoint(`import cv - ${name}`);
+    void scheduleCheckpoint(`import cv - ${name}`);
     replyJson(res, 200, { ok: true, source: `imports/${name}`, extracted: `imports/${path.basename(extracted)}`, text });
   }).catch((error) => {
     fs.rmSync(imported, { force: true });
@@ -2445,7 +2473,7 @@ routes['POST /api/schedule'] = (req, res, body) => {
       }
     } else if (b.action === 'run-now') result = runScheduledNow({ id });
     else return replyJson(res, 400, { error: 'action must be install, remove, or run-now' });
-    if (result.ok) void queueCheckpoint(`schedule ${b.action}`);
+    if (result.ok) void scheduleCheckpoint(`schedule ${b.action}`);
     return replyJson(res, result.ok ? 200 : 500, {
       ...(result.ok ? result : { ok: false, error: 'Schedule could not be changed.', reasonCode: 'request-failed' }),
       id,
@@ -2496,8 +2524,8 @@ routes['POST /api/shutdown'] = (req, res) => {
   }, 200);
 };
 
-registerCompanyRoutes({ routes, repoRoot: WORKSPACE_ROOT, readTracker, onCheckpoint: queueCheckpoint });
-registerChatRoutes({ routes, repoRoot: WORKSPACE_ROOT, readTracker, onCheckpoint: queueCheckpoint });
+registerCompanyRoutes({ routes, repoRoot: WORKSPACE_ROOT, readTracker, onCheckpoint: scheduleCheckpoint });
+registerChatRoutes({ routes, repoRoot: WORKSPACE_ROOT, readTracker, onCheckpoint: scheduleCheckpoint });
 
 export async function runtimeProviderPreflight(root, provider, purpose, {
   source,
@@ -2575,12 +2603,12 @@ if (isMain) {
   server.on('listening', () => {
     console.log(`Scout UI on http://127.0.0.1:${PORT}`);
     if (workspaceInitialised()) {
-      void queueCheckpoint('startup sync');
+      void scheduleCheckpoint('startup sync');
       void checkStartupProviderHealth(WORKSPACE_ROOT).catch(() => {});
       void providerHealthMonitor.runNow().catch(() => {});
     }
   });
   server.listen(PORT, '127.0.0.1');
-  const syncTimer = setInterval(() => { if (workspaceInitialised()) void queueCheckpoint('periodic sync'); }, 5 * 60 * 1000);
+  const syncTimer = setInterval(() => { if (workspaceInitialised()) void scheduleCheckpoint('periodic sync'); }, 5 * 60 * 1000);
   syncTimer.unref();
 }

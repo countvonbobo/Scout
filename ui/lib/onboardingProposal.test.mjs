@@ -9,6 +9,9 @@ import {
   validateOnboardingProposal,
 } from './onboardingProposal.mjs';
 import { readProviderHealth } from './providerHealth.mjs';
+import {
+  acquireProviderAuthMutation, releaseProviderAuthMutation,
+} from './providerAuthMutation.mjs';
 import { DEFAULT_WORKSPACE_CONFIG, writeWorkspaceConfig } from './workspace.mjs';
 
 function root() {
@@ -104,6 +107,35 @@ test('onboarding records remote-auth failure without resending proposal generati
   assert.equal(readProviderHealth(dir, 'codex').state, 'sign-in-required');
   assert.equal(readProviderHealth(dir, 'codex').remoteAuthBarrier, true);
   assert.equal(readOnboardingProposal(dir), null);
+});
+
+test('onboarding proposal generation obeys the durable per-provider auth barrier', async () => {
+  const dir = root();
+  const mutation = acquireProviderAuthMutation(dir, 'codex', {
+    owner: { host: 'synthetic-host', pid: 42, processStart: 'synthetic-start' },
+    mutationId: 'onboarding-auth-mutation',
+  });
+  let invocations = 0;
+  await assert.rejects(createOnboardingProposal(dir, 'codex', {
+    providerStatusFn: status,
+    runStructuredTurnFn: async () => {
+      invocations += 1;
+      return { value: proposal(), usage: {} };
+    },
+  }), (error) => error.reasonCode === 'provider-auth-in-progress');
+  assert.equal(invocations, 0);
+  assert.equal(readOnboardingProposal(dir), null);
+
+  const claude = await createOnboardingProposal(dir, 'claude', {
+    providerStatusFn: status,
+    runStructuredTurnFn: async () => {
+      invocations += 1;
+      return { value: proposal(), usage: {} };
+    },
+  });
+  assert.equal(claude.provider, 'claude');
+  assert.equal(invocations, 1);
+  releaseProviderAuthMutation(dir, mutation);
 });
 
 test('activation rejects stale targets and rolls back every active file if doctor fails', async () => {

@@ -991,7 +991,7 @@ export async function runScanWith(root, provider, mode, {
       async postTerminalSuccess({ lease }) {
         const assertFence = () => assertCurrentFence(lease, synchronousFenceCallback(() => true));
         assertFence();
-        const status = await queueWorkspaceSyncFn(root, `complete ${mode} scan`, { assertFence });
+        const status = await queueWorkspaceSyncFn(root, `complete ${mode} scan`, { assertFence, lease });
         assertFence();
         return backupHookOutcome(status);
       },
