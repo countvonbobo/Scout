@@ -62,6 +62,58 @@ test('canonicalisation is stable when the same observations arrive in another or
   assert.deepEqual(canonicaliseObservations(observations), canonicaliseObservations([...observations].reverse()));
 });
 
+test('canonicalisation merges source-traceable rule evidence from a shorter duplicate', () => {
+  const excludedRule = {
+    id: 'rule-operate-gambling-products',
+    fact: 'operate gambling products',
+  };
+  const shorter = {
+    ...observation({
+      source: 'adzuna',
+      providerId: 'adzuna-exclusion',
+      description: 'Operate gambling products.',
+    }),
+    semanticEvidence: {
+      descriptionPresent: true,
+      descriptionDigest: 'a'.repeat(64),
+      descriptionLength: 27,
+      profileRuleMatches: [excludedRule],
+      responsibilityFacts: ['operate gambling products'],
+      mandatorySignals: [],
+    },
+  };
+  const longer = {
+    ...observation({
+      source: 'greenhouse',
+      providerId: 'greenhouse-longer',
+      description: DESCRIPTION.repeat(4),
+    }),
+    semanticEvidence: {
+      descriptionPresent: true,
+      descriptionDigest: 'b'.repeat(64),
+      descriptionLength: DESCRIPTION.length * 4,
+      profileRuleMatches: [],
+      responsibilityFacts: ['design reliable platform services'],
+      mandatorySignals: [],
+    },
+  };
+
+  const forward = canonicaliseObservations([shorter, longer]).vacancies[0];
+  const reverse = canonicaliseObservations([longer, shorter]).vacancies[0];
+
+  assert.deepEqual(forward, reverse);
+  assert.equal(forward.semanticEvidence.descriptionDigest, 'b'.repeat(64));
+  assert.deepEqual(forward.semanticEvidence.profileRuleMatches, [{
+    ...excludedRule,
+    evidence: [{
+      source: 'adzuna',
+      providerId: 'adzuna-exclusion',
+      descriptionDigest: 'a'.repeat(64),
+      provenance: 'deterministic-extraction',
+    }],
+  }]);
+});
+
 test('content fingerprints ignore tracking copy and identify material updates', () => {
   const oldJob = observation({ description: DESCRIPTION, url: `${DIRECT_URL}?utm_source=board` });
   const sameContent = { ...oldJob, fetchedAt: '2026-07-27T20:00:00.000Z', description: `${DESCRIPTION}\nApply now.` };

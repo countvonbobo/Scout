@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
+import { canonicaliseObservations } from './vacancyCanonical.mjs';
 import { filterVacancies } from './vacancyFilter.mjs';
+import { normaliseObservation } from './vacancyObservation.mjs';
 
 const rule = (value, strength, provenance = 'explicit') => ({ value, strength, provenance });
 const profile = ({
@@ -83,6 +85,77 @@ test('strong negatives and unconfirmed hard rules do not exclude', () => {
     excludedTitles: [rule('Software Engineer', 'strong-negative'), rule('Software Engineer', 'hard-exclusion', 'unconfirmed-inference')],
   }));
   assert.deepEqual(result, { eligible: [softwareJob], excluded: [] });
+});
+
+test('confirmed duplicate-source responsibility evidence blocks without hardening unconfirmed rules', () => {
+  const canonical = canonicaliseObservations([
+    {
+      ...normaliseObservation({
+        providerId: 'short-source',
+        url: 'https://example.test/jobs/shared',
+        title: 'Platform Engineer',
+        company: 'Example Co',
+        description: 'Operate gambling products.',
+      }, {
+        sourceName: 'adzuna',
+        fetchedAt: '2026-07-31T08:00:00.000Z',
+      }),
+      semanticEvidence: {
+        descriptionPresent: true,
+        descriptionDigest: 'a'.repeat(64),
+        descriptionLength: 27,
+        profileRuleMatches: [{
+          id: 'rule-operate-gambling-products',
+          fact: 'operate gambling products',
+        }],
+        responsibilityFacts: ['operate gambling products'],
+        mandatorySignals: [],
+      },
+    },
+    {
+      ...normaliseObservation({
+        providerId: 'long-source',
+        url: 'https://example.test/jobs/shared',
+        title: 'Platform Engineer',
+        company: 'Example Co',
+        description: 'Build and operate reliable public-interest platforms. '.repeat(8),
+      }, {
+        sourceName: 'greenhouse',
+        fetchedAt: '2026-07-31T08:00:00.000Z',
+      }),
+      semanticEvidence: {
+        descriptionPresent: true,
+        descriptionDigest: 'b'.repeat(64),
+        descriptionLength: 400,
+        profileRuleMatches: [],
+        responsibilityFacts: ['build reliable public interest platforms'],
+        mandatorySignals: [],
+      },
+    },
+  ]).vacancies[0];
+  const confirmed = profile({
+    excludedResponsibilities: [
+      rule('operate gambling products', 'hard-exclusion', 'confirmed-inference'),
+    ],
+  });
+
+  const blocked = filterVacancies([canonical], confirmed);
+  assert.equal(blocked.eligible.length, 0);
+  assert.equal(blocked.excluded[0].code, 'excluded-responsibility');
+  assert.deepEqual(blocked.excluded[0].evidence.vacancy.sources, [{
+    source: 'adzuna',
+    providerId: 'short-source',
+    descriptionDigest: 'a'.repeat(64),
+    provenance: 'deterministic-extraction',
+  }]);
+
+  const nonBlocking = filterVacancies([canonical], profile({
+    excludedResponsibilities: [
+      rule('operate gambling products', 'strong-negative', 'explicit'),
+      rule('operate gambling products', 'hard-exclusion', 'unconfirmed-inference'),
+    ],
+  }));
+  assert.deepEqual(nonBlocking, { eligible: [canonical], excluded: [] });
 });
 
 test('structured rules require normalized equality rather than token containment', () => {

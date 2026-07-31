@@ -2329,6 +2329,86 @@ test('semantic recovery preserves a hard exclusion found after the old advert pr
   }
 });
 
+test('persisted filtering keeps bounded source evidence from every canonical duplicate', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'scout-duplicate-exclusion-evidence-'));
+  const profile = {
+    version: 1, status: 'published', id: 'profile-duplicate-exclusion',
+    target: {},
+    negative: {
+      excludedResponsibilities: [{
+        value: 'operate gambling products',
+        strength: 'hard-exclusion',
+        provenance: 'explicit',
+      }],
+    },
+    compensation: {
+      currency: null, period: 'year', minimum: null,
+      minimumStrength: 'neutral', unknownPolicy: 'include',
+    },
+  };
+  try {
+    const result = await runScanPipeline({
+      root,
+      compatibility: RECOVERY_COMPATIBILITY,
+      stages: createRankedDiscoveryStages({
+        collect: async () => ({
+          generatedAt: '2026-07-31T08:00:00.000Z',
+          queries: [],
+          sources: {
+            adzuna: {
+              configured: true,
+              status: 'healthy',
+              count: 1,
+              jobs: [{
+                company: 'Example Co',
+                title: 'Platform Engineer',
+                providerId: 'short-exclusion',
+                url: 'https://example.test/jobs/shared',
+                description: 'Operate gambling products.',
+              }],
+            },
+            greenhouse: {
+              configured: true,
+              status: 'healthy',
+              count: 1,
+              jobs: [{
+                company: 'Example Co',
+                title: 'Platform Engineer',
+                providerId: 'long-neutral',
+                url: 'https://example.test/jobs/shared',
+                description: 'Build and operate reliable public-interest platforms. '.repeat(20),
+              }],
+            },
+          },
+        }),
+        profile,
+      }),
+    });
+
+    assert.equal(result.stageOutputs.select.funnel.uniqueVacancies, 1);
+    assert.equal(result.stageOutputs.select.exclusions.length, 1);
+    const evidence = result.stageOutputs.select.exclusions[0].evidence.vacancy;
+    assert.deepEqual(evidence.sources.map(({ source, providerId, provenance }) => ({
+      source, providerId, provenance,
+    })), [{
+      source: 'adzuna',
+      providerId: 'short-exclusion',
+      provenance: 'deterministic-extraction',
+    }]);
+    assert.ok(evidence.sources.length <= 8);
+    assert.match(evidence.sources[0].descriptionDigest, /^[a-f0-9]{64}$/);
+
+    const persisted = fs.readdirSync(path.join(root, '.scout', 'runs', result.runId, 'artifacts'))
+      .map((name) => fs.readFileSync(path.join(root, '.scout', 'runs', result.runId, 'artifacts', name), 'utf8'))
+      .join('\n');
+    assert.match(persisted, /short-exclusion/);
+    assert.match(persisted, /deterministic-extraction/);
+    assert.doesNotMatch(persisted, /Operate gambling products|Build and operate reliable public-interest platforms/);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test('a failed canonical failure recorder cannot prevent the terminal run event', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'scout-failure-recorder-'));
   try {

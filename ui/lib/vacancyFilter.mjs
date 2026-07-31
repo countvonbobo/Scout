@@ -117,16 +117,20 @@ function structuredExclusions(vacancy, profile) {
 
 function responsibilityExclusions(vacancy, profile) {
   const description = String(vacancy?.description || '');
-  const semanticMatches = new Set((vacancy?.semanticEvidence?.profileRuleMatches || []).map((item) => (
-    typeof item === 'string' ? item : item.id
+  const semanticMatches = new Map((vacancy?.semanticEvidence?.profileRuleMatches || []).map((item) => (
+    typeof item === 'string' ? [item, { id: item, evidence: [] }] : [item.id, item]
   )));
   return (profile?.negative?.excludedResponsibilities || []).flatMap((rule) => {
-    const matched = semanticMatches.has(ruleId(rule)) || phraseMatches(description, rule.value);
+    const matchedRule = semanticMatches.get(ruleId(rule));
+    const matched = Boolean(matchedRule) || phraseMatches(description, rule.value);
     if (!hardRule(rule) || !matched) return [];
     return [exclusion(vacancy, profile, 'excluded-responsibility', rule,
       {
         vacancy: vacancy?.semanticEvidence
-          ? { digest: vacancy.semanticEvidence.descriptionDigest, matchedRule: ruleId(rule) }
+          ? {
+            matchedRule: ruleId(rule),
+            sources: (matchedRule?.evidence || []).slice(0, 8),
+          }
           : description,
         rule: rule.value,
       }, 'explicit-source', false)];

@@ -8,6 +8,9 @@ const DISPLAY_FIELDS = [
 const LIST_FIELDS = ['responsibilities', 'skills', 'qualifications', 'eligibility'];
 const PROVENANCE_RANK = { 'explicit-source': 2, 'deterministic-extraction': 1, unknown: 0 };
 const APPLICATION_BOILERPLATE = /(?:\bapply now\.?|\bclick here to apply\.?|\bsubmit your application\.?)/gi;
+const MAX_SEMANTIC_RULE_MATCHES = 64;
+const MAX_SEMANTIC_MATCH_SOURCES = 8;
+const MAX_RESPONSIBILITY_FACTS = 24;
 
 function valueOf(value) {
   return value && typeof value === 'object' && 'value' in value ? value.value : value;
@@ -107,15 +110,82 @@ function metadataValues(observations, name) {
     .filter(Boolean))].sort(compareStable);
 }
 
+function boundedSemanticText(value, maximum) {
+  return String(value || '').normalize('NFKC').replace(/[\r\n\t]+/g, ' ')
+    .replace(/\s{2,}/g, ' ').trim().slice(0, maximum);
+}
+
+function semanticMatchEvidence(observation, match) {
+  const semantic = observation.semanticEvidence;
+  const fallback = {
+    source: boundedSemanticText(observation.source, 80),
+    providerId: boundedSemanticText(observation.sourceRecordId, 160),
+    descriptionDigest: /^[a-f0-9]{64}$/.test(semantic.descriptionDigest || '')
+      ? semantic.descriptionDigest
+      : '',
+    provenance: 'deterministic-extraction',
+  };
+  const supplied = Array.isArray(match?.evidence) && match.evidence.length
+    ? match.evidence
+    : [fallback];
+  return supplied.map((item) => ({
+    source: boundedSemanticText(item?.source || fallback.source, 80),
+    providerId: boundedSemanticText(item?.providerId || fallback.providerId, 160),
+    descriptionDigest: /^[a-f0-9]{64}$/.test(item?.descriptionDigest || '')
+      ? item.descriptionDigest
+      : fallback.descriptionDigest,
+    provenance: ['explicit-source', 'deterministic-extraction'].includes(item?.provenance)
+      ? item.provenance
+      : fallback.provenance,
+  })).filter(({ source, providerId, descriptionDigest }) => (
+    source || providerId || descriptionDigest
+  ));
+}
+
+function mergedSemanticEvidence(observations) {
+  const semanticObservations = observations.filter((observation) => observation?.semanticEvidence);
+  if (!semanticObservations.length) return null;
+  const selected = [...semanticObservations].sort((left, right) => (
+    Number(right.semanticEvidence.descriptionLength || 0) - Number(left.semanticEvidence.descriptionLength || 0)
+    || compareStable(left.semanticEvidence.descriptionDigest, right.semanticEvidence.descriptionDigest)
+  ))[0];
+  const matches = new Map();
+  for (const observation of semanticObservations) {
+    for (const rawMatch of observation.semanticEvidence.profileRuleMatches || []) {
+      const match = typeof rawMatch === 'string' ? { id: rawMatch, fact: '' } : rawMatch;
+      const id = boundedSemanticText(match?.id, 160);
+      if (!id) continue;
+      const current = matches.get(id) || { id, fact: '', evidence: [] };
+      const fact = boundedSemanticText(match?.fact, 160);
+      if (fact && (!current.fact || compareStable(fact, current.fact) < 0)) current.fact = fact;
+      const evidence = [...current.evidence, ...semanticMatchEvidence(observation, match)];
+      current.evidence = [...new Map(evidence.map((item) => [stableJson(item), item])).values()]
+        .sort((left, right) => compareStable(stableJson(left), stableJson(right)))
+        .slice(0, MAX_SEMANTIC_MATCH_SOURCES);
+      matches.set(id, current);
+    }
+  }
+  const responsibilityFacts = [...new Set(semanticObservations.flatMap(({ semanticEvidence }) => (
+    (semanticEvidence.responsibilityFacts || [])
+      .map((fact) => boundedSemanticText(fact, 160))
+      .filter(Boolean)
+  )))].sort(compareStable).slice(0, MAX_RESPONSIBILITY_FACTS);
+  return {
+    ...selected.semanticEvidence,
+    descriptionPresent: semanticObservations.some(({ semanticEvidence }) => (
+      semanticEvidence.descriptionPresent === true
+    )),
+    profileRuleMatches: [...matches.values()]
+      .sort((left, right) => compareStable(left.id, right.id))
+      .slice(0, MAX_SEMANTIC_RULE_MATCHES),
+    responsibilityFacts,
+  };
+}
+
 function canonicalVacancy(observations) {
   const orderedObservations = sortObservations(observations);
-  const semanticObservation = [...orderedObservations]
-    .filter((observation) => observation?.semanticEvidence)
-    .sort((left, right) => (
-      Number(right.semanticEvidence.descriptionLength || 0) - Number(left.semanticEvidence.descriptionLength || 0)
-      || compareStable(left.semanticEvidence.descriptionDigest, right.semanticEvidence.descriptionDigest)
-    ))[0];
-  const description = semanticObservation
+  const semanticEvidence = mergedSemanticEvidence(orderedObservations);
+  const description = semanticEvidence
     ? ''
     : orderedObservations.map((observation) => String(observation?.description || '').trim())
       .sort((left, right) => right.length - left.length || compareStable(left, right))[0] || '';
@@ -143,7 +213,7 @@ function canonicalVacancy(observations) {
     laneId: laneIds[0] || null,
     roleFamilies,
     roleFamily: roleFamilies[0] || null,
-    ...(semanticObservation ? { semanticEvidence: semanticObservation.semanticEvidence } : {}),
+    ...(semanticEvidence ? { semanticEvidence } : {}),
     ...fields,
     ...Object.fromEntries(LIST_FIELDS.map((name) => [name, listDisplayField(orderedObservations, name)])),
   };
