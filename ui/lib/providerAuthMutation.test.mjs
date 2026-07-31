@@ -10,6 +10,7 @@ import {
   readProviderAuthMutation,
   releaseProviderAuthMutation,
   releaseProviderWork,
+  renewProviderWork,
 } from './providerAuthMutation.mjs';
 
 function workspace(t) {
@@ -168,6 +169,24 @@ test('provider work and authentication mutation are mutually exclusive under one
     workId: 'blocked-work-0001',
   }), (error) => error.reasonCode === 'provider-auth-in-progress');
   releaseProviderAuthMutation(root, auth, { now: 1_005 });
+});
+
+test('active provider work renews before expiry and remains an auth barrier', (t) => {
+  const root = workspace(t);
+  const work = acquireProviderWork(root, 'codex', {
+    owner, now: 1_000, durationMs: 1_000, workId: 'renewed-work-0001',
+  });
+  const renewed = renewProviderWork(root, work, {
+    now: 1_900, durationMs: 1_000,
+  });
+  assert.equal(renewed.expiresAt, 2_900);
+  assert.equal(acquireProviderAuthMutation(root, 'codex', {
+    owner,
+    now: 2_001,
+    durationMs: 100,
+    mutationId: 'blocked-by-renewal',
+  }), null);
+  assert.equal(releaseProviderWork(root, renewed, { now: 2_002 }), true);
 });
 
 test('simultaneous auth and provider-work processes admit exactly one class of operation', async (t) => {

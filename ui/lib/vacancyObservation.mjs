@@ -1,6 +1,8 @@
 import crypto from 'node:crypto';
 
 const TRACKING_PARAMETERS = /^(?:utm_[^=]+|gclid|fbclid|mc_[^=]+)$/i;
+const CREDENTIAL_VALUE = /(?:\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b)|(?:\b(?:access[-_ ]?token|api[-_ ]?(?:key|token)|authorization|password|secret|session[-_ ]?id|token)\s*[:=]\s*\S+)|(?:\bbearer\s+[A-Za-z0-9._~+/-]{8,})|(?:\bsk-[A-Za-z0-9_-]{16,})|(?:\bgh[pousr]_[A-Za-z0-9]{20,})|(?:\bxox[baprs]-[A-Za-z0-9-]{10,})|(?:\bAKIA[0-9A-Z]{16}\b)/i;
+const MAX_SOURCE_RECORD_ID_LENGTH = 160;
 
 function fingerprint(value) {
   return crypto.createHash('sha256').update(value).digest('hex');
@@ -100,7 +102,11 @@ function compensation(job, warnings) {
 
 function sourceRecordId(job, canonicalUrl) {
   const providerId = text(job.sourceRecordId) || text(job.providerId);
-  return providerId || (canonicalUrl ? `url-${fingerprint(canonicalUrl).slice(0, 16)}` : null);
+  if (!providerId) return canonicalUrl ? `url-${fingerprint(canonicalUrl).slice(0, 16)}` : null;
+  if (providerId.length > MAX_SOURCE_RECORD_ID_LENGTH || CREDENTIAL_VALUE.test(providerId)) {
+    return `provider-${fingerprint(providerId).slice(0, 32)}`;
+  }
+  return providerId;
 }
 
 function diagnosticCode(warning) {
@@ -114,7 +120,7 @@ function diagnosticCode(warning) {
 export function normaliseObservation(job, {
   sourceName, collectionSource, fetchedAt, laneId, laneIds, roleFamily,
 } = {}) {
-  const source = text(sourceName) || text(job?.source);
+  const source = metadataText(sourceName) || metadataText(job?.source);
   if (!job || !source) return null;
   const canonicalUrl = canonicaliseUrl(job.url || job.sourceUrl);
   const title = text(job.title);
@@ -157,10 +163,13 @@ export function normaliseObservation(job, {
     roleFamily: _roleFamily,
     roleFamilyId: _roleFamilyId,
     targetRoleFamily: _targetRoleFamily,
+    providerId: _providerId,
+    sourceRecordId: _sourceRecordId,
     ...sourceJob
   } = job;
   const fingerprintInput = {
     ...sourceJob,
+    sourceRecordId: recordId,
     url: canonicalUrl || text(job.url),
     sourceUrl: canonicalUrl || text(job.sourceUrl),
   };

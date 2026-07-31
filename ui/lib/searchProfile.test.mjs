@@ -80,12 +80,32 @@ test('profile rule IDs are field-scoped, bounded and enumerate only published ru
   }];
   const profile = publishSearchProfile(draft, { publishedAt: NOW });
   const ids = [
-    profileRuleId('target', 'primaryTitles', sameText),
-    profileRuleId('target', 'skills', sameText),
-    profileRuleId('negative', 'excludedResponsibilities', sameText),
+    profileRuleId('target', 'primaryTitles', profile.target.primaryTitles[0]),
+    profileRuleId('target', 'skills', profile.target.skills[0]),
+    profileRuleId('negative', 'excludedResponsibilities', profile.negative.excludedResponsibilities[0]),
   ];
   assert.equal(new Set(ids).size, 3);
   assert.ok(ids.every((id) => id.length <= 80));
+  assert.deepEqual(searchProfileRuleIds(profile), new Set(ids));
+});
+
+test('profile rule IDs distinguish strength and provenance for the same field value', () => {
+  const explicitMandatory = {
+    value: 'Shared phrase', strength: 'mandatory', provenance: 'explicit',
+  };
+  const derivedPreference = {
+    value: 'Shared phrase',
+    strength: 'strong-preference',
+    provenance: 'deterministic-derivation',
+  };
+  const draft = genericProfileDraft({
+    primaryTitles: [explicitMandatory, derivedPreference],
+  });
+  const profile = publishSearchProfile(draft, { publishedAt: NOW });
+  const ids = profile.target.primaryTitles.map((rule) => (
+    profileRuleId('target', 'primaryTitles', rule)
+  ));
+  assert.equal(new Set(ids).size, 2);
   assert.deepEqual(searchProfileRuleIds(profile), new Set(ids));
 });
 

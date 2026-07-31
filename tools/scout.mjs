@@ -18,7 +18,7 @@ import {
   providerPreflight, recordProviderResultHealth,
 } from '../ui/lib/providerHealth.mjs';
 import { setupReadiness } from '../ui/lib/setupReadiness.mjs';
-import { runStructuredTurn } from '../ui/lib/structuredTurn.mjs';
+import { ProviderLifecycleUnclosedError, runStructuredTurn } from '../ui/lib/structuredTurn.mjs';
 import {
   assessScanCandidates, assessmentCandidatesForSelection, buildAssessmentPrompt, compactCandidates, createRankedDiscoveryStages, DEFAULT_CANDIDATE_LIMIT,
   coordinateScanArtifacts, durableScanProjection, inboxRecheckCandidates, promptCandidate, runScanPipeline, SCAN_ASSESSMENT_SCHEMA,
@@ -59,7 +59,7 @@ import {
   activeLearningPolicy, createLearningLedger, loadLearningLedger,
 } from '../ui/lib/feedbackLearning.mjs';
 import {
-  acquireProviderWork, releaseProviderWork,
+  acquireProviderWork, releaseProviderWork, renewProviderWork,
 } from '../ui/lib/providerAuthMutation.mjs';
 
 const APP_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -320,7 +320,9 @@ export function workspaceQueryPlan(root, { broadened = false } = {}) {
       priority: lane.priority,
       priorityBand: lane.priorityBand,
       roleFamily: lane.profileFields.find(({ path: field }) => (
-        field === 'target.primaryTitles' || field === 'target.titles'
+        field === 'target.primaryTitles'
+        || field === 'target.adjacentTitles'
+        || field === 'target.titles'
       ))?.value || null,
     }));
     const revision = searchLanePlanRevision(lanePlan);
@@ -757,6 +759,7 @@ export async function runScanWith(root, provider, mode, {
   providerPreflightFn = providerPreflight,
   recordProviderResultHealthFn = recordProviderResultHealth,
   acquireProviderWorkFn = acquireProviderWork,
+  renewProviderWorkFn = renewProviderWork,
   releaseProviderWorkFn = releaseProviderWork,
 } = {}) {
   if (!['codex', 'claude'].includes(provider)) throw new Error('provider must be codex or claude');
@@ -913,7 +916,7 @@ export async function runScanWith(root, provider, mode, {
               scheduleId: request.execution.scheduleId,
               logicalWindowId: request.execution.logicalWindowId,
               purpose: request.purpose,
-              compatibilityFingerprint: request.execution.compatibilityFingerprint,
+              compatibilityFingerprint: compatibilityFingerprint(compatibility),
             }, lease);
           },
         } : {}),
@@ -941,6 +944,7 @@ export async function runScanWith(root, provider, mode, {
             providerPreflightFn,
             recordProviderResultHealthFn,
             acquireProviderWorkFn,
+            renewProviderWorkFn,
             releaseProviderWorkFn,
           });
           if (queued.status === 'in-progress'
@@ -1089,8 +1093,19 @@ export async function runScanWith(root, provider, mode, {
             const paths = workspacePaths(root);
             const emptyContext = buildScanContext(paths, config, []);
             const contextDigests = assessmentContextDigests(paths, config);
-            const providerWork = acquireProviderWorkFn(root, provider);
+            let providerWork = acquireProviderWorkFn(root, provider);
+            let providerWorkRenewalFailure = null;
+            const providerWorkHeartbeat = setInterval(() => {
+              try {
+                providerWork = renewProviderWorkFn(root, providerWork);
+                providerWorkRenewalFailure = null;
+              } catch (error) {
+                providerWorkRenewalFailure = error;
+              }
+            }, 5 * 60 * 1000);
+            providerWorkHeartbeat.unref?.();
             let assessed;
+            let providerWorkTransferred = false;
             try {
               assessed = await assessScanCandidates({
                 run,
@@ -1101,6 +1116,7 @@ export async function runScanWith(root, provider, mode, {
                 contextOverheadCharacters: JSON.stringify(emptyContext).length,
                 contextDigests,
                 invokeProvider({ kind, jobs, validationFailures, timeoutMs, maxInputTokens }) {
+                  if (providerWorkRenewalFailure) throw providerWorkRenewalFailure;
                   const context = buildScanContext(paths, config, jobs.map(promptCandidate));
                   const prompt = buildAssessmentPrompt(context, { kind, validationFailures });
                   const invocation = runStructuredTurnFn({
@@ -1124,8 +1140,27 @@ export async function runScanWith(root, provider, mode, {
                   return invocation;
                 },
               });
+            } catch (error) {
+              if (error instanceof ProviderLifecycleUnclosedError
+                && typeof error.closure?.then === 'function') {
+                providerWorkTransferred = true;
+                void Promise.resolve(error.closure).then(
+                  () => {
+                    clearInterval(providerWorkHeartbeat);
+                    try { releaseProviderWorkFn(root, providerWork); } catch { /* recovery owns stale authority */ }
+                  },
+                  () => {
+                    clearInterval(providerWorkHeartbeat);
+                    try { releaseProviderWorkFn(root, providerWork); } catch { /* recovery owns stale authority */ }
+                  },
+                );
+              }
+              throw error;
             } finally {
-              releaseProviderWorkFn(root, providerWork);
+              if (!providerWorkTransferred) {
+                clearInterval(providerWorkHeartbeat);
+                releaseProviderWorkFn(root, providerWork);
+              }
             }
             assessmentFailures = assessed.failures;
             if (!assessed.assessments.length && assessmentFailures.length) {

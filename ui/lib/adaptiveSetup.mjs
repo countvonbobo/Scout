@@ -17,7 +17,7 @@ const UNIVERSAL = Object.freeze([
   },
   {
     id: 'adjacent-work',
-    field: 'target.titles',
+    field: 'target.adjacentTitles',
     label: 'Adjacent work',
     prompt: 'Which adjacent titles would you genuinely consider?',
     maxItems: 8,
@@ -173,6 +173,7 @@ function question(definition, phase, draft, prompt = definition.prompt) {
 function titleAnchor(draft) {
   const rule = [
     ...(draft?.target?.primaryTitles || []),
+    ...(draft?.target?.adjacentTitles || []),
     ...(draft?.target?.titles || []),
   ].find((item) => String(item?.value || '').trim());
   return String(rule?.value || '').trim() || 'this work';

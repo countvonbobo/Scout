@@ -14,6 +14,7 @@ function draft(overrides = {}) {
     status: 'draft',
     target: {
       primaryTitles: [rule('Platform engineer')],
+      adjacentTitles: [],
       titles: [],
       locations: [],
       workingPatterns: [],
@@ -101,6 +102,26 @@ test('adaptive answers replace only their exact draft fields with explicit rules
   assert.deepEqual(updated.target.employers, original.target.employers);
   assert.equal(updated.unknownPolicies.location, 'penalise');
   assert.deepEqual(original.target.skills, [rule('Old skill')]);
+});
+
+test('adjacent-work reads and replaces the exact adjacentTitles field', () => {
+  const original = draft({
+    target: {
+      adjacentTitles: [rule('Reliability engineer')],
+      titles: [rule('Legacy broad title')],
+    },
+  });
+  const question = buildAdaptiveQuestionnaire(original).questions
+    .find(({ id }) => id === 'adjacent-work');
+  assert.equal(question.field, 'target.adjacentTitles');
+  assert.deepEqual(question.current, original.target.adjacentTitles);
+
+  const updated = applyAdaptiveAnswers(original, [{
+    questionId: 'adjacent-work',
+    values: [{ value: 'Platform operations', strength: 'nice-to-have' }],
+  }]);
+  assert.deepEqual(updated.target.adjacentTitles, [rule('Platform operations', 'nice-to-have')]);
+  assert.deepEqual(updated.target.titles, original.target.titles);
 });
 
 test('adaptive answers reject unbounded, unknown and unconfirmed blocking values', () => {

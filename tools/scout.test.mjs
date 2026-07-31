@@ -180,6 +180,7 @@ test('published search lanes replace legacy categories and annotate collected jo
     status: 'draft',
     target: {
       primaryTitles: [{ value: 'Research coordinator', strength: 'strong-preference', provenance: 'explicit' }],
+      adjacentTitles: [{ value: 'Evidence manager', strength: 'nice-to-have', provenance: 'explicit' }],
       skills: [{ value: 'Evidence synthesis', strength: 'nice-to-have', provenance: 'explicit' }],
     },
     negative: {},
@@ -194,12 +195,17 @@ test('published search lanes replace legacy categories and annotate collected jo
   const queryPlan = workspaceQueryPlan(root);
   assert.equal(queryPlan.source, 'published-search-lanes');
   assert.ok(queryPlan.queries.includes('Research coordinator'));
+  assert.ok(queryPlan.queries.includes('Evidence manager'));
   assert.equal(queryPlan.queries.includes('Legacy query must not run'), false);
   assert.equal(queryPlan.queries.includes('Legacy category must not run'), false);
   assert.equal(queryPlan.generation, 1);
   assert.match(queryPlan.revision, /^[a-f0-9]{64}$/);
   assert.match(queryPlan.selectionFingerprint, /^[a-f0-9]{64}$/);
   assert.ok(queryPlan.lanes.every(({ queryFingerprint }) => /^[a-f0-9]{64}$/.test(queryFingerprint)));
+  assert.equal(
+    queryPlan.lanes.find(({ query }) => query === 'Evidence manager')?.roleFamily,
+    'Evidence manager',
+  );
 
   let seenQueries;
   const collected = await collectScanSources(root, config, {
@@ -706,6 +712,59 @@ test('candidate assessment holds provider-work authority across every provider r
     assert.ok(postRunAuth);
   } finally {
     if (postRunAuth) releaseProviderAuthMutation(root, postRunAuth);
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('unclosed assessment provider work remains an auth barrier until process closure', async () => {
+  const root = scanRoot();
+  enableRankedDiscovery(root);
+  let closeProvider;
+  const closure = new Promise((resolve) => { closeProvider = resolve; });
+  let postClosureAuth = null;
+  try {
+    const result = await runScanWith(root, 'codex', 'primary', {
+      providerStatusFn: authenticated,
+      collectSourcesFn: async () => ({
+        generatedAt: '2026-07-31T10:00:00.000Z',
+        queries: [],
+        sources: {
+          ats: {
+            configured: true,
+            status: 'healthy',
+            count: 1,
+            jobs: [{
+              company: 'Authority Co',
+              title: 'Ideal Role',
+              url: 'https://example.test/provider-unclosed',
+              providerId: 'provider-unclosed',
+            }],
+          },
+        },
+      }),
+      checkLivenessFn: async (candidates) => ({
+        live: candidates,
+        removed: [],
+        summary: { checked: candidates.length, gone: 0, unverified: 0 },
+      }),
+      runStructuredTurnFn: async () => {
+        throw new ProviderLifecycleUnclosedError('provider remains open', closure);
+      },
+    });
+
+    assert.equal(result.status, 'in-progress');
+    assert.equal(acquireProviderAuthMutation(root, 'codex', {
+      mutationId: 'auth-before-provider-closure',
+    }), null);
+    closeProvider();
+    await new Promise((resolve) => setImmediate(resolve));
+    postClosureAuth = acquireProviderAuthMutation(root, 'codex', {
+      mutationId: 'auth-after-provider-closure',
+    });
+    assert.ok(postClosureAuth);
+  } finally {
+    closeProvider?.();
+    if (postClosureAuth) releaseProviderAuthMutation(root, postClosureAuth);
     fs.rmSync(root, { recursive: true, force: true });
   }
 });

@@ -110,9 +110,17 @@ function metadataValues(observations, name) {
     .filter(Boolean))].sort(compareStable);
 }
 
-function canonicalVacancyId(canonicalUrl, identity) {
+function canonicalVacancyId(canonicalUrl, identity, sourceReferences) {
   if (canonicalUrl) return canonicalUrl;
-  return `vacancy-ref-${crypto.createHash('sha256').update(stableJson(identity)).digest('hex').slice(0, 24)}`;
+  const reference = [...sourceReferences].sort((left, right) => (
+    compareStable(
+      `${left.source || ''}\n${left.providerId || ''}\n${left.url || ''}`,
+      `${right.source || ''}\n${right.providerId || ''}\n${right.url || ''}`,
+    )
+  ))[0] || null;
+  return `vacancy-ref-${crypto.createHash('sha256')
+    .update(stableJson({ identity, reference }))
+    .digest('hex').slice(0, 24)}`;
 }
 
 function boundedSemanticText(value, maximum) {
@@ -229,7 +237,7 @@ function canonicalVacancy(observations) {
     location: identity.location,
     seniority: identity.seniority,
   };
-  const vacancyId = canonicalVacancyId(canonicalUrl, fallbackIdentity);
+  const vacancyId = canonicalVacancyId(canonicalUrl, fallbackIdentity, sourceReferences);
   const collectionSources = metadataValues(orderedObservations, 'collectionSource');
   const laneIds = [...new Set([
     ...metadataValues(orderedObservations, 'laneId'),
@@ -255,7 +263,6 @@ function canonicalVacancy(observations) {
     ...(semanticEvidence ? { semanticEvidence } : {}),
     ...fields,
     ...Object.fromEntries(LIST_FIELDS.map((name) => [name, listDisplayField(orderedObservations, name)])),
-    _fallbackIdentity: fallbackIdentity,
   };
 }
 
@@ -268,30 +275,6 @@ export function canonicaliseObservations(observations) {
     else groups.push([observation]);
   }
   const vacancies = groups.sort((left, right) => compareStable(groupKey(left), groupKey(right))).map(canonicalVacancy);
-  const collisions = new Map();
-  for (const vacancy of vacancies) {
-    if (vacancy.canonicalUrl) continue;
-    const peers = collisions.get(vacancy.vacancyId) || [];
-    peers.push(vacancy);
-    collisions.set(vacancy.vacancyId, peers);
-  }
-  for (const peers of collisions.values()) {
-    if (peers.length < 2) continue;
-    const orderedPeers = [...peers].sort((left, right) => compareStable(
-      stableJson(left.sourceReferences),
-      stableJson(right.sourceReferences),
-    ));
-    // Keep the deterministic first peer on the intrinsic identity. Adding or
-    // removing later distinct references must not rewrite an existing vacancy.
-    for (const vacancy of orderedPeers.slice(1)) {
-      vacancy.vacancyId = `vacancy-ref-${crypto.createHash('sha256')
-        .update(stableJson({
-          identity: vacancy._fallbackIdentity,
-          references: vacancy.sourceReferences,
-        })).digest('hex').slice(0, 24)}`;
-    }
-  }
-  for (const vacancy of vacancies) delete vacancy._fallbackIdentity;
   return {
     vacancies,
     duplicateObservations: orderedObservations.length - groups.length,

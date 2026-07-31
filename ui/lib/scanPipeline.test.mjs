@@ -231,7 +231,14 @@ test('durable collection preserves bounded employer monitoring evidence for fina
           status: 'healthy',
           count: 0,
           jobs: [],
-          checks: [],
+          checks: Array.from({ length: 32 }, (_, index) => ({
+            employerId: `employer-${String(index).padStart(16, '0')}`,
+            adapter: 'structured-data',
+            status: 'healthy',
+            returned: 0,
+            parsed: 0,
+            checkedAt: '2026-07-31T09:30:00.000Z',
+          })),
           registryRevision: employerRegistryRevision(registry),
           registrySnapshot: registry,
         },
@@ -253,12 +260,60 @@ test('durable collection preserves bounded employer monitoring evidence for fina
     lease: { runId: 'monitoring-run' },
     priorArtifact: null,
   });
-  assert.deepEqual(collected.sources.employer_registry.registrySnapshot, registry);
+  const durable = stages.collect.artifactCodec.decode(
+    stages.collect.artifactCodec.encode(collected),
+  );
+  assert.deepEqual(durable.sources.employer_registry.registrySnapshot, registry);
   assert.equal(
-    collected.sources.employer_registry.registryRevision,
+    durable.sources.employer_registry.registryRevision,
     employerRegistryRevision(registry),
   );
-  assert.deepEqual(collected.sources.employer_registry.checks, []);
+  assert.equal(durable.sources.employer_registry.checks.length, 32);
+});
+
+test('actual collect codec fingerprints unbounded credential-shaped provider identifiers', async () => {
+  const profile = {
+    version: 1, status: 'published', id: 'profile-source-identity',
+    target: {}, negative: {},
+    compensation: {
+      currency: null, period: 'year', minimum: null,
+      minimumStrength: 'neutral', unknownPolicy: 'include',
+    },
+  };
+  const privateId = `${['access', 'token'].join('_')}=${['TOP', 'SECRET'].join('')}1234567890-${'x'.repeat(200_000)}`;
+  const stages = createRankedDiscoveryStages({
+    collect: async () => ({
+      generatedAt: '2026-07-31T09:30:00.000Z',
+      queries: [],
+      sources: {
+        fixture: {
+          configured: true,
+          status: 'healthy',
+          count: 1,
+          jobs: [{
+            providerId: privateId,
+            title: 'Engineer',
+            company: 'Example',
+            description: 'Build stable services.',
+          }],
+        },
+      },
+    }),
+    profile,
+  });
+  const raw = await stages.collect({
+    run: { runId: 'source-identity-run' },
+    lease: { runId: 'source-identity-run' },
+    priorArtifact: null,
+  });
+  const encoded = stages.collect.artifactCodec.encode(raw);
+  const stored = JSON.stringify(encoded);
+  assert.match(
+    encoded.sources.fixture.observations[0].sourceRecordId,
+    /^provider-[a-f0-9]{32}$/,
+  );
+  assert.ok(stored.length < 20_000);
+  assert.doesNotMatch(stored, /TOPSECRET|access_token/i);
 });
 
 test('ranked discovery excludes zero-score unrelated vacancies below the configured relevance threshold', () => {
@@ -1490,10 +1545,12 @@ test('failed scheduled coverage never drains an equivalent queued request', asyn
       },
     });
 
-    assert.equal(result.outcome, 'complete', JSON.stringify(result));
+    assert.equal(result.outcome, 'failed', JSON.stringify(result));
     assert.equal(coverCalls, 3);
     assert.equal(runCalls, 0);
-    assert.ok(result.failures.some(({ code }) => code === 'queue-coverage-pending'));
+    assert.ok(result.failures.some(({ code, message }) => (
+      code === 'stage-failed' && /coverage/i.test(message)
+    )));
     assert.equal(projectScanQueue(root).requests[0].status, 'queued');
   } finally {
     fs.rmSync(root, { recursive: true, force: true });

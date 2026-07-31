@@ -5,6 +5,8 @@ import {
 
 const MAX_PAGE_BYTES = 1_000_000;
 const MAX_PAGE_JOBS = 100;
+const MAX_JSON_LD_DEPTH = 32;
+const MAX_JSON_LD_NODES = 2_000;
 
 function text(value, maximum = 4000) {
   return String(value ?? '').normalize('NFKC').replace(/\s+/g, ' ').trim().slice(0, maximum);
@@ -62,11 +64,38 @@ function addressText(value) {
 }
 
 function postingObjects(value) {
-  if (Array.isArray(value)) return value.flatMap(postingObjects);
-  if (!value || typeof value !== 'object') return [];
-  const type = Array.isArray(value['@type']) ? value['@type'] : [value['@type']];
-  const self = type.includes('JobPosting') ? [value] : [];
-  return [...self, ...postingObjects(value['@graph'])];
+  const postings = [];
+  const pending = [{ value, depth: 0 }];
+  let visited = 0;
+  while (pending.length) {
+    const current = pending.pop();
+    visited += 1;
+    if (visited > MAX_JSON_LD_NODES || current.depth > MAX_JSON_LD_DEPTH) {
+      const error = new Error('structured data exceeds traversal limits');
+      error.code = 'structured-data-too-complex';
+      throw error;
+    }
+    if (Array.isArray(current.value)) {
+      if (visited + pending.length + current.value.length > MAX_JSON_LD_NODES) {
+        const error = new Error('structured data exceeds traversal limits');
+        error.code = 'structured-data-too-complex';
+        throw error;
+      }
+      for (let index = current.value.length - 1; index >= 0; index -= 1) {
+        pending.push({ value: current.value[index], depth: current.depth + 1 });
+      }
+      continue;
+    }
+    if (!current.value || typeof current.value !== 'object') continue;
+    const type = Array.isArray(current.value['@type'])
+      ? current.value['@type']
+      : [current.value['@type']];
+    if (type.includes('JobPosting')) postings.push(current.value);
+    if (current.value['@graph'] !== undefined) {
+      pending.push({ value: current.value['@graph'], depth: current.depth + 1 });
+    }
+  }
+  return postings;
 }
 
 function parseJobPostingRecords(html, {
@@ -85,7 +114,16 @@ function parseJobPostingRecords(html, {
   for (const match of scripts) {
     let value;
     try { value = JSON.parse(match[1]); } catch { continue; }
-    for (const posting of postingObjects(value)) {
+    let records;
+    try { records = postingObjects(value); } catch (error) {
+      if (error?.code === 'structured-data-too-complex') {
+        return {
+          postings, found, invalid, stale, failureCode: 'structured-data-too-complex',
+        };
+      }
+      throw error;
+    }
+    for (const posting of records) {
       found += 1;
       const rawTitle = text(posting.title, 4_000);
       const title = rawTitle.length <= 240 ? rawTitle : '';
@@ -351,6 +389,11 @@ async function collectCareersPage(employer, fetchImpl, checkedAt, {
     employerId: employer.id,
     now,
   });
+  if (structured.failureCode) {
+    return result(employer, 'structured-data', 'degraded', checkedAt, {
+      failureCode: structured.failureCode,
+    });
+  }
   const postings = await publicJobs(structured.postings, { lookupFn });
   if (postings.length) {
     return result(employer, 'structured-data', 'healthy', checkedAt, {

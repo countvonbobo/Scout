@@ -196,8 +196,10 @@ test('URL-less canonical identities are stable, collision-free and source-order 
   });
   const separate = canonicaliseObservations([first, second]).vacancies;
   const firstAloneId = canonicaliseObservations([first]).vacancies[0].vacancyId;
+  const secondAloneId = canonicaliseObservations([second]).vacancies[0].vacancyId;
 
   assert.equal(separate.length, 2);
+  assert.notEqual(firstAloneId, secondAloneId);
   assert.equal(new Set(separate.map(({ vacancyId }) => vacancyId)).size, 2);
   assert.ok(separate.every(({ vacancyId }) => /^vacancy-ref-[a-f0-9]{24}$/.test(vacancyId)));
   assert.equal(

@@ -236,6 +236,22 @@ test('generic monitoring is opt-in, same-site and bounded', async () => {
   assert.equal(result.jobs[0].url, 'https://careers.example.test/jobs/operations-lead');
 });
 
+test('deep JSON-LD graphs degrade with a fixed structural limit instead of aborting collection', async () => {
+  let graph = { '@type': 'JobPosting', title: 'Too deep' };
+  for (let depth = 0; depth < 80; depth += 1) graph = { '@graph': [graph] };
+  const monitored = await collectEmployer(employer(), {
+    fetchImpl: async () => response(
+      `<script type="application/ld+json">${JSON.stringify(graph)}</script>`,
+      { type: 'text/html' },
+    ),
+    lookupFn: publicLookup,
+    now: () => AT,
+  });
+  assert.equal(monitored.status, 'degraded');
+  assert.equal(monitored.failureCode, 'structured-data-too-complex');
+  assert.deepEqual(monitored.jobs, []);
+});
+
 test('terms, robots, authentication, anti-bot, rate limits and JavaScript shells fail safely', async () => {
   let calls = 0;
   const fetchImpl = async () => { calls += 1; return response(''); };

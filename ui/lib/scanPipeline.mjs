@@ -811,14 +811,6 @@ export async function runScanPipeline({
         }
       }
 
-      appendRunEvent(run, {
-        type: 'run.completed',
-        stageId: 'finalise',
-        idempotencyKey: `run-completed-g${lease.generation}`,
-        payload: { schemaVersion: 1, outcome: 'complete' },
-      }, lease);
-      manifest = validateManifestAgreement(run, lease).manifest;
-      terminal = true;
       if (typeof queue?.cover === 'function') {
         let covered = false;
         for (let attempt = 0; attempt < 3 && !covered; attempt += 1) {
@@ -829,13 +821,17 @@ export async function runScanPipeline({
         }
         if (!covered) {
           queueCoveragePending = true;
-          failures.push(Object.freeze({
-            code: 'queue-coverage-pending',
-            stage: 'post-success',
-            reason: 'window-coverage-failed',
-          }));
+          throw new Error('scheduled window coverage could not be committed');
         }
       }
+      appendRunEvent(run, {
+        type: 'run.completed',
+        stageId: 'finalise',
+        idempotencyKey: `run-completed-g${lease.generation}`,
+        payload: { schemaVersion: 1, outcome: 'complete' },
+      }, lease);
+      manifest = validateManifestAgreement(run, lease).manifest;
+      terminal = true;
       if (postTerminalSuccess !== null) {
         let postSuccessFailure = null;
         if (!mutationReceipt) {
@@ -1532,7 +1528,7 @@ function semanticCollectedSource(source, sourceName, profile, options = {}) {
     ? {
       registrySnapshot: structuredClone(validateEmployerRegistry(source.registrySnapshot)),
       registryRevision: String(source.registryRevision || '').slice(0, 128),
-      checks: structuredClone(source.checks.slice(0, 24)),
+      checks: structuredClone(source.checks.slice(0, 32)),
     }
     : {};
   return {
@@ -2485,7 +2481,8 @@ export function coordinateScanArtifacts(root, input, { run, lease, hooks = {} })
           origin: {
             kind: 'advert-discovered',
             recordedAt: timestamp,
-            reference: String(candidate.vacancyId || candidate.url || `scan:${run.runId}`).slice(0, 160),
+            reference: safeSourceUrl(candidate.vacancyId || candidate.url)
+              || String(candidate.vacancyId || `scan:${run.runId}`).slice(0, 160),
           },
         });
       }

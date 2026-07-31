@@ -253,6 +253,32 @@ export function acquireProviderWork(root, provider, {
   return capability;
 }
 
+export function renewProviderWork(root, capability, {
+  durationMs = DEFAULT_WORK_DURATION_MS,
+  now,
+} = {}) {
+  const provider = checkedProvider(capability?.provider);
+  const at = checkedNow(now);
+  if (!Number.isSafeInteger(durationMs) || durationMs <= 0 || durationMs > DEFAULT_WORK_DURATION_MS) {
+    throw new TypeError('provider work renewal settings are invalid');
+  }
+  const renewed = withGuard(root, provider, at, (target) => {
+    const file = path.join(target.work, `${capability.workId}.json`);
+    if (!fs.existsSync(file)) throw new Error('provider work capability was lost');
+    const current = validateWork(JSON.parse(fs.readFileSync(file, 'utf8')), provider);
+    if (current.workId !== capability.workId || current.expiresAt <= at) {
+      throw new Error('provider work capability was lost');
+    }
+    const mutation = readProviderAuthMutation(root, provider, { now: at });
+    if (mutation) throw new ProviderAuthMutationActiveError(provider, mutation.phase);
+    const record = validateWork({ ...current, expiresAt: at + durationMs }, provider);
+    atomicWriteFile(file, `${JSON.stringify(record)}\n`, { mode: 0o600 });
+    return structuredClone(record);
+  });
+  if (!renewed) throw new Error('provider work authority could not be renewed');
+  return renewed;
+}
+
 export function releaseProviderWork(root, capability, { now } = {}) {
   const provider = checkedProvider(capability?.provider);
   const at = checkedNow(now);

@@ -199,7 +199,13 @@ export function profileRuleId(section, field, rule) {
   if (!value) throw new TypeError('profile rule value is required');
   const fieldSlug = field.replace(/([a-z0-9])([A-Z])/g, '$1-$2').toLowerCase();
   const fingerprint = crypto.createHash('sha256')
-    .update(canonicalJson({ section, field, value }))
+    .update(canonicalJson({
+      section,
+      field,
+      value,
+      strength: rule?.strength,
+      provenance: rule?.provenance,
+    }))
     .digest('hex')
     .slice(0, 16);
   return `rule-${section}-${fieldSlug}-${fingerprint}`;

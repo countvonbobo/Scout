@@ -117,7 +117,17 @@ function origin(value) {
     || !ORIGINS.includes(value.kind)) {
     throw new TypeError('employer origin is invalid');
   }
-  const reference = boundedText(value.reference, 160);
+  const rawReference = boundedText(value.reference, 2_048);
+  let reference = boundedText(rawReference, 160);
+  try {
+    const parsed = new URL(rawReference);
+    if (['http:', 'https:'].includes(parsed.protocol)) {
+      const clean = canonicalUrl(rawReference);
+      reference = clean.length <= 160
+        ? clean
+        : `${new URL(clean).origin}/scout-ref-${digest(clean).slice(0, 16)}`;
+    }
+  } catch { /* non-URL origin references are valid */ }
   if (!reference) throw new TypeError('employer origin reference is required');
   return {
     kind: value.kind,

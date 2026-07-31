@@ -362,7 +362,7 @@ export function searchProfileReviewHtml(state = {}) {
   return `<section class="setup-callout" id="search-profile-review"><h3>Review your search profile</h3>
     ${noDraft}
     <section><h4>Primary work</h4><p>${profileRuleText(draft, 'target', 'primaryTitles', null)}</p></section>
-    <section><h4>Adjacent work</h4><p>${profileRuleText(draft, 'target', 'titles', null)}</p></section>
+    <section><h4>Adjacent work</h4><p>${profileRuleText(draft, 'target', 'adjacentTitles', null)}</p></section>
     <section><h4>Mandatory requirements</h4><p>${profileRuleText(draft, 'target', null, ['mandatory'])}</p></section>
     <section><h4>Preferences</h4><p>${profileRuleText(draft, 'target', null, ['strong-preference', 'nice-to-have', 'neutral'])}</p></section>
     <section><h4>Confirmed exclusions</h4><p>${confirmedExclusions.length ? escapeProfileText(confirmedExclusions.join(', ')) : 'None recorded'}</p></section>

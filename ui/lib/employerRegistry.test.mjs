@@ -33,6 +33,22 @@ test('careers URLs discard search and fragment data before private persistence',
   assert.equal(registry.employers[0].careersUrl, 'https://example.test/careers');
 });
 
+test('URL-valued origin references discard query credentials and fragments', () => {
+  const privateQuery = `${['access', 'token'].join('_')}=${['PRIVATE', 'VALUE'].join('_')}`;
+  const registry = createEmployerRegistry([discovery('Origin Query Example', {
+    origin: {
+      kind: 'advert-discovered',
+      recordedAt: AT,
+      reference: `https://jobs.example.test/role?${privateQuery}#apply`,
+    },
+  })], { now: () => AT });
+  assert.equal(
+    registry.employers[0].origins[0].reference,
+    'https://jobs.example.test/role',
+  );
+  assert.doesNotMatch(JSON.stringify(registry), /PRIVATE_VALUE|access_token/);
+});
+
 test('registry accepts all four discovery origins without inventing priority', () => {
   const registry = createEmployerRegistry([
     discovery('Named Example', {

@@ -220,3 +220,17 @@ test('normalisation retains only bounded redacted diagnostics and a raw fingerpr
   assert.match(observation.rawFingerprint, /^[a-f0-9]{64}$/);
   assert.doesNotMatch(stored, /PRIVATE_SOURCE_TOKEN|PRIVATE_RAW_VALUE|Authorization Bearer/);
 });
+
+test('source record identity is bounded and credential-shaped values are fingerprinted', () => {
+  const privateId = `token=TOPSECRET1234567890-${'x'.repeat(200_000)}`;
+  const observation = normaliseObservation({
+    providerId: privateId,
+    title: 'Engineer',
+    company: 'Acme',
+    description: 'Build stable services.',
+  }, { sourceName: 'fixture', fetchedAt: NOW });
+
+  assert.match(observation.sourceRecordId, /^provider-[a-f0-9]{32}$/);
+  assert.ok(observation.sourceRecordId.length <= 160);
+  assert.doesNotMatch(JSON.stringify(observation), /TOPSECRET|token=/i);
+});
