@@ -214,6 +214,66 @@ test('durable reviewed rejections are seen for novelty and lane productivity', (
   );
 });
 
+test('durable pre-assessment exclusions are seen for novelty and lane productivity', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'scout-pre-assessment-history-'));
+  fs.mkdirSync(path.join(root, 'data'), { recursive: true });
+  fs.writeFileSync(path.join(root, 'data', 'opportunities.json'), '{"updated":"2026-07-01","opportunities":[]}\n');
+  const excluded = {
+    vacancyId: 'vacancy-ref-excluded',
+    company: 'Example Co',
+    role: 'Engineer',
+    source: 'reviewed_lane',
+    laneIds: ['reviewed_lane'],
+    sourceReferences: [{ source: 'reviewed_lane', providerId: 'excluded-1', url: '' }],
+    code: 'hard-title-exclusion',
+  };
+  writeScanArtifacts(root, {
+    provider: 'codex',
+    mode: 'primary',
+    sources: { reviewed_lane: { configured: true, status: 'healthy', count: 1 } },
+    candidates: [],
+    assessmentResult: { assessments: [] },
+    policy: {},
+    startedAt: '2026-07-14T10:00:00Z',
+    ranked: [],
+    exclusions: [excluded],
+    hardExcluded: [excluded],
+  });
+  const history = readVacancyDecisionHistory(root);
+  assert.equal(history.length, 1);
+  assert.equal(history[0].outcome, 'hard-title-exclusion');
+
+  const profile = {
+    version: 1, status: 'published', id: 'profile-exclusion-history',
+    target: {}, negative: {},
+    selection: { breadth: 'balanced' },
+    compensation: {
+      currency: null, period: 'year', minimum: null,
+      minimumStrength: 'neutral', unknownPolicy: 'include',
+    },
+  };
+  const result = prepareRankedDiscovery({
+    sources: {
+      reviewed_lane: {
+        count: 1,
+        jobs: [{
+          company: 'Example Co', title: 'Engineer',
+          source: 'reviewed_lane', providerId: 'excluded-1',
+        }],
+      },
+    },
+    profile,
+    tracker: { opportunities: [] },
+    decisionHistory: history,
+    relevanceThreshold: 0,
+  });
+  assert.deepEqual(result.discoveryCounts, []);
+  assert.equal(
+    result.ranked[0].dimensions.find(({ name }) => name === 'novelty').evidence[0].comparison,
+    'seen-exact',
+  );
+});
+
 test('privacy projection cannot collapse distinct query-addressed provider vacancies', () => {
   const profile = {
     version: 1, status: 'published', id: 'profile-query-identity-collision',
@@ -920,7 +980,7 @@ test('scan artifact exposes a reconciled funnel without claiming all jobs were a
   assert.deepEqual(Object.keys(artifacts.run.explanations[0]).sort(), [
     'above_threshold', 'assessment_status', 'company', 'deterministic_exclusion',
     'deterministic_exclusions', 'dimensions', 'outcome', 'pre_rank', 'reason_code',
-    'role', 'selection_reason', 'source', 'sourceUrl', 'stages', 'tracker_outcome',
+    'role', 'selection_reason', 'source', 'sourceReferences', 'sourceUrl', 'stages', 'tracker_outcome',
     'vacancy_id',
   ].sort());
   assert.equal(artifacts.run.funnel.bySource.ats.uniqueVacancies, 61);

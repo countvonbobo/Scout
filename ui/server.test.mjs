@@ -19,6 +19,7 @@ const {
   publicApiError, publicCvImportError, publicDeviceSettings, publicProviderStatus,
   publicSetupConfigError, recoverProfilePublicationsAtStartup, requestAccess,
   restartControl, runtimeProviderPreflight, shutdownControl,
+  routes,
   stageSearchProfileReviewAtStartup, scheduleCheckpoint, drainScheduledCheckpoints,
   drainRuntimeWork,
 } = await import('./server.mjs');
@@ -91,16 +92,20 @@ test('shutdown drainage starts a queued checkpoint immediately and settles its p
 });
 
 test('a failed runtime drain leaves the production listener available for a safe retry', async () => {
-  const listener = http.createServer((_req, res) => res.end('ok'));
-  await new Promise((resolve) => listener.listen(0, '127.0.0.1', resolve));
+  let rejectDrain;
+  const closing = closeServerSafely(server, {
+    drain: () => new Promise((_, reject) => { rejectDrain = reject; }),
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  const quiesced = await request({ path: '/api/app-info' });
+  assert.equal(quiesced.status, 503);
+  rejectDrain(new Error('provider child did not close'));
   await assert.rejects(
-    closeServerSafely(listener, {
-      drain: async () => { throw new Error('provider child did not close'); },
-    }),
+    closing,
     /provider child did not close/,
   );
-  assert.equal(listener.listening, true);
-  await new Promise((resolve) => listener.close(resolve));
+  assert.equal(server.listening, true);
+  assert.equal((await request({ path: '/api/app-info' })).status, 200);
 });
 
 test('server startup retries a live-fenced profile publication without starting unsafely', () => {
@@ -727,7 +732,18 @@ test('search-profile routes review a complete draft and publish only the current
   fs.writeFileSync(path.join(paths.profile, 'calibration.md'), 'Synthetic calibration evidence. '.repeat(5), 'utf8');
   fs.writeFileSync(path.join(paths.cv, 'master-cv.md'), 'Synthetic CV evidence. '.repeat(25), 'utf8');
   fs.mkdirSync(path.join(WORKSPACE_ROOT, '.scout', 'onboarding'), { recursive: true });
-  fs.writeFileSync(path.join(WORKSPACE_ROOT, '.scout', 'onboarding', 'activated.json'), '{"approved":true}\n', 'utf8');
+  const activatedHashes = Object.fromEntries([
+    'workspace.json', 'profile/context.md', 'profile/calibration.md',
+    'cv/master-cv.md', 'data/search-categories.json',
+  ].map((relative) => [
+    relative,
+    crypto.createHash('sha256').update(fs.readFileSync(path.join(WORKSPACE_ROOT, relative))).digest('hex'),
+  ]));
+  fs.writeFileSync(
+    path.join(WORKSPACE_ROOT, '.scout', 'onboarding', 'activated.json'),
+    `${JSON.stringify({ activatedHashes })}\n`,
+    'utf8',
+  );
   const setupStatus = await request({ method: 'GET', path: '/api/setup/status' });
   assert.equal(setupStatus.status, 200);
   assert.equal(JSON.parse(setupStatus.text).searchProfilePublished, false);
@@ -2118,6 +2134,17 @@ test('a UI mutation racing scan completion preserves every tracked user field', 
 
 test('runtime shutdown closes admission and drains checkpoints produced while work settles', async () => {
   let lateCheckpoint;
+  let admittedCheckpoint;
+  let releaseHandler;
+  let markHandlerStarted;
+  const handlerStarted = new Promise((resolve) => { markHandlerStarted = resolve; });
+  routes['POST /api/test/shutdown-admitted-handler'] = async (_req, res) => {
+    markHandlerStarted();
+    await new Promise((resolve) => { releaseHandler = resolve; });
+    admittedCheckpoint = scheduleCheckpoint('test: checkpoint produced by admitted HTTP handler');
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end('{"ok":true}');
+  };
   operations.start('shutdown-checkpoint-test', async (_update, { signal }) => new Promise((resolve) => {
     signal.addEventListener('abort', () => {
       lateCheckpoint = scheduleCheckpoint('test: checkpoint produced during shutdown');
@@ -2126,12 +2153,27 @@ test('runtime shutdown closes admission and drains checkpoints produced while wo
   }));
   await new Promise((resolve) => setImmediate(resolve));
 
-  await drainRuntimeWork({ timeoutMs: 5_000 });
+  const admittedRequest = request({
+    method: 'POST',
+    path: '/api/test/shutdown-admitted-handler',
+    headers: JSON_HEADERS(),
+    body: '{}',
+  });
+  await handlerStarted;
+  const drainage = drainRuntimeWork({ timeoutMs: 5_000 });
+  await new Promise((resolve) => setImmediate(resolve));
+  releaseHandler();
+  await drainage;
+  assert.equal((await admittedRequest).status, 200);
   assert.ok(lateCheckpoint);
+  assert.ok(admittedCheckpoint);
   const result = await lateCheckpoint;
+  const admittedResult = await admittedCheckpoint;
   assert.ok(['success', 'pending', 'partial', 'needs-attention', 'disabled'].includes(result.state));
+  assert.ok(['success', 'pending', 'partial', 'needs-attention', 'disabled'].includes(admittedResult.state));
   assert.throws(
     () => operations.start('late-shutdown-work', async () => null),
     /shutting down/,
   );
+  delete routes['POST /api/test/shutdown-admitted-handler'];
 });

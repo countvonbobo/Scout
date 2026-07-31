@@ -143,6 +143,28 @@ test('freshness uses persisted observation time and novelty uses only an exact h
   assert.equal(staleFreshness.evidence[0].referenceDate, '2026-07-30T00:00:00.000Z');
 });
 
+test('novelty does not collapse distinct provider openings behind one privacy-canonical URL', () => {
+  const rankedProfile = profile({
+    primaryTitles: [rule('Engineer', 'mandatory')],
+    selection: { breadth: 'focused', relevanceThreshold: 45, exploration: 0 },
+  });
+  const current = vacancy({ vacancyId: 'semantic-engineer', title: 'Engineer' });
+  current.canonicalUrl = 'https://jobs.example/apply';
+  current.sourceReferences = [{
+    source: 'provider-a', providerId: 'opening-2', url: 'https://jobs.example/apply',
+  }];
+  const [result] = rankVacancies([current], rankedProfile, [{
+    vacancyId: 'semantic-engineer',
+    company: 'Example Ltd',
+    role: 'Engineer',
+    url: 'https://jobs.example/apply',
+    sourceReferences: [{
+      source: 'provider-a', providerId: 'opening-1', url: 'https://jobs.example/apply',
+    }],
+  }]);
+  assert.equal(result.dimensions.find(({ name }) => name === 'novelty').evidence[0].comparison, 'unseen');
+});
+
 test('ranking is independent of source response order', () => {
   const rankedProfile = profile({ primaryTitles: [rule('Platform Engineer', 'mandatory')] });
   const weak = vacancy({ vacancyId: 'weak', title: 'Office Administrator' });

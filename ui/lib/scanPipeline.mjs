@@ -1224,7 +1224,19 @@ export function readVacancyDecisionHistory(root, { limit = VACANCY_DECISION_HIST
     } catch {
       continue;
     }
-    for (const item of [...(Array.isArray(run?.reviewed) ? run.reviewed : [])].reverse()) {
+    const assessed = Array.isArray(run?.reviewed) ? run.reviewed : [];
+    const preAssessment = (Array.isArray(run?.explanations) ? run.explanations : [])
+      .filter((item) => item?.stages?.assessed !== true)
+      .map((item) => ({
+        vacancyId: item.vacancy_id,
+        company: item.company,
+        role: item.role,
+        source: item.source,
+        sourceUrl: item.sourceUrl,
+        sourceReferences: item.sourceReferences,
+        outcome: item.reason_code || item.assessment_status,
+      }));
+    for (const item of [...assessed, ...preAssessment].reverse()) {
       if (!item?.company || !item?.role || !item?.outcome) continue;
       records.push({
         vacancyId: boundedText(item.vacancyId, 160) || null,

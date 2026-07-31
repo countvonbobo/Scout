@@ -52,6 +52,7 @@ jobs:
           if ($env:RELEASE_REF_TYPE -eq 'tag' -and $env:RELEASE_REF_NAME -ne "v$packageVersion") { throw 'Tag does not match package version' }
           "value=$version" | Out-File $env:GITHUB_OUTPUT -Append
       - run: node tools/build-release.mjs --installer --version "${{ steps.version.outputs.value }}"
+        env: { SCOUT_RELEASE_MARKERS: "${{ secrets.SCOUT_RELEASE_MARKERS }}" }
       - run: npm run release:audit -- --root dist/release/stage --stage --require-markers
         env: { SCOUT_RELEASE_MARKERS: "${{ secrets.SCOUT_RELEASE_MARKERS }}" }
       - name: Smoke install and preserve workspace
@@ -86,7 +87,8 @@ jobs:
       - run: node tools/typst-runtime.mjs verify --compile
       - run: npm test
       - run: node tools/build-platform.mjs mac
-      - run: npm run release:audit -- --root "dist/release/macos-$(node -p process.arch)" --stage --require-markers
+        env: { SCOUT_RELEASE_MARKERS: "${{ secrets.SCOUT_RELEASE_MARKERS }}" }
+      - run: npm run release:audit -- --root "dist/release/macos-$(node -p process.arch)/dmg-root/Scout.app" --stage --require-markers
         env: { SCOUT_RELEASE_MARKERS: "${{ secrets.SCOUT_RELEASE_MARKERS }}" }
       - name: Mount and initialise workspace
         run: |
@@ -141,6 +143,7 @@ jobs:
       - run: node tools/typst-runtime.mjs verify --compile
       - run: npm test
       - run: node tools/build-platform.mjs linux
+        env: { SCOUT_RELEASE_MARKERS: "${{ secrets.SCOUT_RELEASE_MARKERS }}" }
       - run: npm run release:audit -- --root dist/release/linux-x64 --stage --require-markers
         env: { SCOUT_RELEASE_MARKERS: "${{ secrets.SCOUT_RELEASE_MARKERS }}" }
       - name: Install, initialise and uninstall DEB

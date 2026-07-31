@@ -129,6 +129,31 @@ test('background rendering times out without replacing the previous PDF', async 
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 
+test('background rendering kills Typst when managed shutdown aborts the operation', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'scout-render-abort-'));
+  try {
+    fs.mkdirSync(path.join(root, 'applications', 'example'), { recursive: true });
+    fs.writeFileSync(path.join(root, 'applications', 'example', 'cv.typ'), '= Example');
+    let killed = false;
+    const stalled = () => {
+      const child = new EventEmitter();
+      child.stdout = new PassThrough();
+      child.stderr = new PassThrough();
+      child.kill = () => { killed = true; process.nextTick(() => child.emit('close', null)); };
+      return child;
+    };
+    const controller = new AbortController();
+    const pending = renderCvTarget(root, { target: 'application', slug: 'example' }, {
+      runtimeResolver: () => ({ available: true, command: 'typst' }),
+      spawnImpl: stalled,
+      signal: controller.signal,
+    });
+    controller.abort(new Error('operation cancelled for shutdown'));
+    await assert.rejects(pending, /cancelled for shutdown/);
+    assert.equal(killed, true);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
 test('reports a Scout repair action when no Typst runtime is usable', () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'scout-cv-missing-runtime-'));
   try {

@@ -112,6 +112,34 @@ test('activation holds the shared backup lease across every active-file replacem
   assert.equal(checked, true);
 });
 
+test('ordinary failure after activation-marker publication removes the marker before rollback', async () => {
+  const dir = root();
+  const original = Object.fromEntries(ONBOARDING_FILES.map((relative) => [
+    relative, fs.existsSync(path.join(dir, relative))
+      ? fs.readFileSync(path.join(dir, relative), 'utf8')
+      : null,
+  ]));
+  const staged = await createOnboardingProposal(dir, 'codex', {
+    providerStatusFn: status,
+    runStructuredTurnFn: run,
+  });
+  assert.throws(
+    () => activateOnboardingProposal(dir, staged.proposalId, true, {
+      doctorFn: healthyDoctor,
+      _testHooks: {
+        afterActivatedMarker() { throw new Error('synthetic terminal write failure'); },
+      },
+    }),
+    /synthetic terminal write failure/,
+  );
+  assert.equal(fs.existsSync(path.join(dir, '.scout', 'onboarding', 'activated.json')), false);
+  assert.equal(fs.existsSync(path.join(dir, '.scout', 'onboarding', 'activation.json')), false);
+  for (const relative of ONBOARDING_FILES) {
+    if (original[relative] === null) assert.equal(fs.existsSync(path.join(dir, relative)), false);
+    else assert.equal(fs.readFileSync(path.join(dir, relative), 'utf8'), original[relative]);
+  }
+});
+
 test('onboarding records remote-auth failure without resending proposal generation', async () => {
   const dir = root();
   let invocations = 0;

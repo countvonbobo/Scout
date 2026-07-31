@@ -123,6 +123,63 @@ const REPORTS_DIR = WORKSPACE.reports;
 const SCAN_RUNS = WORKSPACE.scanRuns;
 export const operations = new OperationManager();
 let runtimeHttpServer = null;
+let runtimeRequestAdmissionOpen = true;
+let runtimeRecoveryAdmissionOpen = true;
+const runtimeRecoveryTimers = new Set();
+const pausedRuntimeRecoveries = [];
+const runtimeHttpHandlers = new Set();
+let runtimeSyncTimer = null;
+
+function scheduleRuntimeRecovery(callback, delay, schedule = setTimeout, cancel = clearTimeout) {
+  if (!runtimeRecoveryAdmissionOpen) return null;
+  const record = {
+    timer: null, cancel, callback, delay, schedule,
+  };
+  record.timer = schedule(() => {
+    runtimeRecoveryTimers.delete(record);
+    if (runtimeRecoveryAdmissionOpen) return callback();
+    return undefined;
+  }, delay);
+  runtimeRecoveryTimers.add(record);
+  record.timer?.unref?.();
+  return record.timer;
+}
+
+function closeRuntimeRecoveryAdmission() {
+  runtimeRecoveryAdmissionOpen = false;
+  for (const record of runtimeRecoveryTimers) {
+    record.cancel(record.timer);
+    pausedRuntimeRecoveries.push(record);
+  }
+  runtimeRecoveryTimers.clear();
+}
+
+function trackRuntimeHttpHandler(task) {
+  const pending = Promise.resolve(task);
+  runtimeHttpHandlers.add(pending);
+  void pending.finally(() => runtimeHttpHandlers.delete(pending)).catch(() => {});
+  return pending;
+}
+
+function createRuntimeHttpHandlerBarrier() {
+  let settle;
+  let settled = false;
+  const pending = new Promise((resolve) => { settle = resolve; });
+  trackRuntimeHttpHandler(pending);
+  return () => {
+    if (settled) return;
+    settled = true;
+    settle();
+  };
+}
+
+function startRuntimeSyncTimer() {
+  if (runtimeSyncTimer) return;
+  runtimeSyncTimer = setInterval(() => {
+    if (workspaceInitialised()) void scheduleCheckpoint('periodic sync');
+  }, 5 * 60 * 1000);
+  runtimeSyncTimer.unref();
+}
 
 // Fresh installations remain uninitialised until the person chooses either a
 // new local workspace or Restore. Existing workspaces keep the legacy fast path.
@@ -138,18 +195,18 @@ export function recoverProfilePublicationsAtStartup({
   initialised = workspaceInitialised,
   recover = recoverPendingProfilePublications,
   schedule = setTimeout,
+  cancel = clearTimeout,
 } = {}) {
-  if (!initialised()) return;
+  if (!runtimeRecoveryAdmissionOpen || !initialised()) return;
   try {
     recover(root);
   } catch (error) {
     if (error?.reasonCode !== 'profile-publication-fenced') {
       throw error;
     }
-    const retry = schedule(() => recoverProfilePublicationsAtStartup({
-      root, initialised, recover, schedule,
-    }), 1_000);
-    retry.unref?.();
+    scheduleRuntimeRecovery(() => recoverProfilePublicationsAtStartup({
+      root, initialised, recover, schedule, cancel,
+    }), 1_000, schedule, cancel);
   }
 }
 
@@ -160,16 +217,16 @@ export function recoverOnboardingAtStartup({
   initialised = workspaceInitialised,
   recover = recoverOnboardingActivationAtStartup,
   schedule = setTimeout,
+  cancel = clearTimeout,
 } = {}) {
-  if (!initialised()) return null;
+  if (!runtimeRecoveryAdmissionOpen || !initialised()) return null;
   try {
     return recover(root);
   } catch (error) {
     if (!['mutation-busy', 'scan-in-progress'].includes(error?.reasonCode)) throw error;
-    const retry = schedule(() => recoverOnboardingAtStartup({
-      root, initialised, recover, schedule,
-    }), 1_000);
-    retry.unref?.();
+    scheduleRuntimeRecovery(() => recoverOnboardingAtStartup({
+      root, initialised, recover, schedule, cancel,
+    }), 1_000, schedule, cancel);
     return null;
   }
 }
@@ -185,16 +242,16 @@ export function stageSearchProfileReviewAtStartup({
     return migrateSearchProfile(WORKSPACE_ROOT);
   },
   schedule = setTimeout,
+  cancel = clearTimeout,
 } = {}) {
-  if (!initialised()) return null;
+  if (!runtimeRecoveryAdmissionOpen || !initialised()) return null;
   try {
     return stage();
   } catch (error) {
     if (error?.reasonCode !== 'mutation-busy') throw error;
-    const retry = schedule(() => stageSearchProfileReviewAtStartup({
-      initialised, stage, schedule,
-    }), 1_000);
-    retry.unref?.();
+    scheduleRuntimeRecovery(() => stageSearchProfileReviewAtStartup({
+      initialised, stage, schedule, cancel,
+    }), 1_000, schedule, cancel);
     return null;
   }
 }
@@ -1160,9 +1217,13 @@ async function handleSource(res, id) {
 export function createServer() {
   const server = http.createServer((req, res) => {
     const url = new URL(req.url, `http://127.0.0.1:${PORT}`);
+    if (!runtimeRequestAdmissionOpen) {
+      return sendJson(res, 503, { error: 'Scout is shutting down. Try again shortly.' });
+    }
     if (!guardRequest(req, res, url)) return;
     const routeKey = `${req.method} ${url.pathname}`;
     if (routes[routeKey]) {
+      const finishHandler = createRuntimeHttpHandlerBarrier();
       const limit = url.pathname === '/api/setup/import-cv'
         ? 14 * 1024 * 1024
         : url.pathname.startsWith('/api/provider-login/')
@@ -1178,26 +1239,39 @@ export function createServer() {
         replyJson(res, result.reason === 'too-large' ? 413 : 400, {
           error: result.reason === 'too-large' ? 'request body too large' : 'request body is not valid UTF-8',
         });
+        finishHandler();
       });
+      req.once('aborted', finishHandler);
       req.on('end', () => {
         if (bodyFailed) return;
         const decoded = body.finish();
-        if (!decoded.ok) return replyJson(res, 400, { error: 'request body is not valid UTF-8' });
-        Promise.resolve(routes[routeKey](req, res, decoded.text, url))
-          .catch(() => { if (!res.writableEnded) replyJson(res, 500, publicApiError()); });
+        if (!decoded.ok) {
+          replyJson(res, 400, { error: 'request body is not valid UTF-8' });
+          finishHandler();
+          return;
+        }
+        void trackRuntimeHttpHandler(Promise.resolve(routes[routeKey](req, res, decoded.text, url))
+          .catch(() => { if (!res.writableEnded) replyJson(res, 500, publicApiError()); })
+          .finally(finishHandler));
       });
       return;
     }
-    handleRead(req, res, url)
+    void trackRuntimeHttpHandler(handleRead(req, res, url)
       .then((handled) => { if (handled === null && !res.writableEnded) sendJson(res, 404, { error: 'not found' }); })
-      .catch(() => { if (!res.writableEnded) sendJson(res, 500, publicApiError()); });
+      .catch(() => { if (!res.writableEnded) sendJson(res, 500, publicApiError()); }));
   });
   server.once('close', () => { void providerLoginControl.shutdown().catch(() => {}); });
   return server;
 }
 
 export async function closeServerSafely(server, { drain = drainRuntimeWork } = {}) {
-  await drain();
+  closeRuntimeAdmission();
+  try {
+    await drain();
+  } catch (error) {
+    resumeRuntimeAdmission();
+    throw error;
+  }
   if (!server?.listening) return;
   await new Promise((resolve, reject) => {
     server.close((error) => (error ? reject(error) : resolve()));
@@ -2204,9 +2278,11 @@ routes['POST /api/cv/render'] = (req, res, body) => {
   const target = b.target === 'master' ? 'master' : 'application';
   const slug = target === 'application' ? String(b.slug || '') : '';
   try {
-    const operation = operations.start('cv-render', async (update) => {
+    const operation = operations.start('cv-render', async (update, { signal }) => {
       update({ phase: target === 'master' ? 'Preparing master reference PDF' : 'Preparing tailored PDF', current: 1, total: 3 });
-      const result = await renderCvTarget(WORKSPACE_ROOT, { target, slug }, { appRoot: APP_ROOT });
+      const result = await renderCvTarget(WORKSPACE_ROOT, { target, slug }, {
+        appRoot: APP_ROOT, signal,
+      });
       update({ phase: 'Validating PDF', current: 2, total: 3 });
       void scheduleCheckpoint(target === 'application' ? `render cv - ${slug}` : 'render master cv');
       update({ phase: 'PDF ready', current: 3, total: 3 });
@@ -2662,8 +2738,22 @@ const chatRuntime = registerChatRoutes({
 });
 
 function resumeRuntimeAdmission() {
+  runtimeRequestAdmissionOpen = true;
+  runtimeRecoveryAdmissionOpen = true;
+  for (const record of pausedRuntimeRecoveries.splice(0)) {
+    scheduleRuntimeRecovery(record.callback, record.delay, record.schedule, record.cancel);
+  }
   operations.resumeAdmission();
   chatRuntime.openAdmission();
+  if (runtimeHttpServer?.listening && !runtimeSyncTimer) startRuntimeSyncTimer();
+}
+
+function closeRuntimeAdmission() {
+  runtimeRequestAdmissionOpen = false;
+  closeRuntimeRecoveryAdmission();
+  chatRuntime.closeAdmission();
+  if (runtimeSyncTimer) clearInterval(runtimeSyncTimer);
+  runtimeSyncTimer = null;
 }
 
 export async function runtimeProviderPreflight(root, provider, purpose, {
@@ -2699,7 +2789,7 @@ function trackRuntimeBackgroundTask(task) {
 
 export async function drainRuntimeWork({ timeoutMs = 10_000 } = {}) {
   runtimeProviderHealthMonitor?.stop();
-  chatRuntime.closeAdmission();
+  closeRuntimeAdmission();
   let timer;
   try {
     await Promise.race([
@@ -2710,6 +2800,7 @@ export async function drainRuntimeWork({ timeoutMs = 10_000 } = {}) {
           runtimeProviderHealthMonitor?.drain?.(),
           ...runtimeBackgroundTasks,
         ].filter(Boolean));
+        await Promise.allSettled([...runtimeHttpHandlers]);
         await drainScheduledCheckpoints();
         await providerLoginControl.shutdown();
       })(),
@@ -2795,12 +2886,12 @@ if (isMain) {
     }
   });
   server.listen(PORT, '127.0.0.1');
-  const syncTimer = setInterval(() => { if (workspaceInitialised()) void scheduleCheckpoint('periodic sync'); }, 5 * 60 * 1000);
-  syncTimer.unref();
+  startRuntimeSyncTimer();
   let signalShutdown = null;
   const stopForSignal = async () => {
     if (signalShutdown) return signalShutdown;
-    clearInterval(syncTimer);
+    if (runtimeSyncTimer) clearInterval(runtimeSyncTimer);
+    runtimeSyncTimer = null;
     providerHealthMonitor.stop();
     signalShutdown = (async () => {
       await closeServerSafely(server);

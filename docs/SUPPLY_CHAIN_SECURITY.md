@@ -76,7 +76,14 @@ Release staging refuses symbolic links for both copied trees and individually
 allowlisted inputs, including a link in any ancestor component. Regular files
 are opened without following links; ancestor and opened-file identities are
 checked before and after bytes are read. The staged-tree privacy audit applies
-the same component and identity checks and fails on any symlink.
+the same component and identity checks and fails on any symlink. Directory
+entries are bound to their enumerated identities before recursive copying.
+Windows, macOS and Linux compiler or launcher inputs are copied through this
+verified reader into the fresh stage, checked for change across compilation,
+and the finished platform payload is audited before installer or archive
+creation. The conventional macOS `/Applications` DMG link is added only after
+the symlink-free `Scout.app` payload passes that audit; post-build workflow
+auditing is scoped to the app payload rather than the DMG layout link.
 
 Attestation establishes build provenance, not software safety. It does not prove that the source or resulting package is free of vulnerabilities or malicious behaviour.
 

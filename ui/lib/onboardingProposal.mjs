@@ -98,6 +98,10 @@ function activationIntentFile(root) {
   return path.join(root, '.scout', 'onboarding', 'activation.json');
 }
 
+function activatedMarkerFile(root) {
+  return path.join(root, '.scout', 'onboarding', 'activated.json');
+}
+
 function readActivationIntent(root) {
   const file = activationIntentFile(root);
   if (!fs.existsSync(file)) return null;
@@ -293,7 +297,7 @@ function writeStaged(root, files) {
 }
 
 function completedActivation(root, intent) {
-  const markerFile = path.join(root, '.scout', 'onboarding', 'activated.json');
+  const markerFile = activatedMarkerFile(root);
   if (!fs.existsSync(markerFile)) return false;
   let marker;
   try { marker = JSON.parse(fs.readFileSync(markerFile, 'utf8')); } catch { return false; }
@@ -557,7 +561,7 @@ export function activateOnboardingProposal(root, proposalId, confirmed, {
         stagedHashes: proposal.stagedHashes,
         activatedHashes: Object.fromEntries(ONBOARDING_FILES.map((relative) => [relative, sha256(targetPath(root, relative))])),
       };
-      atomicWriteFile(path.join(root, '.scout', 'onboarding', 'activated.json'), `${JSON.stringify(marker, null, 2)}\n`);
+      atomicWriteFile(activatedMarkerFile(root), `${JSON.stringify(marker, null, 2)}\n`);
       _testHooks.afterActivatedMarker?.();
       fs.rmSync(path.join(root, '.scout', 'onboarding', 'proposal.json'), { force: true });
       _testHooks.afterProposalRemoval?.();
@@ -568,6 +572,18 @@ export function activateOnboardingProposal(root, proposalId, confirmed, {
       if (error?.simulateProcessDeath === true) throw error;
       renew();
       if (!rollbackInputsRemainTrusted(root, intent)) throw error;
+      const markerFile = activatedMarkerFile(root);
+      if (fs.existsSync(markerFile)) {
+        let marker;
+        try { marker = JSON.parse(fs.readFileSync(markerFile, 'utf8')); } catch { throw error; }
+        const ownedMarker = marker?.proposalId === intent.proposalId
+          && marker?.activatedAt === intent.activatedAt
+          && ONBOARDING_FILES.every((relative) => (
+            marker?.activatedHashes?.[relative] === intent.intendedHashes[relative]
+          ));
+        if (!ownedMarker) throw error;
+        fs.rmSync(markerFile);
+      }
       for (const relative of ONBOARDING_FILES) {
         renew();
         const target = targetPath(root, relative);

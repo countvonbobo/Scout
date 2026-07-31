@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -64,7 +65,19 @@ function readyScanRoot({ opportunities = [] } = {}) {
   fs.writeFileSync(path.join(root, 'profile', 'context.md'), 'Synthetic profile evidence. '.repeat(12));
   fs.writeFileSync(path.join(root, 'profile', 'calibration.md'), 'Synthetic calibration evidence. '.repeat(8));
   fs.writeFileSync(path.join(root, 'cv', 'master-cv.md'), 'Synthetic CV evidence. '.repeat(30));
-  fs.writeFileSync(path.join(root, '.scout', 'onboarding', 'activated.json'), '{"approved":true}\n');
+  fs.writeFileSync(path.join(root, 'data', 'search-categories.json'), '{"categories":[]}\n');
+  const activatedFiles = [
+    'workspace.json', 'profile/context.md', 'profile/calibration.md',
+    'cv/master-cv.md', 'data/search-categories.json',
+  ];
+  const activatedHashes = Object.fromEntries(activatedFiles.map((relative) => [
+    relative,
+    crypto.createHash('sha256').update(fs.readFileSync(path.join(root, relative))).digest('hex'),
+  ]));
+  fs.writeFileSync(
+    path.join(root, '.scout', 'onboarding', 'activated.json'),
+    `${JSON.stringify({ activatedHashes })}\n`,
+  );
   fs.writeFileSync(path.join(root, 'data', 'opportunities.json'), `${JSON.stringify({ updated: '2026-07-27', opportunities })}\n`);
   return root;
 }

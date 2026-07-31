@@ -330,6 +330,7 @@ function safeRunRecord(record) {
       outcome: code(item?.outcome),
       source: code(item?.source),
       sourceUrl: canonicalUrl(item?.sourceUrl),
+      sourceReferences: safeReferences({ sourceReferences: item?.sourceReferences }),
     })),
     reviewed: (record?.reviewed || []).map((item) => ({
       vacancyId: identifier(item?.vacancyId),

@@ -112,36 +112,55 @@ function compileArgs(root, descriptor, temp) {
   return ['compile', '--root', '.', '--format', 'pdf', relative(root, descriptor.typst), relative(root, temp)];
 }
 
-async function runTypst(command, args, { cwd, timeoutMs, spawnImpl }) {
+async function runTypst(command, args, {
+  cwd, timeoutMs, spawnImpl, signal = null,
+}) {
   await new Promise((resolve, reject) => {
+    signal?.throwIfAborted();
     const child = spawnImpl(command, args, { cwd, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] });
     let stdout = '';
     let stderr = '';
     child.stdout?.on('data', (chunk) => { stdout += chunk; });
     child.stderr?.on('data', (chunk) => { stderr += chunk; });
-    const timer = setTimeout(() => {
-      child.kill('SIGKILL');
-      reject(new Error(`PDF rendering timed out after ${Math.round(timeoutMs / 1000)} seconds. The previous PDF was kept.`));
-    }, timeoutMs);
-    child.once('error', (error) => { clearTimeout(timer); reject(error); });
-    child.once('close', (code) => {
+    let settled = false;
+    let timer;
+    const finish = (callback, value) => {
+      if (settled) return;
+      settled = true;
       clearTimeout(timer);
-      if (code === 0) resolve();
-      else reject(new Error((stderr || stdout || `Typst exited with code ${code}`).trim()));
+      signal?.removeEventListener('abort', abort);
+      callback(value);
+    };
+    const abort = () => {
+      child.kill('SIGKILL');
+      finish(reject, signal?.reason instanceof Error ? signal.reason : new Error('PDF rendering was cancelled.'));
+    };
+    timer = setTimeout(() => {
+      child.kill('SIGKILL');
+      finish(reject, new Error(`PDF rendering timed out after ${Math.round(timeoutMs / 1000)} seconds. The previous PDF was kept.`));
+    }, timeoutMs);
+    signal?.addEventListener('abort', abort, { once: true });
+    child.once('error', (error) => finish(reject, error));
+    child.once('close', (code) => {
+      if (code === 0) finish(resolve);
+      else finish(reject, new Error((stderr || stdout || `Typst exited with code ${code}`).trim()));
     });
   });
 }
 
 export async function renderCvTarget(root, request, {
   appRoot = DEFAULT_APP_ROOT, runtimeResolver = resolveTypstRuntime, spawnImpl = spawn,
-  timeoutMs = RENDER_TIMEOUT_MS, now,
+  timeoutMs = RENDER_TIMEOUT_MS, now, signal = null,
 } = {}) {
+  signal?.throwIfAborted();
   const descriptor = prepareTarget(root, checkedTarget(root, request));
   const runtime = runtimeResolver({ appRoot });
   if (!runtime.available) throw new Error(runtime.error || "Scout's Typst runtime is unavailable. Repair or reinstall Scout.");
   const temp = temporaryPdf(descriptor.pdf);
   try {
-    await runTypst(runtime.command, compileArgs(root, descriptor, temp), { cwd: root, timeoutMs, spawnImpl });
+    await runTypst(runtime.command, compileArgs(root, descriptor, temp), {
+      cwd: root, timeoutMs, spawnImpl, signal,
+    });
     return finishRender(root, descriptor, temp, now);
   } catch (error) {
     fs.rmSync(temp, { force: true });

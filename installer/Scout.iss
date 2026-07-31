@@ -5,6 +5,12 @@
 #ifndef StageDir
   #define StageDir "..\dist\release\stage"
 #endif
+#ifndef IconFile
+  #define IconFile "..\ui\assets\scout-icon.ico"
+#endif
+#ifndef OutputDir
+  #define OutputDir "output"
+#endif
 
 #define MyAppName "Scout"
 #define MyAppPublisher "Scout contributors"
@@ -22,12 +28,12 @@ DisableProgramGroupPage=yes
 PrivilegesRequired=lowest
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
-OutputDir=output
+OutputDir={#OutputDir}
 OutputBaseFilename=Scout-{#MyAppVersion}-windows-x64
 Compression=lzma2/max
 SolidCompression=yes
 WizardStyle=modern
-SetupIconFile=..\ui\assets\scout-icon.ico
+SetupIconFile={#IconFile}
 UninstallDisplayName=Scout
 LicenseFile={#StageDir}\app\LICENSE
 ChangesEnvironment=no

@@ -20,3 +20,14 @@ test('macOS packaging compiles a native AppKit launcher instead of bundling a sh
   assert.match(launcher, /Scout could not open/);
   assert.match(launcher, /Diagnostic log/);
 });
+
+test('platform packaging consumes verified staged inputs and audits payloads before archive creation', () => {
+  const build = fs.readFileSync(new URL('./build-platform.mjs', import.meta.url), 'utf8');
+  assert.match(build, /copyVerifiedReleaseFile/);
+  assert.match(build, /auditStageBeforePackaging\(stage\)/);
+  assert.doesNotMatch(build, /copy\(path\.join\(ROOT, 'installer\/unix\/ScoutLauncher\.sh'/);
+  assert.match(
+    build.match(/export function buildMac[\s\S]*?return \{ output/)?.[0] || '',
+    /auditStageBeforePackaging\(stage\)[\s\S]*fs\.symlinkSync\('\/Applications'/,
+  );
+});

@@ -8,7 +8,7 @@ import {
   auditPublicSourceStage,
   includePublicSourcePath, includeReleasePath, productionDependencyFilter, productionLockfile,
   productionPackageManifest, PUBLIC_SOURCE_FILES, RELEASE_FILES,
-  sha256, stagePublicSource, stageRelease, writeChecksums,
+  sha256, stagePublicSource, stageRelease, verifiedReleaseTreeDigest, writeChecksums,
 } from './build-release.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -419,4 +419,17 @@ test('checksums use SHA-256 and do not hash the manifest into itself', () => {
   assert.equal(fs.readFileSync(manifest, 'utf8'), `${sha256(artifact)}  Scout.exe\n`);
   writeChecksums(output);
   assert.equal(fs.readFileSync(manifest, 'utf8'), `${sha256(artifact)}  Scout.exe\n`);
+});
+
+test('verified payload digests bind file paths, modes and bytes and reject links', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'scout-payload-digest-'));
+  fs.mkdirSync(path.join(root, 'nested'));
+  fs.writeFileSync(path.join(root, 'nested', 'payload.txt'), 'first');
+  const first = verifiedReleaseTreeDigest(root);
+  fs.writeFileSync(path.join(root, 'nested', 'payload.txt'), 'second');
+  assert.notEqual(verifiedReleaseTreeDigest(root), first);
+  if (process.platform !== 'win32') {
+    fs.symlinkSync(path.join(root, 'nested', 'payload.txt'), path.join(root, 'linked.txt'));
+    assert.throws(() => verifiedReleaseTreeDigest(root), /symbolic link/);
+  }
 });

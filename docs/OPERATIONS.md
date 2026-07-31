@@ -215,10 +215,12 @@ Multi-file onboarding activation additionally writes a prepared intent before
 the first replacement and reconciles it at startup under the shared workspace
 mutation authority. Proposal staging and discard cannot erase that intent;
 conflicting post-crash bytes are preserved for review, and terminal marker
-cleanup is idempotent. Shutdown and restart close background-work admission,
-settle checkpoint producers, then drain acknowledged backup batches,
-provider-health probes, managed operations and complete chat handlers before
-process handoff; a failed drain leaves the listener in place for a safe retry.
+cleanup is idempotent. Setup approval is valid only while every activated file
+matches the marker hash. Shutdown and restart synchronously gate HTTP, chat,
+operation and startup-recovery admission, cancel managed child processes, await
+admitted handlers and settle checkpoint producers, then drain acknowledged
+backup batches and provider-health probes before process handoff. A failed
+drain reopens admission and leaves the listener in place for a safe retry.
 
 Update this file in the same pull request whenever any of these change:
 

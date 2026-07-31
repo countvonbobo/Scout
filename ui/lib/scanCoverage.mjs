@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { sourceReferencesOf } from './jobIdentity.mjs';
 
 const MAX_EXPLANATIONS = 10_000;
 const RECONCILED_STAGES = Object.freeze([
@@ -68,6 +69,17 @@ function sourceOf(value) {
       ?? value?.sourceReferences?.[0]?.source,
     80,
   ) || 'unknown-source';
+}
+
+function durableSourceReferences(value) {
+  return [...new Map(sourceReferencesOf(value).map((reference) => {
+    const safe = {
+      source: reference.source,
+      providerId: reference.providerId,
+      url: canonicalUrl(reference.url),
+    };
+    return [`${safe.source}|${safe.providerId}|${safe.url || ''}`, safe];
+  })).values()].slice(0, 8);
 }
 
 function labelOf(value, names, fallback, maximum = 160) {
@@ -228,6 +240,7 @@ export function buildVacancyExplanations({
       tracker_outcome: reviewedItem?.trackerOutcome ? code(reviewedItem.trackerOutcome) : null,
       source: sourceOf(value),
       sourceUrl: canonicalUrl(value?.url ?? value?.canonicalUrl ?? value?.sourceUrl),
+      sourceReferences: durableSourceReferences(value),
     };
   });
 }

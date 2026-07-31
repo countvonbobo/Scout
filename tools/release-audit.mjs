@@ -413,7 +413,8 @@ function allowedReleaseBinary(relative) {
   if (packaged.startsWith('app/node_modules/') || packaged.startsWith('node_modules/')) return true;
   if (/^(?:.*\/)?runtime\/(?:node|node\.exe|scoutruntime\.exe|typst|typst\.exe)$/.test(value)) return true;
   if (value === 'scout.exe' || /^dist\/release\/[^/]+\/scout\.exe$/.test(value)) return true;
-  if (/(?:^|\/)dmg-root\/scout\.app\/contents\/macos\/scout$/.test(value)) return true;
+  if (/(?:^|\/)dmg-root\/scout\.app\/contents\/macos\/scout$/.test(value)
+    || value === 'contents/macos/scout') return true;
   const asset = packaged.match(/^(?:app\/)?ui\/assets\/([^/]+)$/)?.[1];
   if (asset && PUBLIC_UI_BINARY_ASSETS.has(asset)) return true;
   if ([...PUBLIC_DOC_SCREENSHOTS].some((screenshot) =>
@@ -492,15 +493,24 @@ function readAuditedRegularFile(root, file) {
   const descriptor = fs.openSync(file, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0));
   try {
     const opened = fs.fstatSync(descriptor, { bigint: true });
+    const content = fs.readFileSync(descriptor);
+    const openedAfterRead = fs.fstatSync(descriptor, { bigint: true });
     const ancestorsAfter = assertAuditedPath(root, file);
     const after = fs.lstatSync(file, { bigint: true });
     if (!opened.isFile() || after.isSymbolicLink() || !after.isFile()
       || opened.dev !== before.dev || opened.ino !== before.ino
       || after.dev !== opened.dev || after.ino !== opened.ino
+      || openedAfterRead.dev !== opened.dev || openedAfterRead.ino !== opened.ino
+      || openedAfterRead.size !== opened.size
+      || openedAfterRead.mtimeNs !== opened.mtimeNs
+      || openedAfterRead.ctimeNs !== opened.ctimeNs
+      || after.size !== openedAfterRead.size
+      || after.mtimeNs !== openedAfterRead.mtimeNs
+      || after.ctimeNs !== openedAfterRead.ctimeNs
       || ancestorsAfter !== ancestorsBefore) {
-      throw new Error(`release audit input identity changed while opening: ${file}`);
+      throw new Error(`release audit input identity changed while reading: ${file}`);
     }
-    return fs.readFileSync(descriptor);
+    return content;
   } finally {
     fs.closeSync(descriptor);
   }

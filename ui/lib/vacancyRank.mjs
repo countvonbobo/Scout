@@ -1,5 +1,5 @@
 import { applyLearningToRankedVacancies } from './feedbackLearning.mjs';
-import { sameUnderlyingJob } from './jobIdentity.mjs';
+import { jobIdentity, sameUnderlyingJob } from './jobIdentity.mjs';
 import { profileRuleId } from './searchProfile.mjs';
 
 export const STRENGTH_WEIGHT = Object.freeze({
@@ -400,7 +400,14 @@ function historyIdentityIndex(history) {
 function matchedHistoryKey(vacancy, identities, historyIndex) {
   return identities.find((key) => (
     historyIndex.get(key) || []
-  ).some((entry) => key.startsWith('url:') || sameUnderlyingJob(entry, vacancy)));
+  ).some((entry) => {
+    if (sameUnderlyingJob(entry, vacancy)) return true;
+    const identity = jobIdentity(entry);
+    // Older tracker rows sometimes retained only an exact canonical vacancy ID.
+    // Preserve that decision without letting a rich, contradictory provider
+    // record inherit merely because a privacy-canonical URL is shared.
+    return !identity.company && !identity.title && identity.references.length === 0;
+  }));
 }
 
 function noveltyDimension(vacancy, profile, historyIndex) {

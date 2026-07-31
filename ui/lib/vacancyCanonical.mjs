@@ -255,17 +255,13 @@ function canonicalVacancy(observations) {
     location: fields.location,
     seniority: fields.seniority,
   });
-  const sourceReference = [...sourceReferences]
-    .sort((left, right) => compareStable(stableJson(left), stableJson(right)))[0] || null;
-  const fallbackIdentity = sourceReference
-    ? { sourceReference }
-    : {
-      company: identity.company,
-      title: identity.title,
-      location: identity.location,
-      seniority: identity.seniority,
-    };
-  const vacancyId = canonicalVacancyId(canonicalUrl, fallbackIdentity);
+  // Provider coverage can grow or shrink between scans, so no member of the
+  // reference set is a stable canonical anchor. References still disambiguate
+  // same-scan collisions; the base identifier remains semantic.
+  const vacancyId = canonicalVacancyId(canonicalUrl, {
+    company: identity.company,
+    title: identity.title,
+  });
   const collectionSources = metadataValues(orderedObservations, 'collectionSource');
   const laneIds = [...new Set([
     ...metadataValues(orderedObservations, 'laneId'),
