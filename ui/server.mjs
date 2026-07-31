@@ -37,7 +37,8 @@ import {
   PROVIDER_HEALTH_STATES, providerPreflight, readProviderHealth,
 } from './lib/providerHealth.mjs';
 import {
-  acquireProviderAuthMutation, releaseProviderAuthMutation, renewProviderAuthMutation,
+  acquireProviderAuthMutation, acquireProviderWork, releaseProviderAuthMutation,
+  releaseProviderWork, renewProviderAuthMutation,
 } from './lib/providerAuthMutation.mjs';
 import { createProviderLoginManager } from './lib/providerLogin.mjs';
 import { runStructuredTurn } from './lib/structuredTurn.mjs';
@@ -153,15 +154,30 @@ export function recoverProfilePublicationsAtStartup({
 
 recoverProfilePublicationsAtStartup();
 
-function stageSearchProfileReview() {
-  if (!workspaceInitialised()) return null;
-  const config = loadWorkspaceConfig(WORKSPACE_ROOT);
-  const readiness = setupReadiness(WORKSPACE_ROOT, config, {}, readTracker());
-  if (!(readiness.checks.preferences && readiness.checks.evidence && readiness.checks.approved)) return null;
-  return migrateSearchProfile(WORKSPACE_ROOT);
+export function stageSearchProfileReviewAtStartup({
+  initialised = workspaceInitialised,
+  stage = () => {
+    const config = loadWorkspaceConfig(WORKSPACE_ROOT);
+    const readiness = setupReadiness(WORKSPACE_ROOT, config, {}, readTracker());
+    if (!(readiness.checks.preferences && readiness.checks.evidence && readiness.checks.approved)) return null;
+    return migrateSearchProfile(WORKSPACE_ROOT);
+  },
+  schedule = setTimeout,
+} = {}) {
+  if (!initialised()) return null;
+  try {
+    return stage();
+  } catch (error) {
+    if (error?.reasonCode !== 'mutation-busy') throw error;
+    const retry = schedule(() => stageSearchProfileReviewAtStartup({
+      initialised, stage, schedule,
+    }), 1_000);
+    retry.unref?.();
+    return null;
+  }
 }
 
-stageSearchProfileReview();
+stageSearchProfileReviewAtStartup();
 
 function queueCheckpoint(reason, { includeDevicePreferences = false } = {}) {
   const options = includeDevicePreferences && process.platform === 'win32'
@@ -885,7 +901,7 @@ async function handleRead(req, res, url) {
         pendingSetupSections: [],
       });
     }
-    stageSearchProfileReview();
+    stageSearchProfileReviewAtStartup();
     const config = loadWorkspaceConfig(WORKSPACE_ROOT);
     const providers = await providerDetection.detect();
     const providerStatuses = publicProviderStatuses(providers, WORKSPACE_ROOT);
@@ -1135,8 +1151,17 @@ export function createServer() {
       .then((handled) => { if (handled === null && !res.writableEnded) sendJson(res, 404, { error: 'not found' }); })
       .catch(() => { if (!res.writableEnded) sendJson(res, 500, publicApiError()); });
   });
-  server.once('close', () => { void providerLoginControl.shutdown(); });
+  server.once('close', () => { void providerLoginControl.shutdown().catch(() => {}); });
   return server;
+}
+
+export async function closeServerSafely(server) {
+  if (server?.listening) {
+    await new Promise((resolve, reject) => {
+      server.close((error) => (error ? reject(error) : resolve()));
+    });
+  }
+  await providerLoginControl.shutdown();
 }
 
 // --- Mutation wiring (Task 5) ---
@@ -1336,7 +1361,7 @@ function readDraftSearchProfile() {
 }
 
 function readSearchProfileState() {
-  stageSearchProfileReview();
+  stageSearchProfileReviewAtStartup();
   const draft = readDraftSearchProfile();
   return {
     rawPresent: fs.existsSync(WORKSPACE.searchProfileRaw),
@@ -1447,7 +1472,8 @@ routes['POST /api/feedback'] = (req, res, body) => {
       const profile = loadPublishedSearchProfile(WORKSPACE_ROOT);
       const next = recordFeedback(ledger, {
         opportunityId: opportunity.id,
-        vacancyId: opportunity.jobIdentity?.vacancyId
+        vacancyId: opportunity.vacancyId
+          || opportunity.jobIdentity?.vacancyId
           || opportunity.jobIdentity?.providerId
           || opportunity.id,
         decision: value.decision,
@@ -1564,7 +1590,7 @@ function publicEmployerRegistry(registry) {
 
 routes['GET /api/search-profile/adaptive'] = (req, res) => {
   try {
-    stageSearchProfileReview();
+    stageSearchProfileReviewAtStartup();
     const draft = readDraftSearchProfile();
     const lanePlan = loadSearchLanePlan(WORKSPACE_ROOT);
     return replyJson(res, 200, {
@@ -2575,11 +2601,20 @@ export async function runtimeProviderPreflight(root, provider, purpose, {
   detectProvidersFn = detectProvidersAsync,
   preflightFn = providerPreflight,
 } = {}) {
-  const status = (await detectProvidersFn())[provider];
-  return preflightFn(root, provider, purpose, {
-    source,
-    probe: async () => providerLocalHealthSignal(status, { source }),
-  });
+  let providerWork = null;
+  try {
+    providerWork = acquireProviderWork(root, provider);
+    const status = (await detectProvidersFn())[provider];
+    return await preflightFn(root, provider, purpose, {
+      source,
+      probe: async () => providerLocalHealthSignal(status, { source }),
+    });
+  } catch (error) {
+    if (error?.reasonCode !== 'provider-auth-in-progress') throw error;
+    return preflightFn(root, provider, purpose, { source });
+  } finally {
+    if (providerWork) releaseProviderWork(root, providerWork);
+  }
 }
 
 function configuredHealthProviders(config) {
@@ -2654,4 +2689,19 @@ if (isMain) {
   server.listen(PORT, '127.0.0.1');
   const syncTimer = setInterval(() => { if (workspaceInitialised()) void scheduleCheckpoint('periodic sync'); }, 5 * 60 * 1000);
   syncTimer.unref();
+  let signalShutdown = false;
+  const stopForSignal = async () => {
+    if (signalShutdown) return;
+    signalShutdown = true;
+    clearInterval(syncTimer);
+    providerHealthMonitor.stop();
+    try {
+      await closeServerSafely(server);
+      process.exit(0);
+    } catch {
+      signalShutdown = false;
+    }
+  };
+  process.once('SIGTERM', () => { void stopForSignal(); });
+  process.once('SIGINT', () => { void stopForSignal(); });
 }

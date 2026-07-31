@@ -317,12 +317,22 @@ export function registerChatRoutes({
       const config = loadWorkspaceConfig(repoRoot);
       const detected = detectedModels(usage);
       let providerCatalogues;
-      try { providerCatalogues = await providerCataloguesFn(); }
+      const catalogueWork = [];
+      try {
+        for (const provider of Object.keys(ENGINES).sort()) {
+          catalogueWork.push(acquireProviderWork(repoRoot, provider));
+        }
+        providerCatalogues = await providerCataloguesFn();
+      }
       catch {
         providerCatalogues = {
           codex: { state: 'failed', reasonCode: 'catalogue-check-failed', models: [] },
           claude: { state: 'unsupported', reasonCode: 'enumeration-unsupported', models: [] },
         };
+      } finally {
+        for (const capability of catalogueWork.reverse()) {
+          releaseProviderWork(repoRoot, capability);
+        }
       }
       const engines = Object.fromEntries(Object.keys(ENGINES).map((engine) => {
         const configured = modelForProvider(config, engine);
@@ -653,7 +663,14 @@ export function registerChatRoutes({
 
   async function handleFitAssessment(req, res, { id, entry, engine, text, chat }) {
     sseStart(res);
-    const marker = { stop() {} };
+    let operation = null;
+    let stopRequested = false;
+    const marker = {
+      stop() {
+        stopRequested = true;
+        operation?.stop?.();
+      },
+    };
     running.set(id, marker);
     stopTurnOnDisconnect(req, res, id);
     let providerWork;
@@ -674,9 +691,10 @@ export function registerChatRoutes({
       ].join('\n\n');
       let result;
       try {
-        const operation = runStructuredTurnFn({
+        operation = runStructuredTurnFn({
           provider: engine, status, schema: FIT_SCHEMA, prompt, model, maxInputTokens: 50_000,
         });
+        if (stopRequested) operation.stop?.();
         providerWork.setFailureHandler(() => operation.stop?.());
         result = await operation;
         providerWork.assertCurrent();

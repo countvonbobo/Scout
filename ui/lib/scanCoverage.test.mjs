@@ -42,7 +42,11 @@ test('builds one privacy-bounded stage explanation for every unique vacancy', ()
       { ...ranked[1], candidateId: 'candidate-002' },
     ],
     assessmentResult: { assessments: [{ candidateId: 'candidate-001' }] },
-    reviewed: [{ vacancyId: 'selected-assessed', outcome: 'kept' }],
+    reviewed: [{
+      vacancyId: 'selected-assessed',
+      outcome: 'kept',
+      trackerOutcome: 'added',
+    }],
     selectionDecision: {
       threshold: 40,
       selected: ranked.slice(0, 2),
@@ -89,7 +93,11 @@ test('reconciles every total funnel stage to complete per-source funnels', () =>
       { ...vacancy('selected-failed'), candidateId: 'candidate-002' },
     ],
     assessmentResult: { assessments: [{ candidateId: 'candidate-001' }] },
-    reviewed: [{ vacancyId: 'selected-assessed', outcome: 'kept' }],
+    reviewed: [{
+      vacancyId: 'selected-assessed',
+      outcome: 'kept',
+      trackerOutcome: 'added',
+    }],
     selectionDecision: {
       threshold: 40,
       selected: [vacancy('selected-assessed'), vacancy('selected-failed')],
@@ -106,7 +114,7 @@ test('reconciles every total funnel stage to complete per-source funnels', () =>
     sourceRecords: 7, sourceErrors: 1, failedSourceRecords: 1, parsed: 7, normalised: 6,
     duplicateObservations: 1, uniqueVacancies: 5, deterministicallyExcluded: 1,
     eligible: 4, ranked: 4, aboveThreshold: 3, selected: 2, assessed: 1,
-    assessmentFailed: 1, added: 0, updated: 0, unchanged: 0, closed: 0,
+    assessmentFailed: 1, added: 1, updated: 0, unchanged: 0, closed: 0,
     bySource: {
       ats: { count: 4, failedRecords: 0, sourceErrors: 0 },
       board: { count: 3, failedRecords: 1, sourceErrors: 1 },
@@ -118,7 +126,7 @@ test('reconciles every total funnel stage to complete per-source funnels', () =>
     sourceRecords: 4, parsed: 4, normalised: 4, duplicateObservations: 1,
     uniqueVacancies: 3, deterministicallyExcluded: 1, eligible: 2, ranked: 2,
     aboveThreshold: 2, selected: 2, assessed: 1, assessmentFailed: 1,
-    added: 0, updated: 0, unchanged: 0, closed: 0,
+    added: 1, updated: 0, unchanged: 0, closed: 0,
   });
   assert.deepEqual(funnel.bySource.board, {
     count: 3, failedRecords: 1, sourceErrors: 1,

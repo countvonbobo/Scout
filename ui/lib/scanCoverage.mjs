@@ -225,6 +225,7 @@ export function buildVacancyExplanations({
       deterministic_exclusions: deterministicExclusionsForVacancy,
       assessment_status: assessed ? 'assessed' : selected ? 'assessment-failed' : 'not-selected',
       outcome: reviewedItem?.outcome ? code(reviewedItem.outcome) : null,
+      tracker_outcome: reviewedItem?.trackerOutcome ? code(reviewedItem.trackerOutcome) : null,
       source: sourceOf(value),
       sourceUrl: canonicalUrl(value?.url ?? value?.canonicalUrl ?? value?.sourceUrl),
     };
@@ -291,6 +292,9 @@ export function reconcileCoverageFunnel(funnel, explanations = []) {
     row.selected += Number(item?.stages?.selected === true);
     row.assessed += Number(item?.stages?.assessed === true);
     row.assessmentFailed += Number(item?.stages?.selected === true && item?.stages?.assessed !== true);
+    row.added += Number(item?.tracker_outcome === 'added');
+    row.updated += Number(item?.tracker_outcome === 'updated');
+    row.unchanged += Number(item?.tracker_outcome === 'unchanged');
     row.closed += Number(item?.reason_code === 'advert-closed');
   }
   for (const [source, row] of Object.entries(bySource)) {

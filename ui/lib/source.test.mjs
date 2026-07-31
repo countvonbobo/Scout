@@ -91,6 +91,16 @@ test('buildSourcePayload flags thin text and carries url/fetchedAt', () => {
   assert.equal(buildSourcePayload(long, 'https://x.test', 'now').thin, false);
 });
 
+test('buildSourcePayload never publishes URL credentials, query values or fragments', () => {
+  const payload = buildSourcePayload(
+    '<body><p>vacancy</p></body>',
+    'https://user:password@x.test/job?sig=PRIVATE123#token',
+    '2026-07-31T12:00:00.000Z',
+  );
+  assert.equal(payload.url, 'https://x.test/job');
+  assert.doesNotMatch(JSON.stringify(payload), /user|password|PRIVATE123|token/);
+});
+
 test('sourceUrlOf returns the first http(s) source or null', () => {
   assert.equal(sourceUrlOf({ sources: ['https://a.test/x', 'https://b.test'] }), 'https://a.test/x');
   assert.equal(sourceUrlOf({ sources: ['javascript:alert(1)'] }), null);

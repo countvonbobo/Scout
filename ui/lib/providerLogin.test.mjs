@@ -954,6 +954,30 @@ test('shutdown settles the operation but refuses process handoff until a stubbor
   });
 });
 
+test('shutdown refuses handoff while a pre-session provider start still owns auth authority', async () => {
+  let finishStatus;
+  const statusPending = new Promise((resolve) => { finishStatus = resolve; });
+  const manager = createProviderLoginManager({
+    providerStatus: () => statusPending,
+    acquireAuthMutation: async (provider, phase) => ({
+      provider, phase, mutationId: 'pending-start-authority',
+    }),
+    renewAuthMutation: async (capability) => capability,
+    releaseAuthMutation: async () => true,
+    shutdownDeadlineMs: 20,
+    authRenewalIntervalMs: 5,
+  });
+  const starting = manager.startProviderLogin('codex', OWNER);
+  await new Promise((resolve) => setImmediate(resolve));
+  await assert.rejects(
+    manager.shutdown(),
+    /provider start did not settle during shutdown/,
+  );
+  finishStatus({ installed: false, authenticated: false });
+  await assert.rejects(starting, /shutting down/);
+  await manager.shutdown();
+});
+
 test('Codex device-code parsing rejects token-shaped output', async () => {
   const h = harness();
   const started = await h.manager.startProviderLogin('codex', OWNER);

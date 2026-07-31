@@ -403,7 +403,8 @@ test('collection reports exact degraded capacity when priority employers exceed 
     'priority employer monitoring capacity was exceeded',
   );
   assert.deepEqual(collected.sources.employer_registry.monitoringCapacity, {
-    limit: 32,
+    limit: 12,
+    priorityLimit: 32,
     eligible: 33,
     eligiblePriority: 33,
     omitted: 1,

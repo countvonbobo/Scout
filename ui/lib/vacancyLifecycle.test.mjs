@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { decideVacancyLifecycle } from './vacancyLifecycle.mjs';
+import { decideVacancyLifecycle, partitionVacanciesForAssessment } from './vacancyLifecycle.mjs';
 
 const vacancy = {
   vacancyId: 'vacancy-1',
@@ -120,4 +120,24 @@ test('a resurfaced legacy rejection is re-ranked and reassessed once under the p
   );
   assert.equal(currentDecision.reason, 'unchanged-rejection');
   assert.equal(currentDecision.skipAssessment, true);
+});
+
+test('a distinct same-source provider reference cannot inherit an earlier rejection', () => {
+  const previous = {
+    ...vacancy,
+    vacancyId: 'vacancy-ref-earlier',
+    sourceReferences: [{ source: 'provider-a', providerId: 'opening-1', url: '' }],
+    outcome: 'below_threshold',
+    profileId: 'profile-current',
+  };
+  const current = {
+    ...vacancy,
+    vacancyId: 'vacancy-ref-later',
+    sourceReferences: [{ source: 'provider-a', providerId: 'opening-2', url: '' }],
+  };
+  const result = partitionVacanciesForAssessment([current], [previous], {
+    profileId: 'profile-current',
+  });
+  assert.equal(result.skipped.length, 0);
+  assert.equal(result.eligible[0].lifecycle.reason, 'new-vacancy');
 });

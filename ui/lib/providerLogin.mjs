@@ -416,6 +416,7 @@ export function createProviderLoginManager({
   const sessions = new Map();
   const active = new Map();
   const pendingStarts = new Set();
+  const pendingStartOperations = new Set();
   const starts = new Map();
   const cancels = new Map();
   const retries = new Map();
@@ -983,7 +984,10 @@ export function createProviderLoginManager({
   }
 
   async function startProviderLogin(providerValue, ownerContext) {
-    return start(providerValue, ownerContext, 'start');
+    const operation = start(providerValue, ownerContext, 'start');
+    pendingStartOperations.add(operation);
+    operation.finally(() => pendingStartOperations.delete(operation)).catch(() => {});
+    return operation;
   }
 
   async function retryProviderLogin(providerValue, previousSessionId, ownerContext) {
@@ -1003,7 +1007,10 @@ export function createProviderLoginManager({
     }
     previous.retryInFlight = true;
     try {
-      const successor = await start(provider, ownerContext, 'retry');
+      const operation = start(provider, ownerContext, 'retry');
+      pendingStartOperations.add(operation);
+      operation.finally(() => pendingStartOperations.delete(operation)).catch(() => {});
+      const successor = await operation;
       previous.retryConsumed = true;
       return successor;
     } finally {
@@ -1294,6 +1301,15 @@ export function createProviderLoginManager({
   async function shutdown() {
     shuttingDown = true;
     const deadlineAt = Date.now() + shutdownDeadlineMs;
+    if (pendingStartOperations.size) {
+      await Promise.race([
+        Promise.allSettled([...pendingStartOperations]),
+        new Promise((resolve) => {
+          const timer = setTimeout(resolve, Math.max(0, deadlineAt - Date.now()));
+          timer.unref?.();
+        }),
+      ]);
+    }
     const cleanup = [];
     for (const session of sessions.values()) {
       if (!TERMINAL_STATES.has(session.state)) {
@@ -1322,6 +1338,9 @@ export function createProviderLoginManager({
     );
     await Promise.allSettled([...pendingClearOperations]);
     await Promise.allSettled([...pendingHealthWrites]);
+    if (pendingStartOperations.size) {
+      throw new Error('provider start did not settle during shutdown');
+    }
     if ([...trackedChildren].some(({ closed }) => !closed)) {
       throw new Error('provider child did not close during shutdown');
     }

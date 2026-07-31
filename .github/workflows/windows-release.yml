@@ -40,12 +40,16 @@ jobs:
       - name: Select and validate version
         id: version
         shell: pwsh
+        env:
+          REQUESTED_VERSION: ${{ inputs.version }}
+          RELEASE_REF_NAME: ${{ github.ref_name }}
+          RELEASE_REF_TYPE: ${{ github.ref_type }}
         run: |
-          $version = '${{ inputs.version }}'
-          if ([string]::IsNullOrWhiteSpace($version)) { $version = '${{ github.ref_name }}'.TrimStart('v') }
+          $version = $env:REQUESTED_VERSION
+          if ([string]::IsNullOrWhiteSpace($version)) { $version = $env:RELEASE_REF_NAME.TrimStart('v') }
           $packageVersion = (Get-Content package.json | ConvertFrom-Json).version
           if ($version -ne $packageVersion) { throw 'Requested version does not match package version' }
-          if ('${{ github.ref_type }}' -eq 'tag' -and '${{ github.ref_name }}' -ne "v$packageVersion") { throw 'Tag does not match package version' }
+          if ($env:RELEASE_REF_TYPE -eq 'tag' -and $env:RELEASE_REF_NAME -ne "v$packageVersion") { throw 'Tag does not match package version' }
           "value=$version" | Out-File $env:GITHUB_OUTPUT -Append
       - run: node tools/build-release.mjs --installer --version "${{ steps.version.outputs.value }}"
       - run: npm run release:audit -- --root dist/release/stage --stage --require-markers

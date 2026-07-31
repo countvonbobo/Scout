@@ -511,7 +511,8 @@ export function planEmployerMonitoring(registry, {
     eligiblePriority: priority.length,
     omitted: eligible.filter(({ id }) => !selectedIds.has(id)).length,
     omittedPriority: priority.filter(({ id }) => !selectedIds.has(id)).length,
-    capacity: MAX_MONITORED_EMPLOYERS,
+    capacity,
+    priorityCapacity: MAX_MONITORED_EMPLOYERS,
   });
 }
 

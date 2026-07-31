@@ -869,6 +869,12 @@ test('scan artifact exposes a reconciled funnel without claiming all jobs were a
   assert.equal(artifacts.run.funnel.selected, 60);
   assert.equal(artifacts.run.funnel.assessed, 59);
   assert.equal(artifacts.run.funnel.assessmentFailed, 1);
+  assert.equal(artifacts.run.funnel.added, artifacts.run.keepers_added);
+  assert.equal(
+    artifacts.run.funnel.bySource.ats.added,
+    artifacts.run.keepers_added,
+  );
+  assert.ok(artifacts.run.funnel.added > 0);
   assert.equal(artifacts.run.candidates_found, 60);
   assert.equal(artifacts.run.profile_id, 'profile-123456789abc');
   assert.equal(artifacts.run.selection_summary.selected, 60);
@@ -876,7 +882,8 @@ test('scan artifact exposes a reconciled funnel without claiming all jobs were a
   assert.deepEqual(Object.keys(artifacts.run.explanations[0]).sort(), [
     'above_threshold', 'assessment_status', 'company', 'deterministic_exclusion',
     'deterministic_exclusions', 'dimensions', 'outcome', 'pre_rank', 'reason_code',
-    'role', 'selection_reason', 'source', 'sourceUrl', 'stages', 'vacancy_id',
+    'role', 'selection_reason', 'source', 'sourceUrl', 'stages', 'tracker_outcome',
+    'vacancy_id',
   ].sort());
   assert.equal(artifacts.run.funnel.bySource.ats.uniqueVacancies, 61);
   assert.equal(artifacts.run.funnel.bySource.ats.duplicateObservations, 2471);

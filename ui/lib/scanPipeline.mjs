@@ -2117,7 +2117,7 @@ function mergeTracker(
       ? gate.reasons
       : outcome === 'provider_discarded' ? [assessment.summary]
         : outcome === 'below_threshold' ? ['Below the configured check threshold'] : [];
-    reviewed.push({
+    const review = {
       vacancyId: boundedText(candidate.vacancyId, 160),
       company: boundedText(candidate.company, 120), role: boundedText(candidate.role, 160),
       source: boundedText(candidate.source, 80), sourceUrl: safeSourceUrl(candidate.url),
@@ -2129,8 +2129,9 @@ function mergeTracker(
       categoryId: null,
       outcome, score: gate.score,
       reasons: reasons.map((reason) => boundedText(reason)).filter(Boolean).slice(0, REVIEW_REASON_LIMIT),
-    });
+    };
     if (!gate.keep) {
+      reviewed.push(review);
       continue;
     }
     const baseId = `${slug(candidate.company)}-${slug(candidate.role)}-${date.slice(0, 7)}`;
@@ -2138,6 +2139,7 @@ function mergeTracker(
     let id = previous?.id || baseId;
     for (let suffix = 2; !previous && byId.has(id); suffix += 1) id = `${baseId}-${suffix}`;
     const changedAdvert = Boolean(previous && advertMateriallyChanged(previous, candidate));
+    reviewed.push({ ...review, trackerOutcome: previous ? 'updated' : 'added' });
     const references = mergeSourceReferences(previous || {}, candidate);
     const urls = references.map((reference) => reference.url).filter(Boolean);
     const deterministicDimensions = Array.isArray(candidate.dimensions) ? candidate.dimensions : [];
@@ -2151,6 +2153,7 @@ function mergeTracker(
       status: previous?.status || 'new', category: previous?.category || null,
       tags: [...new Set([...(previous?.tags || []), ...(candidate.tags || []), ...(gate.eligibility === 'check' ? ['Check mandatory requirement'] : []), ...(changedAdvert ? ['Updated advert — review'] : [])])],
       sources: [...new Set([...(previous?.sources || []), ...urls])], sourceReferences: references,
+      vacancyId: boundedText(candidate.vacancyId || previous?.vacancyId, 160),
       jobIdentity: jobIdentity(candidate),
       profileId: boundedText(profileId, 80),
       learningVersionId: boundedText(learningVersionId, 80),
@@ -2253,13 +2256,18 @@ function buildScanArtifacts(root, {
     )
     : { tracker: existing, keepersAdded: 0, keepersUpdated: 0, discarded: { ...EMPTY_DISCARDED }, reviewed: [] };
   const inboxArchived = archiveStaleInboxEntries(merged.tracker, staleInboxEntries, date);
-  const baseFunnel = funnel && error ? {
+  const baseFunnel = funnel ? {
     ...funnel,
-    assessed: Number(assessmentResult?.assessments?.length || 0),
-    assessmentFailed: Math.max(
-      0,
-      Number(funnel.selected || candidates.length) - Number(assessmentResult?.assessments?.length || 0),
-    ),
+    added: merged.keepersAdded,
+    updated: merged.keepersUpdated,
+    unchanged: 0,
+    ...(error ? {
+      assessed: Number(assessmentResult?.assessments?.length || 0),
+      assessmentFailed: Math.max(
+        0,
+        Number(funnel.selected || candidates.length) - Number(assessmentResult?.assessments?.length || 0),
+      ),
+    } : {}),
   } : funnel;
   const effectiveSelectionDecision = selectionDecision ? {
     ...selectionDecision,

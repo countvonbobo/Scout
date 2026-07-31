@@ -633,6 +633,7 @@ export async function collectScanSources(root, config, {
       eligiblePriority: monitoringPlan.eligiblePriority,
       omitted: monitoringPlan.omitted,
       omittedPriority: monitoringPlan.omittedPriority,
+      priorityLimit: monitoringPlan.priorityCapacity,
     },
   };
   const registryOwnsLegacyPortals = employerRegistry.employers.length > 0 || legacyPortals.length > 0;

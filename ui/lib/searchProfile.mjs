@@ -281,6 +281,19 @@ export function loadPublishedSearchProfile(root) {
 }
 
 export function migrateSearchProfile(root, { fileSystem = fs } = {}) {
+  const existingPaths = workspacePaths(root);
+  if (fileSystem.existsSync(existingPaths.searchProfileDraft)
+    || fileSystem.existsSync(existingPaths.searchProfilePublished)) {
+    const rollback = latestBeta22WorkspaceSnapshot(root);
+    if (rollback) {
+      return {
+        migrated: false,
+        draftPath: existingPaths.searchProfileDraft,
+        backupPath: null,
+        rollbackSnapshotPath: rollback.directory,
+      };
+    }
+  }
   return withBeta22MigrationAuthority(root, ({ createSnapshot, renew }) => {
   const paths = workspacePaths(root);
   if (fileSystem.existsSync(paths.searchProfileDraft) || fileSystem.existsSync(paths.searchProfilePublished)) {

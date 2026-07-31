@@ -772,6 +772,65 @@ test('fit assessment retains provider-work fencing until an unclosed child settl
   assert.equal(releases, 1);
 });
 
+test('fit assessment disconnect stops the real structured provider operation', async () => {
+  const root = tmpRoot();
+  let stopped = 0;
+  let rejectTurn;
+  const operation = new Promise((_resolve, reject) => { rejectTurn = reject; });
+  operation.stop = () => {
+    stopped += 1;
+    const error = new Error('stopped');
+    error.reasonCode = 'stopped';
+    rejectTurn(error);
+  };
+  const routes = routeFixture(root, {
+    runStructuredTurnFn: () => operation,
+    recordProviderResultHealthFn: async () => {},
+  });
+  const req = new EventEmitter();
+  const response = new MockResponse();
+  routes['POST /api/chat/send'](
+    req,
+    response,
+    JSON.stringify({
+      id: ID, engine: 'codex', mode: 'fit-assessment', text: 'Assess once.',
+    }),
+  );
+  await new Promise((resolve) => setImmediate(resolve));
+  await callRoute(
+    routes['POST /api/chat/stop'],
+    JSON.stringify({ id: ID }),
+  );
+  await response.finished;
+  assert.equal(stopped, 1);
+});
+
+test('engine catalogue performs no provider probe while authentication is being updated', async () => {
+  const root = tmpRoot();
+  const mutation = acquireProviderAuthMutation(root, 'codex', { phase: 'login' });
+  let probes = 0;
+  try {
+    const routes = routeFixture(root, {
+      providerCataloguesFn: async () => {
+        probes += 1;
+        return {};
+      },
+    });
+    const response = new MockResponse();
+    routes['GET /api/engines'](
+      new EventEmitter(),
+      response,
+      '',
+      new URL('http://127.0.0.1/api/engines'),
+    );
+    await response.finished;
+    assert.equal(response.statusCode, 200);
+    assert.equal(probes, 0);
+  } finally {
+    releaseProviderAuthMutation(root, mutation);
+  }
+});
+
 test('completed assistant updates persist as separate chat messages', async () => {
   const root = tmpRoot();
   const checkpoints = [];

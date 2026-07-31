@@ -98,6 +98,14 @@ test('release workflow builds and smoke tests every supported platform', () => {
   assert.match(workflow, /build-platform\.mjs mac/); assert.match(workflow, /build-platform\.mjs linux/); assert.match(workflow, /preserve workspace/i);
 });
 
+test('release version selection reads dispatch and ref context only through environment values', () => {
+  const step = workflow.match(/- name: Select and validate version[\s\S]*?(?=\n      - (?:name:|run:|uses:))/)?.[0] || '';
+  assert.match(step, /REQUESTED_VERSION: \$\{\{ inputs\.version \}\}/);
+  assert.match(step, /\$version = \$env:REQUESTED_VERSION/);
+  assert.doesNotMatch(step, /\$version\s*=\s*['"]\$\{\{/);
+  assert.doesNotMatch(step, /if\s*\(['"]\$\{\{/);
+});
+
 test('tagged release deploys the private VPS before publication', () => {
   assert.match(workflow, /deploy-vps:[\s\S]*environment: beta-vps/);
   assert.match(workflow, /tailscale\/github-action@306e68a486fd2350f2bfc3b19fcd143891a4a2d8 # v4/);

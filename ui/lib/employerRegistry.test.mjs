@@ -154,12 +154,14 @@ test('priority monitoring overflow reports exact bounded omission evidence', () 
   assert.equal(plan.selected.length, 32);
   assert.deepEqual({
     capacity: plan.capacity,
+    priorityCapacity: plan.priorityCapacity,
     eligible: plan.eligible,
     eligiblePriority: plan.eligiblePriority,
     omitted: plan.omitted,
     omittedPriority: plan.omittedPriority,
   }, {
-    capacity: 32,
+    capacity: 12,
+    priorityCapacity: 32,
     eligible: 33,
     eligiblePriority: 33,
     omitted: 1,

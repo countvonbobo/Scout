@@ -110,10 +110,10 @@ function metadataValues(observations, name) {
     .filter(Boolean))].sort(compareStable);
 }
 
-function canonicalVacancyId(canonicalUrl, identity) {
+function canonicalVacancyId(canonicalUrl, identity, sourceReferences) {
   if (canonicalUrl) return canonicalUrl;
   return `vacancy-ref-${crypto.createHash('sha256')
-    .update(stableJson({ identity }))
+    .update(stableJson({ identity, sourceReferences }))
     .digest('hex').slice(0, 24)}`;
 }
 
@@ -259,7 +259,7 @@ function canonicalVacancy(observations) {
     company: identity.company,
     title: identity.title,
   };
-  const vacancyId = canonicalVacancyId(canonicalUrl, fallbackIdentity);
+  const vacancyId = canonicalVacancyId(canonicalUrl, fallbackIdentity, sourceReferences);
   const collectionSources = metadataValues(orderedObservations, 'collectionSource');
   const laneIds = [...new Set([
     ...metadataValues(orderedObservations, 'laneId'),

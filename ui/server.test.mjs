@@ -18,7 +18,8 @@ const {
   inspectCodexDeepLinkHandler, operations, providerDetection, providerLoginControl,
   publicApiError, publicCvImportError, publicDeviceSettings, publicProviderStatus,
   publicSetupConfigError, recoverProfilePublicationsAtStartup, requestAccess,
-  restartControl, shutdownControl,
+  restartControl, runtimeProviderPreflight, shutdownControl,
+  stageSearchProfileReviewAtStartup,
 } = await import('./server.mjs');
 const { seedWorkspace, loadWorkspaceConfig, workspacePaths, writeWorkspaceConfig } = await import('./lib/workspace.mjs');
 const {
@@ -31,6 +32,9 @@ const { acquireScanLock, releaseScanLock } = await import('../tools/scan-lock.mj
 const { appendRunEvent, openRunJournal } = await import('./lib/runJournal.mjs');
 const { acquireScanLease, currentLeaseOwner, releaseScanLease } = await import('./lib/scanLease.mjs');
 const { enqueueScanRequest } = await import('./lib/scanQueue.mjs');
+const {
+  acquireProviderAuthMutation, releaseProviderAuthMutation,
+} = await import('./lib/providerAuthMutation.mjs');
 
 test('server startup and periodic provider health use the configured runtime entry points', async () => {
   const config = {
@@ -108,6 +112,52 @@ test('server startup retries a live-fenced profile publication without starting 
   assert.equal(timer.unrefCalled, true);
   scheduled.callback();
   assert.deepEqual(calls, ['/synthetic/workspace', '/synthetic/workspace']);
+});
+
+test('server startup retries search-profile staging while workspace mutation authority is busy', () => {
+  let scheduled;
+  let attempts = 0;
+  const timer = { unrefCalled: false, unref() { this.unrefCalled = true; } };
+  const stage = () => {
+    attempts += 1;
+    if (attempts === 1) {
+      const error = new Error('workspace busy');
+      error.reasonCode = 'mutation-busy';
+      throw error;
+    }
+    return { migrated: false };
+  };
+  stageSearchProfileReviewAtStartup({
+    initialised: () => true,
+    stage,
+    schedule(callback, delay) {
+      scheduled = { callback, delay };
+      return timer;
+    },
+  });
+  assert.equal(scheduled.delay, 1_000);
+  assert.equal(timer.unrefCalled, true);
+  assert.deepEqual(scheduled.callback(), { migrated: false });
+});
+
+test('runtime provider preflight performs no provider probe during auth mutation', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'scout-provider-preflight-'));
+  const mutation = acquireProviderAuthMutation(root, 'codex', { phase: 'login' });
+  let detections = 0;
+  try {
+    const result = await runtimeProviderPreflight(root, 'codex', 'periodic', {
+      source: 'periodic',
+      detectProvidersFn: async () => {
+        detections += 1;
+        return {};
+      },
+    });
+    assert.equal(detections, 0);
+    assert.equal(result.state, 'login-in-progress');
+  } finally {
+    releaseProviderAuthMutation(root, mutation);
+    fs.rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test('guided login confirms health with a bounded real provider turn', async () => {
@@ -1754,6 +1804,7 @@ test('feedback, proposal, publication and undo remain separate revisioned mutati
       score: 70,
       profileId: 'profile-aaaaaaaaaaaa',
       learningVersionId: 'learning-baseline',
+      vacancyId: 'vacancy-canonical-feedback',
       jobIdentity: { providerId: 'vacancy-feedback-test' },
     }],
   }, null, 2)}\n`);
@@ -1774,6 +1825,7 @@ test('feedback, proposal, publication and undo remain separate revisioned mutati
   assert.equal(feedbackResponse.status, 200, feedbackResponse.text);
   const feedback = JSON.parse(feedbackResponse.text).ledger;
   assert.equal(feedback.feedbackEvents[0].scope, 'job');
+  assert.equal(feedback.feedbackEvents[0].vacancyId, 'vacancy-canonical-feedback');
   assert.deepEqual(feedback.active.changes, []);
   assert.equal(
     JSON.parse(fs.readFileSync(trackerFile, 'utf8')).opportunities[0].status,
