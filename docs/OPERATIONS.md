@@ -48,12 +48,24 @@ The maintained beta deployment uses one private, single-owner Ubuntu VPS:
   whichever comes first. Equivalent work deduplicates, scheduled equivalents
   coalesce, and stale/expired/superseded work never executes. On handoff, the
   oldest compatible manual request precedes the newest compatible scheduled
-  request. Every transition remains auditable.
-- Only successfully terminalised mutations and scans queue encrypted
+  request. Every transition remains auditable. A genuinely incomplete torn
+  final queue append is content-addressed and quarantined before the valid
+  prefix continues; complete invalid schema, digest or identity evidence fails
+  closed, and compaction retains the recovery receipt.
+- All startup and periodic backup checkpoints use the same fenced lease and
+  shared mutation coordinator as scan and tracker/report mutation. A foreign
+  owner produces a bounded pending result; lease loss stops the checkpoint
+  without an unfenced retry. Short UI mutation bursts coalesce their backup
+  request instead of immediately blocking the next reviewed action. Only
+  successfully terminalised mutations and scans queue encrypted
   private-repository backup checkpoints. The scan keeps its fenced lease and
   heartbeat through the receipt-gated checkpoint. Runtime Git commands are
   asynchronous, time-bounded, and fence-checked around every mutation so the
   heartbeat remains live and a stale owner cannot start another mutation.
+  The mutation guard records the host, process, process-start identity and a
+  pre-spawn child-operation identity. A successor remains blocked while that
+  Git child is live or its state is ambiguous; timeout terminates the complete
+  process tree and observes close before releasing authority.
   Recovery-file encryption, writes, and fast-forward restores run in bounded
   chunks with event-loop yields and component-level fence checks. A timed-out
   Git command terminates its process tree and reaches `close` before the scan

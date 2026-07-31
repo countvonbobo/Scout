@@ -82,19 +82,22 @@ Setup, Settings, CV options and side drawers keep keyboard focus inside the acti
 Scout uses these approved answers, the imported CV and generated search lanes to find and score jobs. It does not inspect unrelated Codex/Claude conversations or automatically infer a career from previous AI usage.
 
 After several scans, open **Settings → Search & profile → Search lanes and run
-history** to see what each query returned and what survived filtering,
-selection and assessment. Scout can offer a lane for retirement only after
-three completed non-failed runs produced no new, eligible, selected or
-promising result. You must confirm retirement, and you can restore the lane
-later without losing its history.
+history** to see each run's returned, parsed, new, eligible, selected and
+promising counts. Review the profile rule value, strength and provenance shown
+with each lane before making a retirement decision. Scout can offer
+a lane for retirement only after three completed non-failed runs produced no
+new, eligible, selected or promising result. You must confirm retirement, and
+you can restore the lane later without losing its history.
 
 Open **Settings → Employers** to review named and advert-discovered employers.
 You can set explicit priority, pause or exclude an employer reversibly, review
-terms and robots permission, configure a public ATS board or careers URL, set
-the minimum check interval, and inspect health and recent outcomes. Generic
-careers-page parsing is off until you enable it. Scout never bypasses sign-in,
-anti-bot or JavaScript-only pages and never treats an empty check as a negative
-preference.
+and undo bounded aliases, industries and locations, review terms and robots
+permission, configure a public ATS board or careers URL, set the minimum check
+interval, and inspect health and recent outcomes. Alias changes are
+revision-bound and explicitly confirmed; one alias cannot identify two
+employers. Generic careers-page parsing is off until you enable it. Scout never
+bypasses sign-in, anti-bot or JavaScript-only pages and never treats an empty
+check as a negative preference.
 
 ### Tailor a CV
 

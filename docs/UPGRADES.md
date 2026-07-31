@@ -35,7 +35,10 @@ new profile. This is a full compatibility boundary rather than the older
 configuration-only JSON backup. It preserves private career data and
 credentials, removes only post-beta.22 profile/fenced runtime state from the
 copy, and records a per-file SHA-256 manifest. The migration is idempotent and
-reuses the newest verified compatibility snapshot.
+reuses an existing verified compatibility snapshot only when its manifest
+proves exact equivalence for every protected live path. If tracker, report, CV,
+configuration or another protected file changed, Scout creates a new
+current-state snapshot before migration.
 
 The first fenced scan-lease activation is a one-way execution boundary, not a
 manual workspace-data conversion. Once activated, the fenced lease is

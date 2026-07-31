@@ -5,6 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { test } from 'node:test';
+import { artifactNames } from './build-platform.mjs';
 
 const workflow = fs.readFileSync(new URL('../.github/workflows/windows-release.yml', import.meta.url), 'utf8');
 const ci = fs.readFileSync(new URL('../.github/workflows/ci.yml', import.meta.url), 'utf8');
@@ -35,11 +36,34 @@ test('release publication has scoped write permission and publishes checksum', (
 test('tagged releases keylessly attest and verify every checksum subject before publication', () => {
   assert.match(workflow, /publish:[\s\S]*permissions:[\s\S]*id-token: write/);
   assert.match(workflow, /publish:[\s\S]*permissions:[\s\S]*attestations: write/);
-  assert.match(workflow, /uses: actions\/attest@v4[\s\S]*subject-checksums: release-assets\/checksums\.txt/);
+  assert.match(workflow, /uses: actions\/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d # v4[\s\S]*subject-checksums: release-assets\/checksums\.txt/);
   assert.match(workflow, /steps\.attest\.outputs\.bundle-path/);
   assert.match(workflow, /checksums\.intoto\.jsonl/);
   assert.match(workflow, /gh attestation verify/);
   assert.doesNotMatch(workflow, /COSIGN_(?:PRIVATE_KEY|PASSWORD)/);
+});
+
+test('privileged release jobs reject every mutable action reference', () => {
+  const headings = [...workflow.matchAll(/^  ([a-z0-9-]+):\n/gm)];
+  const jobs = headings.map((heading, index) => ({
+    name: heading[1],
+    body: workflow.slice(
+      heading.index + heading[0].length,
+      headings[index + 1]?.index ?? workflow.length,
+    ),
+  }));
+  const privileged = jobs.filter(({ body }) => (
+    /^\s{6}(?:contents|id-token|packages|attestations): write$/m.test(body)
+  ));
+  assert.deepEqual(privileged.map(({ name }) => name), ['publish']);
+  for (const { name, body } of privileged) {
+    const references = [...body.matchAll(/^\s+- uses:\s+([^\s#]+)(?:\s+#.*)?$/gm)]
+      .map((match) => match[1]);
+    assert.ok(references.length > 0, `${name} has no reviewed action references`);
+    for (const reference of references) {
+      assert.match(reference, /@[a-f0-9]{40}$/, `${name}: mutable action reference ${reference}`);
+    }
+  }
 });
 
 test('release documentation defines checksum, keyless identity and platform-signing boundaries', () => {
@@ -64,7 +88,7 @@ test('release workflow builds and smoke tests every supported platform', () => {
 
 test('tagged release deploys the private VPS before publication', () => {
   assert.match(workflow, /deploy-vps:[\s\S]*environment: beta-vps/);
-  assert.match(workflow, /tailscale\/github-action@v4/);
+  assert.match(workflow, /tailscale\/github-action@306e68a486fd2350f2bfc3b19fcd143891a4a2d8 # v4/);
   assert.match(workflow, /oauth-secret: \$\{\{ secrets\.TS_OAUTH_SECRET \}\}/);
   assert.match(workflow, /tags: tag:scout-deploy/);
   assert.match(workflow, /StrictHostKeyChecking=yes/);
@@ -139,9 +163,24 @@ test('workspace repair is protected, local-only and verifies backup plus rendere
 
 test('package, installer and release notes use one beta version', () => {
   const pkg = JSON.parse(fs.readFileSync(new URL('../package.json', import.meta.url), 'utf8'));
+  const lock = JSON.parse(fs.readFileSync(new URL('../package-lock.json', import.meta.url), 'utf8'));
   const installer = fs.readFileSync(new URL('../installer/Scout.iss', import.meta.url), 'utf8');
+  const release = fs.readFileSync(new URL(`../docs/releases/${pkg.version}.md`, import.meta.url), 'utf8');
+  assert.equal(pkg.name, 'scout-opportunity-finder');
+  assert.equal(pkg.version, '0.1.0-beta.23');
+  assert.equal(lock.name, pkg.name);
+  assert.equal(lock.version, pkg.version);
+  assert.equal(lock.packages[''].name, pkg.name);
+  assert.equal(lock.packages[''].version, pkg.version);
   assert.match(installer, new RegExp(`MyAppVersion "${pkg.version.replaceAll('.', '\\.')}"`));
   assert.equal(fs.existsSync(new URL(`../docs/releases/${pkg.version}.md`, import.meta.url)), true);
+  assert.match(release, new RegExp(`^# Scout ${pkg.version.replaceAll('.', '\\.')}$`, 'm'));
+  assert.deepEqual(artifactNames(), {
+    macArm: `Scout-${pkg.version}-macos-arm64.dmg`,
+    macIntel: `Scout-${pkg.version}-macos-x64.dmg`,
+    linuxDeb: `Scout-${pkg.version}-linux-x64.deb`,
+    linuxTar: `Scout-${pkg.version}-linux-x64.tar.gz`,
+  });
 });
 
 test('Windows setup uses the tracked Scout icon', () => {

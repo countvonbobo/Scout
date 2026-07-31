@@ -352,6 +352,8 @@ test('search settings review lane evidence before reversible retirement', async 
   await dialog.getByText('Search lanes and run history', { exact: true }).click();
   await expect(dialog.getByText('Platform engineer', { exact: true })).toBeVisible();
   await expect(dialog.getByText(/3 run\(s\)/)).toBeVisible();
+  await expect(dialog.getByText(/0 returned,\s+0 parsed,\s+0 new,\s+0 eligible,\s+0 selected,\s+0 promising/).first()).toBeVisible();
+  await expect(dialog.getByText(/value: Platform engineer; strength: strong-preference; provenance: explicit/)).toBeVisible();
   await dialog.getByRole('button', { name: 'Retire reviewed unproductive lanes' }).click();
   await expect(page.locator('#setup-status')).toContainText('Confirm that you reviewed');
   await dialog.locator('#search-lanes-retire-confirm').check();

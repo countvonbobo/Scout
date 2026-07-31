@@ -144,6 +144,18 @@ test('maintainer instructions require operations context, documentation upkeep a
   assert.match(policy, /Do not create root-level TODO/i);
 });
 
+test('completed implementation plans are not shipped as current documentation', () => {
+  for (const directory of [
+    path.join(root, 'docs', 'implementation'),
+    path.join(root, 'docs', 'superpowers', 'plans'),
+  ]) {
+    const markdown = fs.existsSync(directory)
+      ? fs.readdirSync(directory).filter((name) => name.endsWith('.md'))
+      : [];
+    assert.deepEqual(markdown, [], directory);
+  }
+});
+
 test('beta.23 upgrade guidance explains the one-way fenced lease boundary', () => {
   const release = fs.readFileSync(path.join(root, 'docs', 'releases', '0.1.0-beta.23.md'), 'utf8');
   const upgrades = fs.readFileSync(path.join(root, 'docs', 'UPGRADES.md'), 'utf8');
@@ -166,6 +178,26 @@ test('beta.23 notes reconcile beta.22 through the candidate and readiness work 7
   }
   assert.match(release, /unknown location facts.*include.*penalise.*exclude/is);
   assert.match(release, /live.*(?:pending|not yet recorded)|(?:pending|not yet recorded).*live/is);
+});
+
+test('current guides explain the repaired beta.23 safety and review contracts', () => {
+  const release = fs.readFileSync(path.join(root, 'docs', 'releases', '0.1.0-beta.23.md'), 'utf8');
+  const quickStart = fs.readFileSync(path.join(root, 'docs', 'QUICK_START.md'), 'utf8');
+  const providers = fs.readFileSync(path.join(root, 'docs', 'PROVIDERS.md'), 'utf8');
+  const operations = fs.readFileSync(path.join(root, 'docs', 'OPERATIONS.md'), 'utf8');
+  const privacy = fs.readFileSync(path.join(root, 'docs', 'PRIVACY.md'), 'utf8');
+  const supplyChain = fs.readFileSync(path.join(root, 'docs', 'SUPPLY_CHAIN_SECURITY.md'), 'utf8');
+
+  assert.match(quickStart, /returned.*parsed.*new.*eligible.*selected.*promising/is);
+  assert.match(quickStart, /rule value.*strength.*provenance/is);
+  assert.match(providers, /sign-in.*blocks.*same provider.*other provider/is);
+  assert.match(operations, /startup.*periodic.*backup.*fenced lease.*mutation coordinator/is);
+  assert.match(operations, /torn.*queue.*quarantin/is);
+  assert.match(privacy, /private.*redirect.*DNS|DNS.*private.*redirect/is);
+  assert.match(release, /SSRF|server-side request forgery/i);
+  assert.match(release, /orphaned.*Git|Git.*child.*successor/is);
+  assert.match(release, /torn.*queue/i);
+  assert.match(supplyChain, /full commit SHA|immutable commit SHA/i);
 });
 
 test('configuration distinguishes field influence and published-profile authority', () => {

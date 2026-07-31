@@ -170,13 +170,18 @@ test('search-lane review shows bounded evidence with explicit retirement and res
     state: 'active',
     runCount: 3,
     consecutiveUnproductiveRuns: 3,
-    aggregate: { returned: 4, eligible: 0, promising: 0 },
-    profileFields: [{ path: 'target.primaryTitles' }],
+    aggregate: {
+      returned: 4, parsed: 3, new: 2, eligible: 0, selected: 0, promising: 0,
+    },
+    profileFields: [{
+      path: 'target.primaryTitles',
+      value: 'Platform engineer',
+      strength: 'strong-preference',
+      provenance: 'explicit',
+    }],
     history: [{
       recordedAt: '2026-07-30T10:00:00.000Z',
-      returned: 1,
-      eligible: 0,
-      promising: 0,
+      returned: 1, parsed: 1, new: 1, eligible: 0, selected: 0, promising: 0,
       failures: [{ source: 'adzuna', code: 'source-query-failed' }],
     }],
   };
@@ -201,6 +206,9 @@ test('search-lane review shows bounded evidence with explicit retirement and res
   assert.doesNotMatch(html, /<script>Platform/);
   assert.match(html, /&lt;script&gt;Platform engineer&lt;\/script&gt;/);
   assert.match(html, /source failure recorded/);
+  assert.match(html, /4 returned,\s+3 parsed,\s+2 new,\s+0 eligible,\s+0 selected,\s+0 promising/);
+  assert.match(html, /1 returned,\s+1 parsed,\s+1 new,\s+0 eligible,\s+0 selected,\s+0 promising/);
+  assert.match(html, /value: Platform engineer; strength: strong-preference; provenance: explicit/);
   assert.match(html, /search-lanes-retire-confirm/);
   assert.match(html, /data-search-lane-restore="lane-bbbbbbbbbbbbbbbb"/);
 });

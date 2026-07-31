@@ -313,16 +313,26 @@ export function searchLanePlanHtml(adaptive = {}) {
     const counts = item.aggregate || {};
     const recent = (item.history || []).slice(-3).reverse().map((event) => (
       `<li>${escapeProfileText(String(event.recordedAt || '').slice(0, 10) || 'unknown date')}: `
-      + `${escapeProfileText(event.returned || 0)} returned, ${escapeProfileText(event.eligible || 0)} eligible, `
-      + `${escapeProfileText(event.promising || 0)} promising${event.failures?.length ? ' (source failure recorded)' : ''}</li>`
+      + `${escapeProfileText(event.returned || 0)} returned, ${escapeProfileText(event.parsed || 0)} parsed, `
+      + `${escapeProfileText(event.new || 0)} new, ${escapeProfileText(event.eligible || 0)} eligible, `
+      + `${escapeProfileText(event.selected || 0)} selected, ${escapeProfileText(event.promising || 0)} promising`
+      + `${event.failures?.length ? ' (source failure recorded)' : ''}</li>`
     )).join('') || '<li>No completed run yet.</li>';
+    const fields = (item.profileFields || []).map((field) => {
+      const value = typeof field.value === 'string' ? field.value : JSON.stringify(field.value ?? '');
+      return `<li>${escapeProfileText(field.path || 'unknown rule')} — value: ${escapeProfileText(value)}; `
+        + `strength: ${escapeProfileText(field.strength || 'unknown')}; `
+        + `provenance: ${escapeProfileText(field.provenance || 'unknown')}</li>`;
+    }).join('') || '<li>No profile rule evidence recorded.</li>';
     return `<li data-search-lane="${escapeProfileText(item.id)}">
       <strong>${escapeProfileText(item.query)}</strong>
       <span class="meta"> — ${escapeProfileText(item.kind)}; ${escapeProfileText(item.state)};
       ${escapeProfileText(item.runCount || 0)} run(s); totals: ${escapeProfileText(counts.returned || 0)} returned,
-      ${escapeProfileText(counts.eligible || 0)} eligible, ${escapeProfileText(counts.promising || 0)} promising.</span>
-      <details><summary>Recent lane history and provenance</summary><ul>${recent}</ul>
-      <p class="meta">Profile fields: ${escapeProfileText((item.profileFields || []).map(({ path }) => path).join(', '))}</p></details>
+      ${escapeProfileText(counts.parsed || 0)} parsed, ${escapeProfileText(counts.new || 0)} new,
+      ${escapeProfileText(counts.eligible || 0)} eligible, ${escapeProfileText(counts.selected || 0)} selected,
+      ${escapeProfileText(counts.promising || 0)} promising.</span>
+      <details open><summary>Recent lane history and provenance</summary><ul>${recent}</ul>
+      <p class="meta">Profile rules used by this lane:</p><ul>${fields}</ul></details>
       ${item.state === 'retired' && item.retirement?.reversible
         ? `<button class="act" type="button" data-search-lane-restore="${escapeProfileText(item.id)}">Restore this lane</button>`
         : ''}

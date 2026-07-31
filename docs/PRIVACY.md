@@ -23,6 +23,12 @@ Company relationship history is stored under `data/companies/`. It may contain r
 - AI-assisted setup, chat and scans send necessary context to Codex or Claude under that provider's terms and account controls.
 - Adzuna searches send search parameters and credentials to Adzuna.
 - ATS and public-source requests reveal ordinary request metadata to those sites.
+- Careers and advert discovery accepts only public HTTP(S) destinations. Scout
+  rejects credentials in URLs, validates every DNS answer immediately before
+  connecting, pins that validated resolution for the request, and repeats the
+  public-address check after each bounded redirect. A private, loopback,
+  link-local or otherwise non-public address reached directly, through DNS or
+  through a redirect is never fetched.
 - Scout never submits an application or sends outreach.
 - Scout contacts GitHub only after the user chooses private backup or restore. Desktop HTTPS uses Git Credential Manager. An unattended VPS may instead use a passphrase-free SSH deploy key restricted to the one private workspace repository; Scout pins GitHub's published Ed25519 host key and requires strict host-key checking.
 - Optional Private Remote Access uses Tailscale Serve while Scout continues listening only on `127.0.0.1`. Scout requires the configured owner's `Tailscale-User-Login` identity on every remote page, API, download and stream; tagged devices and other identities are rejected. Funnel and public/LAN listeners are not used.
@@ -45,6 +51,13 @@ revalidated and skipped without sending the advert to the assessment provider
 again; a material, reopened, profile-changed or assessment-contract-changed
 vacancy is eligible for reassessment. Existing run-retention and encrypted
 backup policies govern the underlying private run and scan-log files.
+
+The durable scan queue is append-only. If power loss leaves only an incomplete
+final JSON append, Scout preserves the valid prefix and stores the bounded torn
+bytes plus a content-addressed receipt under private `.scout` recovery state
+before continuing. A complete entry with an invalid schema, digest or identity
+is not discarded as a torn write and fails closed for review. Queue compaction
+does not remove that recovery evidence.
 
 ## Back up, move or delete
 
