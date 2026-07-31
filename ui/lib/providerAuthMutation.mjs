@@ -31,6 +31,14 @@ function checkedNow(now) {
   return value;
 }
 
+function createDirectory(directory) {
+  try {
+    fs.mkdirSync(directory, { mode: 0o700 });
+  } catch (error) {
+    if (error?.code !== 'EEXIST') throw error;
+  }
+}
+
 function paths(root, provider, create = false) {
   checkedProvider(provider);
   const workspace = path.resolve(root);
@@ -40,7 +48,7 @@ function paths(root, provider, create = false) {
   const physical = fs.realpathSync.native(workspace);
   let directory = path.join(workspace, '.scout');
   for (const part of ['provider-auth', `v${SCHEMA_VERSION}`]) {
-    if (create && !fs.existsSync(directory)) fs.mkdirSync(directory, { mode: 0o700 });
+    if (create) createDirectory(directory);
     if (fs.existsSync(directory)) {
       const stat = fs.lstatSync(directory);
       if (stat.isSymbolicLink() || !stat.isDirectory()
@@ -50,7 +58,7 @@ function paths(root, provider, create = false) {
     }
     directory = path.join(directory, part);
   }
-  if (create && !fs.existsSync(directory)) fs.mkdirSync(directory, { mode: 0o700 });
+  if (create) createDirectory(directory);
   if (fs.existsSync(directory)) {
     const stat = fs.lstatSync(directory);
     if (stat.isSymbolicLink() || !stat.isDirectory()) {
