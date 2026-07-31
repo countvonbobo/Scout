@@ -10,7 +10,9 @@ const SCHEMA_VERSION = 1;
 const DEFAULT_DURATION_MS = 11 * 60 * 1000;
 const DEFAULT_WORK_DURATION_MS = 30 * 60 * 1000;
 const GUARD_STALE_MS = 15_000;
+const GUARD_ACQUIRE_TIMEOUT_MS = 2_000;
 const GUARD_RECORD = 'owner.json';
+const guardSleep = new Int32Array(new SharedArrayBuffer(4));
 
 export class ProviderAuthMutationActiveError extends Error {
   constructor(provider, phase) {
@@ -176,43 +178,56 @@ function createOwnedGuard(directory, acquiredAt) {
       owner: currentLeaseOwner(),
       acquiredAt,
     })}\n`, { mode: 0o600 });
-    fs.renameSync(candidate, directory);
   } catch (error) {
     fs.rmSync(candidate, { recursive: true, force: true });
     throw error;
   }
-  return token;
+  return { candidate, token };
 }
 
 function withGuard(root, provider, now, callback) {
   const target = paths(root, provider, true);
-  let token;
+  const acquiredAt = checkedNow(now);
+  const deadline = performance.now() + GUARD_ACQUIRE_TIMEOUT_MS;
+  const prepared = createOwnedGuard(target.guard, acquiredAt);
+  let published = false;
   try {
-    token = createOwnedGuard(target.guard, checkedNow(now));
-  } catch (error) {
-    if (!['EEXIST', 'ENOTEMPTY'].includes(error?.code)) throw error;
-    const observed = readGuardRecord(target.guard);
-    if (!observed
-      || checkedNow(now) - observed.acquiredAt <= GUARD_STALE_MS
-      || processOwnerIsLiveOrAmbiguous(observed.owner)) return null;
-    const quarantine = `${target.guard}.stale-${randomUUID()}`;
-    try {
-      fs.renameSync(target.guard, quarantine);
-      const moved = readGuardRecord(quarantine);
-      if (!moved || moved.token !== observed.token) {
-        if (!fs.existsSync(target.guard)) fs.renameSync(quarantine, target.guard);
-        return null;
+    while (!published) {
+      try {
+        fs.renameSync(prepared.candidate, target.guard);
+        published = true;
+      } catch (error) {
+        if (!['EEXIST', 'ENOTEMPTY', 'EBUSY', 'EPERM', 'EACCES'].includes(error?.code)) throw error;
+        const observed = readGuardRecord(target.guard);
+        if (observed) {
+          if (acquiredAt - observed.acquiredAt <= GUARD_STALE_MS
+            || processOwnerIsLiveOrAmbiguous(observed.owner)) return null;
+          const quarantine = `${target.guard}.stale-${randomUUID()}`;
+          try {
+            fs.renameSync(target.guard, quarantine);
+            const moved = readGuardRecord(quarantine);
+            if (!moved || moved.token !== observed.token) {
+              if (!fs.existsSync(target.guard)) fs.renameSync(quarantine, target.guard);
+              return null;
+            }
+            fs.rmSync(quarantine, { recursive: true, force: true });
+            continue;
+          } catch {
+            return null;
+          }
+        }
+        if (fs.existsSync(target.guard)) return null;
+        const remaining = deadline - performance.now();
+        if (remaining <= 0) return null;
+        Atomics.wait(guardSleep, 0, 0, Math.min(5, remaining));
       }
-      fs.rmSync(quarantine, { recursive: true, force: true });
-      token = createOwnedGuard(target.guard, checkedNow(now));
-    } catch {
-      return null;
     }
-  }
-  try {
     return callback(target);
   } finally {
-    removeOwnedGuard(target.guard, token);
+    if (published) removeOwnedGuard(target.guard, prepared.token);
+    else {
+      try { fs.rmSync(prepared.candidate, { recursive: true, force: true }); } catch {}
+    }
   }
 }
 

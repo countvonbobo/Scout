@@ -147,6 +147,36 @@ test('an old guard owned by this live process cannot be stolen', (t) => {
   );
 });
 
+test('transient guard publication contention retries before reporting an auth result', (t) => {
+  const root = workspace(t);
+  const originalRename = fs.renameSync;
+  let publicationAttempts = 0;
+  fs.renameSync = (source, destination) => {
+    if (String(source).includes('codex.guard.candidate-')
+      && String(destination).endsWith('codex.guard')) {
+      publicationAttempts += 1;
+      if (publicationAttempts === 1) {
+        throw Object.assign(new Error('injected Windows publication contention'), { code: 'EPERM' });
+      }
+    }
+    return originalRename(source, destination);
+  };
+  let auth;
+  try {
+    auth = acquireProviderAuthMutation(root, 'codex', {
+      owner,
+      now: 1_000,
+      durationMs: 5_000,
+      mutationId: 'transient-publish-01',
+    });
+  } finally {
+    fs.renameSync = originalRename;
+  }
+  assert.ok(auth);
+  assert.equal(publicationAttempts, 2);
+  assert.equal(releaseProviderAuthMutation(root, auth, { now: 1_001 }), true);
+});
+
 test('expired authentication authority is recovered with a new capability', (t) => {
   const root = workspace(t);
   const deadOwner = {
