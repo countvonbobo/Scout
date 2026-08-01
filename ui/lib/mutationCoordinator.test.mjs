@@ -283,10 +283,7 @@ test('parent death during merge, add, commit and push keeps every live child fen
       );
 
       if (process.platform === 'win32') {
-        spawn('taskkill.exe', ['/pid', String(childPid), '/T', '/F'], {
-          windowsHide: true,
-          stdio: 'ignore',
-        });
+        process.kill(childPid, 'SIGKILL');
       } else {
         try { process.kill(-childPid, 'SIGKILL'); } catch { process.kill(childPid, 'SIGKILL'); }
       }
