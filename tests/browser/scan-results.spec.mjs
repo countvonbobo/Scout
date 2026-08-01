@@ -297,8 +297,8 @@ test('missing operation stays fenced when durable scan state is unavailable', as
   queueRequests = 0;
   await page.evaluate(() => window.Scout.watchScanOperation('scan-unknown-after-restart'));
   await expect.poll(() => reconciliationRequests).toBeGreaterThan(1);
-  expect(runsRequests).toBeGreaterThan(1);
-  expect(queueRequests).toBeGreaterThan(1);
+  await expect.poll(() => runsRequests).toBeGreaterThan(1);
+  await expect.poll(() => queueRequests).toBeGreaterThan(1);
   await expect(page.locator('#scan-now')).toBeDisabled();
   await expect.poll(() => page.evaluate(() => window.Scout.scanRunning)).toBe(true);
 });
