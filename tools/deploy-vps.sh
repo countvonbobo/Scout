@@ -96,10 +96,12 @@ rollback() {
   status=$?
   trap - ERR
   set +e
-  if [[ $switched == 1 && $previous_commit != "$expected_commit" ]]; then
+  if [[ $switched == 1 ]]; then
     printf 'Deployment failed; restoring Scout commit %s.\n' "$previous_commit" >&2
     rollback_failed=0
-    git -C "$app_root" checkout --detach "$previous_commit" || rollback_failed=1
+    if [[ $previous_commit != "$expected_commit" ]]; then
+      git -C "$app_root" checkout --detach "$previous_commit" || rollback_failed=1
+    fi
     (cd "$app_root" && npm ci --omit=dev) || rollback_failed=1
     previous_version=$(cd "$app_root" && node -p "require('./package.json').version") || rollback_failed=1
     sudo -n systemctl restart "$service" || rollback_failed=1

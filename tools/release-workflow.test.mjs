@@ -137,6 +137,8 @@ test('tagged release deploys the private VPS before publication', () => {
   assert.match(deploy, /export PATH="\$\(dirname "\$service_node"\):\$PATH"/);
   assert.match(deploy, /Controlled rehearsal failure requested/);
   assert.match(deploy, /Rollback restored Scout/);
+  assert.match(deploy, /if \[\[ \$switched == 1 \]\]; then[\s\S]*if \[\[ \$previous_commit != "\$expected_commit" \]\]; then[\s\S]*checkout --detach "\$previous_commit"[\s\S]*fi[\s\S]*npm ci --omit=dev[\s\S]*systemctl restart/);
+  assert.doesNotMatch(deploy, /\$switched == 1 && \$previous_commit !=/);
   assert.doesNotMatch(deploy, /tailscale serve (?:reset|--bg|--https)/);
   assert.doesNotMatch(deploy, /Documents\/Scout Workspace.*(?:rm|git|npm)/);
 });

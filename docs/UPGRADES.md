@@ -31,10 +31,12 @@ Scout validates `workspace.json`. Versioned migrations are designed to be safe t
 
 The ranked-discovery migration also creates one verified
 `0.1.0-beta.22`-compatible workspace snapshot before staging or publishing the
-new profile. This is a full compatibility boundary rather than the older
-configuration-only JSON backup. It preserves private career data and
-credentials, removes only post-beta.22 profile/fenced runtime state from the
-copy, and records a per-file SHA-256 manifest. The migration is idempotent and
+new profile. This is a compatibility-data snapshot rather than the older
+configuration-only JSON backup or a complete workspace/Git backup. It preserves
+the allowlisted private career data and credentials needed by beta.22, while
+omitting `.git`, `.scout` operational state (including backup connection
+settings), post-beta.22 profile/fenced runtime state, and unlisted workspace-root
+content. It records a per-file SHA-256 manifest. The migration is idempotent and
 reuses an existing verified compatibility snapshot only when its manifest
 proves exact equivalence for every protected live path. If tracker, report, CV,
 configuration or another protected file changed, Scout creates a new
@@ -96,5 +98,12 @@ application, and only then start beta.22 with the separate restored workspace.
 Use `scout workspace snapshot-beta22 --workspace PATH` to display or create the
 compatibility snapshot explicitly. A damaged snapshot fails closed; restore a
 verified private backup instead of editing its manifest.
+
+If final verification fails, Scout may intentionally preserve an unaccepted
+destination and/or its temporary `.scout-rollback-*` sibling because either
+pathname could have been substituted concurrently. Do not run or delete those
+trees by assumption. Preserve them for operator review, compare their physical
+identity and manifest content, and choose a new absent destination for any
+subsequent reviewed rollback attempt.
 
 Uninstall removes application files but intentionally preserves the workspace. Verify this on important deployments and remove schedules separately.
