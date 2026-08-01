@@ -107,6 +107,18 @@ function setupStatus() {
 }
 
 async function installRecoverableRoutes(page, state) {
+  // These projections deliberately reload through many synthetic run states.
+  // Service-worker activation is covered by offline-module-graph.spec.mjs and
+  // must not race this fixture's mocked application bootstrap.
+  await page.context().route('**/service-worker.js', (route) => route.abort());
+  await page.route('**/api/setup/proposal', (route) => route.fulfill({
+    contentType: 'application/json',
+    body: JSON.stringify({ proposal: null }),
+  }));
+  await page.route('**/api/operations?type=*', (route) => route.fulfill({
+    contentType: 'application/json',
+    body: JSON.stringify({ operation: null }),
+  }));
   await page.route('**/api/setup/status', (route) => route.fulfill({
     contentType: 'application/json',
     body: JSON.stringify(setupStatus()),
