@@ -7,6 +7,17 @@ import { openCodexTask as codexTaskLaunchView } from './lib/codexDeepLink.mjs?v=
 const SCOUT_UI_BUILD = typeof document !== 'undefined'
   ? document.querySelector?.('meta[name="scout-ui-build"]')?.content || null
   : null;
+const DURABLE_RUN_STATES = new Set([
+  'collecting', 'normalising', 'deduplicating', 'filtering', 'ranking', 'selecting',
+  'assessing', 'repairing', 'recovering', 'updating-tracker', 'writing-report',
+  'finalising', 'partial', 'abandoned', 'failed', 'complete',
+]);
+const TERMINAL_RUN_STATES = new Set(['partial', 'abandoned', 'failed', 'complete']);
+const ACTIVE_QUEUE_STATES = new Set(['queued', 'claimed', 'legacy-claimed']);
+const TERMINAL_QUEUE_STATES = new Set([
+  'expired', 'stale', 'skipped', 'superseded', 'succeeded', 'succeeded-pending',
+  'succeeded-partial', 'failed',
+]);
 // Character frame count, frame rate, looping, reduced-motion frame and anchor
 // belong to ui/lib/scoutCharacter.mjs alone. index.html loads that module and it
 // publishes window.ScoutCharacter; app.js only forwards to it, so there is no
@@ -545,7 +556,7 @@ const Scout = {
   },
 
   async reattachScanOperation({ reconcileMissing = false } = {}) {
-    const button = document.getElementById('scan-now');
+    const button = document.getElementById?.('scan-now') || null;
     try {
       const response = await fetch('/api/operations?type=scan');
       const body = await response.json();
@@ -565,11 +576,22 @@ const Scout = {
         || !durableQueue || !Array.isArray(durableQueue.requests)) {
         throw new Error('durable scan state is invalid');
       }
+      if (!durableRuns.runs.every((run) => DURABLE_RUN_STATES.has(run?.state))
+        || durableRuns.state !== (durableRuns.runs[0]?.state || 'waiting')
+        || !durableQueue.requests.every(
+          (request) => ACTIVE_QUEUE_STATES.has(request?.status)
+            || TERMINAL_QUEUE_STATES.has(request?.status),
+        )
+        || durableQueue.state !== (
+          durableQueue.requests.some((request) => request.status === 'queued') ? 'queued' : 'waiting'
+        )) {
+        throw new Error('durable scan state is invalid');
+      }
       const activeRun = durableRuns.runs.some(
-        (run) => !['complete', 'partial', 'abandoned', 'failed'].includes(run.state),
+        (run) => !TERMINAL_RUN_STATES.has(run.state),
       );
       const queued = durableQueue.requests.some(
-        (request) => ['queued', 'claimed', 'legacy-claimed'].includes(request.status),
+        (request) => ACTIVE_QUEUE_STATES.has(request.status),
       );
       if (activeRun || queued) {
         this.scanRunning = true;

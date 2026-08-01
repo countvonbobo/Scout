@@ -316,7 +316,7 @@ test('claimed durable queue work remains fenced before a recovered run exists', 
   }));
   await page.route('**/api/scan/queue', (route) => route.fulfill({
     contentType: 'application/json', body: JSON.stringify({
-      state: 'claimed',
+      state: 'waiting',
       requests: [
         { id: 'claimed-request', status: 'claimed' },
         { id: 'legacy-claimed-request', status: 'legacy-claimed' },
@@ -330,6 +330,39 @@ test('claimed durable queue work remains fenced before a recovered run exists', 
     window.Scout.watchScanOperation('scan-claimed-before-restart');
   });
   await page.waitForTimeout(1500);
+  await expect(page.locator('#scan-now')).toBeDisabled();
+  await expect.poll(() => page.evaluate(() => window.Scout.scanRunning)).toBe(true);
+});
+
+test('malformed durable statuses never prove restart reconciliation is idle', async ({ page }) => {
+  await page.waitForFunction(() => Boolean(window.Scout.state.data));
+  let reconciliations = 0;
+  await page.route('**/api/operations/scan-malformed-after-restart', (route) => route.fulfill({
+    status: 404, contentType: 'application/json', body: '{"error":"operation not found"}',
+  }));
+  await page.route('**/api/operations?type=scan', (route) => {
+    reconciliations += 1;
+    return route.fulfill({ contentType: 'application/json', body: '{"operation":null,"operations":[]}' });
+  });
+  await page.route('**/api/scan/runs', (route) => route.fulfill({
+    contentType: 'application/json', body: '{"state":"waiting","runs":[]}',
+  }));
+  await page.route('**/api/scan/queue', (route) => {
+    const malformed = [
+      { state: 'waiting', requests: [{ status: 'unsupported' }] },
+      { state: 'waiting', requests: [{}] },
+      { state: 'claimed', requests: [] },
+    ][Math.min(Math.max(reconciliations - 1, 0), 2)];
+    return route.fulfill({ contentType: 'application/json', body: JSON.stringify(malformed) });
+  });
+  await page.waitForTimeout(500);
+  await page.evaluate(() => {
+    clearTimeout(window.Scout.scanOperationTimer);
+    window.Scout.scanOperationTimer = null;
+  });
+  reconciliations = 0;
+  await page.evaluate(() => window.Scout.watchScanOperation('scan-malformed-after-restart'));
+  await expect.poll(() => reconciliations).toBeGreaterThan(3);
   await expect(page.locator('#scan-now')).toBeDisabled();
   await expect.poll(() => page.evaluate(() => window.Scout.scanRunning)).toBe(true);
 });
