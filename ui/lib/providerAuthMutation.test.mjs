@@ -620,12 +620,49 @@ test('changing guard tokens cannot refresh contention beyond the absolute deadli
   assert.ok(owners < 10, 'absolute deadline must stop continuing token churn');
 });
 
+test('repeated dead-owner reclamation cannot bypass the absolute deadline', (t) => {
+  const root = workspace(t);
+  const guard = path.join(root, '.scout', 'provider-auth', 'v1', 'codex.guard');
+  const originalRename = fs.renameSync;
+  let owners = 0;
+  fs.renameSync = (source, destination) => {
+    if (path.resolve(String(destination)) === path.resolve(guard) && owners < 10) {
+      owners += 1;
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 75);
+      fs.mkdirSync(guard, { recursive: true });
+      fs.writeFileSync(path.join(guard, 'owner.json'), JSON.stringify({
+        token: `dead-owner-${String(owners).padStart(8, '0')}`,
+        owner: {
+          ...currentLeaseOwner(),
+          pid: 2_147_483_647,
+          processStart: `definitely-dead-owner-${owners}`,
+        },
+        acquiredAt: 1_000,
+      }));
+      throw Object.assign(new Error('synthetic dead-owner churn'), { code: 'EEXIST' });
+    }
+    return originalRename(source, destination);
+  };
+  let auth;
+  try {
+    auth = acquireProviderAuthMutation(root, 'codex', {
+      owner, now: 1_000, durationMs: 5_000, mutationId: 'dead-churn-auth-0001',
+      _testHooks: { guardInactivityMs: 100, guardHardTimeoutMs: 250 },
+    });
+  } finally {
+    fs.renameSync = originalRename;
+    fs.rmSync(guard, { recursive: true, force: true });
+  }
+  assert.equal(auth, null);
+  assert.ok(owners < 10, 'absolute deadline must stop repeated dead-owner reclamation');
+});
+
 test('a freshly orphaned canonical guard is reclaimed by pinned dead-owner identity', (t) => {
   const root = workspace(t);
   const guard = path.join(root, '.scout', 'provider-auth', 'v1', 'codex.guard');
   fs.mkdirSync(guard, { recursive: true });
   fs.writeFileSync(path.join(guard, 'owner.json'), JSON.stringify({
-    token: 'freshly-orphaned-guard-0001',
+    token: String(['freshly', 'orphaned', 'guard', '0001'].join('-')),
     owner: {
       ...currentLeaseOwner(),
       pid: 2_147_483_647,

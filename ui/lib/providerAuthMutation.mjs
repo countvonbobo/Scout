@@ -340,6 +340,7 @@ function withGuard(root, provider, now, callback, scheduler = setTimeout, timing
   let published = false;
   try {
     while (!published) {
+      if (performance.now() >= hardDeadline) return null;
       try {
         fs.renameSync(prepared.candidate, target.guard);
         published = true;
