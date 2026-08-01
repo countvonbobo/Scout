@@ -129,6 +129,33 @@ function temporaryLiveGuard(root, holdMs = 100) {
   });
 }
 
+function temporaryAbandonedGuard(root, holdMs = 100) {
+  const scanLeaseUrl = new URL('./scanLease.mjs', import.meta.url).href;
+  const source = `
+    import fs from 'node:fs';
+    import path from 'node:path';
+    import { currentLeaseOwner } from ${JSON.stringify(scanLeaseUrl)};
+    const guard = path.join(process.env.SCOUT_AUTH_ROOT, '.scout', 'provider-auth', 'v1', 'codex.guard');
+    fs.mkdirSync(guard, { recursive: true });
+    fs.writeFileSync(path.join(guard, 'owner.json'), JSON.stringify({
+      token: String(['temporary', 'abandoned', 'guard', '0001'].join('-')),
+      owner: currentLeaseOwner(), acquiredAt: Date.now(),
+    }));
+    process.stdout.write('ready\\n');
+    setTimeout(() => {}, Number(process.env.HOLD_MS));
+  `;
+  const child = spawn(process.execPath, ['--input-type=module', '--eval', source], {
+    env: { ...process.env, SCOUT_AUTH_ROOT: root, HOLD_MS: String(holdMs) },
+    stdio: ['ignore', 'pipe', 'pipe'],
+    windowsHide: true,
+  });
+  return new Promise((resolve, reject) => {
+    child.once('error', reject);
+    child.stderr.once('data', (chunk) => reject(new Error(String(chunk))));
+    child.stdout.once('data', () => resolve(child));
+  });
+}
+
 test('authentication mutation authority blocks only the same provider', (t) => {
   const root = workspace(t);
   const codex = acquireProviderAuthMutation(root, 'codex', {
@@ -676,6 +703,18 @@ test('a freshly orphaned canonical guard is reclaimed by pinned dead-owner ident
     _testHooks: { guardInactivityMs: 100, guardHardTimeoutMs: 250 },
   });
   assert.ok(auth);
+  assert.equal(releaseProviderAuthMutation(root, auth), true);
+});
+
+test('an observed guard is reclaimed when its same-token owner exits', async (t) => {
+  const root = workspace(t);
+  const child = await temporaryAbandonedGuard(root, 500);
+  t.after(() => { try { child.kill('SIGKILL'); } catch {} });
+  const auth = acquireProviderAuthMutation(root, 'codex', {
+    owner, now: Date.now(), durationMs: 5_000, mutationId: 'same-token-owner-exit',
+    _testHooks: { guardInactivityMs: 1_000, guardHardTimeoutMs: 1_500 },
+  });
+  assert.ok(auth, 'the waiter should reclaim a guard after its observed owner exits');
   assert.equal(releaseProviderAuthMutation(root, auth), true);
 });
 

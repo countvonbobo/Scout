@@ -14,6 +14,7 @@ const DEFAULT_WORK_DURATION_MS = 30 * 60 * 1000;
 const GUARD_STALE_MS = 15_000;
 const GUARD_ACQUIRE_TIMEOUT_MS = 2_000;
 const GUARD_HARD_TIMEOUT_MS = 6_000;
+const GUARD_PID_RECHECK_MS = 50;
 const WORK_GUARD_ACQUIRE_ATTEMPTS = 3;
 const GUARD_RECORD = 'owner.json';
 const guardSleep = new Int32Array(new SharedArrayBuffer(4));
@@ -351,6 +352,7 @@ function withGuard(root, provider, now, callback, scheduler = setTimeout, timing
   // not lock contention. Give every prepared candidate the full retry budget.
   let deadline = Math.min(hardDeadline, performance.now() + inactivityMs);
   let observedToken = null;
+  let nextOwnerPidCheck = 0;
   let published = false;
   try {
     while (!published) {
@@ -363,15 +365,20 @@ function withGuard(root, provider, now, callback, scheduler = setTimeout, timing
         const observed = readGuardRecord(target.guard);
         if (observed) {
           let reclaim = false;
+          const observedAt = performance.now();
           if (observed.token !== observedToken) {
             observedToken = observed.token;
             // A new verified owner means contenders are making progress.
             // Bound only inactivity so several short critical sections can
             // serialize without later contenders being misreported as busy.
-            deadline = Math.min(hardDeadline, performance.now() + inactivityMs);
+            deadline = Math.min(hardDeadline, observedAt + inactivityMs);
+            nextOwnerPidCheck = observedAt + GUARD_PID_RECHECK_MS;
             reclaim = ownerPidIsDefinitelyAbsent(observed.owner)
               || (acquiredAt - observed.acquiredAt > GUARD_STALE_MS
                 && !processOwnerIsLiveOrAmbiguous(observed.owner));
+          } else if (observedAt >= nextOwnerPidCheck) {
+            nextOwnerPidCheck = observedAt + GUARD_PID_RECHECK_MS;
+            reclaim = ownerPidIsDefinitelyAbsent(observed.owner);
           }
           if (reclaim) {
             const quarantine = `${target.guard}.stale-${randomUUID()}`;

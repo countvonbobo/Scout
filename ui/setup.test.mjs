@@ -14,6 +14,7 @@ import {
   operationElapsed,
   operationRemaining,
   providerLoginPanelHtml,
+  providerCardPresentation,
   scanOutcomeSummary,
   shouldRequestRecoveryKey,
   adaptiveQuestionnaireHtml,
@@ -313,6 +314,28 @@ test('provider login panel exposes only accessible state-specific guided actions
   });
   assert.match(succeeded, /Sign-in succeeded/);
   assert.doesNotMatch(succeeded, /Sign in to Codex with Scout/);
+});
+
+test('provider cards fail closed with truthful health-state guidance', () => {
+  const base = { installed: true, authenticated: true, capabilities: { structuredOutput: true } };
+  const expected = new Map([
+    ['checking', /checking provider status/],
+    ['sign-in-required', /sign-in required/],
+    ['login-in-progress', /sign-in in progress/],
+    ['network-unavailable', /network unavailable/],
+    ['rate-limited', /rate limited/],
+    ['cli-update-required', /CLI update required/],
+    ['provider-error', /provider error/],
+  ]);
+  for (const [healthState, label] of expected) {
+    const presentation = providerCardPresentation({ ...base, healthState });
+    assert.equal(presentation.available, false, healthState);
+    assert.match(presentation.label, label, healthState);
+    assert.ok(presentation.help.length > 0, healthState);
+  }
+  assert.equal(providerCardPresentation({ ...base, healthState: 'ready' }).available, true);
+  assert.equal(providerCardPresentation({ ...base, healthState: 'credentials-present-unverified' }).available, true);
+  assert.equal(providerCardPresentation({ ...base, healthState: 'future-state' }).available, false);
 });
 
 test('provider login UI keeps its CSRF token and manual code out of browser storage', () => {

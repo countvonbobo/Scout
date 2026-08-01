@@ -862,6 +862,42 @@ test('a durable remote authentication failure keeps reauthentication reachable',
   await expect(codexCard).not.toContainText('Installed, signed in and compatible');
 });
 
+test('provider cards render every non-usable health state truthfully and disabled', async ({ page }) => {
+  const expected = [
+    ['checking', 'checking provider status'],
+    ['login-in-progress', 'sign-in in progress'],
+    ['network-unavailable', 'network unavailable'],
+    ['rate-limited', 'provider rate limited'],
+    ['provider-error', 'provider error'],
+  ];
+  for (const [healthState, label] of expected) {
+    const rendered = await page.evaluate(({ nextHealthState }) => {
+      const setup = window.ScoutSetup;
+      setup.status = {
+        ...setup.status,
+        providers: {
+          ...setup.status.providers,
+          codex: {
+            installed: true,
+            authenticated: true,
+            capabilities: { structuredOutput: true },
+            healthState: nextHealthState,
+          },
+        },
+      };
+      const card = document.createElement('div');
+      card.innerHTML = setup.providerCard('codex');
+      return {
+        disabled: card.querySelector('input[name="setup-provider"]')?.disabled,
+        text: card.textContent,
+      };
+    }, { nextHealthState: healthState });
+    expect(rendered.disabled, healthState).toBe(true);
+    expect(rendered.text, healthState).toContain(label);
+    expect(rendered.text, healthState).not.toContain('Installed, signed in and compatible');
+  }
+});
+
 test('guided login preserves failed logout state and reports no false success', async ({ page }) => {
   await page.unroute('**/api/setup/status');
   await page.route('**/api/setup/status', (route) => route.fulfill({

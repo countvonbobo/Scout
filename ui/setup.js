@@ -135,6 +135,66 @@ export function providerLoginPanelHtml(
   </section>`;
 }
 
+export function providerCardPresentation(provider = {}) {
+  if (provider.installed !== true) {
+    return {
+      available: false,
+      label: 'Not installed',
+      help: 'Install this provider CLI from its official guide, then refresh provider status.',
+    };
+  }
+  const blocked = {
+    checking: {
+      label: 'Installed; checking provider status',
+      help: 'Wait for the bounded provider check to finish, then refresh if needed.',
+    },
+    'sign-in-required': {
+      label: 'Installed; sign-in required',
+      help: 'Sign in with Scout or use the manual provider command, then refresh.',
+    },
+    'login-in-progress': {
+      label: 'Installed; sign-in in progress',
+      help: 'Wait for the current sign-in flow to finish before selecting this provider.',
+    },
+    'network-unavailable': {
+      label: 'Installed; network unavailable',
+      help: 'Restore provider network access, then refresh. Scout will not replay blocked work automatically.',
+    },
+    'rate-limited': {
+      label: 'Installed; provider rate limited',
+      help: 'Wait for the provider rate limit to clear, then retry explicitly.',
+    },
+    'cli-update-required': {
+      label: 'Installed and signed in; CLI update required',
+      help: 'Update this CLI from its official installation guide, then refresh.',
+    },
+    'provider-error': {
+      label: 'Installed; provider error',
+      help: 'Resolve the provider error and refresh status before selecting it.',
+    },
+  };
+  if (Object.hasOwn(blocked, provider.healthState)) {
+    return { available: false, ...blocked[provider.healthState] };
+  }
+  if (provider.healthState
+    && !['ready', 'credentials-present-unverified'].includes(provider.healthState)) {
+    return {
+      available: false,
+      label: 'Installed; provider status unavailable',
+      help: 'Refresh provider status. Scout will keep this provider disabled until its state is known.',
+    };
+  }
+  if (provider.authenticated !== true) return { available: false, ...blocked['sign-in-required'] };
+  if (provider.capabilities?.structuredOutput === false) {
+    return { available: false, ...blocked['cli-update-required'] };
+  }
+  return {
+    available: true,
+    label: 'Installed, signed in and compatible',
+    help: '',
+  };
+}
+
 export function buildConfig(form, current = {}) {
   const salary = String(form.salaryMinimum || '').trim();
   return {
@@ -1765,20 +1825,13 @@ const Setup = {
   providerCard(name) {
     const provider = this.status?.providers?.[name] || {};
     const selected = (this.status?.config?.ai?.provider || '') === name;
-    const authenticated = provider.authenticated === true
-      && provider.healthState !== 'sign-in-required';
-    const compatible = Boolean(authenticated && provider.capabilities?.structuredOutput !== false);
-    const state = !provider.installed ? 'Not installed'
-      : !authenticated ? 'Installed; sign-in required'
-        : compatible ? 'Installed, signed in and compatible' : 'Installed and signed in; CLI update required';
-    return `<section class="setup-provider ${compatible ? 'available' : ''}">
+    const presentation = providerCardPresentation(provider);
+    return `<section class="setup-provider ${presentation.available ? 'available' : ''}">
       <label>
-      <input type="radio" name="setup-provider" value="${name}" ${selected ? 'checked' : ''} ${compatible ? '' : 'disabled'}>
+      <input type="radio" name="setup-provider" value="${name}" ${selected ? 'checked' : ''} ${presentation.available ? '' : 'disabled'}>
       <strong>${name[0].toUpperCase() + name.slice(1)}</strong>
-      <span class="meta">${state}</span>
-      ${compatible ? '' : authenticated
-        ? '<span class="meta">Update this CLI from its official installation guide, then refresh. Scout requires schema-constrained output for bounded workflows.</span>'
-        : '<span class="meta">Scout needs an authenticated command-line provider; a desktop-app login alone is not enough. Your provider account may have separate usage limits or costs.</span>'}
+      <span class="meta">${presentation.label}</span>
+      ${presentation.help ? `<span class="meta">${presentation.help}</span>` : ''}
       </label>
       ${providerLoginPanelHtml(
         name,
