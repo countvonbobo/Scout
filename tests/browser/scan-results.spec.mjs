@@ -197,3 +197,68 @@ test('transient operation polling failure keeps the active scan fenced and recov
   releaseRecovery();
   await expect(page.locator('#scan-status')).toContainText(/Scoring candidates/i);
 });
+
+test('missing pre-restart operation is rediscovered without dropping the scan fence', async ({ page }) => {
+  await page.waitForFunction(() => Boolean(window.Scout.state.data));
+  await page.waitForTimeout(100);
+  let replacementPolls = 0;
+  let discoveryRequests = 0;
+  await page.route('**/api/operations/scan-before-restart', (route) => route.fulfill({
+    status: 404, contentType: 'application/json', body: '{"error":"operation not found"}',
+  }));
+  await page.route('**/api/operations?type=scan', (route) => {
+    discoveryRequests += 1;
+    return route.fulfill({ contentType: 'application/json', body: JSON.stringify({
+      operation: {
+        id: 'scan-after-restart', type: 'scan', status: 'running', phase: 'Recovering scan',
+        progress: { current: 1, total: 3 }, startedAt: new Date(Date.now() - 30_000).toISOString(),
+      },
+    }) });
+  });
+  await page.route('**/api/operations/scan-after-restart', (route) => {
+    replacementPolls += 1;
+    return route.fulfill({ contentType: 'application/json', body: JSON.stringify({
+      operation: {
+        id: 'scan-after-restart', type: 'scan', status: 'running', phase: 'Recovering scan',
+        progress: { current: 1, total: 3 }, startedAt: new Date(Date.now() - 30_000).toISOString(),
+      },
+    }) });
+  });
+  await page.waitForTimeout(500);
+  await page.evaluate(() => {
+    clearTimeout(window.Scout.scanOperationTimer);
+    window.Scout.scanOperationTimer = null;
+  });
+  discoveryRequests = 0;
+  replacementPolls = 0;
+  await page.evaluate(() => window.Scout.watchScanOperation('scan-before-restart'));
+  await expect.poll(() => discoveryRequests).toBe(1);
+  await expect.poll(() => replacementPolls).toBeGreaterThan(0);
+  await expect(page.locator('#scan-now')).toBeDisabled();
+  await expect.poll(() => page.evaluate(() => window.Scout.scanRunning)).toBe(true);
+  await expect(page.locator('#scan-status')).toContainText(/Recovering scan/i);
+});
+
+test('missing operation re-enables scanning only after durable state is idle', async ({ page }) => {
+  await page.waitForFunction(() => Boolean(window.Scout.state.data));
+  await page.route('**/api/operations/scan-finished-before-restart', (route) => route.fulfill({
+    status: 404, contentType: 'application/json', body: '{"error":"operation not found"}',
+  }));
+  await page.route('**/api/operations?type=scan', (route) => route.fulfill({
+    contentType: 'application/json', body: '{"operation":null,"operations":[]}',
+  }));
+  await page.route('**/api/scan/runs', (route) => route.fulfill({
+    contentType: 'application/json', body: '{"state":"waiting","runs":[]}',
+  }));
+  await page.route('**/api/scan/queue', (route) => route.fulfill({
+    contentType: 'application/json', body: '{"state":"waiting","requests":[]}',
+  }));
+  await page.waitForTimeout(500);
+  await page.evaluate(() => {
+    clearTimeout(window.Scout.scanOperationTimer);
+    window.Scout.scanOperationTimer = null;
+    window.Scout.watchScanOperation('scan-finished-before-restart');
+  });
+  await expect(page.locator('#scan-now')).toBeEnabled();
+  await expect.poll(() => page.evaluate(() => window.Scout.scanRunning)).toBe(false);
+});

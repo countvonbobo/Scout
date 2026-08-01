@@ -514,6 +514,11 @@ const Scout = {
     const poll = async () => {
       try {
         const response = await fetch(`/api/operations/${encodeURIComponent(id)}`);
+        if (response.status === 404) {
+          this.scanOperationTimer = null;
+          await this.reattachScanOperation({ reconcileMissing: true });
+          return;
+        }
         const body = await response.json();
         if (!response.ok) throw new Error(body.error || 'Scan status unavailable');
         this.showOperation(body.operation);
@@ -535,15 +540,44 @@ const Scout = {
     this.scanOperationTimer = setTimeout(poll, 250);
   },
 
-  async reattachScanOperation() {
+  async reattachScanOperation({ reconcileMissing = false } = {}) {
+    const button = document.getElementById('scan-now');
     try {
       const response = await fetch('/api/operations?type=scan');
       const body = await response.json();
       if (response.ok && body.operation && ['queued', 'running'].includes(body.operation.status)) {
         this.showOperation(body.operation);
         this.watchScanOperation(body.operation.id);
+        return;
       }
-    } catch { /* the normal last-scan label remains available */ }
+      if (!reconcileMissing) return;
+      // Operation IDs are process-local. After a restart, reconcile against
+      // durable run/queue state before deciding whether submission is safe.
+      this.scanRunning = false;
+      await this.loadOpportunities();
+      const activeRun = this.scanRuns.some(
+        (run) => !['complete', 'partial', 'abandoned', 'failed'].includes(run.state),
+      );
+      const queued = this.scanQueue.requests.some((request) => request.status === 'queued');
+      if (activeRun || queued) {
+        this.scanRunning = true;
+        if (button) { button.disabled = true; button.textContent = 'Scanning…'; }
+        this.scanOperationTimer = setTimeout(
+          () => this.reattachScanOperation({ reconcileMissing: true }),
+          1000,
+        );
+        return;
+      }
+      if (button) { button.disabled = false; button.textContent = 'Scan now'; }
+    } catch {
+      if (!reconcileMissing) return;
+      this.scanRunning = true;
+      if (button) { button.disabled = true; button.textContent = 'Scanning…'; }
+      this.scanOperationTimer = setTimeout(
+        () => this.reattachScanOperation({ reconcileMissing: true }),
+        1000,
+      );
+    }
   },
 
   discoveryKey() {
