@@ -211,6 +211,49 @@ test('the shared OS-level coordinator excludes another mutation boundary', () =>
   assert.equal(fs.existsSync(path.join(root, '.scout', 'mutation.guard')), false);
 });
 
+test('guard publication failure never exposes an unverifiable canonical directory', () => {
+  const { root, lease } = fixture();
+  const originalRename = fs.renameSync;
+  let injected = false;
+  fs.renameSync = (source, destination) => {
+    if (!injected && String(source).includes('mutation.guard.candidate.')
+      && String(destination).endsWith('mutation.guard')) {
+      injected = true;
+      throw Object.assign(new Error('injected publication interruption'), { code: 'EACCES' });
+    }
+    return originalRename(source, destination);
+  };
+  try {
+    assert.throws(() => withMutationCoordinator(root, lease, () => 'never'), /publication interruption/);
+  } finally {
+    fs.renameSync = originalRename;
+  }
+  const scout = path.join(root, '.scout');
+  assert.equal(fs.existsSync(path.join(scout, 'mutation.guard')), false);
+  assert.equal(fs.readdirSync(scout).some((name) => name.startsWith('mutation.guard.candidate.')), false);
+  assert.equal(withMutationCoordinator(root, lease, () => 'recovered'), 'recovered');
+});
+
+test('guard removal contention retires canonical authority before cleanup', () => {
+  const { root, lease } = fixture();
+  const originalRemove = fs.rmSync;
+  let injected = false;
+  fs.rmSync = (target, options) => {
+    if (!injected && String(target).includes('mutation.guard.cleanup.')) {
+      injected = true;
+      throw Object.assign(new Error('injected quarantine cleanup contention'), { code: 'EPERM' });
+    }
+    return originalRemove(target, options);
+  };
+  try {
+    assert.equal(withMutationCoordinator(root, lease, () => 'first'), 'first');
+  } finally {
+    fs.rmSync = originalRemove;
+  }
+  assert.equal(fs.existsSync(path.join(root, '.scout', 'mutation.guard')), false);
+  assert.equal(withMutationCoordinator(root, lease, () => 'successor'), 'successor');
+});
+
 test('the shared coordinator remains held until the durable receipt is appended', () => {
   const { root, lease, handle } = fixture();
   const { target, content } = mutationInput(root);

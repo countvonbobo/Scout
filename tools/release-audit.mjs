@@ -448,6 +448,12 @@ function sameDirectoryIdentity(left, right) {
     && left.mtimeNs === right.mtimeNs && left.ctimeNs === right.ctimeNs;
 }
 
+function withinPath(parent, child) {
+  const relative = path.relative(path.resolve(parent), path.resolve(child));
+  return relative === '' || (!relative.startsWith(`..${path.sep}`)
+    && relative !== '..' && !path.isAbsolute(relative));
+}
+
 function snapshotDirectory(directory) {
   const before = fs.lstatSync(directory, { bigint: true });
   if (before.isSymbolicLink() || !before.isDirectory()) {
@@ -472,12 +478,22 @@ function verifyDirectorySnapshot(snapshot) {
   }
 }
 
-function filesUnder(directory, { includeDependencies = false, directorySnapshots = [] } = {}) {
+function filesUnder(directory, {
+  includeDependencies = false, directorySnapshots = [], linkSnapshots = [], allowStageLinks = false,
+} = {}) {
   if (!fs.existsSync(directory)) return [];
   const result = [];
   const visit = (entry) => {
     const stat = fs.lstatSync(entry);
-    if (stat.isSymbolicLink()) throw new Error(`release audit refuses symbolic link: ${entry}`);
+    if (stat.isSymbolicLink()) {
+      const relative = normaliseRelative(directory, entry);
+      const target = fs.readlinkSync(entry);
+      if (allowStageLinks && relative === 'dmg-root/Applications' && target === '/Applications') {
+        linkSnapshots.push({ file: entry, target });
+        return;
+      }
+      throw new Error(`release audit refuses symbolic link: ${entry}`);
+    }
     if (stat.isFile()) {
       result.push(entry);
       return;
@@ -555,7 +571,7 @@ function readAuditedRegularFile(root, file) {
   }
 }
 
-function auditedTreeDigest(root, files, directories) {
+function auditedTreeDigest(root, files, directories, links = []) {
   const records = [
     ...directories.map((snapshot) => ({
       type: 'directory',
@@ -568,6 +584,11 @@ function auditedTreeDigest(root, files, directories) {
       mode: Number(record.identity.mode & 0o777n),
       sha256: record.sha256,
     })),
+    ...links.map((record) => ({
+      type: 'link',
+      path: normaliseRelative(root, record.file),
+      target: record.target,
+    })),
   ].sort((a, b) => a.path.localeCompare(b.path, 'en') || a.type.localeCompare(b.type, 'en'));
   return crypto.createHash('sha256').update(JSON.stringify(records)).digest('hex');
 }
@@ -575,12 +596,15 @@ function auditedTreeDigest(root, files, directories) {
 export function verifiedAuditTreeDigest(root) {
   const absoluteRoot = path.resolve(root);
   const directories = [];
+  const links = [];
   const files = filesUnder(absoluteRoot, {
     includeDependencies: true,
     directorySnapshots: directories,
+    linkSnapshots: links,
+    allowStageLinks: true,
   }).map((file) => ({ file, ...readAuditedRegularFile(absoluteRoot, file) }));
   for (const snapshot of directories) verifyDirectorySnapshot(snapshot);
-  return auditedTreeDigest(absoluteRoot, files, directories);
+  return auditedTreeDigest(absoluteRoot, files, directories, links);
 }
 
 export function collectTrackedFiles(root) {
@@ -606,6 +630,8 @@ export function auditRelease({
   markers = [],
   markerFile = null,
   directorySnapshots = [],
+  linkSnapshots = [],
+  snapshotRoot = null,
 } = {}) {
   const absoluteRoot = path.resolve(root);
   const excluded = markerFile ? path.resolve(markerFile) : null;
@@ -626,6 +652,22 @@ export function auditRelease({
   const files = [...new Set([...tracked, ...built])]
     .filter((file) => file !== excluded)
     .sort((a, b) => normaliseRelative(absoluteRoot, a).localeCompare(normaliseRelative(absoluteRoot, b), 'en'));
+  const snapshot = snapshotRoot ? path.resolve(snapshotRoot) : null;
+  if (snapshot) {
+    if (withinPath(absoluteRoot, snapshot) || fs.existsSync(snapshot)) {
+      throw new Error('release audit snapshot destination is invalid');
+    }
+    fs.mkdirSync(snapshot, { recursive: false, mode: 0o700 });
+    for (const directory of traversalSnapshots) {
+      const relative = normaliseRelative(absoluteRoot, directory.directory);
+      if (relative) fs.mkdirSync(path.join(snapshot, relative), { recursive: true, mode: 0o700 });
+    }
+    for (const link of linkSnapshots) {
+      const target = path.join(snapshot, normaliseRelative(absoluteRoot, link.file));
+      fs.mkdirSync(path.dirname(target), { recursive: true, mode: 0o700 });
+      fs.symlinkSync(link.target, target, process.platform === 'win32' ? 'junction' : undefined);
+    }
+  }
   const findings = [];
   const scannedFiles = [];
   let filesScanned = 0;
@@ -635,6 +677,12 @@ export function auditRelease({
     scannedFiles.push({ file, identity: scanned.identity, sha256: scanned.sha256 });
     filesScanned += 1;
     const relative = normaliseRelative(absoluteRoot, file);
+    if (snapshot) {
+      const target = path.join(snapshot, relative);
+      fs.mkdirSync(path.dirname(target), { recursive: true, mode: 0o700 });
+      fs.writeFileSync(target, content, { mode: Number(scanned.identity.mode & 0o777n) });
+      fs.chmodSync(target, Number(scanned.identity.mode & 0o777n));
+    }
     const privateRuntime = privateRuntimeArtifact(relative);
     const pathFindings = [];
     const lowerRelative = relative.toLocaleLowerCase('en-US');
@@ -710,8 +758,29 @@ export function auditRelease({
     filesScanned,
     markerCount: markers.length,
     findings,
-    treeDigest: auditedTreeDigest(absoluteRoot, scannedFiles, traversalSnapshots),
+    treeDigest: auditedTreeDigest(absoluteRoot, scannedFiles, traversalSnapshots, linkSnapshots),
   };
+}
+
+export function auditStagedRelease({ root, markers = [], snapshotRoot = null } = {}) {
+  const absoluteRoot = path.resolve(root);
+  const directories = [];
+  const links = [];
+  const files = filesUnder(absoluteRoot, {
+    includeDependencies: true,
+    directorySnapshots: directories,
+    linkSnapshots: links,
+    allowStageLinks: true,
+  }).map((file) => normaliseRelative(absoluteRoot, file));
+  return auditRelease({
+    root: absoluteRoot,
+    trackedFiles: files,
+    buildDirs: [],
+    markers,
+    directorySnapshots: directories,
+    linkSnapshots: links,
+    snapshotRoot,
+  });
 }
 
 function valuesAfter(flag, argv) {
@@ -730,10 +799,13 @@ export function main(argv = process.argv.slice(2), env = process.env) {
   const explicitBuildDirs = valuesAfter('--build', argv);
   const stagedTree = argv.includes('--stage');
   const stagedDirectorySnapshots = [];
+  const stagedLinkSnapshots = [];
   const stagedFiles = stagedTree
     ? filesUnder(root, {
       includeDependencies: true,
       directorySnapshots: stagedDirectorySnapshots,
+      linkSnapshots: stagedLinkSnapshots,
+      allowStageLinks: true,
     })
       .map((file) => normaliseRelative(root, file))
     : undefined;
@@ -743,6 +815,7 @@ export function main(argv = process.argv.slice(2), env = process.env) {
     markers,
     trackedFiles: stagedFiles,
     directorySnapshots: stagedDirectorySnapshots,
+    linkSnapshots: stagedLinkSnapshots,
     buildDirs: stagedTree ? [] : (explicitBuildDirs.length ? explicitBuildDirs : DEFAULT_BUILD_DIRS),
   });
   process.stdout.write(`Release audit scanned ${result.filesScanned} files with ${result.markerCount} configured personal markers.\n`);

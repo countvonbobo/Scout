@@ -261,6 +261,7 @@ async function runGitAsync(cwd, args, options = {}) {
   let result;
   const childOperation = options.mutationCoordinator?.beginChild(args[0]);
   let childFinished = false;
+  let cleanupDelay = 25;
   const finishChild = () => {
     if (childOperation === undefined || childFinished) return;
     options.mutationCoordinator.finishChild(childOperation);
@@ -273,10 +274,15 @@ async function runGitAsync(cwd, args, options = {}) {
       // Keep the durable child fence after a bounded timeout result. The
       // process close event is the only authority that may retire an
       // unresolved child operation.
-      child.once('close', () => {
-        // A substituted guard must fail closed without turning a late child
-        // event into an uncaught process exception.
-        try { finishChild(); } catch {}
+      child.once('close', function retryFinishChild() {
+        try {
+          finishChild();
+        } catch {
+          cleanupDelay = Math.min(cleanupDelay * 2, 1_000);
+          const scheduler = options._testHooks?.guardCleanupScheduler || setTimeout;
+          const retry = scheduler(retryFinishChild, cleanupDelay);
+          retry.unref?.();
+        }
       });
     };
   try {
@@ -301,7 +307,7 @@ async function runGitAsync(cwd, args, options = {}) {
       );
     }
   } finally {
-    if (result?.terminationUnresolved === true) {
+    if (result?.terminationUnresolved === true && !childFinished) {
       options.mutationCoordinator?.deferChildRelease(childOperation);
     } else {
       finishChild();

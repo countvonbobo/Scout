@@ -5,7 +5,9 @@ import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { isMainModule } from '../ui/lib/mainModule.mjs';
-import { verifiedAuditTreeDigest } from './release-audit.mjs';
+import {
+  auditStagedRelease, loadMarkers, verifiedAuditTreeDigest,
+} from './release-audit.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const DEFAULT_ROOT = path.resolve(HERE, '..');
@@ -287,20 +289,56 @@ export function auditStageBeforePackaging(stageDir, {
   env = process.env,
   requireMarkers = true,
 } = {}) {
-  const args = [
-    path.join(DEFAULT_ROOT, 'tools', 'release-audit.mjs'),
-    '--root', path.resolve(stageDir), '--stage',
-    ...(requireMarkers ? ['--require-markers'] : []),
-  ];
-  const result = spawnSync(process.execPath, args, {
-    cwd: DEFAULT_ROOT, env, encoding: 'utf8', windowsHide: true,
-  });
-  if (result.status !== 0) {
-    throw new Error(`pre-package release audit failed:\n${result.stdout || ''}\n${result.stderr || ''}`.trim());
+  const source = path.resolve(stageDir);
+  const markerFile = env.SCOUT_RELEASE_MARKERS_FILE
+    ? path.resolve(DEFAULT_ROOT, env.SCOUT_RELEASE_MARKERS_FILE) : null;
+  const markers = loadMarkers({ markerFile, envMarkers: env.SCOUT_RELEASE_MARKERS });
+  if (requireMarkers && markers.length === 0) {
+    throw new Error('pre-package release audit failed: release audit requires at least one configured personal marker');
   }
-  const match = String(result.stdout || '').match(/Release audit tree digest: ([0-9a-f]{64})/);
-  if (!match) throw new Error('pre-package release audit did not return a payload digest');
-  return { output: result.stdout, treeDigest: match[1] };
+  const snapshot = `${source}.audited-${crypto.randomUUID()}`;
+  try {
+    const result = auditStagedRelease({ root: source, markers, snapshotRoot: snapshot });
+    if (!result.ok) {
+      const findings = result.findings.map(({ file, line, rule }) => `${file}:${line} ${rule}`).join('\n');
+      throw new Error(`pre-package release audit failed:\n${findings}`);
+    }
+    if (verifiedAuditTreeDigest(snapshot) !== result.treeDigest) {
+      throw new Error('pre-package release audit snapshot differs from inspected bytes');
+    }
+    const seal = (entry) => {
+      const stat = fs.lstatSync(entry);
+      if (stat.isSymbolicLink()) return;
+      if (stat.isDirectory()) {
+        for (const name of fs.readdirSync(entry)) seal(path.join(entry, name));
+        fs.chmodSync(entry, 0o555);
+      } else if (stat.isFile()) {
+        fs.chmodSync(entry, stat.mode & ~0o222);
+      }
+    };
+    seal(snapshot);
+    const output = [
+      `Release audit scanned ${result.filesScanned} files with ${result.markerCount} configured personal markers.`,
+      `Release audit tree digest: ${result.treeDigest}`,
+      'Release audit passed.',
+      '',
+    ].join('\n');
+    return { output, treeDigest: result.treeDigest, stageDir: snapshot };
+  } catch (error) {
+    try {
+      const restoreWrite = (entry) => {
+        if (!fs.existsSync(entry)) return;
+        const stat = fs.lstatSync(entry);
+        if (stat.isDirectory()) {
+          fs.chmodSync(entry, 0o755);
+          for (const name of fs.readdirSync(entry)) restoreWrite(path.join(entry, name));
+        } else if (!stat.isSymbolicLink()) fs.chmodSync(entry, stat.mode | 0o200);
+      };
+      restoreWrite(snapshot);
+      fs.rmSync(snapshot, { recursive: true, force: true });
+    } catch {}
+    throw error;
+  }
 }
 
 export function stagePublicSource({
@@ -533,10 +571,8 @@ export function buildInstaller({ root = DEFAULT_ROOT, stageDir, version, isccPat
     throw new Error('verified Windows package input changed during compilation');
   }
   const audit = auditStageBeforePackaging(staged.stageDir);
-  if (verifiedAuditTreeDigest(staged.stageDir) !== audit.treeDigest) {
-    throw new Error('Windows release payload changed after privacy audit');
-  }
-  const auditedPayloadDigest = verifiedReleaseTreeDigest(staged.stageDir);
+  const auditedStage = audit.stageDir;
+  const auditedPayloadDigest = verifiedReleaseTreeDigest(auditedStage);
   const outputDir = path.join(root, 'installer', 'output');
   fs.rmSync(outputDir, { recursive: true, force: true });
   fs.mkdirSync(outputDir, { recursive: true });
@@ -545,13 +581,13 @@ export function buildInstaller({ root = DEFAULT_ROOT, stageDir, version, isccPat
   const selectedVersion = checkedVersion(version || process.env.SCOUT_VERSION || packageVersion(root));
   const result = spawnSync(iscc, [
     `/DMyAppVersion=${selectedVersion}`,
-    `/DStageDir=${staged.stageDir}`,
-    `/DIconFile=${stagedIcon}`,
+    `/DStageDir=${auditedStage}`,
+    `/DIconFile=${path.join(auditedStage, path.relative(staged.stageDir, stagedIcon))}`,
     `/DOutputDir=${outputDir}`,
-    installerSource,
-  ], { cwd: staged.stageDir, encoding: 'utf8', windowsHide: true });
+    path.join(auditedStage, path.relative(staged.stageDir, installerSource)),
+  ], { cwd: auditedStage, encoding: 'utf8', windowsHide: true });
   if (result.status !== 0) throw new Error(`Inno Setup failed:\n${String(result.stdout || '')}\n${String(result.stderr || '')}`.trim());
-  if (verifiedReleaseTreeDigest(staged.stageDir) !== auditedPayloadDigest) {
+  if (verifiedReleaseTreeDigest(auditedStage) !== auditedPayloadDigest) {
     throw new Error('audited Windows release payload changed during packaging');
   }
   const checksums = writeChecksums(outputDir);

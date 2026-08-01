@@ -544,13 +544,20 @@ function createGuard(root, lease) {
     childOperation: null,
   };
   const acquire = () => {
-    fs.mkdirSync(directory);
-    atomicWriteFile(path.join(directory, 'owner.json'), `${stableJson(metadata)}\n`, { mode: 0o600 });
+    const candidate = `${directory}.candidate.${randomUUID()}`;
+    fs.mkdirSync(candidate);
+    try {
+      atomicWriteFile(path.join(candidate, 'owner.json'), `${stableJson(metadata)}\n`, { mode: 0o600 });
+      fs.renameSync(candidate, directory);
+    } catch (error) {
+      fs.rmSync(candidate, { recursive: true, force: true });
+      throw error;
+    }
   };
   try {
     acquire();
   } catch (error) {
-    if (error?.code !== 'EEXIST') throw error;
+    if (!fs.existsSync(directory)) throw error;
     const existing = readGuard(directory);
     if (Number.isSafeInteger(existing?.fencingGeneration)
       && existing.fencingGeneration < lease.generation
@@ -610,11 +617,19 @@ function guardController(guard) {
       childReleaseDeferred = true;
     },
     finishChild(operationId) {
+      if (guard.metadata.childOperation === null && scopeClosed && childReleaseDeferred) {
+        releaseGuard(guard);
+        childReleaseDeferred = false;
+        return;
+      }
       if (guard.metadata.childOperation?.operationId !== operationId) {
         throw new MutationCoordinatorBusyError('workspace mutation child operation ownership changed');
       }
       replaceGuard(guard, { ...guard.metadata, childOperation: null });
-      if (scopeClosed) releaseGuard(guard);
+      if (scopeClosed) {
+        releaseGuard(guard);
+        childReleaseDeferred = false;
+      }
     },
     closeScope() {
       if (scopeClosed) return;
@@ -633,8 +648,19 @@ function releaseGuard(guard) {
   if (current.childOperation !== null) {
     throw new MutationCoordinatorBusyError('workspace mutation child operation has not closed');
   }
-  fs.unlinkSync(path.join(guard.directory, 'owner.json'));
-  fs.rmdirSync(guard.directory);
+  const quarantine = `${guard.directory}.cleanup.${randomUUID()}`;
+  fs.renameSync(guard.directory, quarantine);
+  const moved = readGuard(quarantine);
+  if (stableJson(moved) !== stableJson(guard.metadata)) {
+    if (!fs.existsSync(guard.directory)) fs.renameSync(quarantine, guard.directory);
+    throw new MutationCoordinatorBusyError('workspace mutation coordinator ownership changed during release');
+  }
+  try {
+    fs.rmSync(quarantine, { recursive: true, force: true });
+  } catch {
+    // The canonical authority is already retired. A uniquely named, fully
+    // identified quarantine is harmless and can be reclaimed on startup.
+  }
 }
 
 function assertFence(lease) {

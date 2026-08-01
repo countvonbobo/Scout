@@ -590,6 +590,7 @@ test('Windows unresolved Git child keeps durable mutation authority until close'
   commandChild.kill = () => false;
   const killer = new EventEmitter();
   killer.kill = () => true;
+  const scheduledCleanup = [];
   const spawnAsync = async (command, args, options) => (
     args[0] === 'commit' ? commandChild : spawnSync(command, args, options)
   );
@@ -601,6 +602,10 @@ test('Windows unresolved Git child keeps durable mutation authority until close'
       spawnAuxiliary: () => killer,
       auxiliaryTimeoutMs: 1,
       closeTimeoutMs: 5,
+      guardCleanupScheduler: (callback) => {
+        scheduledCleanup.push(callback);
+        return { unref() {} };
+      },
     },
   });
   assert.equal(result.state, 'needs-attention');
@@ -613,9 +618,25 @@ test('Windows unresolved Git child keeps durable mutation authority until close'
   assert.equal(contender.pending, true);
   assert.equal(fs.existsSync(guard), true);
 
-  commandChild.exitCode = 1;
-  commandChild.emit('close', 1);
-  await new Promise((resolve) => setImmediate(resolve));
+  const originalRename = fs.renameSync;
+  let cleanupContended = false;
+  fs.renameSync = (source, destination) => {
+    if (!cleanupContended && String(source).endsWith('mutation.guard')
+      && String(destination).includes('mutation.guard.cleanup.')) {
+      cleanupContended = true;
+      throw Object.assign(new Error('injected late guard cleanup contention'), { code: 'EPERM' });
+    }
+    return originalRename(source, destination);
+  };
+  try {
+    commandChild.exitCode = 1;
+    commandChild.emit('close', 1);
+  } finally {
+    fs.renameSync = originalRename;
+  }
+  assert.equal(scheduledCleanup.length, 1);
+  assert.equal(fs.existsSync(guard), true);
+  scheduledCleanup.shift()();
   assert.equal(fs.existsSync(guard), false);
   fs.rmSync(f.base, { recursive: true, force: true });
 });

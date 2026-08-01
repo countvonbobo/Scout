@@ -235,6 +235,21 @@ test('stage audit inspects unexpected nested git metadata', () => {
   );
 });
 
+test('packaging consumes the audit-created read-only content snapshot', () => {
+  const stageDir = fs.mkdtempSync(path.join(os.tmpdir(), 'scout-audited-stage-'));
+  fs.writeFileSync(path.join(stageDir, 'a.txt'), 'audited-a');
+  fs.writeFileSync(path.join(stageDir, 'b.txt'), 'audited-b');
+  const audit = auditStageBeforePackaging(stageDir, {
+    env: { ...process.env, SCOUT_RELEASE_MARKERS: 'SyntheticPackagingMarker' },
+  });
+  fs.writeFileSync(path.join(stageDir, 'a.txt'), 'changed-after-audit');
+  assert.equal(fs.readFileSync(path.join(audit.stageDir, 'a.txt'), 'utf8'), 'audited-a');
+  assert.throws(
+    () => fs.writeFileSync(path.join(audit.stageDir, 'a.txt'), 'mutation'),
+    /EACCES|EPERM|permission denied/i,
+  );
+});
+
 test('public and release staging refuse allowlisted leaf symlinks', () => {
   if (process.platform === 'win32') return;
   const privateFile = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'scout-private-leaf-')), 'private.txt');
