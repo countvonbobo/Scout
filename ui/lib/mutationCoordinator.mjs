@@ -571,16 +571,33 @@ function createGuard(root, lease) {
   return { directory, metadata };
 }
 
-function replaceGuard(guard, next) {
+function replaceGuard(guard, next, writeGuard = atomicWriteFile) {
   const current = readGuard(guard.directory);
   if (stableJson(current) !== stableJson(guard.metadata)) {
     throw new MutationCoordinatorBusyError('workspace mutation coordinator ownership changed');
   }
-  atomicWriteFile(path.join(guard.directory, 'owner.json'), `${stableJson(next)}\n`, { mode: 0o600 });
+  try {
+    writeGuard(path.join(guard.directory, 'owner.json'), `${stableJson(next)}\n`, { mode: 0o600 });
+  } catch (error) {
+    let durable;
+    try { durable = readGuard(guard.directory); }
+    catch {
+      throw new MutationCoordinatorBusyError('workspace mutation coordinator publication is unverifiable');
+    }
+    if (stableJson(durable) === stableJson(next)) {
+      // Replacement completed before a directory durability operation failed.
+      // Reconcile memory to the canonical bytes so later child closure can
+      // converge instead of leaving a live owner permanently wedged.
+      guard.metadata = next;
+      return;
+    }
+    if (stableJson(durable) === stableJson(current)) throw error;
+    throw new MutationCoordinatorBusyError('workspace mutation coordinator ownership changed during publication');
+  }
   guard.metadata = next;
 }
 
-function guardController(guard, releaseScheduler = setTimeout) {
+function guardController(guard, releaseScheduler = setTimeout, writeGuard = atomicWriteFile) {
   let scopeClosed = false;
   let childReleaseDeferred = false;
   return Object.freeze({
@@ -593,7 +610,7 @@ function guardController(guard, releaseScheduler = setTimeout) {
       replaceGuard(guard, {
         ...guard.metadata,
         childOperation: { operationId, phase, state: 'starting', owner: null },
-      });
+      }, writeGuard);
       return operationId;
     },
     attachChild(operationId, pid) {
@@ -608,7 +625,7 @@ function guardController(guard, releaseScheduler = setTimeout) {
           state: 'running',
           owner: observeProcessOwner(pid),
         },
-      });
+      }, writeGuard);
     },
     deferChildRelease(operationId) {
       if (guard.metadata.childOperation?.operationId !== operationId) {
@@ -625,7 +642,7 @@ function guardController(guard, releaseScheduler = setTimeout) {
       if (guard.metadata.childOperation?.operationId !== operationId) {
         throw new MutationCoordinatorBusyError('workspace mutation child operation ownership changed');
       }
-      replaceGuard(guard, { ...guard.metadata, childOperation: null });
+      replaceGuard(guard, { ...guard.metadata, childOperation: null }, writeGuard);
       if (scopeClosed) {
         releaseGuard(guard, releaseScheduler);
         childReleaseDeferred = false;
@@ -682,12 +699,14 @@ function assertFence(lease) {
   return assertCurrentFence(lease, synchronousFenceCallback(() => true));
 }
 
-export function withMutationCoordinator(root, lease, commit, { releaseScheduler = setTimeout } = {}) {
+export function withMutationCoordinator(root, lease, commit, {
+  releaseScheduler = setTimeout, writeGuard = atomicWriteFile,
+} = {}) {
   if (typeof commit !== 'function') throw new TypeError('workspace mutation coordinator callback is required');
   assertScanLeaseScope(lease, root, lease?.runId);
   assertFence(lease);
   const guard = createGuard(root, lease);
-  const controller = guardController(guard, releaseScheduler);
+  const controller = guardController(guard, releaseScheduler, writeGuard);
   let result;
   try {
     assertFence(lease);

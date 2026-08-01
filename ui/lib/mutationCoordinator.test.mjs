@@ -27,6 +27,7 @@ import {
   createEmployerRegistry, employerRegistryRevision, loadEmployerRegistry,
   writeEmployerRegistry,
 } from './employerRegistry.mjs';
+import { atomicWriteFile } from './atomicWrite.mjs';
 
 const roots = [];
 
@@ -232,6 +233,28 @@ test('guard publication failure never exposes an unverifiable canonical director
   assert.equal(fs.existsSync(path.join(scout, 'mutation.guard')), false);
   assert.equal(fs.readdirSync(scout).some((name) => name.startsWith('mutation.guard.candidate.')), false);
   assert.equal(withMutationCoordinator(root, lease, () => 'recovered'), 'recovered');
+});
+
+test('guard transitions reconcile a failure after canonical owner publication', () => {
+  const { root, lease } = fixture();
+  let injected = false;
+  assert.equal(withMutationCoordinator(root, lease, (coordinator) => {
+    const operation = coordinator.beginChild('post-publication');
+    coordinator.attachChild(operation, process.pid);
+    coordinator.finishChild(operation);
+    return 'reconciled';
+  }, {
+    writeGuard(file, value, options) {
+      atomicWriteFile(file, value, options);
+      const metadata = JSON.parse(value);
+      if (!injected && metadata.childOperation?.state === 'running') {
+        injected = true;
+        throw new Error('synthetic post-publication directory sync failure');
+      }
+    },
+  }), 'reconciled');
+  assert.equal(injected, true);
+  assert.equal(fs.existsSync(path.join(root, '.scout', 'mutation.guard')), false);
 });
 
 test('guard detach contention retries before admitting a successor', () => {
