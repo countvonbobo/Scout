@@ -140,12 +140,34 @@ test('first-run queue and waiting states come from durable summaries', async ({ 
 });
 
 test('manual scan status and approximate remaining time stay visible on a narrow screen', async ({ page }) => {
+  await page.unroute('**/api/scan/runs');
+  let releaseRuns;
+  let markRunsRequested;
+  const runsRequested = new Promise((resolve) => { markRunsRequested = resolve; });
+  await page.route('**/api/scan/runs', async (route) => {
+    markRunsRequested();
+    await new Promise((resolve) => { releaseRuns = resolve; });
+    await route.fulfill({ contentType: 'application/json', body: JSON.stringify({
+      runs: [{
+        id: 'run-1234…', state: 'repairing', label: 'Repairing affected jobs',
+        assessment: { currentBatch: 2, totalBatches: 4, totalBatchesExact: true },
+      }],
+    }) });
+  });
+  const reload = page.reload({ waitUntil: 'domcontentloaded' });
+  await runsRequested;
   await page.setViewportSize({ width: 375, height: 760 });
-  await page.evaluate(() => window.Scout.showOperation({
-    id: 'scan-eta', type: 'scan', status: 'running', phase: 'Scoring candidates',
-    progress: { current: 3, total: 5 }, startedAt: new Date(Date.now() - 120000).toISOString(),
-    estimate: { basis: 'history', sampleSize: 3, totalSecondsLow: 360, totalSecondsHigh: 540 },
-  }));
+  await page.evaluate(() => {
+    window.Scout.scanRunning = true;
+    window.Scout.showOperation({
+      id: 'scan-eta', type: 'scan', status: 'running', phase: 'Scoring candidates',
+      progress: { current: 3, total: 5 }, startedAt: new Date(Date.now() - 120000).toISOString(),
+      estimate: { basis: 'history', sampleSize: 3, totalSecondsLow: 360, totalSecondsHigh: 540 },
+    });
+  });
+  releaseRuns();
+  await reload;
+  await page.waitForFunction(() => Boolean(window.Scout.state.data));
   await expect(page.locator('#scan-status')).toBeVisible();
   await expect(page.locator('#scan-status')).toContainText(/about 4–7 min remaining/i);
 });

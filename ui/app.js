@@ -365,7 +365,7 @@ const Scout = {
     const activeRun = this.scanRuns.find((run) => !['complete', 'partial', 'abandoned', 'failed'].includes(run.state));
     const queuedCount = this.scanQueue.requests.filter((request) => request.status === 'queued').length;
     const status = document.getElementById('scan-status');
-    if (status) {
+    if (status && !this.scanRunning) {
       status.textContent = activeRun
         ? `${activeRun.label || 'Scan in progress'}${activeRun.assessment?.totalBatches ? ` · batch ${activeRun.assessment.currentBatch} of ${activeRun.assessment.totalBatchesExact ? '' : 'at least '}${activeRun.assessment.totalBatches}` : ''}`
         : queuedCount
