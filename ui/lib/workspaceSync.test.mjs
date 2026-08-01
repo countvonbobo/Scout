@@ -604,6 +604,32 @@ test('backup setup publishes a concrete child identity for crash recovery', asyn
   fs.rmSync(f.base, { recursive: true, force: true });
 });
 
+test('backup setup attachment failure closes the spawned Git child before releasing authority', async () => {
+  const f = fixture();
+  let childPid = null;
+  const syncSpawn = (command, args, options) => {
+    if (args[0] === 'credential-manager') return { status: 0, stdout: 'test-gcm', stderr: '' };
+    return spawnSync(command, args, options);
+  };
+  await assert.rejects(() => connectWorkspaceSync(f.root, {
+    remoteUrl: 'https://github.com/example/setup-attach-failure', passphrase: 'correct horse battery staple',
+  }, {
+    verifyRemote: async () => ({ url: f.remote, empty: true }),
+    spawn: syncSpawn,
+    spawnAsync: (command, args, options) => spawn(command, args, options),
+    _testHooks: {
+      beforeAttachChild(child) {
+        childPid = child.pid;
+        throw new Error('synthetic child attachment publication failure');
+      },
+    },
+  }), /synthetic child attachment publication failure/);
+  assert.equal(Number.isSafeInteger(childPid) && childPid > 0, true);
+  await waitUntil(() => !processExists(childPid));
+  await waitUntil(() => !fs.existsSync(path.join(f.root, '.scout', 'mutation.guard')));
+  fs.rmSync(f.base, { recursive: true, force: true });
+});
+
 test('Windows unresolved Git child keeps durable mutation authority until close', async (t) => {
   if (process.platform !== 'win32') {
     t.diagnostic('taskkill is Windows-specific');

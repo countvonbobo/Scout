@@ -656,7 +656,6 @@ export function materializeBeta22Rollback(root, destination, {
   verifySnapshotStorage(workspaceRoot, storage);
   const staging = `${target}.scout-rollback-${crypto.randomUUID()}`;
   if (fs.existsSync(staging)) throw new Error('beta.22 rollback staging destination already exists');
-  let publishedIdentity = null;
   try {
     verifyRollbackDestination(workspaceRoot, destinationAuthority);
     copySnapshotEntry(chosen.directory, staging, '', () => {
@@ -683,8 +682,7 @@ export function materializeBeta22Rollback(root, destination, {
       || within(fs.realpathSync(workspaceRoot), fs.realpathSync(target))) {
       throw new Error('beta.22 rollback publication identity changed');
     }
-    publishedIdentity = { dev: targetIdentity.dev, ino: targetIdentity.ino };
-    _testHooks.afterPublicationRename?.(target);
+    _testHooks.afterPublicationRename?.(target, staging);
     verifyRollbackDestination(workspaceRoot, destinationAuthority);
     const publishedEntries = snapshotEntries(target);
     if (JSON.stringify(publishedEntries) !== JSON.stringify(manifest.entries)
@@ -699,15 +697,9 @@ export function materializeBeta22Rollback(root, destination, {
       treeDigest: manifest.treeDigest,
     };
   } catch (error) {
-    fs.rmSync(staging, { recursive: true, force: true });
-    if (publishedIdentity !== null && fs.existsSync(target)) {
-      try {
-        const current = fs.lstatSync(target, { bigint: true });
-        if (current.dev === publishedIdentity.dev && current.ino === publishedIdentity.ino) {
-          fs.rmSync(target, { recursive: true, force: true });
-        }
-      } catch { /* preserve the publication failure; never delete an unproven replacement */ }
-    }
+    // Neither staging nor target can be deleted safely by pathname after a
+    // failed verification: another process may have substituted either name.
+    // Preserve the unaccepted tree for explicit operator review.
     throw error;
   }
 }

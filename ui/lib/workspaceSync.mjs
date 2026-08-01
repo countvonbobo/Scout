@@ -26,6 +26,7 @@ const DEFAULT_COMMAND_TIMEOUT_MS = 30_000;
 const COMMAND_OUTPUT_LIMIT = 64 * 1024;
 const PROCESS_TREE_KILL_GRACE_MS = 100;
 const RUNTIME_FENCE_FAILURE = Symbol('runtime-fence-failure');
+const CHILD_TERMINATION_UNRESOLVED = Symbol('child-termination-unresolved');
 const MARKER_FILTER = 'scout-marker';
 const MARKER_FILTER_PATHS = Object.freeze([
   'data/opportunities.json',
@@ -203,6 +204,21 @@ function collectChildProcess(child, timeoutMs, terminationOptions = {}) {
   });
 }
 
+async function observeSpawnedChild(child, timeoutMs, onSpawn, terminationOptions) {
+  const collected = collectChildProcess(child, timeoutMs, terminationOptions);
+  try {
+    onSpawn?.(child);
+  } catch (error) {
+    await terminateProcessTree(child, terminationOptions);
+    const closure = await collected;
+    if (closure.terminationUnresolved === true) {
+      Object.defineProperty(error, CHILD_TERMINATION_UNRESOLVED, { value: true });
+    }
+    throw error;
+  }
+  return collected;
+}
+
 function defaultSpawnAsync(command, args, spawnOptions, timeoutMs, onSpawn, terminationOptions = {}) {
   const child = spawn(command, args, {
     ...spawnOptions,
@@ -210,8 +226,7 @@ function defaultSpawnAsync(command, args, spawnOptions, timeoutMs, onSpawn, term
     encoding: undefined,
     stdio: ['ignore', 'pipe', 'pipe'],
   });
-  onSpawn?.(child);
-  return collectChildProcess(child, timeoutMs, terminationOptions);
+  return observeSpawnedChild(child, timeoutMs, onSpawn, terminationOptions);
 }
 
 async function adapterSpawnAsync(
@@ -243,10 +258,10 @@ async function adapterSpawnAsync(
     clearTimeout(timer);
   }
   if (!isChildProcess(value)) return value;
-  onSpawn?.(value);
-  return collectChildProcess(
+  return observeSpawnedChild(
     value,
     Math.max(1, timeoutMs - (Date.now() - startedAt)),
+    onSpawn,
     terminationOptions,
   );
 }
@@ -262,6 +277,7 @@ async function runGitAsync(cwd, args, options = {}) {
     env: { ...process.env, ...(options.env || {}), GIT_TERMINAL_PROMPT: options.allowPrompt ? '1' : '0' },
   };
   let result;
+  let operationError = null;
   const childOperation = options.mutationCoordinator?.beginChild(args[0]);
   let childFinished = false;
   let cleanupDelay = 25;
@@ -273,7 +289,6 @@ async function runGitAsync(cwd, args, options = {}) {
   const onSpawn = childOperation === undefined
     ? undefined
     : (child) => {
-      options.mutationCoordinator.attachChild(childOperation, child.pid);
       // Keep the durable child fence after a bounded timeout result. The
       // process close event is the only authority that may retire an
       // unresolved child operation.
@@ -287,6 +302,8 @@ async function runGitAsync(cwd, args, options = {}) {
           retry.unref?.();
         }
       });
+      options._testHooks?.beforeAttachChild?.(child);
+      options.mutationCoordinator.attachChild(childOperation, child.pid);
     };
   try {
     const terminationOptions = {
@@ -309,8 +326,12 @@ async function runGitAsync(cwd, args, options = {}) {
         'git', args, spawnOptions, timeoutMs, onSpawn, terminationOptions,
       );
     }
+  } catch (error) {
+    operationError = error;
+    throw error;
   } finally {
-    if (result?.terminationUnresolved === true && !childFinished) {
+    if ((result?.terminationUnresolved === true || operationError?.[CHILD_TERMINATION_UNRESOLVED] === true)
+      && !childFinished) {
       options.mutationCoordinator?.deferChildRelease(childOperation);
     } else {
       finishChild();
