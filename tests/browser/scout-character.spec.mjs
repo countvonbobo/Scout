@@ -5,6 +5,18 @@ const ACTION_STATES = ['searching', 'writing', 'success'];
 const RENDER_SIZES = [44, 112];
 const MODULE_URL = '**/lib/scoutCharacter.mjs*';
 
+test.beforeEach(async ({ context }, testInfo) => {
+  // App, setup and report boot have dedicated browser coverage. Character
+  // probes need only the production CSS, canonical module and sprite assets;
+  // the fallback group intentionally exercises app.js without that module.
+  const entrypoints = testInfo.titlePath.includes('Scout character before its module is available')
+    ? ['setup.js', 'reportView.js']
+    : ['app.js', 'setup.js', 'reportView.js'];
+  for (const entrypoint of entrypoints) {
+    await context.route(`**/${entrypoint}*`, (route) => route.abort());
+  }
+});
+
 // One navigation per test. Probes are mounted and replaced in place, so adding
 // a state costs an evaluate rather than a full dashboard load.
 async function openDashboard(page) {
