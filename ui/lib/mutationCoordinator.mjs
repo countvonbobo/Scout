@@ -574,6 +574,8 @@ function replaceGuard(guard, next) {
 }
 
 function guardController(guard) {
+  let scopeClosed = false;
+  let childReleaseDeferred = false;
   return Object.freeze({
     beginChild(phase) {
       requireId(phase, 'workspace mutation child phase');
@@ -601,11 +603,24 @@ function guardController(guard) {
         },
       });
     },
+    deferChildRelease(operationId) {
+      if (guard.metadata.childOperation?.operationId !== operationId) {
+        throw new MutationCoordinatorBusyError('workspace mutation child operation ownership changed');
+      }
+      childReleaseDeferred = true;
+    },
     finishChild(operationId) {
       if (guard.metadata.childOperation?.operationId !== operationId) {
         throw new MutationCoordinatorBusyError('workspace mutation child operation ownership changed');
       }
       replaceGuard(guard, { ...guard.metadata, childOperation: null });
+      if (scopeClosed) releaseGuard(guard);
+    },
+    closeScope() {
+      if (scopeClosed) return;
+      scopeClosed = true;
+      if (guard.metadata.childOperation !== null && childReleaseDeferred) return;
+      releaseGuard(guard);
     },
   });
 }
@@ -632,18 +647,19 @@ export function withMutationCoordinator(root, lease, commit) {
   assertFence(lease);
   const guard = createGuard(root, lease);
   const controller = guardController(guard);
+  let result;
   try {
     assertFence(lease);
-    const result = commit(controller);
-    if (result && typeof result.then === 'function') {
-      return Promise.resolve(result).finally(() => releaseGuard(guard));
-    }
-    releaseGuard(guard);
-    return result;
+    result = commit(controller);
   } catch (error) {
-    releaseGuard(guard);
+    controller.closeScope();
     throw error;
   }
+  if (result && typeof result.then === 'function') {
+    return Promise.resolve(result).finally(() => controller.closeScope());
+  }
+  controller.closeScope();
+  return result;
 }
 
 export function applyPreparedMutation(plan, lease, hooks = {}) {

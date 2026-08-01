@@ -245,7 +245,7 @@ test('simultaneous provider work acquisitions are serialized but all admitted', 
   assert.deepEqual(results, ['acquired', 'acquired', 'acquired', 'acquired']);
 });
 
-test('committed authority survives transient canonical guard cleanup contention', async (t) => {
+test('committed authority survives transient canonical guard cleanup contention', (t) => {
   const root = workspace(t);
   const originalRename = fs.renameSync;
   let injected = false;
@@ -257,18 +257,70 @@ test('committed authority survives transient canonical guard cleanup contention'
     }
     return originalRename(source, destination);
   };
+  const scheduled = [];
+  const cleanupScheduler = (callback) => {
+    scheduled.push(callback);
+    return { unref() {} };
+  };
   let auth;
   try {
     auth = acquireProviderAuthMutation(root, 'codex', {
       owner: currentLeaseOwner(), now: Date.now(), durationMs: 5_000,
       mutationId: 'cleanup-contention-01',
+      _testHooks: { cleanupScheduler },
     });
   } finally {
     fs.renameSync = originalRename;
   }
   assert.ok(auth);
   assert.equal(readProviderAuthMutation(root, 'codex').mutationId, auth.mutationId);
-  await new Promise((resolve) => setTimeout(resolve, 75));
+  assert.equal(scheduled.length, 1);
+  scheduled.shift()();
+  assert.equal(releaseProviderAuthMutation(root, auth), true);
+});
+
+test('canonical cleanup retries transient owner record unreadability', (t) => {
+  const root = workspace(t);
+  const originalRename = fs.renameSync;
+  const originalRead = fs.readFileSync;
+  const scheduled = [];
+  const cleanupScheduler = (callback) => {
+    scheduled.push(callback);
+    return { unref() {} };
+  };
+  fs.renameSync = (source, destination) => {
+    if (String(source).endsWith('codex.guard') && String(destination).includes('.cleanup-')) {
+      throw Object.assign(new Error('injected canonical contention'), { code: 'EPERM' });
+    }
+    return originalRename(source, destination);
+  };
+  let auth;
+  try {
+    auth = acquireProviderAuthMutation(root, 'codex', {
+      owner: currentLeaseOwner(), now: Date.now(), durationMs: 5_000,
+      mutationId: 'cleanup-unreadable-01', _testHooks: { cleanupScheduler },
+    });
+  } finally {
+    fs.renameSync = originalRename;
+  }
+  const ownerFile = path.join(root, '.scout', 'provider-auth', 'v1', 'codex.guard', 'owner.json');
+  let unreadable = true;
+  fs.readFileSync = (file, ...args) => {
+    if (unreadable && path.resolve(String(file)) === path.resolve(ownerFile)) {
+      unreadable = false;
+      throw Object.assign(new Error('injected transient owner read contention'), { code: 'EBUSY' });
+    }
+    return originalRead(file, ...args);
+  };
+  try {
+    assert.equal(scheduled.length, 1);
+    scheduled.shift()();
+  } finally {
+    fs.readFileSync = originalRead;
+  }
+  assert.equal(scheduled.length, 1, 'ambiguous owner reads must remain scheduled');
+  scheduled.shift()();
+  assert.equal(fs.existsSync(path.dirname(ownerFile)), false);
   assert.equal(releaseProviderAuthMutation(root, auth), true);
 });
 

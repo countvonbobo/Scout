@@ -139,13 +139,15 @@ function activeWorkRecords(target, provider, at, { prune = false } = {}) {
   return active;
 }
 
-function readGuardRecord(directory) {
+function inspectGuardRecord(directory) {
   try {
     const stat = fs.lstatSync(directory);
-    if (stat.isSymbolicLink() || !stat.isDirectory()) return null;
+    if (stat.isSymbolicLink() || !stat.isDirectory()) return { state: 'ambiguous', record: null };
     const file = path.join(directory, GUARD_RECORD);
     const fileStat = fs.lstatSync(file);
-    if (fileStat.isSymbolicLink() || !fileStat.isFile() || fileStat.size > 4_096) return null;
+    if (fileStat.isSymbolicLink() || !fileStat.isFile() || fileStat.size > 4_096) {
+      return { state: 'ambiguous', record: null };
+    }
     const record = JSON.parse(fs.readFileSync(file, 'utf8'));
     if (!record || Object.keys(record).sort().join(',') !== 'acquiredAt,owner,token'
       || !Number.isSafeInteger(record.acquiredAt)
@@ -154,11 +156,18 @@ function readGuardRecord(directory) {
       || Object.keys(record.owner).sort().join(',') !== 'host,pid,processStart'
       || typeof record.owner.host !== 'string'
       || !Number.isSafeInteger(record.owner.pid)
-      || typeof record.owner.processStart !== 'string') return null;
-    return record;
-  } catch {
-    return null;
+      || typeof record.owner.processStart !== 'string') return { state: 'ambiguous', record: null };
+    return { state: 'record', record };
+  } catch (error) {
+    return {
+      state: error?.code === 'ENOENT' ? 'absent' : 'ambiguous',
+      record: null,
+    };
   }
+}
+
+function readGuardRecord(directory) {
+  return inspectGuardRecord(directory).record;
 }
 
 function removeOwnedGuard(directory, token, scheduler = setTimeout) {
@@ -194,12 +203,14 @@ function scheduleQuarantineCleanup(directory, token, scheduler = setTimeout) {
   const retry = () => {
     try {
       if (!fs.existsSync(directory)) return;
-      const pending = readGuardRecord(directory);
+      const observed = inspectGuardRecord(directory);
+      const pending = observed.record;
       if (pending?.token === token) {
         fs.rmSync(directory, { recursive: true, force: true });
         return;
       }
       if (pending) return;
+      if (observed.state === 'ambiguous') throw new Error('guard cleanup identity is temporarily unreadable');
       // A prior verified recursive delete may have removed owner.json before
       // Windows refused the final directory removal. Only an empty, ordinary
       // quarantine at this unguessable identity path is safe to finish.
@@ -220,8 +231,15 @@ function scheduleQuarantineCleanup(directory, token, scheduler = setTimeout) {
 function scheduleOwnedGuardCleanup(directory, token, scheduler = setTimeout) {
   let delay = 25;
   const retry = () => {
-    const current = readGuardRecord(directory);
-    if (!current || current.token !== token) return;
+    const observed = inspectGuardRecord(directory);
+    const current = observed.record;
+    if (observed.state === 'absent' || (current && current.token !== token)) return;
+    if (observed.state === 'ambiguous') {
+      delay = Math.min(delay * 2, 1_000);
+      const timer = scheduler(retry, delay);
+      timer.unref?.();
+      return;
+    }
     let removed = false;
     try { removed = removeOwnedGuard(directory, token, scheduler); } catch {}
     if (removed || !fs.existsSync(directory)) return;

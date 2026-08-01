@@ -6,7 +6,38 @@ import path from 'node:path';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 import { RELEASE_FILES } from './build-release.mjs';
-import { auditRelease, loadMarkers, main } from './release-audit.mjs';
+import {
+  auditRelease, loadMarkers, main, verifiedAuditTreeDigest,
+} from './release-audit.mjs';
+
+test('audit digest cannot authorize bytes changed after an earlier final read', () => {
+  const root = fixture();
+  const first = path.join(root, 'a.txt');
+  fs.writeFileSync(first, 'clean-a');
+  fs.writeFileSync(path.join(root, 'b.txt'), 'clean-b');
+  const originalRead = fs.readFileSync;
+  let descriptorReads = 0;
+  fs.readFileSync = (file, ...args) => {
+    const value = originalRead(file, ...args);
+    if (typeof file === 'number' && ++descriptorReads === 4) {
+      fs.writeFileSync(first, 'SYNTHETIC-PRIVATE-MARKER');
+    }
+    return value;
+  };
+  let result;
+  try {
+    result = auditRelease({
+      root,
+      trackedFiles: [],
+      buildDirs: ['.'],
+      markers: ['SYNTHETIC-PRIVATE-MARKER'],
+    });
+  } finally {
+    fs.readFileSync = originalRead;
+  }
+  assert.equal(result.ok, true, 'fixture mutation occurs after the earlier file final read');
+  assert.notEqual(verifiedAuditTreeDigest(root), result.treeDigest);
+});
 
 function fixture() {
   return fs.mkdtempSync(path.join(os.tmpdir(), 'scout-release-audit-'));

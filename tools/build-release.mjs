@@ -5,6 +5,7 @@ import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { isMainModule } from '../ui/lib/mainModule.mjs';
+import { verifiedAuditTreeDigest } from './release-audit.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const DEFAULT_ROOT = path.resolve(HERE, '..');
@@ -297,7 +298,9 @@ export function auditStageBeforePackaging(stageDir, {
   if (result.status !== 0) {
     throw new Error(`pre-package release audit failed:\n${result.stdout || ''}\n${result.stderr || ''}`.trim());
   }
-  return result.stdout;
+  const match = String(result.stdout || '').match(/Release audit tree digest: ([0-9a-f]{64})/);
+  if (!match) throw new Error('pre-package release audit did not return a payload digest');
+  return { output: result.stdout, treeDigest: match[1] };
 }
 
 export function stagePublicSource({
@@ -529,7 +532,10 @@ export function buildInstaller({ root = DEFAULT_ROOT, stageDir, version, isccPat
   ) {
     throw new Error('verified Windows package input changed during compilation');
   }
-  auditStageBeforePackaging(staged.stageDir);
+  const audit = auditStageBeforePackaging(staged.stageDir);
+  if (verifiedAuditTreeDigest(staged.stageDir) !== audit.treeDigest) {
+    throw new Error('Windows release payload changed after privacy audit');
+  }
   const auditedPayloadDigest = verifiedReleaseTreeDigest(staged.stageDir);
   const outputDir = path.join(root, 'installer', 'output');
   fs.rmSync(outputDir, { recursive: true, force: true });

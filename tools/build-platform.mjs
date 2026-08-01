@@ -5,6 +5,7 @@ import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { isMainModule } from '../ui/lib/mainModule.mjs';
+import { verifiedAuditTreeDigest } from './release-audit.mjs';
 import {
   auditStageBeforePackaging, copyVerifiedReleaseFile, sha256, stageRelease,
   verifiedReleaseFileDigest, verifiedReleaseTreeDigest, writeChecksums,
@@ -42,7 +43,10 @@ export function buildMac({ arch = process.arch, nodeExecutable = process.execPat
   executable(launcher);
   const plist = `<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd"><plist version="1.0"><dict><key>CFBundleName</key><string>Scout</string><key>CFBundleDisplayName</key><string>Scout</string><key>CFBundleIdentifier</key><string>app.scout.local</string><key>CFBundleVersion</key><string>${VERSION}</string><key>CFBundleShortVersionString</key><string>${VERSION}</string><key>CFBundleExecutable</key><string>Scout</string><key>CFBundlePackageType</key><string>APPL</string><key>LSMinimumSystemVersion</key><string>13.0</string><key>NSHighResolutionCapable</key><true/></dict></plist>`;
   fs.writeFileSync(path.join(contents, 'Info.plist'), plist);
-  auditStageBeforePackaging(stage);
+  const audit = auditStageBeforePackaging(stage);
+  if (verifiedAuditTreeDigest(stage) !== audit.treeDigest) {
+    throw new Error('macOS release payload changed after privacy audit');
+  }
   fs.symlinkSync('/Applications', path.join(stage, 'dmg-root', 'Applications'));
   const auditedPayloadDigest = verifiedMacDmgRootDigest(path.join(stage, 'dmg-root'));
   const output = path.join(ROOT, 'installer', 'output'); fs.mkdirSync(output, { recursive: true }); const name = arch === 'arm64' ? artifactNames().macArm : artifactNames().macIntel;
@@ -93,7 +97,10 @@ export function buildLinux({ nodeExecutable = process.execPath } = {}) {
   if (verifiedReleaseFileDigest(launcherSource, { verifiedRoot: stage }) !== launcherSourceDigest) {
     throw new Error('verified Linux package input changed during staging');
   }
-  auditStageBeforePackaging(stage);
+  const audit = auditStageBeforePackaging(stage);
+  if (verifiedAuditTreeDigest(stage) !== audit.treeDigest) {
+    throw new Error('Linux release payload changed after privacy audit');
+  }
   const auditedPayloadDigest = verifiedReleaseTreeDigest(stage);
   run('dpkg-deb', ['--build', '--root-owner-group', pkg, deb]);
   const tar = path.join(output, artifactNames().linuxTar); run('tar', ['-czf', tar, '-C', stage, path.basename(portable)]);

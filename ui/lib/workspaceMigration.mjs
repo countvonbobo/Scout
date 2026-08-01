@@ -162,8 +162,15 @@ function verifySourceFile(record) {
 }
 
 function verifySourceAuthority(authority, budget) {
-  for (const record of authority.files) verifySourceFile(record);
-  for (const record of authority.directories) {
+  // Verify in the opposite order from capture. This closes the publication
+  // boundary over earlier sources after later sources have been copied, while
+  // the workspace mutation coordinator excludes all Scout writers.
+  for (const record of [...authority.files].reverse()) {
+    budget.renew?.();
+    verifySourceFile(record);
+  }
+  for (const record of [...authority.directories].reverse()) {
+    budget.renew?.();
     verifyTraversedDirectory(record.source, record.snapshot, record.relative, budget);
   }
 }
@@ -508,6 +515,7 @@ function createBeta22WorkspaceSnapshotUnderAuthority(root, {
   try {
     fs.mkdirSync(staging, { recursive: false, mode: 0o700 });
     const budget = snapshotBudget(workspaceRoot);
+    budget.renew = renew;
     const sourceAuthority = { files: [], directories: [] };
     for (const relative of SNAPSHOT_PATHS) {
       renew();
@@ -602,6 +610,7 @@ export function materializeBeta22Rollback(root, destination, {
   }
   verifySnapshotStorage(workspaceRoot, storage);
   _testHooks.afterStorageValidation?.();
+  verifySnapshotStorage(workspaceRoot, storage);
   const manifest = verifySnapshotDirectory(chosen.directory);
   verifySnapshotStorage(workspaceRoot, storage);
   const staging = `${target}.scout-rollback-${crypto.randomUUID()}`;

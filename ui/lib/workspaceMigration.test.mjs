@@ -284,6 +284,30 @@ test('beta.22 snapshot rejects mutation of an earlier top-level source during la
   assert.equal(mutated, true);
 });
 
+test('beta.22 snapshot rejects an earlier verified file changed when a later file is reopened', () => {
+  const root = productionShapedWorkspace();
+  const earlier = path.join(root, 'data', 'a.txt');
+  const later = path.join(root, 'data', 'b.txt');
+  fs.writeFileSync(earlier, 'old-a');
+  fs.writeFileSync(later, 'old-b');
+  const originalOpen = fs.openSync;
+  let laterOpens = 0;
+  fs.openSync = (file, ...args) => {
+    if (path.resolve(String(file)) === path.resolve(later) && ++laterOpens === 2) {
+      fs.writeFileSync(earlier, 'new-a');
+    }
+    return originalOpen(file, ...args);
+  };
+  try {
+    assert.throws(
+      () => createBeta22WorkspaceSnapshot(root, { now: () => NOW }),
+      /source changed after copy/,
+    );
+  } finally {
+    fs.openSync = originalOpen;
+  }
+});
+
 test('beta.22 snapshot rejects trees deeper than its traversal bound', () => {
   const root = productionShapedWorkspace();
   let directory = path.join(root, 'logs');
@@ -358,10 +382,6 @@ test('explicit beta.22 rollback rejects a pre-existing redirected snapshot root'
 });
 
 test('beta.22 rollback rejects snapshot-root substitution after validation', (t) => {
-  if (process.platform === 'win32') {
-    t.diagnostic('live parent substitution fixture is not portable to Windows');
-    return;
-  }
   const root = productionShapedWorkspace();
   const snapshot = createBeta22WorkspaceSnapshot(root, { now: () => NOW });
   const outside = temporaryRoot('scout-beta22-substituted-snapshots-');
@@ -375,7 +395,7 @@ test('beta.22 rollback rejects snapshot-root substitution after validation', (t)
       _testHooks: {
         afterStorageValidation() {
           fs.renameSync(backups, outside);
-          fs.symlinkSync(outside, backups, 'dir');
+          fs.mkdirSync(backups, { recursive: true });
         },
       },
     }),

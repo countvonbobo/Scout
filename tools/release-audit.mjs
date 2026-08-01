@@ -555,6 +555,34 @@ function readAuditedRegularFile(root, file) {
   }
 }
 
+function auditedTreeDigest(root, files, directories) {
+  const records = [
+    ...directories.map((snapshot) => ({
+      type: 'directory',
+      path: normaliseRelative(root, snapshot.directory),
+      names: snapshot.names,
+    })),
+    ...files.map((record) => ({
+      type: 'file',
+      path: normaliseRelative(root, record.file),
+      mode: Number(record.identity.mode & 0o777n),
+      sha256: record.sha256,
+    })),
+  ].sort((a, b) => a.path.localeCompare(b.path, 'en') || a.type.localeCompare(b.type, 'en'));
+  return crypto.createHash('sha256').update(JSON.stringify(records)).digest('hex');
+}
+
+export function verifiedAuditTreeDigest(root) {
+  const absoluteRoot = path.resolve(root);
+  const directories = [];
+  const files = filesUnder(absoluteRoot, {
+    includeDependencies: true,
+    directorySnapshots: directories,
+  }).map((file) => ({ file, ...readAuditedRegularFile(absoluteRoot, file) }));
+  for (const snapshot of directories) verifyDirectorySnapshot(snapshot);
+  return auditedTreeDigest(absoluteRoot, files, directories);
+}
+
 export function collectTrackedFiles(root) {
   const result = spawnSync('git', ['ls-files', '-z'], { cwd: root, encoding: 'buffer', windowsHide: true });
   if (result.status !== 0) throw new Error('could not list Git-tracked files');
@@ -677,7 +705,13 @@ export function auditRelease({
   }
   for (const snapshot of traversalSnapshots) verifyDirectorySnapshot(snapshot);
   findings.sort((a, b) => a.file.localeCompare(b.file, 'en') || a.line - b.line || a.rule.localeCompare(b.rule, 'en'));
-  return { ok: findings.length === 0, filesScanned, markerCount: markers.length, findings };
+  return {
+    ok: findings.length === 0,
+    filesScanned,
+    markerCount: markers.length,
+    findings,
+    treeDigest: auditedTreeDigest(absoluteRoot, scannedFiles, traversalSnapshots),
+  };
 }
 
 function valuesAfter(flag, argv) {
@@ -712,6 +746,7 @@ export function main(argv = process.argv.slice(2), env = process.env) {
     buildDirs: stagedTree ? [] : (explicitBuildDirs.length ? explicitBuildDirs : DEFAULT_BUILD_DIRS),
   });
   process.stdout.write(`Release audit scanned ${result.filesScanned} files with ${result.markerCount} configured personal markers.\n`);
+  process.stdout.write(`Release audit tree digest: ${result.treeDigest}\n`);
   for (const finding of result.findings) process.stdout.write(`${finding.file}:${finding.line} ${finding.rule}\n`);
   process.stdout.write(result.ok ? 'Release audit passed.\n' : `Release audit failed with ${result.findings.length} finding(s).\n`);
   if (!result.ok) process.exitCode = 1;

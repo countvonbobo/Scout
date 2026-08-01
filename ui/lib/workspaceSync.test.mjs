@@ -574,6 +574,52 @@ test('Windows runtime timeout remains bounded when taskkill never closes', async
   fs.rmSync(f.base, { recursive: true, force: true });
 });
 
+test('Windows unresolved Git child keeps durable mutation authority until close', async (t) => {
+  if (process.platform !== 'win32') {
+    t.diagnostic('taskkill is Windows-specific');
+    return;
+  }
+  const f = fixture();
+  git(f.root, 'init');
+  const commandChild = new EventEmitter();
+  commandChild.pid = 2_147_482_999;
+  commandChild.exitCode = null;
+  commandChild.signalCode = null;
+  commandChild.stdout = new EventEmitter();
+  commandChild.stderr = new EventEmitter();
+  commandChild.kill = () => false;
+  const killer = new EventEmitter();
+  killer.kill = () => true;
+  const spawnAsync = async (command, args, options) => (
+    args[0] === 'commit' ? commandChild : spawnSync(command, args, options)
+  );
+
+  const result = await runWorkspaceSync(f.root, 'unresolved child checkpoint', {
+    commandTimeoutMs: 5,
+    spawnAsync,
+    _testHooks: {
+      spawnAuxiliary: () => killer,
+      auxiliaryTimeoutMs: 1,
+      closeTimeoutMs: 5,
+    },
+  });
+  assert.equal(result.state, 'needs-attention');
+  const guard = path.join(f.root, '.scout', 'mutation.guard');
+  assert.equal(fs.existsSync(guard), true);
+  assert.equal(JSON.parse(fs.readFileSync(path.join(guard, 'owner.json'), 'utf8'))
+    .childOperation.state, 'running');
+
+  const contender = await runWorkspaceSync(f.root, 'blocked successor checkpoint');
+  assert.equal(contender.pending, true);
+  assert.equal(fs.existsSync(guard), true);
+
+  commandChild.exitCode = 1;
+  commandChild.emit('close', 1);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(fs.existsSync(guard), false);
+  fs.rmSync(f.base, { recursive: true, force: true });
+});
+
 test('a stale runtime sync fence prevents the first local mutation', async () => {
   const f = fixture();
   git(f.root, 'init');
