@@ -15,7 +15,9 @@ import {
   LeaseLostError, acquireScanLease, assertCurrentFence, currentLeaseOwner,
   releaseScanLease, startLeaseHeartbeat, synchronousFenceCallback,
 } from './scanLease.mjs';
-import { withWorkspaceMutationAuthority } from './workspaceMutationAuthority.mjs';
+import {
+  withWorkspaceMutationAuthority, withWorkspaceMutationAuthorityAsync,
+} from './workspaceMutationAuthority.mjs';
 
 const SETTINGS = '.scout/sync.json';
 const STATUS = new Map();
@@ -1322,22 +1324,25 @@ export async function connectWorkspaceSync(root, { remoteUrl: value, passphrase 
     : await verifyPrivateGithubRemote(value, { ...options, cwd: root });
   const transport = verified.transport || (() => { try { return validateGithubUrl(value).transport; } catch { return 'https'; } })();
   if (transport === 'https' && !git.credentialManager) throw new Error('Install Git Credential Manager before setting up an HTTPS private backup');
-  const created = withWorkspaceMutationAuthority(root, {
+  const created = await withWorkspaceMutationAuthorityAsync(root, {
     kind: 'backup-setup', phase: 'connect-backup',
-  }, ({ coordinator }) => {
-    const guardedOptions = { ...options, mutationCoordinator: coordinator };
-    ensureRepo(root, guardedOptions);
-    untrackLegacyChats(root, guardedOptions);
-    untrackLegacyManagedInstructions(root, guardedOptions);
-    assertNoTrackedSecrets(root, guardedOptions);
-    const current = remoteUrl(root, guardedOptions);
+  }, async ({ coordinator, renew }) => {
+    const guardedOptions = {
+      ...options, mutationCoordinator: coordinator, assertFence: renew,
+    };
+    await ensureRepoAsync(root, guardedOptions);
+    await untrackLegacyChatsAsync(root, guardedOptions);
+    await untrackLegacyManagedInstructionsAsync(root, guardedOptions);
+    await assertNoTrackedSecretsAsync(root, guardedOptions);
+    const currentResult = await runtimeGit(root, ['remote', 'get-url', 'origin'], guardedOptions);
+    const current = currentResult.ok ? currentResult.stdout : null;
     if (current && !sameGithubRepository(current, verified.url)) throw new Error('This workspace is already connected to a different origin');
     if (!verified.empty && !current) throw new Error('This repository is not empty. Use Restore existing workspace instead');
     if (!current) {
-      const add = runGit(root, ['remote', 'add', 'origin', verified.url], guardedOptions);
+      const add = await runtimeGit(root, ['remote', 'add', 'origin', verified.url], guardedOptions, { mutation: true });
       if (!add.ok) throw new Error(add.error);
     } else if (current !== verified.url) {
-      const update = runGit(root, ['remote', 'set-url', 'origin', verified.url], guardedOptions);
+      const update = await runtimeGit(root, ['remote', 'set-url', 'origin', verified.url], guardedOptions, { mutation: true });
       if (!update.ok) throw new Error(update.error);
     }
     const recovery = initializeRecoveryBackup(root, passphrase, { devicePreferences: deviceBackupPreferences(options.deviceSettings) });

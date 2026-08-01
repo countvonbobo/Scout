@@ -77,7 +77,7 @@ allowlisted inputs, including a link in any ancestor component, except for the
 single exact DMG layout entry `dmg-root/Applications -> /Applications`. Regular files
 are opened without following links; ancestor and opened-file identities are
 checked before and after bytes are read. The staged-tree privacy audit applies
-the same component and identity checks and fails on any symlink. Directory
+the same component and identity checks and fails on any other symlink. Directory
 entries are bound to their enumerated identities before recursive copying.
 Windows, macOS and Linux compiler or launcher inputs are copied through this
 verified reader into the fresh stage, checked for change across compilation,

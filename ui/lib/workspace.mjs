@@ -3,7 +3,9 @@ import os from 'node:os';
 import path from 'node:path';
 import { atomicWriteFile } from './atomicWrite.mjs';
 import { normaliseScheduleDays } from './scheduler.mjs';
-import { withWorkspaceMutationAuthority } from './workspaceMutationAuthority.mjs';
+import {
+  withWorkspaceMutationAuthority, withWorkspaceMutationAuthorityAsync,
+} from './workspaceMutationAuthority.mjs';
 import { workspacePaths } from './workspacePaths.mjs';
 
 export { workspacePaths } from './workspacePaths.mjs';
@@ -201,13 +203,31 @@ export function loadWorkspaceConfig(root, { allowMissing = true } = {}) {
   return validateWorkspaceConfig(mergeWorkspaceDefaults(value));
 }
 
-export function writeWorkspaceConfig(root, config) {
+function persistWorkspaceConfig(root, config) {
   const checked = validateWorkspaceConfig(config);
+  atomicWriteFile(workspacePaths(root).config, `${JSON.stringify(checked, null, 2)}\n`);
+  return checked;
+}
+
+export function writeWorkspaceConfig(root, config) {
   return withWorkspaceMutationAuthority(root, {
     kind: 'workspace-config', phase: 'persist-config',
-  }, () => {
-    atomicWriteFile(workspacePaths(root).config, `${JSON.stringify(checked, null, 2)}\n`);
-    return workspacePaths(root).config;
+  }, () => persistWorkspaceConfig(root, config));
+}
+
+export function mutateWorkspaceConfig(root, { kind, phase }, transform) {
+  if (typeof transform !== 'function') throw new TypeError('workspace config transform is required');
+  return withWorkspaceMutationAuthority(root, { kind, phase }, () => {
+    const next = transform(loadWorkspaceConfig(root));
+    return next === null ? null : persistWorkspaceConfig(root, next);
+  });
+}
+
+export function mutateWorkspaceConfigAsync(root, { kind, phase }, transform) {
+  if (typeof transform !== 'function') throw new TypeError('workspace config transform is required');
+  return withWorkspaceMutationAuthorityAsync(root, { kind, phase }, async () => {
+    const next = await transform(loadWorkspaceConfig(root));
+    return next === null ? null : persistWorkspaceConfig(root, next);
   });
 }
 

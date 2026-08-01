@@ -574,6 +574,36 @@ test('Windows runtime timeout remains bounded when taskkill never closes', async
   fs.rmSync(f.base, { recursive: true, force: true });
 });
 
+test('backup setup publishes a concrete child identity for crash recovery', async () => {
+  const f = fixture();
+  let setupChild = null;
+  const syncSpawn = (command, args, options) => {
+    if (args[0] === 'credential-manager') return { status: 0, stdout: 'test-gcm', stderr: '' };
+    return spawnSync(command, args, options);
+  };
+  const spawnAsync = (command, args, options) => {
+    if (args[0] === 'init') {
+      setupChild = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 30000)'], options);
+      return setupChild;
+    }
+    return spawn(command, args, options);
+  };
+  const pending = connectWorkspaceSync(f.root, {
+    remoteUrl: 'https://github.com/example/setup-crash', passphrase: 'correct horse battery staple',
+  }, {
+    verifyRemote: async () => ({ url: f.remote, empty: true }),
+    spawn: syncSpawn,
+    spawnAsync,
+  });
+  await waitUntil(() => setupChild?.pid && fs.existsSync(path.join(f.root, '.scout', 'mutation.guard', 'owner.json')));
+  const guard = JSON.parse(fs.readFileSync(path.join(f.root, '.scout', 'mutation.guard', 'owner.json'), 'utf8'));
+  assert.equal(guard.childOperation.state, 'running');
+  assert.equal(guard.childOperation.owner.pid, setupChild.pid);
+  setupChild.kill();
+  await assert.rejects(pending, /git init failed|failed|SIGTERM|exit/i);
+  fs.rmSync(f.base, { recursive: true, force: true });
+});
+
 test('Windows unresolved Git child keeps durable mutation authority until close', async (t) => {
   if (process.platform !== 'win32') {
     t.diagnostic('taskkill is Windows-specific');

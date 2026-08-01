@@ -95,7 +95,7 @@ import {
 } from './lib/feedbackLearning.mjs';
 import {
   loadWorkspaceConfig, migrateWorkspace, resolveWorkspaceRoot, seedWorkspace, syncManagedInstructions,
-  workspacePaths, writeWorkspaceConfig,
+  mutateWorkspaceConfig, mutateWorkspaceConfigAsync, workspacePaths,
 } from './lib/workspace.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -2390,8 +2390,9 @@ routes['POST /api/setup/config'] = (req, res, body) => {
   const b = parseBody(body); if (!b) return replyJson(res, 400, { error: 'bad json' });
   try {
     if (!fs.existsSync(TRACKER)) seedWorkspace(APP_ROOT, WORKSPACE_ROOT);
-    const current = loadWorkspaceConfig(WORKSPACE_ROOT);
-    const next = {
+    const next = mutateWorkspaceConfig(WORKSPACE_ROOT, {
+      kind: 'setup-config', phase: 'update-config',
+    }, (current) => ({
       ...current,
       ...b,
       profile: { ...current.profile, ...(b.profile || {}) },
@@ -2407,8 +2408,7 @@ routes['POST /api/setup/config'] = (req, res, body) => {
       ai: { ...current.ai, ...(b.ai || {}), models: { ...current.ai?.models, ...(b.ai?.models || {}) } },
       schedule: b.schedule?.jobs ? { jobs: b.schedule.jobs } : current.schedule,
       setup: { ...current.setup, ...(b.setup || {}) },
-    };
-    writeWorkspaceConfig(WORKSPACE_ROOT, next);
+    }));
     void scheduleCheckpoint('update setup');
     return replyJson(res, 200, { ok: true, config: next });
   } catch (error) { return replyJson(res, 400, publicSetupConfigError(error)); }
@@ -2417,14 +2417,21 @@ routes['POST /api/setup/config'] = (req, res, body) => {
 routes['POST /api/setup/complete'] = async (req, res, body) => {
   const b = parseBody(body); if (!b) return replyJson(res, 400, { error: 'bad json' });
   try {
-    const config = loadWorkspaceConfig(WORKSPACE_ROOT);
-    if (!config.setup?.completedAt) {
-      const providers = publicProviderStatuses(await providerDetection.detect(), WORKSPACE_ROOT);
-      const readiness = setupReadiness(WORKSPACE_ROOT, config, providers, readTracker());
-      if (!readiness.ready) return replyJson(res, 409, { error: 'review and activate a complete onboarding proposal before finishing setup' });
-    }
-    config.setup = { ...config.setup, completedAt: new Date().toISOString(), completedSections: completedWorkspaceSections({ completedAt: new Date().toISOString() }) };
-    writeWorkspaceConfig(WORKSPACE_ROOT, config);
+    const config = await mutateWorkspaceConfigAsync(WORKSPACE_ROOT, {
+      kind: 'setup-complete', phase: 'complete-setup',
+    }, async (current) => {
+      if (!current.setup?.completedAt) {
+        const providers = publicProviderStatuses(await providerDetection.detect(), WORKSPACE_ROOT);
+        const readiness = setupReadiness(WORKSPACE_ROOT, current, providers, readTracker());
+        if (!readiness.ready) return null;
+      }
+      const completedAt = new Date().toISOString();
+      return {
+        ...current,
+        setup: { ...current.setup, completedAt, completedSections: completedWorkspaceSections({ completedAt }) },
+      };
+    });
+    if (config === null) return replyJson(res, 409, { error: 'review and activate a complete onboarding proposal before finishing setup' });
     if (process.platform === 'win32') {
       const device = loadDeviceSettings();
       device.completedSections['windows-startup'] = 1;
@@ -2692,11 +2699,19 @@ routes['POST /api/schedule'] = (req, res, body) => {
       }
       result = installSchedule(WORKSPACE_ROOT, b.time || '07:30', provider, { id, mode, model, days: b.days ?? null });
     } else if (b.action === 'remove') {
-      result = removeSchedule({ id });
-      if (result.ok) {
-        config.schedule.jobs = config.schedule.jobs.map((job) => job.id === id ? { ...job, enabled: false } : job);
-        writeWorkspaceConfig(WORKSPACE_ROOT, config);
-      }
+      mutateWorkspaceConfig(WORKSPACE_ROOT, {
+        kind: 'schedule-remove', phase: 'remove-schedule',
+      }, (current) => {
+        result = removeSchedule({ id });
+        if (!result.ok) return null;
+        return {
+          ...current,
+          schedule: {
+            ...current.schedule,
+            jobs: current.schedule.jobs.map((job) => job.id === id ? { ...job, enabled: false } : job),
+          },
+        };
+      });
     } else if (b.action === 'run-now') result = runScheduledNow({ id });
     else return replyJson(res, 400, { error: 'action must be install, remove, or run-now' });
     if (result.ok) void scheduleCheckpoint(`schedule ${b.action}`);

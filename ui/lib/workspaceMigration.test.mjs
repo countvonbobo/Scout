@@ -482,6 +482,25 @@ test('beta.22 rollback never accepts a substituted staging directory at final re
   assert.equal(fs.existsSync(path.join(destination, 'workspace.json')), false);
 });
 
+test('beta.22 rollback removes its owned destination when post-rename verification fails', () => {
+  const root = productionShapedWorkspace();
+  const snapshot = createBeta22WorkspaceSnapshot(root, { now: () => NOW });
+  const parent = temporaryRoot('scout-beta22-post-rename-');
+  const destination = path.join(parent, 'restored');
+  assert.throws(
+    () => materializeBeta22Rollback(root, destination, {
+      snapshotDirectory: snapshot.directory,
+      _testHooks: {
+        afterPublicationRename(target) {
+          fs.writeFileSync(path.join(target, 'unexpected.txt'), 'synthetic post-rename mutation');
+        },
+      },
+    }),
+    /publication verification failed/,
+  );
+  assert.equal(fs.existsSync(destination), false);
+});
+
 test('snapshot verification rejects tampering before creating a rollback workspace', () => {
   const root = productionShapedWorkspace();
   const snapshot = createBeta22WorkspaceSnapshot(root, { now: () => NOW });

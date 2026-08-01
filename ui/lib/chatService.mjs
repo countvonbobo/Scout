@@ -158,6 +158,7 @@ export function registerChatRoutes({
   acquireProviderWorkFn = acquireProviderWork,
   renewProviderWorkFn = renewProviderWork,
   releaseProviderWorkFn = releaseProviderWork,
+  withWorkspaceMutationAuthorityAsyncFn = withWorkspaceMutationAuthorityAsync,
 }) {
   let accepting = true;
   const activeHandlers = new Set();
@@ -199,14 +200,23 @@ export function registerChatRoutes({
   }
   async function runEditableProviderTurn(id, phase, start) {
     let turn = null;
-    const result = await withWorkspaceMutationAuthorityAsync(repoRoot, {
+    const result = await withWorkspaceMutationAuthorityAsyncFn(repoRoot, {
       kind: 'chat-provider', phase,
     }, async ({ coordinator }) => {
       let childOperation = coordinator.beginChild(phase);
       try {
         turn = start();
         if (Number.isSafeInteger(turn?.pid) && turn.pid > 0) {
-          coordinator.attachChild(childOperation, turn.pid);
+          try {
+            coordinator.attachChild(childOperation, turn.pid);
+          } catch (error) {
+            // Attachment is the durable proof that survives a Scout crash. If
+            // it cannot be published, retain authority until the spawned
+            // writer has actually closed; it must never escape unfenced.
+            try { turn.stop?.(); } catch {}
+            try { await turn.finished; } catch {}
+            throw error;
+          }
         } else {
           // Injected/test runners may not expose a process. The live authority
           // still fences their full promise lifetime in this process.

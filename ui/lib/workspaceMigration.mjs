@@ -656,6 +656,7 @@ export function materializeBeta22Rollback(root, destination, {
   verifySnapshotStorage(workspaceRoot, storage);
   const staging = `${target}.scout-rollback-${crypto.randomUUID()}`;
   if (fs.existsSync(staging)) throw new Error('beta.22 rollback staging destination already exists');
+  let publishedIdentity = null;
   try {
     verifyRollbackDestination(workspaceRoot, destinationAuthority);
     copySnapshotEntry(chosen.directory, staging, '', () => {
@@ -674,14 +675,16 @@ export function materializeBeta22Rollback(root, destination, {
     verifySnapshotStorage(workspaceRoot, storage);
     verifyRollbackDestination(workspaceRoot, destinationAuthority);
     fs.renameSync(staging, target);
-    const publishedIdentity = fs.lstatSync(target, { bigint: true });
-    if (!publishedIdentity.isDirectory()
-      || publishedIdentity.dev !== stagingIdentity.dev
-      || publishedIdentity.ino !== stagingIdentity.ino
+    const targetIdentity = fs.lstatSync(target, { bigint: true });
+    if (!targetIdentity.isDirectory()
+      || targetIdentity.dev !== stagingIdentity.dev
+      || targetIdentity.ino !== stagingIdentity.ino
       || fs.realpathSync(target) === stagingPhysical
       || within(fs.realpathSync(workspaceRoot), fs.realpathSync(target))) {
       throw new Error('beta.22 rollback publication identity changed');
     }
+    publishedIdentity = { dev: targetIdentity.dev, ino: targetIdentity.ino };
+    _testHooks.afterPublicationRename?.(target);
     verifyRollbackDestination(workspaceRoot, destinationAuthority);
     const publishedEntries = snapshotEntries(target);
     if (JSON.stringify(publishedEntries) !== JSON.stringify(manifest.entries)
@@ -697,6 +700,14 @@ export function materializeBeta22Rollback(root, destination, {
     };
   } catch (error) {
     fs.rmSync(staging, { recursive: true, force: true });
+    if (publishedIdentity !== null && fs.existsSync(target)) {
+      try {
+        const current = fs.lstatSync(target, { bigint: true });
+        if (current.dev === publishedIdentity.dev && current.ino === publishedIdentity.ino) {
+          fs.rmSync(target, { recursive: true, force: true });
+        }
+      } catch { /* preserve the publication failure; never delete an unproven replacement */ }
+    }
     throw error;
   }
 }

@@ -304,6 +304,34 @@ test('an editable provider turn holds the workspace mutation fence until its pro
   writeWorkspaceConfig(root, mergeWorkspaceDefaults());
 });
 
+test('provider attachment failure stops and observes the spawned writer before authority closes', async () => {
+  const root = tmpRoot();
+  let stopped = false;
+  let closeChild;
+  let finishCalls = 0;
+  const routes = routeFixture(root, {
+    runTurnFn: () => ({
+      pid: 4242,
+      stop() { stopped = true; closeChild({ ok: false, reasonCode: 'stopped' }); },
+      finished: new Promise((resolve) => { closeChild = resolve; }),
+    }),
+    withWorkspaceMutationAuthorityAsyncFn: async (_root, _metadata, commit) => commit({
+      coordinator: {
+        beginChild: () => 'child-operation',
+        attachChild: () => { throw new Error('synthetic attachment publication failure'); },
+        finishChild: () => { finishCalls += 1; },
+      },
+    }),
+  });
+  const response = await callRoute(
+    routes['POST /api/chat/send'],
+    JSON.stringify({ id: ID, engine: 'codex', text: 'Edit my CV' }),
+  );
+  assert.equal(stopped, true);
+  assert.equal(finishCalls, 1);
+  assert.equal(sseEvents(response.text()).at(-1).event, 'error');
+});
+
 test('chat routes reject unknown purposes and fit mode in prep chats', async () => {
   const root = tmpRoot();
   const routes = routeFixture(root);

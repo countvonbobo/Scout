@@ -36,7 +36,7 @@ import {
 } from '../ui/lib/scheduler.mjs';
 import {
   loadWorkspaceConfig, resolveWorkspaceRoot, seedWorkspace as seedWorkspaceFiles,
-  syncManagedInstructions, workspacePaths, writeWorkspaceConfig,
+  mutateWorkspaceConfig, syncManagedInstructions, workspacePaths,
 } from '../ui/lib/workspace.mjs';
 import { acquireScanLock, readScanLock, releaseScanLock } from './scan-lock.mjs';
 import { runRemoteHostingPreflight } from './remote-hosting-preflight.mjs';
@@ -431,18 +431,21 @@ function initWorkspace(root) {
 }
 
 function inferLegacyConfig(sourceRoot, targetRoot) {
-  const config = loadWorkspaceConfig(targetRoot);
-  const cv = path.join(sourceRoot, 'cv', 'master-cv.md');
-  if (fs.existsSync(cv)) {
-    const heading = fs.readFileSync(cv, 'utf8').match(/^#\s+(.+?)(?:\s+[—-]\s+|$)/m);
-    if (heading) config.profile.displayName = heading[1].trim();
-  }
-  const commute = path.join(sourceRoot, 'data', 'commute-policy.md');
-  if (fs.existsSync(commute)) {
-    const postcode = fs.readFileSync(commute, 'utf8').match(/Origin postcode[^`]*`([^`]+)`/i);
-    if (postcode) config.commute.origin = postcode[1].trim();
-  }
-  writeWorkspaceConfig(targetRoot, config);
+  return mutateWorkspaceConfig(targetRoot, {
+    kind: 'legacy-config', phase: 'infer-config',
+  }, (config) => {
+    const cv = path.join(sourceRoot, 'cv', 'master-cv.md');
+    if (fs.existsSync(cv)) {
+      const heading = fs.readFileSync(cv, 'utf8').match(/^#\s+(.+?)(?:\s+[—-]\s+|$)/m);
+      if (heading) config.profile.displayName = heading[1].trim();
+    }
+    const commute = path.join(sourceRoot, 'data', 'commute-policy.md');
+    if (fs.existsSync(commute)) {
+      const postcode = fs.readFileSync(commute, 'utf8').match(/Origin postcode[^`]*`([^`]+)`/i);
+      if (postcode) config.commute.origin = postcode[1].trim();
+    }
+    return config;
+  });
 }
 
 export function migrateLegacyWorkspace(sourceRoot, targetRoot) {
@@ -1297,35 +1300,39 @@ export function installSchedule(root, time, provider, { id = `${provider}-primar
   if (!['primary', 'second-pass'].includes(mode)) throw new Error('schedule mode must be primary or second-pass');
   model = assertSafeModel(model);
   const selectedDays = normaliseScheduleDays(days);
-  const config = loadWorkspaceConfig(root);
-  removeLegacySchedule();
-  const cli = fileURLToPath(import.meta.url);
-  if (process.platform !== 'win32') {
-    const args = [
-      cli, 'scan', '--workspace', root, '--provider', provider, '--mode', mode,
-      '--scheduled', '--schedule-id', id,
-    ];
-    if (model) args.push('--model', model);
-    const result = registerUnixSchedule({ id, platform: process.platform, command: process.execPath, args, workingDirectory: APP_ROOT, time, timezone: config.timezone, days: selectedDays });
-    if (result.ok) {
-      config.schedule.jobs = [...config.schedule.jobs.filter((job) => job.id !== id), { id, enabled: true, time, days: selectedDays, provider, mode, model: model || null }];
-      writeWorkspaceConfig(root, config);
+  let result;
+  mutateWorkspaceConfig(root, {
+    kind: 'schedule-install', phase: 'install-schedule',
+  }, (config) => {
+    removeLegacySchedule();
+    const cli = fileURLToPath(import.meta.url);
+    if (process.platform !== 'win32') {
+      const args = [
+        cli, 'scan', '--workspace', root, '--provider', provider, '--mode', mode,
+        '--scheduled', '--schedule-id', id,
+      ];
+      if (model) args.push('--model', model);
+      result = registerUnixSchedule({ id, platform: process.platform, command: process.execPath, args, workingDirectory: APP_ROOT, time, timezone: config.timezone, days: selectedDays });
+    } else {
+      const scriptFile = path.join(os.tmpdir(), `scout-task-${process.pid}.ps1`);
+      fs.writeFileSync(scriptFile, schedulerRegistrationScript(), 'utf8');
+      try {
+        const argumentsText = `"${cli}" scan --workspace "${root}" --provider ${provider} --mode ${mode} --scheduled --schedule-id ${id}${model ? ` --model ${model}` : ''}`;
+        result = registerDailySchedule({ id, scriptFile, command: process.execPath, argumentsText, workingDirectory: APP_ROOT, time, days: selectedDays });
+      } finally {
+        fs.rmSync(scriptFile, { force: true });
+      }
     }
-    return result;
-  }
-  const scriptFile = path.join(os.tmpdir(), `scout-task-${process.pid}.ps1`);
-  fs.writeFileSync(scriptFile, schedulerRegistrationScript(), 'utf8');
-  try {
-    const argumentsText = `"${cli}" scan --workspace "${root}" --provider ${provider} --mode ${mode} --scheduled --schedule-id ${id}${model ? ` --model ${model}` : ''}`;
-    const result = registerDailySchedule({ id, scriptFile, command: process.execPath, argumentsText, workingDirectory: APP_ROOT, time, days: selectedDays });
-    if (result.ok) {
-      config.schedule.jobs = [...config.schedule.jobs.filter((job) => job.id !== id), { id, enabled: true, time, days: selectedDays, provider, mode, model: model || null }];
-      writeWorkspaceConfig(root, config);
-    }
-    return result;
-  } finally {
-    fs.rmSync(scriptFile, { force: true });
-  }
+    if (!result.ok) return null;
+    return {
+      ...config,
+      schedule: {
+        ...config.schedule,
+        jobs: [...config.schedule.jobs.filter((job) => job.id !== id), { id, enabled: true, time, days: selectedDays, provider, mode, model: model || null }],
+      },
+    };
+  });
+  return result;
 }
 
 function print(value) { process.stdout.write(`${typeof value === 'string' ? value : JSON.stringify(value, null, 2)}\n`); }
@@ -1460,11 +1467,20 @@ async function main() {
       runs: config.schedule.jobs.map((job) => ({ ...job, ...scheduleStatus({ id: job.id }) })),
     });
     if (action === 'remove') {
-      const result = removeSchedule({ id });
-      if (result.ok) {
-        config.schedule.jobs = config.schedule.jobs.map((job) => job.id === id ? { ...job, enabled: false } : job);
-        writeWorkspaceConfig(root, config);
-      }
+      let result;
+      mutateWorkspaceConfig(root, {
+        kind: 'schedule-remove', phase: 'remove-schedule',
+      }, (current) => {
+        result = removeSchedule({ id });
+        if (!result.ok) return null;
+        return {
+          ...current,
+          schedule: {
+            ...current.schedule,
+            jobs: current.schedule.jobs.map((job) => job.id === id ? { ...job, enabled: false } : job),
+          },
+        };
+      });
       return print(result);
     }
     if (action === 'run-now') return print(runScheduledNow({ id }));

@@ -2014,10 +2014,13 @@ test('a scheduled queued run remains bound to its claimed inputs when workspace 
         });
       } else {
         const config = loadWorkspaceConfig(root);
-        writeWorkspaceConfig(root, {
+        // Simulate an out-of-band legacy writer. Supported config writers are
+        // now excluded by the scan authority, but claim binding must still be
+        // robust to bytes changed outside Scout's coordinated APIs.
+        fs.writeFileSync(path.join(root, 'workspace.json'), `${JSON.stringify({
           ...config,
           triage: { ...config.triage, checkScore: Number(config.triage.checkScore) + 1 },
-        });
+        }, null, 2)}\n`);
       }
       return {
         generatedAt: '2026-07-28T09:00:00.000Z',

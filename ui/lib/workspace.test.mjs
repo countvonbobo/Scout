@@ -5,7 +5,8 @@ import path from 'node:path';
 import { afterEach, test } from 'node:test';
 import {
   CURRENT_WORKSPACE_SCHEMA, backupWorkspace, defaultWorkspaceRoot, ensureWorkspaceDirectories, mergeWorkspaceDefaults, migrateWorkspace, resolveWorkspaceRoot,
-  modelForProvider, syncManagedInstructions, validateWorkspaceConfig, workspacePaths, writeWorkspaceConfig,
+  modelForProvider, mutateWorkspaceConfig, mutateWorkspaceConfigAsync, syncManagedInstructions,
+  validateWorkspaceConfig, workspacePaths, writeWorkspaceConfig,
 } from './workspace.mjs';
 import { withWorkspaceMutationAuthorityAsync } from './workspaceMutationAuthority.mjs';
 
@@ -73,6 +74,33 @@ test('workspace config writes cannot cross an active mutation authority', async 
   await active;
   writeWorkspaceConfig(root, mergeWorkspaceDefaults());
   assert.equal(JSON.parse(fs.readFileSync(path.join(root, 'workspace.json'), 'utf8')).schemaVersion, CURRENT_WORKSPACE_SCHEMA);
+});
+
+test('async config read-modify-write excludes a concurrent disjoint update', async () => {
+  const root = temp();
+  writeWorkspaceConfig(root, mergeWorkspaceDefaults());
+  let entered;
+  const transformEntered = new Promise((resolve) => { entered = resolve; });
+  let release;
+  const first = mutateWorkspaceConfigAsync(root, {
+    kind: 'first-config', phase: 'update-config',
+  }, async (current) => {
+    entered();
+    await new Promise((resolve) => { release = resolve; });
+    return { ...current, locale: 'en-US' };
+  });
+  await transformEntered;
+  assert.throws(
+    () => mutateWorkspaceConfig(root, {
+      kind: 'second-config', phase: 'update-config',
+    }, (current) => ({ ...current, currency: 'USD' })),
+    /another workspace mutation is in progress/,
+  );
+  release();
+  await first;
+  const saved = JSON.parse(fs.readFileSync(path.join(root, 'workspace.json'), 'utf8'));
+  assert.equal(saved.locale, 'en-US');
+  assert.equal(saved.currency, 'GBP');
 });
 
 test('search-profile migration backups use a distinct reviewable label', () => {
