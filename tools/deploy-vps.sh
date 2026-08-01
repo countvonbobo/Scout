@@ -103,6 +103,8 @@ rollback() {
       git -C "$app_root" checkout --detach "$previous_commit" || rollback_failed=1
     fi
     (cd "$app_root" && npm ci --omit=dev) || rollback_failed=1
+    (cd "$app_root" && node tools/typst-runtime.mjs install) || rollback_failed=1
+    (cd "$app_root" && node tools/typst-runtime.mjs verify --compile) || rollback_failed=1
     previous_version=$(cd "$app_root" && node -p "require('./package.json').version") || rollback_failed=1
     sudo -n systemctl restart "$service" || rollback_failed=1
     rollback_healthy=false
