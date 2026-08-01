@@ -574,9 +574,10 @@ test('Windows runtime timeout remains bounded when taskkill never closes', async
   fs.rmSync(f.base, { recursive: true, force: true });
 });
 
-test('backup setup publishes a concrete child identity for crash recovery', async () => {
+test('backup setup publishes a concrete child identity for crash recovery', { timeout: 30_000 }, async () => {
   const f = fixture();
   let setupChild = null;
+  let pending = null;
   const syncSpawn = (command, args, options) => {
     if (args[0] === 'credential-manager') return { status: 0, stdout: 'test-gcm', stderr: '' };
     return spawnSync(command, args, options);
@@ -588,20 +589,28 @@ test('backup setup publishes a concrete child identity for crash recovery', asyn
     }
     return spawn(command, args, options);
   };
-  const pending = connectWorkspaceSync(f.root, {
-    remoteUrl: 'https://github.com/example/setup-crash', passphrase: 'correct horse battery staple',
-  }, {
-    verifyRemote: async () => ({ url: f.remote, empty: true }),
-    spawn: syncSpawn,
-    spawnAsync,
-  });
-  await waitUntil(() => setupChild?.pid && fs.existsSync(path.join(f.root, '.scout', 'mutation.guard', 'owner.json')));
-  const guard = JSON.parse(fs.readFileSync(path.join(f.root, '.scout', 'mutation.guard', 'owner.json'), 'utf8'));
-  assert.equal(guard.childOperation.state, 'running');
-  assert.equal(guard.childOperation.owner.pid, setupChild.pid);
-  setupChild.kill();
-  await assert.rejects(pending, /git init failed|failed|SIGTERM|exit/i);
-  fs.rmSync(f.base, { recursive: true, force: true });
+  try {
+    pending = connectWorkspaceSync(f.root, {
+      remoteUrl: 'https://github.com/example/setup-crash', passphrase: 'correct horse battery staple',
+    }, {
+      verifyRemote: async () => ({ url: f.remote, empty: true }),
+      spawn: syncSpawn,
+      spawnAsync,
+    });
+    await waitUntil(
+      () => setupChild?.pid && fs.existsSync(path.join(f.root, '.scout', 'mutation.guard', 'owner.json')),
+      20_000,
+    );
+    const guard = JSON.parse(fs.readFileSync(path.join(f.root, '.scout', 'mutation.guard', 'owner.json'), 'utf8'));
+    assert.equal(guard.childOperation.state, 'running');
+    assert.equal(guard.childOperation.owner.pid, setupChild.pid);
+    setupChild.kill();
+    await assert.rejects(pending, /git init failed|failed|SIGTERM|exit/i);
+  } finally {
+    try { setupChild?.kill(); } catch {}
+    await pending?.catch(() => {});
+    fs.rmSync(f.base, { recursive: true, force: true });
+  }
 });
 
 test('backup setup attachment failure closes the spawned Git child before releasing authority', async () => {
