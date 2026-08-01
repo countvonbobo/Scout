@@ -496,20 +496,21 @@ test('runtime command timeout terminates the process tree and awaits parent clos
     "const fs = require('node:fs');",
     `const child = spawn(process.execPath, ['-e', ${JSON.stringify(grandchildScript)}, process.argv[1]], { stdio: 'ignore', windowsHide: true });`,
     "fs.writeFileSync(process.argv[2], String(child.pid));",
-    'setTimeout(() => process.exit(0), 800);',
+    'setInterval(() => {}, 1000);',
   ].join(' ');
   const spawnAsync = async (command, args, options) => {
     if (args[0] !== 'commit') return spawnSync(command, args, options);
+    return commandProcess;
+  };
+
+  try {
     commandProcess = spawn(process.execPath, ['-e', parentScript, sentinel, grandchildPidFile], {
       detached: process.platform !== 'win32',
       windowsHide: true,
       stdio: ['ignore', 'pipe', 'pipe'],
     });
     commandProcess.once('close', () => { commandClosed = true; });
-    return commandProcess;
-  };
-
-  try {
+    await waitUntil(() => fs.existsSync(grandchildPidFile));
     const result = await runWorkspaceSync(f.root, 'timed process-tree checkpoint', {
       commandTimeoutMs: 50,
       spawnAsync,
