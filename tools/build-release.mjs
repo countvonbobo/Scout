@@ -341,6 +341,27 @@ export function auditStageBeforePackaging(stageDir, {
   }
 }
 
+export function removeAuditedStage(stageDir) {
+  const root = path.resolve(stageDir);
+  if (!path.basename(root).includes('.audited-') || !fs.existsSync(root)) return;
+  const restore = (entry) => {
+    const stat = fs.lstatSync(entry);
+    if (stat.isDirectory()) {
+      fs.chmodSync(entry, 0o755);
+      for (const name of fs.readdirSync(entry)) restore(path.join(entry, name));
+    } else if (!stat.isSymbolicLink()) fs.chmodSync(entry, stat.mode | 0o200);
+  };
+  restore(root);
+  fs.rmSync(root, { recursive: true, force: true });
+}
+
+export function assertAuditedStage(audit) {
+  if (!audit?.stageDir || !/^[a-f0-9]{64}$/.test(String(audit.treeDigest || ''))
+    || verifiedAuditTreeDigest(audit.stageDir) !== audit.treeDigest) {
+    throw new Error('audited release payload differs from the privacy-authorized snapshot');
+  }
+}
+
 export function stagePublicSource({
   root = DEFAULT_ROOT,
   stageDir = path.join(root, 'dist', 'release', 'public-source'),
@@ -572,26 +593,32 @@ export function buildInstaller({ root = DEFAULT_ROOT, stageDir, version, isccPat
   }
   const audit = auditStageBeforePackaging(staged.stageDir);
   const auditedStage = audit.stageDir;
-  const auditedPayloadDigest = verifiedReleaseTreeDigest(auditedStage);
-  const outputDir = path.join(root, 'installer', 'output');
-  fs.rmSync(outputDir, { recursive: true, force: true });
-  fs.mkdirSync(outputDir, { recursive: true });
-  const iscc = isccPath || findIscc();
-  if (!iscc) throw new Error('Inno Setup 6 was not found; install it or set ISCC_PATH');
-  const selectedVersion = checkedVersion(version || process.env.SCOUT_VERSION || packageVersion(root));
-  const result = spawnSync(iscc, [
-    `/DMyAppVersion=${selectedVersion}`,
-    `/DStageDir=${auditedStage}`,
-    `/DIconFile=${path.join(auditedStage, path.relative(staged.stageDir, stagedIcon))}`,
-    `/DOutputDir=${outputDir}`,
-    path.join(auditedStage, path.relative(staged.stageDir, installerSource)),
-  ], { cwd: auditedStage, encoding: 'utf8', windowsHide: true });
-  if (result.status !== 0) throw new Error(`Inno Setup failed:\n${String(result.stdout || '')}\n${String(result.stderr || '')}`.trim());
-  if (verifiedReleaseTreeDigest(auditedStage) !== auditedPayloadDigest) {
-    throw new Error('audited Windows release payload changed during packaging');
+  try {
+    assertAuditedStage(audit);
+    const auditedPayloadDigest = verifiedReleaseTreeDigest(auditedStage);
+    const outputDir = path.join(root, 'installer', 'output');
+    fs.rmSync(outputDir, { recursive: true, force: true });
+    fs.mkdirSync(outputDir, { recursive: true });
+    const iscc = isccPath || findIscc();
+    if (!iscc) throw new Error('Inno Setup 6 was not found; install it or set ISCC_PATH');
+    const selectedVersion = checkedVersion(version || process.env.SCOUT_VERSION || packageVersion(root));
+    const result = spawnSync(iscc, [
+      `/DMyAppVersion=${selectedVersion}`,
+      `/DStageDir=${auditedStage}`,
+      `/DIconFile=${path.join(auditedStage, path.relative(staged.stageDir, stagedIcon))}`,
+      `/DOutputDir=${outputDir}`,
+      path.join(auditedStage, path.relative(staged.stageDir, installerSource)),
+    ], { cwd: auditedStage, encoding: 'utf8', windowsHide: true });
+    if (result.status !== 0) throw new Error(`Inno Setup failed:\n${String(result.stdout || '')}\n${String(result.stderr || '')}`.trim());
+    if (verifiedReleaseTreeDigest(auditedStage) !== auditedPayloadDigest) {
+      throw new Error('audited Windows release payload changed during packaging');
+    }
+    assertAuditedStage(audit);
+    const checksums = writeChecksums(outputDir);
+    return { ...staged, outputDir, checksums, version: selectedVersion };
+  } finally {
+    removeAuditedStage(auditedStage);
   }
-  const checksums = writeChecksums(outputDir);
-  return { ...staged, outputDir, checksums, version: selectedVersion };
 }
 
 function valueAfter(flag, argv) {

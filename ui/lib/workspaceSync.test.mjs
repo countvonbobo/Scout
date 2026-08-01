@@ -621,10 +621,9 @@ test('Windows unresolved Git child keeps durable mutation authority until close'
   const originalRename = fs.renameSync;
   let cleanupContended = false;
   fs.renameSync = (source, destination) => {
-    if (!cleanupContended && String(source).endsWith('mutation.guard')
-      && String(destination).includes('mutation.guard.cleanup.')) {
+    if (!cleanupContended && String(destination).endsWith(path.join('mutation.guard', 'owner.json'))) {
       cleanupContended = true;
-      throw Object.assign(new Error('injected late guard cleanup contention'), { code: 'EPERM' });
+      throw Object.assign(new Error('injected late guard metadata contention'), { code: 'EPERM' });
     }
     return originalRename(source, destination);
   };

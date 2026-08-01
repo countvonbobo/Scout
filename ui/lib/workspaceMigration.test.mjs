@@ -6,7 +6,10 @@ import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { afterEach, test } from 'node:test';
 import { publishSearchProfile } from './searchProfile.mjs';
-import { acquireScanLease, currentLeaseOwner } from './scanLease.mjs';
+import { emptyChat, saveChat } from './chatStore.mjs';
+import { emptyCompanyTimeline } from './companyTimeline.mjs';
+import { saveCompanyTimeline } from './companyStore.mjs';
+import { acquireScanLease, currentLeaseOwner, releaseScanLease } from './scanLease.mjs';
 import {
   createBeta22WorkspaceSnapshot,
   materializeBeta22Rollback,
@@ -213,6 +216,26 @@ test('beta.22 snapshot rejects special files and oversized regular files before 
   );
 });
 
+test('beta.22 snapshot excludes chat and company writers for its full capture', () => {
+  const root = productionShapedWorkspace();
+  let checked = false;
+  createBeta22WorkspaceSnapshot(root, {
+    now: () => NOW,
+    _testHooks: {
+      beforeCopy(relative) {
+        if (checked || relative !== 'workspace.json') return;
+        checked = true;
+        assert.throws(() => saveChat(root, 'synthetic-role-2026-08', emptyChat('codex')), /mutation/i);
+        assert.throws(
+          () => saveCompanyTimeline(root, 'Synthetic Company', emptyCompanyTimeline('Synthetic Company')),
+          /mutation/i,
+        );
+      },
+    },
+  });
+  assert.equal(checked, true);
+});
+
 test('beta.22 snapshot rejects same-size source mutation during file copying', () => {
   const root = productionShapedWorkspace();
   const source = path.join(root, 'logs', 'large-provider.log');
@@ -404,6 +427,28 @@ test('beta.22 rollback rejects snapshot-root substitution after validation', (t)
   assert.equal(fs.existsSync(destination), false);
 });
 
+test('beta.22 rollback rejects destination-parent substitution after validation', () => {
+  const root = productionShapedWorkspace();
+  const snapshot = createBeta22WorkspaceSnapshot(root, { now: () => NOW });
+  const parent = temporaryRoot('scout-beta22-destination-parent-');
+  const moved = temporaryRoot('scout-beta22-destination-parent-moved-');
+  fs.rmSync(moved, { recursive: true });
+  const destination = path.join(parent, 'restored');
+  assert.throws(
+    () => materializeBeta22Rollback(root, destination, {
+      snapshotDirectory: snapshot.directory,
+      _testHooks: {
+        afterStorageValidation() {
+          fs.renameSync(parent, moved);
+          fs.mkdirSync(parent);
+        },
+      },
+    }),
+    /destination changed during materialization/,
+  );
+  assert.equal(fs.existsSync(destination), false);
+});
+
 test('snapshot verification rejects tampering before creating a rollback workspace', () => {
   const root = productionShapedWorkspace();
   const snapshot = createBeta22WorkspaceSnapshot(root, { now: () => NOW });
@@ -488,6 +533,27 @@ test('historical vacancies are re-ranked in an immutable profile artifact withou
   assert.equal(repeated.created, false);
   assert.ok(fs.readFileSync(trackerFile).equals(beforeTracker));
   assert.ok(fs.readFileSync(runsFile).equals(beforeRuns));
+});
+
+test('historical ranking cannot publish after its lease is superseded', () => {
+  const root = productionShapedWorkspace();
+  const profile = publishedProfile();
+  const stale = acquireScanLease(root, currentLeaseOwner(), {
+    kind: 'search-plan-mutation', runId: 'stale-ranking-run', phase: 'publish',
+  });
+  releaseScanLease(stale);
+  const successor = acquireScanLease(root, currentLeaseOwner(), {
+    kind: 'scan', runId: 'ranking-successor', phase: 'assessment',
+  });
+  try {
+    assert.throws(
+      () => rerankHistoricalVacancies(root, profile, { lease: stale, renew: () => {} }),
+      /lease/i,
+    );
+    assert.equal(fs.existsSync(path.join(root, 'profile', 'search', 'rankings', `${profile.id}.json`)), false);
+  } finally {
+    releaseScanLease(successor);
+  }
 });
 
 test('the public CLI creates and materialises the verified beta.22 rollback path', () => {

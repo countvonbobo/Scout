@@ -98,11 +98,17 @@ The maintained beta deployment uses one private, single-owner Ubuntu VPS:
   snapshot before profile state changes. The snapshot preserves the documented
   private workspace boundaries, including encrypted `.scout-backup` recovery
   data, but omits `profile/search` and fenced `.scout` runtime state.
+  Snapshot capture holds the shared workspace mutation authority; CV, import,
+  chat, company, environment and ranking publishers must acquire that same
+  authority before changing any included path. Historical ranking renews and
+  rechecks the publication lease before its immutable artifact is written.
   Publishing writes a separate immutable historical-ranking
   artifact for the new profile; it never rewrites tracker or scan decisions
   and labels unreconstructable old profile/scoring provenance as legacy.
   Rollback validation materialises only into a new workspace outside the live
-  root, verifies every copied digest, and leaves the newer workspace untouched.
+  root, pins and rechecks both source-storage and destination-ancestor
+  identities throughout copying, verifies every copied digest, and leaves the
+  newer workspace untouched.
 - Assessment work is split into stable provider batches of at most ten jobs,
   with smaller deterministic batches when the context budget requires them.
   The strict provider-neutral schema accepts nuanced responsibility fit,
@@ -200,6 +206,9 @@ Access details differ by operator and must be discovered from the private operat
 2. Use a disposable synthetic workspace for tests; never point development tests at the authoritative workspace.
 3. Implement the change with regression coverage and update affected documentation and in-app guidance.
 4. Run the complete test suite, release privacy audit, packaging checks, and relevant manual acceptance. For a workspace-format release, also migrate a production-shaped synthetic workspace, materialise its beta.22 rollback into a separate directory, compare every manifest digest and prove the live synthetic workspace retained its newer data.
+   Platform packagers consume only the audit-created content snapshot, recheck
+   its privacy-authorized digest immediately before and after packaging, and
+   remove the sealed snapshot in a `finally` path.
 5. Commit intentionally, push the branch, and open a pull request against `main`.
 6. For release rehearsal, update the protected `codex/release-candidate` branch to the reviewed commit.
 7. Tag the reviewed package version. The protected release workflow builds every platform, deploys the exact tag to the VPS, verifies health and rollback, and only then publishes.

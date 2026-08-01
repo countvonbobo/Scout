@@ -6,7 +6,7 @@ import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { isMainModule } from '../ui/lib/mainModule.mjs';
 import {
-  auditStageBeforePackaging, copyVerifiedReleaseFile, sha256, stageRelease,
+  assertAuditedStage, auditStageBeforePackaging, copyVerifiedReleaseFile, removeAuditedStage, sha256, stageRelease,
   verifiedReleaseFileDigest, verifiedReleaseTreeDigest, writeChecksums,
 } from './build-release.mjs';
 
@@ -45,13 +45,19 @@ export function buildMac({ arch = process.arch, nodeExecutable = process.execPat
   fs.symlinkSync('/Applications', path.join(stage, 'dmg-root', 'Applications'));
   const audit = auditStageBeforePackaging(stage);
   const auditedStage = audit.stageDir;
-  const auditedPayloadDigest = verifiedMacDmgRootDigest(path.join(auditedStage, 'dmg-root'));
-  const output = path.join(ROOT, 'installer', 'output'); fs.mkdirSync(output, { recursive: true }); const name = arch === 'arm64' ? artifactNames().macArm : artifactNames().macIntel;
-  run('hdiutil', ['create', '-volname', 'Scout', '-srcfolder', path.join(auditedStage, 'dmg-root'), '-ov', '-format', 'UDZO', path.join(output, name)]);
-  if (verifiedMacDmgRootDigest(path.join(auditedStage, 'dmg-root')) !== auditedPayloadDigest) {
-    throw new Error('audited macOS package root changed during packaging');
+  try {
+    assertAuditedStage(audit);
+    const auditedPayloadDigest = verifiedMacDmgRootDigest(path.join(auditedStage, 'dmg-root'));
+    const output = path.join(ROOT, 'installer', 'output'); fs.mkdirSync(output, { recursive: true }); const name = arch === 'arm64' ? artifactNames().macArm : artifactNames().macIntel;
+    run('hdiutil', ['create', '-volname', 'Scout', '-srcfolder', path.join(auditedStage, 'dmg-root'), '-ov', '-format', 'UDZO', path.join(output, name)]);
+    if (verifiedMacDmgRootDigest(path.join(auditedStage, 'dmg-root')) !== auditedPayloadDigest) {
+      throw new Error('audited macOS package root changed during packaging');
+    }
+    assertAuditedStage(audit);
+    return { output: path.join(output, name), sha256: sha256(path.join(output, name)) };
+  } finally {
+    removeAuditedStage(auditedStage);
   }
-  return { output: path.join(output, name), sha256: sha256(path.join(output, name)) };
 }
 
 function launcher(rootExpression) {
@@ -96,13 +102,19 @@ export function buildLinux({ nodeExecutable = process.execPath } = {}) {
   }
   const audit = auditStageBeforePackaging(stage);
   const auditedStage = audit.stageDir;
-  const auditedPayloadDigest = verifiedReleaseTreeDigest(auditedStage);
-  run('dpkg-deb', ['--build', '--root-owner-group', path.join(auditedStage, path.relative(stage, pkg)), deb]);
-  const tar = path.join(output, artifactNames().linuxTar); run('tar', ['-czf', tar, '-C', auditedStage, path.basename(portable)]);
-  if (verifiedReleaseTreeDigest(auditedStage) !== auditedPayloadDigest) {
-    throw new Error('audited Linux release payload changed during packaging');
+  try {
+    assertAuditedStage(audit);
+    const auditedPayloadDigest = verifiedReleaseTreeDigest(auditedStage);
+    run('dpkg-deb', ['--build', '--root-owner-group', path.join(auditedStage, path.relative(stage, pkg)), deb]);
+    const tar = path.join(output, artifactNames().linuxTar); run('tar', ['-czf', tar, '-C', auditedStage, path.basename(portable)]);
+    if (verifiedReleaseTreeDigest(auditedStage) !== auditedPayloadDigest) {
+      throw new Error('audited Linux release payload changed during packaging');
+    }
+    assertAuditedStage(audit);
+    writeChecksums(output); return { deb, tar };
+  } finally {
+    removeAuditedStage(auditedStage);
   }
-  writeChecksums(output); return { deb, tar };
 }
 
 const isMain = isMainModule(import.meta.url);

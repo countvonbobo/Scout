@@ -12,6 +12,9 @@ import {
   recoverPendingProfilePublications,
 } from './lib/profilePublication.mjs';
 import { rerankHistoricalVacancies } from './lib/workspaceMigration.mjs';
+import {
+  withWorkspaceMutationAuthority, withWorkspaceMutationAuthorityAsync,
+} from './lib/workspaceMutationAuthority.mjs';
 import { codexDeepLinkCapability } from './lib/codexDeepLink.mjs';
 import { triage } from './lib/derive.mjs';
 import { emptyTrackerView, pipeline } from './lib/pipeline.mjs';
@@ -22,7 +25,8 @@ import {
   scanHealthFromText,
 } from './lib/scanHealth.mjs';
 import {
-  acquireScanLease, currentLeaseOwner, readScanLease, releaseScanLease, startLeaseHeartbeat,
+  acquireScanLease, currentLeaseOwner, readScanLease, releaseScanLease, renewScanLease,
+  startLeaseHeartbeat,
 } from './lib/scanLease.mjs';
 import { scanEstimate } from './lib/scanEstimate.mjs';
 import { createProviderHealthMonitor, scheduleStatus, scheduleSummary } from './lib/scheduler.mjs';
@@ -1999,7 +2003,10 @@ routes['POST /api/search-profile/publish'] = (req, res, body) => {
       const published = publishSearchProfile(draft);
       const lanePlan = reconcileSearchLanePlan(loadSearchLanePlan(WORKSPACE_ROOT), published);
       const employerRegistry = employerRegistryForPublishedProfile(published);
-      const historicalRerank = rerankHistoricalVacancies(WORKSPACE_ROOT, published);
+      const historicalRerank = rerankHistoricalVacancies(WORKSPACE_ROOT, published, {
+        lease,
+        renew: () => renewScanLease(lease),
+      });
       const config = loadWorkspaceConfig(WORKSPACE_ROOT);
       const nextConfig = {
         ...config,
@@ -2278,7 +2285,11 @@ routes['POST /api/cv/save'] = (req, res, body) => {
   if (path.resolve(abs) === path.resolve(WORKSPACE.cv, 'master-cv.md') && Buffer.byteLength(b.content.trim(), 'utf8') < 500) {
     return replyJson(res, 409, { error: 'The master CV is empty or incomplete. Scout kept the existing file; restore the reviewed proposal or enter at least 500 bytes before saving.' });
   }
-  try { atomicWriteFile(abs, b.content); } catch { return replyJson(res, 500, publicApiError('CV file could not be saved.')); }
+  try {
+    withWorkspaceMutationAuthority(WORKSPACE_ROOT, {
+      kind: 'cv-save', phase: 'persist-cv',
+    }, () => atomicWriteFile(abs, b.content));
+  } catch { return replyJson(res, 500, publicApiError('CV file could not be saved.')); }
   void scheduleCheckpoint(`edit cv - ${b.path}`);
   replyJson(res, 200, { ok: true, savedLocally: true, syncQueued: true });
 };
@@ -2588,16 +2599,22 @@ routes['POST /api/setup/import-cv'] = (req, res, body) => {
   let bytes;
   try { bytes = Buffer.from(encoded, 'base64'); } catch { return replyJson(res, 400, { error: 'invalid base64' }); }
   if (!bytes.length || bytes.length > 10 * 1024 * 1024) return replyJson(res, 400, { error: 'CV must be between 1 byte and 10 MB' });
-  fs.mkdirSync(WORKSPACE.imports, { recursive: true });
   const imported = path.join(WORKSPACE.imports, name);
-  atomicWriteFile(imported, bytes, { mode: 0o600 });
-  extractCvText(imported).then((text) => {
+  void withWorkspaceMutationAuthorityAsync(WORKSPACE_ROOT, {
+    kind: 'cv-import', phase: 'import-cv',
+  }, async () => {
+    fs.mkdirSync(WORKSPACE.imports, { recursive: true });
+    atomicWriteFile(imported, bytes, { mode: 0o600 });
+    let text;
+    try { text = await extractCvText(imported); }
+    catch (error) { fs.rmSync(imported, { force: true }); throw error; }
     const extracted = path.join(WORKSPACE.imports, `${name}.txt`);
     atomicWriteFile(extracted, `${text}\n`, { mode: 0o600 });
+    return { text, extracted };
+  }).then(({ text, extracted }) => {
     void scheduleCheckpoint(`import cv - ${name}`);
     replyJson(res, 200, { ok: true, source: `imports/${name}`, extracted: `imports/${path.basename(extracted)}`, text });
   }).catch((error) => {
-    fs.rmSync(imported, { force: true });
     replyJson(res, 400, publicCvImportError(error));
   });
 };

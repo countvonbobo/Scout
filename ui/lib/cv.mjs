@@ -4,6 +4,7 @@ import fs from 'node:fs';
 import { spawn, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { atomicWriteFile } from './atomicWrite.mjs';
+import { withWorkspaceMutationAuthorityAsync } from './workspaceMutationAuthority.mjs';
 import { resolveTypstRuntime } from './typstRuntime.mjs';
 
 const SLUG = /^[a-z0-9-]+$/;
@@ -160,21 +161,25 @@ export async function renderCvTarget(root, request, {
   appRoot = DEFAULT_APP_ROOT, runtimeResolver = resolveTypstRuntime, spawnImpl = spawn,
   timeoutMs = RENDER_TIMEOUT_MS, now, signal = null,
 } = {}) {
-  signal?.throwIfAborted();
-  const descriptor = prepareTarget(root, checkedTarget(root, request));
-  const runtime = runtimeResolver({ appRoot });
-  if (!runtime.available) throw new Error(runtime.error || "Scout's Typst runtime is unavailable. Repair or reinstall Scout.");
-  const temp = temporaryPdf(descriptor.pdf);
-  try {
-    await runTypst(runtime.command, compileArgs(root, descriptor, temp), {
-      cwd: root, timeoutMs, spawnImpl, signal,
-    });
-    return finishRender(root, descriptor, temp, now);
-  } catch (error) {
-    fs.rmSync(temp, { force: true });
-    if (error?.code === 'ENOENT') throw new Error("Scout's Typst runtime disappeared while rendering. Repair or reinstall Scout.");
-    throw error;
-  }
+  return withWorkspaceMutationAuthorityAsync(root, {
+    kind: 'cv-render', phase: 'render-cv',
+  }, async () => {
+    signal?.throwIfAborted();
+    const descriptor = prepareTarget(root, checkedTarget(root, request));
+    const runtime = runtimeResolver({ appRoot });
+    if (!runtime.available) throw new Error(runtime.error || "Scout's Typst runtime is unavailable. Repair or reinstall Scout.");
+    const temp = temporaryPdf(descriptor.pdf);
+    try {
+      await runTypst(runtime.command, compileArgs(root, descriptor, temp), {
+        cwd: root, timeoutMs, spawnImpl, signal,
+      });
+      return finishRender(root, descriptor, temp, now);
+    } catch (error) {
+      fs.rmSync(temp, { force: true });
+      if (error?.code === 'ENOENT') throw new Error("Scout's Typst runtime disappeared while rendering. Repair or reinstall Scout.");
+      throw error;
+    }
+  });
 }
 
 // The CLI quality command may block its own short-lived process, but server routes use renderCvTarget.

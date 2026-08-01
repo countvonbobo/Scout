@@ -580,7 +580,7 @@ function replaceGuard(guard, next) {
   guard.metadata = next;
 }
 
-function guardController(guard) {
+function guardController(guard, releaseScheduler = setTimeout) {
   let scopeClosed = false;
   let childReleaseDeferred = false;
   return Object.freeze({
@@ -618,7 +618,7 @@ function guardController(guard) {
     },
     finishChild(operationId) {
       if (guard.metadata.childOperation === null && scopeClosed && childReleaseDeferred) {
-        releaseGuard(guard);
+        releaseGuard(guard, releaseScheduler);
         childReleaseDeferred = false;
         return;
       }
@@ -627,7 +627,7 @@ function guardController(guard) {
       }
       replaceGuard(guard, { ...guard.metadata, childOperation: null });
       if (scopeClosed) {
-        releaseGuard(guard);
+        releaseGuard(guard, releaseScheduler);
         childReleaseDeferred = false;
       }
     },
@@ -635,44 +635,51 @@ function guardController(guard) {
       if (scopeClosed) return;
       scopeClosed = true;
       if (guard.metadata.childOperation !== null && childReleaseDeferred) return;
-      releaseGuard(guard);
+      releaseGuard(guard, releaseScheduler);
     },
   });
 }
 
-function releaseGuard(guard) {
-  const current = readGuard(guard.directory);
-  if (stableJson(current) !== stableJson(guard.metadata)) {
-    throw new MutationCoordinatorBusyError('workspace mutation coordinator ownership changed');
-  }
-  if (current.childOperation !== null) {
-    throw new MutationCoordinatorBusyError('workspace mutation child operation has not closed');
-  }
-  const quarantine = `${guard.directory}.cleanup.${randomUUID()}`;
-  fs.renameSync(guard.directory, quarantine);
-  const moved = readGuard(quarantine);
-  if (stableJson(moved) !== stableJson(guard.metadata)) {
-    if (!fs.existsSync(guard.directory)) fs.renameSync(quarantine, guard.directory);
-    throw new MutationCoordinatorBusyError('workspace mutation coordinator ownership changed during release');
-  }
-  try {
-    fs.rmSync(quarantine, { recursive: true, force: true });
-  } catch {
-    // The canonical authority is already retired. A uniquely named, fully
-    // identified quarantine is harmless and can be reclaimed on startup.
-  }
+function releaseGuard(guard, scheduler = setTimeout) {
+  let delay = 25;
+  const retry = () => {
+    const current = readGuard(guard.directory);
+    if (stableJson(current) !== stableJson(guard.metadata)) {
+      throw new MutationCoordinatorBusyError('workspace mutation coordinator ownership changed');
+    }
+    if (current.childOperation !== null) {
+      throw new MutationCoordinatorBusyError('workspace mutation child operation has not closed');
+    }
+    const quarantine = `${guard.directory}.cleanup.${randomUUID()}`;
+    try {
+      fs.renameSync(guard.directory, quarantine);
+    } catch (error) {
+      if (!['EBUSY', 'EPERM', 'EACCES'].includes(error?.code)) throw error;
+      delay = Math.min(delay * 2, 1_000);
+      const timer = scheduler(() => { try { retry(); } catch {} }, delay);
+      timer.unref?.();
+      return;
+    }
+    const moved = readGuard(quarantine);
+    if (stableJson(moved) !== stableJson(guard.metadata)) {
+      if (!fs.existsSync(guard.directory)) fs.renameSync(quarantine, guard.directory);
+      throw new MutationCoordinatorBusyError('workspace mutation coordinator ownership changed during release');
+    }
+    try { fs.rmSync(quarantine, { recursive: true, force: true }); } catch {}
+  };
+  retry();
 }
 
 function assertFence(lease) {
   return assertCurrentFence(lease, synchronousFenceCallback(() => true));
 }
 
-export function withMutationCoordinator(root, lease, commit) {
+export function withMutationCoordinator(root, lease, commit, { releaseScheduler = setTimeout } = {}) {
   if (typeof commit !== 'function') throw new TypeError('workspace mutation coordinator callback is required');
   assertScanLeaseScope(lease, root, lease?.runId);
   assertFence(lease);
   const guard = createGuard(root, lease);
-  const controller = guardController(guard);
+  const controller = guardController(guard, releaseScheduler);
   let result;
   try {
     assertFence(lease);

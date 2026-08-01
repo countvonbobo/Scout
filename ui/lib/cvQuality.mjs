@@ -2,6 +2,7 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { atomicWriteFile } from './atomicWrite.mjs';
+import { withWorkspaceMutationAuthority } from './workspaceMutationAuthority.mjs';
 import { renderCv } from './cv.mjs';
 
 const SLUG = /^[a-z0-9-]+$/;
@@ -164,6 +165,9 @@ export function assessCvSource(source, manifest, { locale = 'en-GB', pdfExists =
 export function runCvQuality(root, slug, {
   locale = 'en-GB', compile = true, now = () => new Date().toISOString(), appRoot,
 } = {}) {
+  return withWorkspaceMutationAuthority(root, {
+    kind: 'cv-quality', phase: 'review-cv',
+  }, () => {
   const paths = cvQualityPaths(root, slug);
   if (!fs.existsSync(paths.source)) throw new Error(`CV source does not exist: applications/${slug}/cv.typ`);
   let render = { ok: fs.existsSync(paths.pdf), stdout: '', stderr: '' };
@@ -192,6 +196,7 @@ export function runCvQuality(root, slug, {
   };
   atomicWriteFile(paths.quality, `${JSON.stringify(report, null, 2)}\n`);
   return report;
+  });
 }
 
 export function readCvQuality(root, slug) {
@@ -215,6 +220,9 @@ export function readCvQuality(root, slug) {
 }
 
 export function overrideCvQuality(root, slug, expectedHash, { now = () => new Date().toISOString() } = {}) {
+  return withWorkspaceMutationAuthority(root, {
+    kind: 'cv-quality', phase: 'override-cv',
+  }, () => {
   const paths = cvQualityPaths(root, slug);
   const current = readCvQuality(root, slug);
   const hash = current.currentCvSha256 || current.cvSha256;
@@ -231,6 +239,7 @@ export function overrideCvQuality(root, slug, expectedHash, { now = () => new Da
   report.override = { cvSha256: hash, acceptedAt: now() };
   atomicWriteFile(paths.quality, `${JSON.stringify(report, null, 2)}\n`);
   return readCvQuality(root, slug);
+  });
 }
 
 export function cvDownloadDecision(root, slug) {

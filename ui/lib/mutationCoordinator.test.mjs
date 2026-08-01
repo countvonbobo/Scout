@@ -234,22 +234,32 @@ test('guard publication failure never exposes an unverifiable canonical director
   assert.equal(withMutationCoordinator(root, lease, () => 'recovered'), 'recovered');
 });
 
-test('guard removal contention retires canonical authority before cleanup', () => {
+test('guard detach contention retries before admitting a successor', () => {
   const { root, lease } = fixture();
-  const originalRemove = fs.rmSync;
+  const originalRename = fs.renameSync;
   let injected = false;
-  fs.rmSync = (target, options) => {
-    if (!injected && String(target).includes('mutation.guard.cleanup.')) {
+  fs.renameSync = (source, destination) => {
+    if (!injected && String(source).endsWith('mutation.guard')
+      && String(destination).includes('mutation.guard.cleanup.')) {
       injected = true;
-      throw Object.assign(new Error('injected quarantine cleanup contention'), { code: 'EPERM' });
+      throw Object.assign(new Error('injected guard detach contention'), { code: 'EPERM' });
     }
-    return originalRemove(target, options);
+    return originalRename(source, destination);
   };
+  const scheduled = [];
   try {
-    assert.equal(withMutationCoordinator(root, lease, () => 'first'), 'first');
+    assert.equal(withMutationCoordinator(root, lease, () => 'first', {
+      releaseScheduler(callback) {
+        scheduled.push(callback);
+        return { unref() {} };
+      },
+    }), 'first');
   } finally {
-    fs.rmSync = originalRemove;
+    fs.renameSync = originalRename;
   }
+  assert.equal(scheduled.length, 1);
+  assert.equal(fs.existsSync(path.join(root, '.scout', 'mutation.guard')), true);
+  scheduled.shift()();
   assert.equal(fs.existsSync(path.join(root, '.scout', 'mutation.guard')), false);
   assert.equal(withMutationCoordinator(root, lease, () => 'successor'), 'successor');
 });

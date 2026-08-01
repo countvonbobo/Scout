@@ -32,7 +32,7 @@ test('platform packaging consumes verified staged inputs and audits payloads bef
   assert.match(build, /path\.join\(stage, 'app\/ui\/assets\/scout-icon\.png'\)/);
   assert.match(
     build.match(/export function buildMac[\s\S]*?return \{ output/)?.[0] || '',
-    /auditStageBeforePackaging\(stage\)[\s\S]*fs\.symlinkSync\('\/Applications'/,
+    /fs\.symlinkSync\('\/Applications'[\s\S]*auditStageBeforePackaging\(stage\)/,
   );
 });
 

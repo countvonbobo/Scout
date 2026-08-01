@@ -7,6 +7,9 @@ import { filterVacancies } from './vacancyFilter.mjs';
 import { rankVacancies } from './vacancyRank.mjs';
 import { workspacePaths } from './workspace.mjs';
 import { withWorkspaceMutationAuthority } from './workspaceMutationAuthority.mjs';
+import {
+  assertCurrentFence, renewScanLease, synchronousFenceCallback,
+} from './scanLease.mjs';
 
 export const BETA22_COMPATIBLE_VERSION = '0.1.0-beta.22';
 const SNAPSHOT_SCHEMA_VERSION = 1;
@@ -67,6 +70,43 @@ function snapshotBudget(physicalRoot = null) {
     totalBytes: 0,
     physicalRoot: physicalRoot ? fs.realpathSync(physicalRoot) : null,
   };
+}
+
+function captureRollbackDestination(workspaceRoot, target) {
+  const parent = path.dirname(path.resolve(target));
+  if (!fs.existsSync(parent)) throw new Error('beta.22 rollback destination parent must already exist');
+  const entries = [];
+  let current = parent;
+  while (true) {
+    const stat = fs.lstatSync(current, { bigint: true });
+    if (stat.isSymbolicLink() || !stat.isDirectory()) {
+      throw new Error('beta.22 rollback destination ancestry is redirected');
+    }
+    entries.push({ entry: current, physical: fs.realpathSync(current), stat });
+    const next = path.dirname(current);
+    if (next === current) break;
+    current = next;
+  }
+  const physicalTarget = physicalDestination(target);
+  const physicalRoot = fs.realpathSync(workspaceRoot);
+  if (within(physicalRoot, physicalTarget)) {
+    throw new Error('beta.22 rollback must use a separate workspace outside the live workspace');
+  }
+  return { target: path.resolve(target), physicalTarget, entries };
+}
+
+function verifyRollbackDestination(workspaceRoot, authority) {
+  const current = captureRollbackDestination(workspaceRoot, authority.target);
+  if (current.physicalTarget !== authority.physicalTarget
+    || current.entries.length !== authority.entries.length
+    || current.entries.some((entry, index) => (
+      entry.entry !== authority.entries[index].entry
+      || entry.physical !== authority.entries[index].physical
+      || entry.stat.dev !== authority.entries[index].stat.dev
+      || entry.stat.ino !== authority.entries[index].stat.ino
+    ))) {
+    throw new Error('beta.22 rollback destination changed during materialization');
+  }
 }
 
 function sameSnapshotIdentity(left, right) {
@@ -599,6 +639,7 @@ export function materializeBeta22Rollback(root, destination, {
     throw new Error('beta.22 rollback must use a separate workspace outside the live workspace');
   }
   if (fs.existsSync(target)) throw new Error('beta.22 rollback destination must not already exist');
+  const destinationAuthority = captureRollbackDestination(workspaceRoot, target);
   const chosen = snapshotDirectory
     ? { directory: path.resolve(snapshotDirectory) }
     : latestBeta22WorkspaceSnapshot(workspaceRoot);
@@ -616,7 +657,12 @@ export function materializeBeta22Rollback(root, destination, {
   const staging = `${target}.scout-rollback-${crypto.randomUUID()}`;
   if (fs.existsSync(staging)) throw new Error('beta.22 rollback staging destination already exists');
   try {
-    copySnapshotEntry(chosen.directory, staging, '', () => {});
+    verifyRollbackDestination(workspaceRoot, destinationAuthority);
+    copySnapshotEntry(chosen.directory, staging, '', () => {
+      verifyRollbackDestination(workspaceRoot, destinationAuthority);
+      verifySnapshotStorage(workspaceRoot, storage);
+    });
+    verifyRollbackDestination(workspaceRoot, destinationAuthority);
     verifySnapshotStorage(workspaceRoot, storage);
     const copiedEntries = snapshotEntries(staging);
     if (JSON.stringify(copiedEntries) !== JSON.stringify(manifest.entries)
@@ -624,6 +670,7 @@ export function materializeBeta22Rollback(root, destination, {
       throw new Error('beta.22 rollback copy verification failed');
     }
     verifySnapshotStorage(workspaceRoot, storage);
+    verifyRollbackDestination(workspaceRoot, destinationAuthority);
     fs.renameSync(staging, target);
     return {
       compatibleVersion: BETA22_COMPATIBLE_VERSION,
@@ -774,7 +821,20 @@ function publicHistoricalRank(item, profile) {
   };
 }
 
-export function rerankHistoricalVacancies(root, profile, { now = () => new Date().toISOString() } = {}) {
+export function rerankHistoricalVacancies(root, profile, {
+  now = () => new Date().toISOString(), lease = null, renew = null, _authorized = false,
+} = {}) {
+  if (!lease && !_authorized) {
+    return withWorkspaceMutationAuthority(root, {
+      kind: 'historical-ranking', phase: 'rerank-history',
+    }, (authority) => rerankHistoricalVacancies(root, profile, {
+      now, renew: authority.renew, _authorized: true,
+    }));
+  }
+  const renewAuthority = renew || (() => renewScanLease(lease));
+  const fencedWrite = (commit) => (lease
+    ? assertCurrentFence(lease, synchronousFenceCallback(commit))
+    : commit());
   if (!profile || profile.status !== 'published' || !profile.id) {
     throw new Error('historical re-ranking requires a published search profile');
   }
@@ -792,12 +852,15 @@ export function rerankHistoricalVacancies(root, profile, { now = () => new Date(
     return { artifactPath, created: false, totals: existing.totals };
   }
   const paths = workspacePaths(root);
+  renewAuthority();
   const trackerBytes = fs.readFileSync(paths.tracker);
   const scanRunBytes = fs.existsSync(paths.scanRuns) ? fs.readFileSync(paths.scanRuns) : null;
   const vacancies = collectHistoricalVacancies(root);
+  renewAuthority();
   const filtered = filterVacancies(vacancies, profile);
   const ranked = rankVacancies(filtered.eligible, profile, vacancies)
     .map((item) => publicHistoricalRank(item, profile));
+  renewAuthority();
   const excludedById = new Map();
   for (const exclusion of filtered.excluded) {
     const key = String(exclusion.vacancyId);
@@ -840,9 +903,11 @@ export function rerankHistoricalVacancies(root, profile, { now = () => new Date(
     ranked,
     excluded,
   };
-  fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
-  fs.chmodSync(directory, 0o700);
-  atomicWriteFile(artifactPath, `${JSON.stringify(artifact, null, 2)}\n`, { mode: 0o600 });
+  fencedWrite(() => {
+    fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
+    fs.chmodSync(directory, 0o700);
+    atomicWriteFile(artifactPath, `${JSON.stringify(artifact, null, 2)}\n`, { mode: 0o600 });
+  });
   return {
     artifactPath,
     created: true,

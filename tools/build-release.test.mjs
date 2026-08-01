@@ -5,11 +5,12 @@ import path from 'node:path';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 import {
+  assertAuditedStage,
   auditStageBeforePackaging,
   auditPublicSourceStage,
   includePublicSourcePath, includeReleasePath, productionDependencyFilter, productionLockfile,
   productionPackageManifest, PUBLIC_SOURCE_FILES, RELEASE_FILES,
-  sha256, stagePublicSource, stageRelease, verifiedReleaseTreeDigest, writeChecksums,
+  removeAuditedStage, sha256, stagePublicSource, stageRelease, verifiedReleaseTreeDigest, writeChecksums,
 } from './build-release.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -248,6 +249,11 @@ test('packaging consumes the audit-created read-only content snapshot', () => {
     () => fs.writeFileSync(path.join(audit.stageDir, 'a.txt'), 'mutation'),
     /EACCES|EPERM|permission denied/i,
   );
+  fs.chmodSync(audit.stageDir, 0o755);
+  fs.chmodSync(path.join(audit.stageDir, 'a.txt'), 0o644);
+  fs.writeFileSync(path.join(audit.stageDir, 'a.txt'), 'SyntheticPackagingMarker');
+  assert.throws(() => assertAuditedStage(audit), /privacy-authorized snapshot/);
+  removeAuditedStage(audit.stageDir);
 });
 
 test('public and release staging refuse allowlisted leaf symlinks', () => {
