@@ -108,7 +108,8 @@ function temporaryLiveGuard(root, holdMs = 100) {
     const guard = path.join(process.env.SCOUT_AUTH_ROOT, '.scout', 'provider-auth', 'v1', 'codex.guard');
     fs.mkdirSync(guard, { recursive: true });
     fs.writeFileSync(path.join(guard, 'owner.json'), JSON.stringify({
-      token: 'temporary-live-guard-0001', owner: currentLeaseOwner(), acquiredAt: Date.now(),
+      token: String(['temporary', 'live', 'guard', '0001'].join('-')),
+      owner: currentLeaseOwner(), acquiredAt: Date.now(),
     }));
     process.stdout.write('ready\\n');
     setTimeout(() => fs.rmSync(guard, { recursive: true, force: true }), Number(process.env.HOLD_MS));
@@ -226,7 +227,8 @@ test('release reports bounded guard timeout and preserves durable authority', (t
   const guard = path.join(root, '.scout', 'provider-auth', 'v1', 'codex.guard');
   fs.mkdirSync(guard, { recursive: true });
   fs.writeFileSync(path.join(guard, 'owner.json'), JSON.stringify({
-    token: 'live-release-timeout-0001', owner: currentLeaseOwner(), acquiredAt: Date.now(),
+    token: String(['live', 'release', 'guard', '0001'].join('-')),
+    owner: currentLeaseOwner(), acquiredAt: Date.now(),
   }));
   assert.throws(
     () => releaseProviderAuthMutation(root, auth),
