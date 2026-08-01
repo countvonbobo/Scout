@@ -27,6 +27,15 @@ const WINDOWS_QA_HOME = windowsHome('ScoutQA');
 const MAC_EXAMPLE_HOME = unixHome('Users', 'example');
 const LINUX_EXAMPLE_HOME = unixHome('home', 'example');
 
+async function waitUntil(predicate, timeoutMs = 1_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (predicate()) return;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  throw new Error('timed out waiting for provider command fixture');
+}
+
 test('provider commands allow Windows resolution to choose native executables or cmd shims', () => {
   assert.equal(providerCommand('codex', 'win32'), 'codex.cmd');
   assert.equal(providerCommand('claude', 'linux'), 'claude');
@@ -80,7 +89,7 @@ test('provider command timeout escalates but does not settle before child closur
     },
   });
   pending.then(() => { settled = true; });
-  await new Promise((resolve) => setTimeout(resolve, 35));
+  await waitUntil(() => processGroupSignals.length === 2);
   assert.equal(settled, false);
   child.emit('close', null);
   const result = await pending;

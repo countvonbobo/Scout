@@ -83,6 +83,15 @@ async function waitUntil(predicate, timeoutMs = 5_000) {
   throw new Error('timed out waiting for backup coordination fixture');
 }
 
+function processExists(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return error?.code === 'EPERM';
+  }
+}
+
 function commitRawIndexEntry(root, relative, mode, contentOrOid, message) {
   let oid = contentOrOid;
   if (mode !== '160000') {
@@ -473,22 +482,25 @@ function terminateTestProcessTree(child) {
 test('runtime command timeout terminates the process tree and awaits parent close', async () => {
   const f = fixture();
   const sentinel = path.join(f.base, 'surviving-grandchild.txt');
+  const grandchildPidFile = path.join(f.base, 'grandchild.pid');
   git(f.root, 'init');
   let commandProcess;
   let commandClosed = false;
   const grandchildScript = [
     "const fs = require('node:fs');",
     "const destination = process.argv[1];",
-    "setTimeout(() => fs.writeFileSync(destination, 'survived'), 400);",
+    "setTimeout(() => fs.writeFileSync(destination, 'survived'), 5000);",
   ].join(' ');
   const parentScript = [
     "const { spawn } = require('node:child_process');",
-    `spawn(process.execPath, ['-e', ${JSON.stringify(grandchildScript)}, process.argv[1]], { stdio: 'ignore', windowsHide: true });`,
+    "const fs = require('node:fs');",
+    `const child = spawn(process.execPath, ['-e', ${JSON.stringify(grandchildScript)}, process.argv[1]], { stdio: 'ignore', windowsHide: true });`,
+    "fs.writeFileSync(process.argv[2], String(child.pid));",
     'setTimeout(() => process.exit(0), 800);',
   ].join(' ');
   const spawnAsync = async (command, args, options) => {
     if (args[0] !== 'commit') return spawnSync(command, args, options);
-    commandProcess = spawn(process.execPath, ['-e', parentScript, sentinel], {
+    commandProcess = spawn(process.execPath, ['-e', parentScript, sentinel, grandchildPidFile], {
       detached: process.platform !== 'win32',
       windowsHide: true,
       stdio: ['ignore', 'pipe', 'pipe'],
@@ -506,7 +518,9 @@ test('runtime command timeout terminates the process tree and awaits parent clos
     assert.equal(result.state, 'needs-attention');
     assert.equal(result.pending, true);
     assert.equal(commandClosed, true, 'sync must await the timed-out parent close event');
-    await new Promise((resolve) => setTimeout(resolve, 550));
+    assert.equal(fs.existsSync(grandchildPidFile), true, 'fixture must start a transport grandchild');
+    const grandchildPid = Number(fs.readFileSync(grandchildPidFile, 'utf8'));
+    assert.equal(processExists(grandchildPid), false, 'a timed-out transport grandchild must be terminated');
     assert.equal(fs.existsSync(sentinel), false, 'a timed-out transport grandchild must not outlive sync');
   } finally {
     terminateTestProcessTree(commandProcess);
