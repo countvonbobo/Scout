@@ -342,13 +342,17 @@ const Scout = {
     return (e.sources && e.sources[0]) ? this.safeHref(e.sources[0]) : '';
   },
 
-  async loadOpportunities() {
+  async loadOpportunities({ durableRuns: suppliedRuns, durableQueue: suppliedQueue } = {}) {
     const [data, cvFiles, latest, durableRuns, durableQueue, feedbackLearning] = await Promise.all([
       this.api('/api/opportunities'),
       this.api('/api/cv'),
       this.api('/api/scans/latest').catch(() => ({ scan: null })),
-      this.api('/api/scan/runs').catch(() => ({ state: 'waiting', runs: [] })),
-      this.api('/api/scan/queue').catch(() => ({ state: 'waiting', requests: [] })),
+      suppliedRuns === undefined
+        ? this.api('/api/scan/runs').catch(() => ({ state: 'waiting', runs: [] }))
+        : Promise.resolve(suppliedRuns),
+      suppliedQueue === undefined
+        ? this.api('/api/scan/queue').catch(() => ({ state: 'waiting', requests: [] }))
+        : Promise.resolve(suppliedQueue),
       this.api('/api/feedback-learning').catch(() => null),
     ]);
     this.state.data = data;
@@ -553,21 +557,32 @@ const Scout = {
       if (!reconcileMissing) return;
       // Operation IDs are process-local. After a restart, reconcile against
       // durable run/queue state before deciding whether submission is safe.
-      this.scanRunning = false;
-      await this.loadOpportunities();
-      const activeRun = this.scanRuns.some(
+      const [durableRuns, durableQueue] = await Promise.all([
+        this.api('/api/scan/runs'),
+        this.api('/api/scan/queue'),
+      ]);
+      if (!durableRuns || !Array.isArray(durableRuns.runs)
+        || !durableQueue || !Array.isArray(durableQueue.requests)) {
+        throw new Error('durable scan state is invalid');
+      }
+      const activeRun = durableRuns.runs.some(
         (run) => !['complete', 'partial', 'abandoned', 'failed'].includes(run.state),
       );
-      const queued = this.scanQueue.requests.some((request) => request.status === 'queued');
+      const queued = durableQueue.requests.some(
+        (request) => ['queued', 'claimed', 'legacy-claimed'].includes(request.status),
+      );
       if (activeRun || queued) {
         this.scanRunning = true;
         if (button) { button.disabled = true; button.textContent = 'Scanning…'; }
+        await this.loadOpportunities({ durableRuns, durableQueue });
         this.scanOperationTimer = setTimeout(
           () => this.reattachScanOperation({ reconcileMissing: true }),
           1000,
         );
         return;
       }
+      this.scanRunning = false;
+      await this.loadOpportunities({ durableRuns, durableQueue });
       if (button) { button.disabled = false; button.textContent = 'Scan now'; }
     } catch {
       if (!reconcileMissing) return;

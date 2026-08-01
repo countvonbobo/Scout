@@ -262,3 +262,74 @@ test('missing operation re-enables scanning only after durable state is idle', a
   await expect(page.locator('#scan-now')).toBeEnabled();
   await expect.poll(() => page.evaluate(() => window.Scout.scanRunning)).toBe(false);
 });
+
+test('missing operation stays fenced when durable scan state is unavailable', async ({ page }) => {
+  await page.waitForFunction(() => Boolean(window.Scout.state.data));
+  let reconciliationRequests = 0;
+  let runsRequests = 0;
+  let queueRequests = 0;
+  await page.route('**/api/operations/scan-unknown-after-restart', (route) => route.fulfill({
+    status: 404, contentType: 'application/json', body: '{"error":"operation not found"}',
+  }));
+  await page.route('**/api/operations?type=scan', (route) => {
+    reconciliationRequests += 1;
+    return route.fulfill({ contentType: 'application/json', body: '{"operation":null,"operations":[]}' });
+  });
+  await page.route('**/api/scan/runs', (route) => {
+    runsRequests += 1;
+    return route.fulfill(runsRequests % 2 === 1
+      ? { status: 503, contentType: 'application/json', body: '{"error":"durable scan state needs attention"}' }
+      : { contentType: 'application/json', body: '{"state":"waiting","runs":[]}' });
+  });
+  await page.route('**/api/scan/queue', (route) => {
+    queueRequests += 1;
+    return route.fulfill(queueRequests % 2 === 0
+      ? { status: 503, contentType: 'application/json', body: '{"error":"durable queue state needs attention"}' }
+      : { contentType: 'application/json', body: '{"state":"waiting","requests":[]}' });
+  });
+  await page.waitForTimeout(500);
+  await page.evaluate(() => {
+    clearTimeout(window.Scout.scanOperationTimer);
+    window.Scout.scanOperationTimer = null;
+  });
+  reconciliationRequests = 0;
+  runsRequests = 0;
+  queueRequests = 0;
+  await page.evaluate(() => window.Scout.watchScanOperation('scan-unknown-after-restart'));
+  await expect.poll(() => reconciliationRequests).toBeGreaterThan(1);
+  expect(runsRequests).toBeGreaterThan(1);
+  expect(queueRequests).toBeGreaterThan(1);
+  await expect(page.locator('#scan-now')).toBeDisabled();
+  await expect.poll(() => page.evaluate(() => window.Scout.scanRunning)).toBe(true);
+});
+
+test('claimed durable queue work remains fenced before a recovered run exists', async ({ page }) => {
+  await page.waitForFunction(() => Boolean(window.Scout.state.data));
+  await page.route('**/api/operations/scan-claimed-before-restart', (route) => route.fulfill({
+    status: 404, contentType: 'application/json', body: '{"error":"operation not found"}',
+  }));
+  await page.route('**/api/operations?type=scan', (route) => route.fulfill({
+    contentType: 'application/json', body: '{"operation":null,"operations":[]}',
+  }));
+  await page.route('**/api/scan/runs', (route) => route.fulfill({
+    contentType: 'application/json', body: '{"state":"waiting","runs":[]}',
+  }));
+  await page.route('**/api/scan/queue', (route) => route.fulfill({
+    contentType: 'application/json', body: JSON.stringify({
+      state: 'claimed',
+      requests: [
+        { id: 'claimed-request', status: 'claimed' },
+        { id: 'legacy-claimed-request', status: 'legacy-claimed' },
+      ],
+    }),
+  }));
+  await page.waitForTimeout(500);
+  await page.evaluate(() => {
+    clearTimeout(window.Scout.scanOperationTimer);
+    window.Scout.scanOperationTimer = null;
+    window.Scout.watchScanOperation('scan-claimed-before-restart');
+  });
+  await page.waitForTimeout(1500);
+  await expect(page.locator('#scan-now')).toBeDisabled();
+  await expect.poll(() => page.evaluate(() => window.Scout.scanRunning)).toBe(true);
+});
