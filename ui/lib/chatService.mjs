@@ -18,6 +18,7 @@ import {
 import { loadWorkspaceConfig, modelForProvider } from './workspace.mjs';
 import { detectProviderModelCataloguesAsync, providerStatus } from './providers.mjs';
 import { runStructuredTurn } from './structuredTurn.mjs';
+import { withWorkspaceMutationAuthorityAsync } from './workspaceMutationAuthority.mjs';
 import { recordProviderResultHealth } from './providerHealth.mjs';
 import {
   acquireProviderWork, assertProviderAuthIdle, createProviderWorkSupervisor,
@@ -195,6 +196,30 @@ export function registerChatRoutes({
       renew: renewProviderWorkFn,
       release: releaseProviderWorkFn,
     });
+  }
+  async function runEditableProviderTurn(id, phase, start) {
+    let turn = null;
+    const result = await withWorkspaceMutationAuthorityAsync(repoRoot, {
+      kind: 'chat-provider', phase,
+    }, async ({ coordinator }) => {
+      let childOperation = coordinator.beginChild(phase);
+      try {
+        turn = start();
+        if (Number.isSafeInteger(turn?.pid) && turn.pid > 0) {
+          coordinator.attachChild(childOperation, turn.pid);
+        } else {
+          // Injected/test runners may not expose a process. The live authority
+          // still fences their full promise lifetime in this process.
+          coordinator.finishChild(childOperation);
+          childOperation = null;
+        }
+        running.set(id, turn);
+        return await turn.finished;
+      } finally {
+        if (childOperation !== null) coordinator.finishChild(childOperation);
+      }
+    });
+    return { turn, result };
   }
   async function observeProviderResult(provider, result) {
     try {
@@ -452,38 +477,38 @@ export function registerChatRoutes({
     sseSend(res, 'status', { message: `asking ${from} for a handoff summary…` });
     let t1;
     let work1;
-    try {
-      work1 = superviseProviderWork(from);
-      t1 = runTurnFn({
-        ...engineBuild(from, chat.cliSessionId),
-        prompt: HANDOFF_SUMMARY_PROMPT,
-        cwd: repoRoot,
-        parseLine: ENGINES[from].parse,
-        onEvent: () => {},
-      });
-      work1.setFailureHandler(() => t1.stop?.());
-    } catch (e) {
-      if (work1) await work1.release();
-      sseSend(res, 'error', {
-        message: turnStartMessage(e, 'Handoff summary could not start.'),
-      });
-      return sseEnd(res);
-    }
-    running.set(id, t1);
     let r1;
     let r1Health;
     let r1LifecycleError = null;
+    let r1StartError = null;
     try {
-      r1 = await t1.finished;
+      work1 = superviseProviderWork(from);
+      const execution = await runEditableProviderTurn(id, 'chat-handoff-summary', () => {
+        t1 = runTurnFn({
+          ...engineBuild(from, chat.cliSessionId),
+          prompt: HANDOFF_SUMMARY_PROMPT,
+          cwd: repoRoot,
+          parseLine: ENGINES[from].parse,
+          onEvent: () => {},
+        });
+        work1.setFailureHandler(() => t1.stop?.());
+        return t1;
+      });
+      r1 = execution.result;
       work1.assertCurrent();
       r1Health = r1;
     } catch (e) {
       r1LifecycleError = e;
       r1Health = e;
+      if (!t1) r1StartError = e;
       r1 = { ok: false, reasonCode: 'provider-error' };
     } finally {
       if (running.get(id) === t1) running.delete(id);
-      await work1.release(r1LifecycleError);
+      if (work1) await work1.release(r1LifecycleError);
+    }
+    if (r1StartError) {
+      sseSend(res, 'error', { message: turnStartMessage(r1StartError, 'Handoff summary could not start.') });
+      return sseEnd(res);
     }
     await observeProviderResult(from, r1Health);
     if (!accepting) {
@@ -520,39 +545,41 @@ export function registerChatRoutes({
       : `${selectedEntryContext(selected)}\n\n${handoff}`;
     let t2;
     let work2;
-    try {
-      work2 = superviseProviderWork(to);
-      t2 = runTurnFn({
-        ...engineBuild(to, null),
-        prompt: opening,
-        cwd: repoRoot,
-        parseLine: ENGINES[to].parse,
-        onEvent: (ev) => { if (ev.kind === 'delta') sseSend(res, 'delta', { text: ev.text }); },
-      });
-      work2.setFailureHandler(() => t2.stop?.());
-    } catch (e) {
-      if (work2) await work2.release();
-      const message = turnStartMessage(e, 'Handoff provider turn could not start.');
-      appendMessage(chat, 'system', message, nowIso());
-      try { saveChatFn(repoRoot, id, chat, purpose); } catch { /* the earlier handoff state is already persisted */ }
-      sseSend(res, 'error', { message, engine: to, sessionId: chat.cliSessionId });
-      return sseEnd(res);
-    }
-    running.set(id, t2);
     let r2;
     let r2Health;
     let r2LifecycleError = null;
+    let r2StartError = null;
     try {
-      r2 = await t2.finished;
+      work2 = superviseProviderWork(to);
+      const execution = await runEditableProviderTurn(id, 'chat-handoff-resume', () => {
+        t2 = runTurnFn({
+          ...engineBuild(to, null),
+          prompt: opening,
+          cwd: repoRoot,
+          parseLine: ENGINES[to].parse,
+          onEvent: (ev) => { if (ev.kind === 'delta') sseSend(res, 'delta', { text: ev.text }); },
+        });
+        work2.setFailureHandler(() => t2.stop?.());
+        return t2;
+      });
+      r2 = execution.result;
       work2.assertCurrent();
       r2Health = r2;
     } catch (e) {
       r2LifecycleError = e;
       r2Health = e;
+      if (!t2) r2StartError = e;
       r2 = { ok: false, reasonCode: 'provider-error' };
     } finally {
       if (running.get(id) === t2) running.delete(id);
-      await work2.release(r2LifecycleError);
+      if (work2) await work2.release(r2LifecycleError);
+    }
+    if (r2StartError) {
+      const message = turnStartMessage(r2StartError, 'Handoff provider turn could not start.');
+      appendMessage(chat, 'system', message, nowIso());
+      try { saveChatFn(repoRoot, id, chat, purpose); } catch { /* the earlier handoff state is already persisted */ }
+      sseSend(res, 'error', { message, engine: to, sessionId: chat.cliSessionId });
+      return sseEnd(res);
     }
     await observeProviderResult(to, r2Health);
 
@@ -626,43 +653,44 @@ export function registerChatRoutes({
     }
     const attemptedModel = model || modelForProvider(loadWorkspaceConfig(repoRoot), engine);
     let turn;
-    try {
-      turn = runTurnFn({
-        ...built,
-        prompt: entry.id === ONBOARDING_CHAT_ID
-          ? text
-          : purpose === 'interview-prep'
-            ? `${selectedEntryContext(entry)}\n\n${interviewPrepAgentPrompt(entry, text)}`
-            : `${selectedEntryContext(entry)}\n\nUser request:\n${text}`,
-        cwd: repoRoot,
-        parseLine: ENGINES[engine].parse,
-        onEvent: (ev) => {
-          if (ev.kind === 'delta') sseSend(res, 'delta', { text: ev.text });
-          if (ev.kind === 'tool') sseSend(res, 'tool', publicToolProjection(ev));
-        },
-      });
-      providerWork.setFailureHandler(() => turn.stop?.());
-    } catch (error) {
-      await providerWork.release();
-      sseSend(res, 'error', { message: turnStartMessage(error, 'Provider turn could not start.') });
-      return sseEnd(res);
-    }
-    running.set(id, turn);
-    stopTurnOnDisconnect(req, res, id);
     let r;
     let healthResult;
     let lifecycleError = null;
     try {
-      r = await turn.finished;
+      const execution = await runEditableProviderTurn(id, 'chat-edit', () => {
+        turn = runTurnFn({
+          ...built,
+          prompt: entry.id === ONBOARDING_CHAT_ID
+            ? text
+            : purpose === 'interview-prep'
+              ? `${selectedEntryContext(entry)}\n\n${interviewPrepAgentPrompt(entry, text)}`
+              : `${selectedEntryContext(entry)}\n\nUser request:\n${text}`,
+          cwd: repoRoot,
+          parseLine: ENGINES[engine].parse,
+          onEvent: (ev) => {
+            if (ev.kind === 'delta') sseSend(res, 'delta', { text: ev.text });
+            if (ev.kind === 'tool') sseSend(res, 'tool', publicToolProjection(ev));
+          },
+        });
+        providerWork.setFailureHandler(() => turn.stop?.());
+        stopTurnOnDisconnect(req, res, id);
+        return turn;
+      });
+      r = execution.result;
       providerWork.assertCurrent();
       healthResult = r;
     } catch (e) {
+      if (!turn) {
+        await providerWork.release(e);
+        sseSend(res, 'error', { message: turnStartMessage(e, 'Provider turn could not start.') });
+        return sseEnd(res);
+      }
       lifecycleError = e;
       healthResult = e;
       r = { ok: false, reasonCode: 'provider-error' };
     } finally {
       running.delete(id);
-      await providerWork.release(lifecycleError);
+      if (turn) await providerWork.release(lifecycleError);
     }
     await observeProviderResult(engine, healthResult);
     if (attemptedModel && isSafeModelId(attemptedModel)) {

@@ -669,9 +669,25 @@ export function materializeBeta22Rollback(root, destination, {
       || treeDigest(copiedEntries) !== manifest.treeDigest) {
       throw new Error('beta.22 rollback copy verification failed');
     }
+    const stagingIdentity = fs.lstatSync(staging, { bigint: true });
+    const stagingPhysical = fs.realpathSync(staging);
     verifySnapshotStorage(workspaceRoot, storage);
     verifyRollbackDestination(workspaceRoot, destinationAuthority);
     fs.renameSync(staging, target);
+    const publishedIdentity = fs.lstatSync(target, { bigint: true });
+    if (!publishedIdentity.isDirectory()
+      || publishedIdentity.dev !== stagingIdentity.dev
+      || publishedIdentity.ino !== stagingIdentity.ino
+      || fs.realpathSync(target) === stagingPhysical
+      || within(fs.realpathSync(workspaceRoot), fs.realpathSync(target))) {
+      throw new Error('beta.22 rollback publication identity changed');
+    }
+    verifyRollbackDestination(workspaceRoot, destinationAuthority);
+    const publishedEntries = snapshotEntries(target);
+    if (JSON.stringify(publishedEntries) !== JSON.stringify(manifest.entries)
+      || treeDigest(publishedEntries) !== manifest.treeDigest) {
+      throw new Error('beta.22 rollback publication verification failed');
+    }
     return {
       compatibleVersion: BETA22_COMPATIBLE_VERSION,
       snapshotDirectory: chosen.directory,

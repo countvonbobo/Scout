@@ -264,6 +264,36 @@ test('guard detach contention retries before admitting a successor', () => {
   assert.equal(withMutationCoordinator(root, lease, () => 'successor'), 'successor');
 });
 
+test('guard detach retries transient canonical metadata unreadability', () => {
+  const { root, lease } = fixture();
+  const originalRead = fs.readFileSync;
+  const ownerFile = path.join(root, '.scout', 'mutation.guard', 'owner.json');
+  let injected = false;
+  fs.readFileSync = (file, ...args) => {
+    if (!injected && path.resolve(String(file)) === path.resolve(ownerFile)) {
+      injected = true;
+      throw Object.assign(new Error('injected guard metadata contention'), { code: 'EBUSY' });
+    }
+    return originalRead(file, ...args);
+  };
+  const scheduled = [];
+  try {
+    assert.equal(withMutationCoordinator(root, lease, () => 'committed', {
+      releaseScheduler(callback) {
+        scheduled.push(callback);
+        return { unref() {} };
+      },
+    }), 'committed');
+  } finally {
+    fs.readFileSync = originalRead;
+  }
+  assert.equal(scheduled.length, 1);
+  assert.equal(fs.existsSync(path.dirname(ownerFile)), true);
+  scheduled.shift()();
+  assert.equal(fs.existsSync(path.dirname(ownerFile)), false);
+  assert.equal(withMutationCoordinator(root, lease, () => 'successor'), 'successor');
+});
+
 test('the shared coordinator remains held until the durable receipt is appended', () => {
   const { root, lease, handle } = fixture();
   const { target, content } = mutationInput(root);

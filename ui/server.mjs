@@ -15,6 +15,7 @@ import { rerankHistoricalVacancies } from './lib/workspaceMigration.mjs';
 import {
   withWorkspaceMutationAuthority, withWorkspaceMutationAuthorityAsync,
 } from './lib/workspaceMutationAuthority.mjs';
+import { withMutationCoordinator } from './lib/mutationCoordinator.mjs';
 import { codexDeepLinkCapability } from './lib/codexDeepLink.mjs';
 import { triage } from './lib/derive.mjs';
 import { emptyTrackerView, pipeline } from './lib/pipeline.mjs';
@@ -1774,7 +1775,8 @@ function withSearchPlanMutation(res, phase, action) {
       });
     }
     heartbeat = startLeaseHeartbeat(lease);
-    return action({ lease, runId });
+    if (phase === 'publish') return action({ lease, runId });
+    return withMutationCoordinator(WORKSPACE_ROOT, lease, () => action({ lease, runId }));
   } finally {
     heartbeat?.stop();
     if (lease) {
@@ -2604,13 +2606,20 @@ routes['POST /api/setup/import-cv'] = (req, res, body) => {
     kind: 'cv-import', phase: 'import-cv',
   }, async () => {
     fs.mkdirSync(WORKSPACE.imports, { recursive: true });
-    atomicWriteFile(imported, bytes, { mode: 0o600 });
-    let text;
-    try { text = await extractCvText(imported); }
-    catch (error) { fs.rmSync(imported, { force: true }); throw error; }
     const extracted = path.join(WORKSPACE.imports, `${name}.txt`);
-    atomicWriteFile(extracted, `${text}\n`, { mode: 0o600 });
-    return { text, extracted };
+    let completed = false;
+    try {
+      atomicWriteFile(imported, bytes, { mode: 0o600 });
+      const text = await extractCvText(imported);
+      atomicWriteFile(extracted, `${text}\n`, { mode: 0o600 });
+      completed = true;
+      return { text, extracted };
+    } finally {
+      if (!completed) {
+        fs.rmSync(imported, { force: true });
+        fs.rmSync(extracted, { force: true });
+      }
+    }
   }).then(({ text, extracted }) => {
     void scheduleCheckpoint(`import cv - ${name}`);
     replyJson(res, 200, { ok: true, source: `imports/${name}`, extracted: `imports/${path.basename(extracted)}`, text });

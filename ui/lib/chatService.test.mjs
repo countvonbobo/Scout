@@ -12,6 +12,7 @@ import { HANDOFF_SUMMARY_PROMPT } from './chatPrompts.mjs';
 import { interviewPrepPath } from './interviewPrep.mjs';
 import { readProviderHealth } from './providerHealth.mjs';
 import { ProviderLifecycleUnclosedError } from './structuredTurn.mjs';
+import { mergeWorkspaceDefaults, writeWorkspaceConfig } from './workspace.mjs';
 import {
   acquireProviderAuthMutation, releaseProviderAuthMutation,
 } from './providerAuthMutation.mjs';
@@ -278,6 +279,29 @@ test('job and prep conversations share one running slot per opportunity', async 
   assert.match(JSON.parse(job.text()).error, /already running/);
   finish({ ok: true, text: 'Done', sessionId: 'prep-session', filesTouched: [] });
   assert.equal(sseEvents((await prepPromise).text()).at(-1).event, 'done');
+});
+
+test('an editable provider turn holds the workspace mutation fence until its process closes', async () => {
+  const root = tmpRoot();
+  let finish;
+  const routes = routeFixture(root, {
+    runTurnFn: () => ({
+      stop() {},
+      finished: new Promise((resolve) => { finish = resolve; }),
+    }),
+  });
+  const pending = callRoute(
+    routes['POST /api/chat/send'],
+    JSON.stringify({ id: ID, engine: 'codex', text: 'Edit my CV' }),
+  );
+  while (!finish) await new Promise((resolve) => setImmediate(resolve));
+  assert.throws(
+    () => writeWorkspaceConfig(root, mergeWorkspaceDefaults()),
+    /another workspace mutation is in progress/,
+  );
+  finish({ ok: true, text: 'Done', sessionId: 'session', filesTouched: [], usage: {} });
+  assert.equal(sseEvents((await pending).text()).at(-1).event, 'done');
+  writeWorkspaceConfig(root, mergeWorkspaceDefaults());
 });
 
 test('chat routes reject unknown purposes and fit mode in prep chats', async () => {

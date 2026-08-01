@@ -15,6 +15,7 @@ import {
   LeaseLostError, acquireScanLease, assertCurrentFence, currentLeaseOwner,
   releaseScanLease, startLeaseHeartbeat, synchronousFenceCallback,
 } from './scanLease.mjs';
+import { withWorkspaceMutationAuthority } from './workspaceMutationAuthority.mjs';
 
 const SETTINGS = '.scout/sync.json';
 const STATUS = new Map();
@@ -1321,24 +1322,30 @@ export async function connectWorkspaceSync(root, { remoteUrl: value, passphrase 
     : await verifyPrivateGithubRemote(value, { ...options, cwd: root });
   const transport = verified.transport || (() => { try { return validateGithubUrl(value).transport; } catch { return 'https'; } })();
   if (transport === 'https' && !git.credentialManager) throw new Error('Install Git Credential Manager before setting up an HTTPS private backup');
-  ensureRepo(root, options);
-  untrackLegacyChats(root, options);
-  untrackLegacyManagedInstructions(root, options);
-  assertNoTrackedSecrets(root, options);
-  const current = remoteUrl(root, options);
-  if (current && !sameGithubRepository(current, verified.url)) throw new Error('This workspace is already connected to a different origin');
-  if (!verified.empty && !current) throw new Error('This repository is not empty. Use Restore existing workspace instead');
-  if (!current) {
-    const add = runGit(root, ['remote', 'add', 'origin', verified.url], options);
-    if (!add.ok) throw new Error(add.error);
-  } else if (current !== verified.url) {
-    const update = runGit(root, ['remote', 'set-url', 'origin', verified.url], options);
-    if (!update.ok) throw new Error(update.error);
-  }
-  const created = initializeRecoveryBackup(root, passphrase, { devicePreferences: deviceBackupPreferences(options.deviceSettings) });
-  saveSyncSettings(root, {
-    enabled: true, remoteUrl: verified.url, dataKey: created.dataKey.toString('base64url'),
-    pendingRecoveryKey: created.recoveryKey,
+  const created = withWorkspaceMutationAuthority(root, {
+    kind: 'backup-setup', phase: 'connect-backup',
+  }, ({ coordinator }) => {
+    const guardedOptions = { ...options, mutationCoordinator: coordinator };
+    ensureRepo(root, guardedOptions);
+    untrackLegacyChats(root, guardedOptions);
+    untrackLegacyManagedInstructions(root, guardedOptions);
+    assertNoTrackedSecrets(root, guardedOptions);
+    const current = remoteUrl(root, guardedOptions);
+    if (current && !sameGithubRepository(current, verified.url)) throw new Error('This workspace is already connected to a different origin');
+    if (!verified.empty && !current) throw new Error('This repository is not empty. Use Restore existing workspace instead');
+    if (!current) {
+      const add = runGit(root, ['remote', 'add', 'origin', verified.url], guardedOptions);
+      if (!add.ok) throw new Error(add.error);
+    } else if (current !== verified.url) {
+      const update = runGit(root, ['remote', 'set-url', 'origin', verified.url], guardedOptions);
+      if (!update.ok) throw new Error(update.error);
+    }
+    const recovery = initializeRecoveryBackup(root, passphrase, { devicePreferences: deviceBackupPreferences(options.deviceSettings) });
+    saveSyncSettings(root, {
+      enabled: true, remoteUrl: verified.url, dataKey: recovery.dataKey.toString('base64url'),
+      pendingRecoveryKey: recovery.recoveryKey,
+    });
+    return recovery;
   });
   let status;
   try {
@@ -1428,7 +1435,9 @@ export async function rotateWorkspaceRecoveryPassphrase(root, passphrase, option
   if (!settings.enabled) throw new Error('Encrypted private backup is not enabled');
   const dataKey = Buffer.from(String(settings.dataKey || ''), 'base64url');
   if (dataKey.length !== 32) throw new Error('Recovery key cache is missing');
-  rotateRecoveryPassphrase(root, dataKey, passphrase);
+  withWorkspaceMutationAuthority(root, {
+    kind: 'backup-rotation', phase: 'rotate-recovery',
+  }, () => rotateRecoveryPassphrase(root, dataKey, passphrase));
   const status = await runWorkspaceSync(root, 'rotate recovery passphrase', options);
   return { ok: status.state === 'synced', status };
 }

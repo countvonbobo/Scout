@@ -449,6 +449,39 @@ test('beta.22 rollback rejects destination-parent substitution after validation'
   assert.equal(fs.existsSync(destination), false);
 });
 
+test('beta.22 rollback never accepts a substituted staging directory at final rename', () => {
+  const root = productionShapedWorkspace();
+  const snapshot = createBeta22WorkspaceSnapshot(root, { now: () => NOW });
+  const parent = temporaryRoot('scout-beta22-final-parent-');
+  const moved = temporaryRoot('scout-beta22-final-parent-moved-');
+  fs.rmSync(moved, { recursive: true });
+  const destination = path.join(parent, 'restored');
+  const originalRename = fs.renameSync;
+  let substituted = false;
+  fs.renameSync = (source, target) => {
+    if (!substituted && path.resolve(String(target)) === path.resolve(destination)
+      && String(source).includes('.scout-rollback-')) {
+      substituted = true;
+      fs.renameSync = originalRename;
+      originalRename(parent, moved);
+      fs.mkdirSync(parent);
+      fs.mkdirSync(source);
+      fs.writeFileSync(path.join(source, 'attacker.txt'), 'synthetic substitution');
+    }
+    return originalRename(source, target);
+  };
+  try {
+    assert.throws(
+      () => materializeBeta22Rollback(root, destination, { snapshotDirectory: snapshot.directory }),
+      /publication identity changed|destination changed during materialization/,
+    );
+  } finally {
+    fs.renameSync = originalRename;
+  }
+  assert.equal(substituted, true);
+  assert.equal(fs.existsSync(path.join(destination, 'workspace.json')), false);
+});
+
 test('snapshot verification rejects tampering before creating a rollback workspace', () => {
   const root = productionShapedWorkspace();
   const snapshot = createBeta22WorkspaceSnapshot(root, { now: () => NOW });

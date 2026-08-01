@@ -10,7 +10,7 @@ import {
   LeaseLostError, assertCurrentFence, assertScanLeaseScope, currentLeaseOwner,
   isScanLease, observeProcessOwner, processOwnerIsLiveOrAmbiguous, synchronousFenceCallback,
 } from './scanLease.mjs';
-import { workspacePaths } from './workspace.mjs';
+import { workspacePaths } from './workspacePaths.mjs';
 import { canonicalMutationRecipe, renderMutationRecipe } from './scanMutationProjection.mjs';
 
 export const MUTATION_SCHEMA_VERSION = 1;
@@ -643,7 +643,15 @@ function guardController(guard, releaseScheduler = setTimeout) {
 function releaseGuard(guard, scheduler = setTimeout) {
   let delay = 25;
   const retry = () => {
-    const current = readGuard(guard.directory);
+    let current;
+    try { current = readGuard(guard.directory); }
+    catch (error) {
+      if (!(error instanceof MutationCoordinatorBusyError)) throw error;
+      delay = Math.min(delay * 2, 1_000);
+      const timer = scheduler(() => { try { retry(); } catch {} }, delay);
+      timer.unref?.();
+      return;
+    }
     if (stableJson(current) !== stableJson(guard.metadata)) {
       throw new MutationCoordinatorBusyError('workspace mutation coordinator ownership changed');
     }

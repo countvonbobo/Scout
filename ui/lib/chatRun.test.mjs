@@ -24,7 +24,9 @@ function fakeTurn(prompt, extra = {}) {
 
 test('happy path: streams events, captures session, text, files, usage', async () => {
   const events = [];
-  const { finished } = fakeTurn('hello world', { onEvent: (e) => events.push(e) });
+  const turn = fakeTurn('hello world', { onEvent: (e) => events.push(e) });
+  assert.equal(Number.isSafeInteger(turn.pid) && turn.pid > 0, true);
+  const { finished } = turn;
   const r = await finished;
   assert.equal(r.ok, true);
   assert.equal(r.text, 'echo: hello world');

@@ -237,6 +237,10 @@ export function runTurn({
   });
   return {
     finished,
+    // The workspace mutation coordinator records the concrete provider process
+    // identity. If Scout itself exits while a provider is still editing, a
+    // successor must keep treating that child as an active writer.
+    get pid() { return child?.pid ?? null; },
     stop: () => {
       stopped = true;
       if (child) {
