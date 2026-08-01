@@ -502,6 +502,19 @@ test('expired authentication authority is recovered with a new capability', (t) 
   assert.equal(readProviderAuthMutation(root, 'codex', { now: 1_012 }), null);
 });
 
+test('provider work retries bounded guard contention before reporting semantic blockage', async (t) => {
+  const root = workspace(t);
+  const child = await temporaryLiveGuard(root, 2_500);
+  const work = acquireProviderWork(root, 'codex', {
+    owner, now: Date.now(), durationMs: 5_000, workId: 'retry-contention-work1',
+  });
+  await new Promise((resolve, reject) => {
+    child.once('close', (status) => (status === 0 ? resolve() : reject(new Error(`guard child exited ${status}`))));
+  });
+  assert.equal(work.workId, 'retry-contention-work1');
+  assert.equal(releaseProviderWork(root, work), true);
+});
+
 test('guard setup time does not consume the contention retry budget', (t) => {
   const root = workspace(t);
   const directory = path.join(root, '.scout', 'provider-auth', 'v1');
@@ -532,6 +545,41 @@ test('guard setup time does not consume the contention retry budget', (t) => {
     fs.readdirSync = originalReadDirectory;
     fs.renameSync = originalRename;
   }
+  assert.ok(auth);
+  assert.equal(releaseProviderAuthMutation(root, auth, { now: 1_001 }), true);
+});
+
+test('verified guard ownership progress refreshes the contention retry budget', (t) => {
+  const root = workspace(t);
+  const guard = path.join(root, '.scout', 'provider-auth', 'v1', 'codex.guard');
+  const originalRename = fs.renameSync;
+  let owners = 0;
+  fs.renameSync = (source, destination) => {
+    if (path.resolve(String(destination)) === path.resolve(guard) && owners < 3) {
+      owners += 1;
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 750);
+      fs.mkdirSync(guard, { recursive: true });
+      fs.writeFileSync(path.join(guard, 'owner.json'), JSON.stringify({
+        token: `progress-owner-${String(owners).padStart(4, '0')}`,
+        owner,
+        acquiredAt: 1_000,
+      }));
+      throw Object.assign(new Error('synthetic changing owner'), { code: 'EEXIST' });
+    }
+    if (path.resolve(String(destination)) === path.resolve(guard)) {
+      fs.rmSync(guard, { recursive: true, force: true });
+    }
+    return originalRename(source, destination);
+  };
+  let auth;
+  try {
+    auth = acquireProviderAuthMutation(root, 'codex', {
+      owner, now: 1_000, durationMs: 5_000, mutationId: 'progress-budget-auth',
+    });
+  } finally {
+    fs.renameSync = originalRename;
+  }
+  assert.equal(owners, 3);
   assert.ok(auth);
   assert.equal(releaseProviderAuthMutation(root, auth, { now: 1_001 }), true);
 });

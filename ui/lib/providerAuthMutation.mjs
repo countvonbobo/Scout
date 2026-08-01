@@ -13,6 +13,7 @@ const DEFAULT_DURATION_MS = 11 * 60 * 1000;
 const DEFAULT_WORK_DURATION_MS = 30 * 60 * 1000;
 const GUARD_STALE_MS = 15_000;
 const GUARD_ACQUIRE_TIMEOUT_MS = 2_000;
+const WORK_GUARD_ACQUIRE_ATTEMPTS = 3;
 const GUARD_RECORD = 'owner.json';
 const guardSleep = new Int32Array(new SharedArrayBuffer(4));
 
@@ -326,7 +327,8 @@ function withGuard(root, provider, now, callback, scheduler = setTimeout) {
   const prepared = createOwnedGuard(target.guard, acquiredAt);
   // Platform process-identity probes and orphan housekeeping are setup work,
   // not lock contention. Give every prepared candidate the full retry budget.
-  const deadline = performance.now() + GUARD_ACQUIRE_TIMEOUT_MS;
+  let deadline = performance.now() + GUARD_ACQUIRE_TIMEOUT_MS;
+  let observedToken = null;
   let published = false;
   try {
     while (!published) {
@@ -337,6 +339,13 @@ function withGuard(root, provider, now, callback, scheduler = setTimeout) {
         if (!['EEXIST', 'ENOTEMPTY', 'EBUSY', 'EPERM', 'EACCES'].includes(error?.code)) throw error;
         const observed = readGuardRecord(target.guard);
         if (observed) {
+          if (observed.token !== observedToken) {
+            observedToken = observed.token;
+            // A new verified owner means contenders are making progress.
+            // Bound only inactivity so several short critical sections can
+            // serialize without later contenders being misreported as busy.
+            deadline = performance.now() + GUARD_ACQUIRE_TIMEOUT_MS;
+          }
           if (acquiredAt - observed.acquiredAt > GUARD_STALE_MS
             && !processOwnerIsLiveOrAmbiguous(observed.owner)) {
             const quarantine = `${target.guard}.stale-${randomUUID()}`;
@@ -502,26 +511,29 @@ export function acquireProviderWork(root, provider, {
   if (!Number.isSafeInteger(durationMs) || durationMs <= 0 || durationMs > DEFAULT_WORK_DURATION_MS) {
     throw new TypeError('provider work authority settings are invalid');
   }
-  const capability = withGuard(root, provider, at, (target) => {
-    const current = readProviderAuthMutation(root, provider, { now: at });
-    if (current) throw new ProviderAuthMutationActiveError(provider, current.phase);
-    activeWorkRecords(target, provider, at, { prune: true });
-    if (!fs.existsSync(target.work)) fs.mkdirSync(target.work, { mode: 0o700 });
-    const record = validateWork({
-      schemaVersion: SCHEMA_VERSION,
-      provider,
-      workId,
-      owner: {
-        host: String(owner.host),
-        pid: Number(owner.pid),
-        processStart: String(owner.processStart),
-      },
-      acquiredAt: at,
-      expiresAt: at + durationMs,
-    }, provider);
-    atomicWriteFile(path.join(target.work, `${workId}.json`), `${JSON.stringify(record)}\n`, { mode: 0o600 });
-    return structuredClone(record);
-  });
+  let capability = null;
+  for (let attempt = 0; attempt < WORK_GUARD_ACQUIRE_ATTEMPTS && !capability; attempt += 1) {
+    capability = withGuard(root, provider, at, (target) => {
+      const current = readProviderAuthMutation(root, provider, { now: at });
+      if (current) throw new ProviderAuthMutationActiveError(provider, current.phase);
+      activeWorkRecords(target, provider, at, { prune: true });
+      if (!fs.existsSync(target.work)) fs.mkdirSync(target.work, { mode: 0o700 });
+      const record = validateWork({
+        schemaVersion: SCHEMA_VERSION,
+        provider,
+        workId,
+        owner: {
+          host: String(owner.host),
+          pid: Number(owner.pid),
+          processStart: String(owner.processStart),
+        },
+        acquiredAt: at,
+        expiresAt: at + durationMs,
+      }, provider);
+      atomicWriteFile(path.join(target.work, `${workId}.json`), `${JSON.stringify(record)}\n`, { mode: 0o600 });
+      return structuredClone(record);
+    });
+  }
   if (!capability) throw new ProviderAuthMutationActiveError(provider, 'unknown');
   return capability;
 }
