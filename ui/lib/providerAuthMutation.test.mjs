@@ -131,7 +131,7 @@ function temporaryLiveGuard(root, holdMs = 100) {
 
 function temporaryAbandonedGuard(root, holdMs = 100) {
   const scanLeaseUrl = new URL('./scanLease.mjs', import.meta.url).href;
-  const source = `
+  const ownerSource = `
     import fs from 'node:fs';
     import path from 'node:path';
     import { currentLeaseOwner } from ${JSON.stringify(scanLeaseUrl)};
@@ -143,6 +143,18 @@ function temporaryAbandonedGuard(root, holdMs = 100) {
     }));
     process.stdout.write('ready\\n');
     setTimeout(() => {}, Number(process.env.HOLD_MS));
+  `;
+  const source = `
+    import { spawn } from 'node:child_process';
+    const owner = spawn(process.execPath, ['--input-type=module', '--eval', ${JSON.stringify(ownerSource)}], {
+      env: process.env,
+      stdio: ['ignore', 'pipe', 'pipe'],
+      windowsHide: true,
+    });
+    owner.stdout.once('data', (chunk) => process.stdout.write(chunk));
+    owner.stderr.on('data', (chunk) => process.stderr.write(chunk));
+    owner.once('error', (error) => { throw error; });
+    owner.once('close', (status) => process.exit(status ?? 1));
   `;
   const child = spawn(process.execPath, ['--input-type=module', '--eval', source], {
     env: { ...process.env, SCOUT_AUTH_ROOT: root, HOLD_MS: String(holdMs) },
