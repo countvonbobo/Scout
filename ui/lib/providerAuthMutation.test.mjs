@@ -323,14 +323,16 @@ test('committed authority schedules identity-checked cleanup after persistent Wi
       owner: currentLeaseOwner(), now: Date.now(), durationMs: 5_000,
       mutationId: 'cleanup-pending-0001',
     });
+    await new Promise((resolve) => setTimeout(resolve, 2_200));
   } finally {
     fs.rmSync = originalRemove;
     fs.renameSync = originalRename;
   }
   assert.ok(auth);
-  await new Promise((resolve) => setTimeout(resolve, 75));
+  await new Promise((resolve) => setTimeout(resolve, 1_200));
   assert.equal(fs.existsSync(path.join(root, '.scout', 'provider-auth', 'v1', 'codex.guard')), false);
   assert.equal(releaseProviderAuthMutation(root, auth), true);
+  assert.equal(fs.existsSync(path.join(root, '.scout', 'provider-auth', 'v1', 'codex.guard')), false);
 });
 
 test('detached cleanup finishes an empty quarantine after partial Windows removal', async (t) => {

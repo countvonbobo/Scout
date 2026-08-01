@@ -824,6 +824,33 @@ test('stage mode audits installed dependency JSON, YAML, TOML, text, log and run
   assert.match(writes.join(''), /Release audit failed with 6 finding/);
 });
 
+test('stage mode fails closed when a file appears after directory enumeration', () => {
+  const root = fixture();
+  fs.mkdirSync(path.join(root, 'app'), { recursive: true });
+  fs.writeFileSync(path.join(root, 'app', 'README.md'), '# Scout\n');
+  const injected = path.join(root, 'app', 'late-private.txt');
+  const originalRead = fs.readFileSync;
+  let inserted = false;
+  fs.readFileSync = (target, ...args) => {
+    if (!inserted && typeof target === 'number') {
+      inserted = true;
+      fs.writeFileSync(injected, 'Synthetic Late Private Marker\n');
+    }
+    return originalRead(target, ...args);
+  };
+  try {
+    assert.throws(
+      () => main(['--root', root, '--stage'], {
+        SCOUT_RELEASE_MARKERS: 'Synthetic Late Private Marker',
+      }),
+      /directory changed after enumeration/,
+    );
+  } finally {
+    fs.readFileSync = originalRead;
+  }
+  assert.equal(inserted, true);
+});
+
 test('ranked discovery production sources stay neutral and release bundles omit raw observation caches', () => {
   const productionText = RANKED_DISCOVERY_SOURCES
     .map((relative) => fs.readFileSync(path.join(ROOT, relative), 'utf8')).join('\n');

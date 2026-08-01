@@ -443,7 +443,36 @@ function binaryContent(content) {
   return sample.length > 0 && controls / sample.length > 0.01;
 }
 
-function filesUnder(directory, { includeDependencies = false } = {}) {
+function sameDirectoryIdentity(left, right) {
+  return left.dev === right.dev && left.ino === right.ino
+    && left.mtimeNs === right.mtimeNs && left.ctimeNs === right.ctimeNs;
+}
+
+function snapshotDirectory(directory) {
+  const before = fs.lstatSync(directory, { bigint: true });
+  if (before.isSymbolicLink() || !before.isDirectory()) {
+    throw new Error(`release audit refuses non-directory traversal input: ${directory}`);
+  }
+  const names = fs.readdirSync(directory).sort();
+  const after = fs.lstatSync(directory, { bigint: true });
+  if (!sameDirectoryIdentity(before, after)) {
+    throw new Error(`release audit directory changed during enumeration: ${directory}`);
+  }
+  return { directory, identity: after, names };
+}
+
+function verifyDirectorySnapshot(snapshot) {
+  const before = fs.lstatSync(snapshot.directory, { bigint: true });
+  const names = fs.readdirSync(snapshot.directory).sort();
+  const after = fs.lstatSync(snapshot.directory, { bigint: true });
+  if (!sameDirectoryIdentity(snapshot.identity, before)
+    || !sameDirectoryIdentity(before, after)
+    || JSON.stringify(names) !== JSON.stringify(snapshot.names)) {
+    throw new Error(`release audit directory changed after enumeration: ${snapshot.directory}`);
+  }
+}
+
+function filesUnder(directory, { includeDependencies = false, directorySnapshots = [] } = {}) {
   if (!fs.existsSync(directory)) return [];
   const result = [];
   const visit = (entry) => {
@@ -459,7 +488,9 @@ function filesUnder(directory, { includeDependencies = false } = {}) {
       IGNORED_DIRECTORY_NAMES.has(name)
       && (name !== 'node_modules' || !includeDependencies)
     ) return;
-    for (const name of fs.readdirSync(entry).sort()) visit(path.join(entry, name));
+    const snapshot = snapshotDirectory(entry);
+    directorySnapshots.push(snapshot);
+    for (const child of snapshot.names) visit(path.join(entry, child));
   };
   visit(directory);
   return result;
@@ -542,6 +573,7 @@ export function auditRelease({
   buildDirs = DEFAULT_BUILD_DIRS,
   markers = [],
   markerFile = null,
+  directorySnapshots = [],
 } = {}) {
   const absoluteRoot = path.resolve(root);
   const excluded = markerFile ? path.resolve(markerFile) : null;
@@ -555,7 +587,10 @@ export function auditRelease({
       if (stat.isSymbolicLink()) throw new Error(`release audit refuses symbolic link: ${file}`);
       return stat.isFile();
     });
-  const built = buildDirs.flatMap((dir) => filesUnder(path.resolve(absoluteRoot, dir)));
+  const traversalSnapshots = [...directorySnapshots];
+  const built = buildDirs.flatMap((dir) => filesUnder(path.resolve(absoluteRoot, dir), {
+    directorySnapshots: traversalSnapshots,
+  }));
   const files = [...new Set([...tracked, ...built])]
     .filter((file) => file !== excluded)
     .sort((a, b) => normaliseRelative(absoluteRoot, a).localeCompare(normaliseRelative(absoluteRoot, b), 'en'));
@@ -625,6 +660,7 @@ export function auditRelease({
       findings.push({ file: publicFile, ...finding });
     }
   }
+  for (const snapshot of traversalSnapshots) verifyDirectorySnapshot(snapshot);
   findings.sort((a, b) => a.file.localeCompare(b.file, 'en') || a.line - b.line || a.rule.localeCompare(b.rule, 'en'));
   return { ok: findings.length === 0, filesScanned, markerCount: markers.length, findings };
 }
@@ -644,8 +680,12 @@ export function main(argv = process.argv.slice(2), env = process.env) {
   if (argv.includes('--require-markers') && markers.length === 0) throw new Error('release audit requires at least one configured personal marker');
   const explicitBuildDirs = valuesAfter('--build', argv);
   const stagedTree = argv.includes('--stage');
+  const stagedDirectorySnapshots = [];
   const stagedFiles = stagedTree
-    ? filesUnder(root, { includeDependencies: true })
+    ? filesUnder(root, {
+      includeDependencies: true,
+      directorySnapshots: stagedDirectorySnapshots,
+    })
       .map((file) => normaliseRelative(root, file))
     : undefined;
   const result = auditRelease({
@@ -653,6 +693,7 @@ export function main(argv = process.argv.slice(2), env = process.env) {
     markerFile,
     markers,
     trackedFiles: stagedFiles,
+    directorySnapshots: stagedDirectorySnapshots,
     buildDirs: stagedTree ? [] : (explicitBuildDirs.length ? explicitBuildDirs : DEFAULT_BUILD_DIRS),
   });
   process.stdout.write(`Release audit scanned ${result.filesScanned} files with ${result.markerCount} configured personal markers.\n`);

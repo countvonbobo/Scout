@@ -370,6 +370,32 @@ test('malformed or non-monotonic learning histories fail closed', () => {
   assert.throws(() => validateLearningLedger(branched), /ancestry/);
 
   const recorded = recordFeedback(initial, event());
+  const missingVersion = structuredClone(recorded);
+  missingVersion.feedbackEvents[0].learningVersionId = 'learning-missing';
+  assert.throws(() => validateLearningLedger(missingVersion), /learning version is unavailable/);
+
+  const proposed = proposeLearningChange(recorded, {
+    sourceEventIds: [recorded.feedbackEvents[0].id],
+    explanation: 'A reviewed small preference.',
+    change: {
+      kind: 'rank-adjustment', field: 'location', value: 'Manchester',
+      weight: 2, scope: 'profile-wide',
+    },
+  });
+  const published = publishLearningProposal(proposed, {
+    proposalId: proposed.proposals[0].id,
+    confirmed: true,
+  });
+  const mutated = structuredClone(published);
+  mutated.versions[1].changes[0].weight = 10;
+  assert.throws(() => validateLearningLedger(mutated), /publication change/);
+  const unprovenanced = structuredClone(published);
+  unprovenanced.versions[1].changes.push({
+    kind: 'rank-adjustment', field: 'location', value: 'London',
+    weight: 3, scope: 'profile-wide', scopeValue: null,
+  });
+  assert.throws(() => validateLearningLedger(unprovenanced), /proposal|publication change/);
+
   assert.throws(() => validateLearningLedger({
     ...recorded,
     proposals: [{

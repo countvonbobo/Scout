@@ -206,6 +206,9 @@ export function validateLearningLedger(value) {
   }
   const eventIds = new Set(result.feedbackEvents.map(({ id }) => id));
   const proposalIds = new Set(result.proposals.map(({ id }) => id));
+  if (result.feedbackEvents.some(({ learningVersionId }) => !versionIds.has(learningVersionId))) {
+    throw new TypeError('feedback learning version is unavailable');
+  }
   for (const item of result.proposals) {
     if (item.sourceEventIds.some((id) => !eventIds.has(id))) throw new TypeError('learning proposal source event is unavailable');
     if (item.publishedVersionId !== null && !versionIds.has(item.publishedVersionId)) {
@@ -215,7 +218,7 @@ export function validateLearningLedger(value) {
       throw new TypeError('learning proposal publication state is inconsistent');
     }
   }
-  for (const item of result.versions) {
+  for (const [index, item] of result.versions.entries()) {
     if (item.sourceProposalIds.some((id) => !proposalIds.has(id))) {
       throw new TypeError('learning version proposal is unavailable');
     }
@@ -226,8 +229,26 @@ export function validateLearningLedger(value) {
         throw new TypeError('learning version proposal provenance is inconsistent');
       }
     }
-    if (item.changes.some(({ proposalId }) => proposalId && !proposalIds.has(proposalId))) {
+    if (item.changes.some(({ proposalId }) => !proposalId || !proposalIds.has(proposalId))) {
       throw new TypeError('learning change proposal is unavailable');
+    }
+    if (index === 0) continue;
+    const parent = result.versions[index - 1];
+    if (item.undoOf !== null) {
+      const undoTarget = result.versions[index - 2];
+      if (item.undoOf !== parent.id || item.sourceProposalIds.length !== 0 || !undoTarget
+        || JSON.stringify(item.changes) !== JSON.stringify(undoTarget.changes)) {
+        throw new TypeError('learning undo provenance is inconsistent');
+      }
+      continue;
+    }
+    if (item.sourceProposalIds.length !== 1) {
+      throw new TypeError('learning publication provenance is inconsistent');
+    }
+    const source = result.proposals.find(({ id }) => id === item.sourceProposalIds[0]);
+    const taggedChange = { ...source.change, proposalId: source.id };
+    if (JSON.stringify(item.changes) !== JSON.stringify([...parent.changes, taggedChange])) {
+      throw new TypeError('learning publication change is inconsistent');
     }
   }
   for (const item of result.proposals.filter(({ status }) => status === 'published')) {

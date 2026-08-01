@@ -69,9 +69,14 @@ function snapshotBudget(physicalRoot = null) {
   };
 }
 
+function sameSnapshotIdentity(left, right) {
+  return left.dev === right.dev && left.ino === right.ino && left.size === right.size
+    && left.mtimeNs === right.mtimeNs && left.ctimeNs === right.ctimeNs;
+}
+
 function inspectSnapshotEntry(source, relative, budget, depth) {
   if (depth > MAX_SNAPSHOT_DEPTH) throw new Error('beta.22 workspace snapshot exceeds the depth limit');
-  const stat = fs.lstatSync(source);
+  const stat = fs.lstatSync(source, { bigint: true });
   if (stat.isSymbolicLink()) {
     throw new Error(`beta.22 workspace snapshot does not accept symbolic links: ${slash(relative)}`);
   }
@@ -88,10 +93,10 @@ function inspectSnapshotEntry(source, relative, budget, depth) {
     throw new Error('beta.22 workspace snapshot exceeds the entry limit');
   }
   if (stat.isFile()) {
-    if (stat.size > MAX_SNAPSHOT_FILE_BYTES) {
+    if (stat.size > BigInt(MAX_SNAPSHOT_FILE_BYTES)) {
       throw new Error(`beta.22 workspace snapshot file exceeds the size limit: ${slash(relative)}`);
     }
-    budget.totalBytes += stat.size;
+    budget.totalBytes += Number(stat.size);
     if (budget.totalBytes > MAX_SNAPSHOT_TOTAL_BYTES) {
       throw new Error('beta.22 workspace snapshot exceeds the total size limit');
     }
@@ -100,22 +105,39 @@ function inspectSnapshotEntry(source, relative, budget, depth) {
 }
 
 function snapshotDirectoryEntries(source, stat, relative, budget) {
-  const names = fs.readdirSync(source);
-  const current = fs.lstatSync(source);
+  const before = fs.lstatSync(source, { bigint: true });
+  const names = fs.readdirSync(source).sort();
+  const current = fs.lstatSync(source, { bigint: true });
   const physical = fs.realpathSync(source);
-  if (!current.isDirectory() || current.dev !== stat.dev || current.ino !== stat.ino
+  if (!current.isDirectory() || !sameSnapshotIdentity(before, stat)
+    || !sameSnapshotIdentity(current, before)
     || !within(budget.physicalRoot, physical)) {
     throw new Error(`beta.22 workspace snapshot directory changed during traversal: ${slash(relative)}`);
   }
-  return names;
+  return { names, identity: current };
+}
+
+function verifyTraversedDirectory(source, snapshot, relative, budget) {
+  const before = fs.lstatSync(source, { bigint: true });
+  const names = fs.readdirSync(source).sort();
+  const after = fs.lstatSync(source, { bigint: true });
+  const physical = fs.realpathSync(source);
+  if (!after.isDirectory() || !sameSnapshotIdentity(snapshot.identity, before)
+    || !sameSnapshotIdentity(before, after)
+    || JSON.stringify(names) !== JSON.stringify(snapshot.names)
+    || !within(budget.physicalRoot, physical)) {
+    throw new Error(`beta.22 workspace snapshot directory changed during traversal: ${slash(relative)}`);
+  }
 }
 
 function assertPhysicalTree(source, relative = '', budget = snapshotBudget(source), depth = 0) {
   const stat = inspectSnapshotEntry(source, relative, budget, depth);
   if (!stat.isDirectory()) return budget;
-  for (const name of snapshotDirectoryEntries(source, stat, relative, budget)) {
+  const snapshot = snapshotDirectoryEntries(source, stat, relative, budget);
+  for (const name of snapshot.names) {
     assertPhysicalTree(path.join(source, name), path.join(relative, name), budget, depth + 1);
   }
+  verifyTraversedDirectory(source, snapshot, relative, budget);
   return budget;
 }
 
@@ -138,7 +160,8 @@ function copySnapshotEntry(
     if (ignoredSnapshotPath(relative)) return;
     fs.mkdirSync(target, { recursive: true, mode: 0o700 });
     fs.chmodSync(target, 0o700);
-    for (const name of snapshotDirectoryEntries(source, stat, relative, budget).sort()) {
+    const snapshot = snapshotDirectoryEntries(source, stat, relative, budget);
+    for (const name of snapshot.names) {
       copySnapshotEntry(
         path.join(source, name),
         path.join(target, name),
@@ -148,6 +171,7 @@ function copySnapshotEntry(
         depth + 1,
       );
     }
+    verifyTraversedDirectory(source, snapshot, relative, budget);
     return;
   }
   fs.mkdirSync(path.dirname(target), { recursive: true });
@@ -157,29 +181,32 @@ function copySnapshotEntry(
   const input = fs.openSync(source, inputFlags);
   let output;
   try {
-    const opened = fs.fstatSync(input);
-    if (!opened.isFile() || opened.dev !== stat.dev || opened.ino !== stat.ino) {
+    const opened = fs.fstatSync(input, { bigint: true });
+    if (!opened.isFile() || !sameSnapshotIdentity(opened, stat)) {
       throw new Error(`beta.22 workspace snapshot file changed during copy: ${slash(relative)}`);
     }
-    output = fs.openSync(target, 'wx', stat.mode & 0o100 ? 0o700 : 0o600);
+    output = fs.openSync(target, 'wx', Number(stat.mode) & 0o100 ? 0o700 : 0o600);
     const buffer = Buffer.allocUnsafe(SNAPSHOT_COPY_CHUNK_BYTES);
     let position = 0;
-    while (position < stat.size) {
+    const size = Number(stat.size);
+    while (position < size) {
       renew();
-      const count = fs.readSync(input, buffer, 0, Math.min(buffer.length, stat.size - position), position);
+      const count = fs.readSync(input, buffer, 0, Math.min(buffer.length, size - position), position);
       if (count <= 0) throw new Error(`beta.22 workspace snapshot file changed during copy: ${slash(relative)}`);
       let written = 0;
       while (written < count) written += fs.writeSync(output, buffer, written, count - written);
       position += count;
     }
-    if (fs.fstatSync(input).size !== stat.size) {
+    const openedAfter = fs.fstatSync(input, { bigint: true });
+    const pathAfter = fs.lstatSync(source, { bigint: true });
+    if (!sameSnapshotIdentity(openedAfter, opened) || !sameSnapshotIdentity(pathAfter, opened)) {
       throw new Error(`beta.22 workspace snapshot file changed during copy: ${slash(relative)}`);
     }
   } finally {
     fs.closeSync(input);
     if (output !== undefined) fs.closeSync(output);
   }
-  fs.chmodSync(target, stat.mode & 0o100 ? 0o700 : 0o600);
+  fs.chmodSync(target, Number(stat.mode) & 0o100 ? 0o700 : 0o600);
 }
 
 function beta22WorkspaceConfigBytes(file, budget = snapshotBudget(file)) {
@@ -191,13 +218,14 @@ function beta22WorkspaceConfigBytes(file, budget = snapshotBudget(file)) {
   );
   let source;
   try {
-    const opened = fs.fstatSync(descriptor);
-    if (!opened.isFile() || opened.dev !== stat.dev || opened.ino !== stat.ino
-      || opened.size !== stat.size) {
+    const opened = fs.fstatSync(descriptor, { bigint: true });
+    if (!opened.isFile() || !sameSnapshotIdentity(opened, stat)) {
       throw new Error('beta.22 rollback workspace config changed during copy');
     }
     source = fs.readFileSync(descriptor);
-    if (fs.fstatSync(descriptor).size !== stat.size) {
+    const openedAfter = fs.fstatSync(descriptor, { bigint: true });
+    const pathAfter = fs.lstatSync(file, { bigint: true });
+    if (!sameSnapshotIdentity(openedAfter, opened) || !sameSnapshotIdentity(pathAfter, opened)) {
       throw new Error('beta.22 rollback workspace config changed during copy');
     }
   } finally {
@@ -219,26 +247,29 @@ function digestSnapshotFile(file, stat, renew) {
     fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0) | (fs.constants.O_NONBLOCK || 0),
   );
   try {
-    const opened = fs.fstatSync(descriptor);
-    if (!opened.isFile() || opened.dev !== stat.dev || opened.ino !== stat.ino) {
+    const opened = fs.fstatSync(descriptor, { bigint: true });
+    if (!opened.isFile() || !sameSnapshotIdentity(opened, stat)) {
       throw new Error('beta.22 snapshot file changed during verification');
     }
     const buffer = Buffer.allocUnsafe(SNAPSHOT_COPY_CHUNK_BYTES);
     let position = 0;
-    while (position < stat.size) {
+    const size = Number(stat.size);
+    while (position < size) {
       renew();
       const count = fs.readSync(
         descriptor,
         buffer,
         0,
-        Math.min(buffer.length, stat.size - position),
+        Math.min(buffer.length, size - position),
         position,
       );
       if (count <= 0) throw new Error('beta.22 snapshot file changed during verification');
       hash.update(buffer.subarray(0, count));
       position += count;
     }
-    if (fs.fstatSync(descriptor).size !== stat.size) {
+    const openedAfter = fs.fstatSync(descriptor, { bigint: true });
+    const pathAfter = fs.lstatSync(file, { bigint: true });
+    if (!sameSnapshotIdentity(openedAfter, opened) || !sameSnapshotIdentity(pathAfter, opened)) {
       throw new Error('beta.22 snapshot file changed during verification');
     }
     return hash.digest('hex');
@@ -254,14 +285,16 @@ function snapshotEntries(directory, renew = () => {}) {
     renew();
     const stat = inspectSnapshotEntry(current, relative, budget, depth);
     if (stat.isDirectory()) {
-      for (const name of snapshotDirectoryEntries(current, stat, relative, budget).sort()) {
+      const snapshot = snapshotDirectoryEntries(current, stat, relative, budget);
+      for (const name of snapshot.names) {
         visit(path.join(current, name), path.join(relative, name), depth + 1);
       }
+      verifyTraversedDirectory(current, snapshot, relative, budget);
       return;
     }
     entries.push({
       path: slash(relative),
-      bytes: stat.size,
+      bytes: Number(stat.size),
       sha256: digestSnapshotFile(current, stat, renew),
     });
   }

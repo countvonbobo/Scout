@@ -371,6 +371,16 @@ function validateLaneHistory(lane) {
   }
 }
 
+function hasRetirementEvidence(lane) {
+  const minimum = lane.retirement?.minimumRuns;
+  if (!Number.isSafeInteger(minimum) || minimum < 3 || minimum > MAX_LANE_HISTORY
+    || lane.history.length < minimum) return false;
+  return lane.history.slice(-minimum).every((event) => (
+    !(event.failures?.length)
+    && ['new', 'eligible', 'selected', 'promising'].every((name) => event[name] === 0)
+  ));
+}
+
 function validateLane(lane, states = ['active', 'retired']) {
   if (!lane || typeof lane !== 'object' || Array.isArray(lane)) throw new TypeError('lane must be an object');
   if (!/^lane-[a-f0-9]{16}$/.test(lane.id || '')) throw new TypeError('lane ID is invalid');
@@ -421,6 +431,7 @@ function validateLane(lane, states = ['active', 'retired']) {
     throw new TypeError('lane run counters are inconsistent');
   }
   validateLaneHistory(lane);
+  if (lane.runCount < lane.history.length) throw new TypeError('lane run counters are inconsistent');
   if (lane.state === 'active' && lane.retirement !== null) {
     throw new TypeError('active lane retirement metadata is invalid');
   }
@@ -430,6 +441,7 @@ function validateLane(lane, states = ['active', 'retired']) {
     || !Number.isSafeInteger(lane.retirement?.minimumRuns)
     || lane.retirement.minimumRuns < 3
     || lane.consecutiveUnproductiveRuns < lane.retirement.minimumRuns
+    || !hasRetirementEvidence(lane)
   )) {
     throw new TypeError('retired lane metadata is invalid');
   }

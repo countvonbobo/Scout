@@ -237,6 +237,33 @@ test('retirement rejects fewer than three completed unproductive runs', () => {
 
   forged.lanes[0].retirement.minimumRuns = 3;
   assert.throws(() => validateSearchLanePlan(forged), /retired lane metadata/);
+
+  const forgedCounters = structuredClone(generated);
+  forgedCounters.lanes[0].state = 'retired';
+  forgedCounters.lanes[0].runCount = 3;
+  forgedCounters.lanes[0].consecutiveUnproductiveRuns = 3;
+  forgedCounters.lanes[0].retirement = {
+    reason: 'consistently-unproductive',
+    retiredAt: '2026-08-03T10:00:00.000Z',
+    minimumRuns: 3,
+    reversible: true,
+  };
+  assert.throws(() => validateSearchLanePlan(forgedCounters), /retired lane metadata/);
+
+  let evidenced = generated;
+  for (let attempt = 1; attempt <= 3; attempt += 1) {
+    evidenced = recordSearchLaneRun(evidenced, {
+      runId: `run-evidence-${attempt}`,
+      recordedAt: `2026-08-0${attempt}T11:00:00.000Z`,
+      results: [{
+        laneId: lane.id, returned: 0, parsed: 0, new: 0,
+        eligible: 0, selected: 0, promising: 0,
+      }],
+    });
+  }
+  const retired = retireUnproductiveSearchLanes(evidenced);
+  retired.lanes[0].history.at(-1).promising = 1;
+  assert.throws(() => validateSearchLanePlan(retired), /retired lane metadata/);
 });
 
 test('lane metrics reconcile exact query returns with persisted discovery and assessment evidence', () => {

@@ -213,6 +213,56 @@ test('beta.22 snapshot rejects special files and oversized regular files before 
   );
 });
 
+test('beta.22 snapshot rejects same-size source mutation during file copying', () => {
+  const root = productionShapedWorkspace();
+  const source = path.join(root, 'logs', 'large-provider.log');
+  const bytes = 2 * 1024 * 1024;
+  fs.writeFileSync(source, Buffer.alloc(bytes, 0x41));
+  const originalRead = fs.readSync;
+  let mutated = false;
+  fs.readSync = (descriptor, ...args) => {
+    if (!mutated && fs.fstatSync(descriptor).size === bytes) {
+      mutated = true;
+      fs.writeFileSync(source, Buffer.alloc(bytes, 0x42));
+    }
+    return originalRead(descriptor, ...args);
+  };
+  try {
+    assert.throws(
+      () => createBeta22WorkspaceSnapshot(root, { now: () => NOW }),
+      /file changed during copy/,
+    );
+  } finally {
+    fs.readSync = originalRead;
+  }
+  assert.equal(mutated, true);
+});
+
+test('beta.22 snapshot rejects directory membership changes during descendant copying', () => {
+  const root = productionShapedWorkspace();
+  const source = path.join(root, 'logs', 'large-provider.log');
+  const bytes = 2 * 1024 * 1024;
+  fs.writeFileSync(source, Buffer.alloc(bytes, 0x41));
+  const originalRead = fs.readSync;
+  let inserted = false;
+  fs.readSync = (descriptor, ...args) => {
+    if (!inserted && fs.fstatSync(descriptor).size === bytes) {
+      inserted = true;
+      fs.writeFileSync(path.join(root, 'logs', 'late-provider.log'), 'late\n');
+    }
+    return originalRead(descriptor, ...args);
+  };
+  try {
+    assert.throws(
+      () => createBeta22WorkspaceSnapshot(root, { now: () => NOW }),
+      /directory changed during traversal/,
+    );
+  } finally {
+    fs.readSync = originalRead;
+  }
+  assert.equal(inserted, true);
+});
+
 test('beta.22 snapshot rejects trees deeper than its traversal bound', () => {
   const root = productionShapedWorkspace();
   let directory = path.join(root, 'logs');

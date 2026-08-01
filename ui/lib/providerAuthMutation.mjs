@@ -216,12 +216,13 @@ function scheduleQuarantineCleanup(directory, token) {
 }
 
 function scheduleOwnedGuardCleanup(directory, token) {
-  const deadline = performance.now() + GUARD_ACQUIRE_TIMEOUT_MS;
+  let delay = 25;
   const retry = () => {
     let removed = false;
     try { removed = removeOwnedGuard(directory, token); } catch {}
-    if (removed || !fs.existsSync(directory) || performance.now() >= deadline) return;
-    const timer = setTimeout(retry, 25);
+    if (removed || !fs.existsSync(directory)) return;
+    delay = Math.min(delay * 2, 1_000);
+    const timer = setTimeout(retry, delay);
     timer.unref?.();
   };
   const timer = setTimeout(retry, 25);
