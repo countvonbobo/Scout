@@ -169,6 +169,27 @@ test('a verified beta.22 snapshot materialises into a separate compatible worksp
   assert.equal(fs.existsSync(path.join(destination, '.scout')), false);
 });
 
+test('beta.22 rollback accepts an unchanged canonical destination through a stable redirected ancestor', () => {
+  const root = productionShapedWorkspace();
+  const snapshot = createBeta22WorkspaceSnapshot(root, { now: () => NOW });
+  const lexicalParent = temporaryRoot('scout-beta22-stable-link-');
+  const physicalParent = temporaryRoot('scout-beta22-stable-physical-');
+  const redirect = path.join(lexicalParent, 'redirect');
+  fs.symlinkSync(physicalParent, redirect, process.platform === 'win32' ? 'junction' : 'dir');
+  const destination = path.join(redirect, 'restored');
+
+  const restored = materializeBeta22Rollback(root, destination, {
+    snapshotDirectory: snapshot.directory,
+  });
+
+  assert.equal(restored.destination, path.resolve(destination));
+  assert.equal(fs.realpathSync(destination), path.join(fs.realpathSync(physicalParent), 'restored'));
+  assert.match(
+    fs.readFileSync(path.join(destination, 'data', 'opportunities.json'), 'utf8'),
+    /Human decision must remain unchanged/,
+  );
+});
+
 test('beta.22 snapshot holds the shared backup lease throughout tree copying', () => {
   const root = productionShapedWorkspace();
   let checked = false;
@@ -447,6 +468,36 @@ test('beta.22 rollback rejects destination-parent substitution after validation'
     /destination changed during materialization/,
   );
   assert.equal(fs.existsSync(destination), false);
+});
+
+test('beta.22 rollback rejects a redirected ancestor retargeted after destination validation', () => {
+  const root = productionShapedWorkspace();
+  const snapshot = createBeta22WorkspaceSnapshot(root, { now: () => NOW });
+  const lexicalParent = temporaryRoot('scout-beta22-retargeted-link-');
+  const approvedParent = temporaryRoot('scout-beta22-approved-physical-');
+  const hostileParent = temporaryRoot('scout-beta22-hostile-physical-');
+  const redirect = path.join(lexicalParent, 'redirect');
+  const linkType = process.platform === 'win32' ? 'junction' : 'dir';
+  fs.symlinkSync(approvedParent, redirect, linkType);
+  const destination = path.join(redirect, 'restored');
+  let retargeted = false;
+
+  assert.throws(
+    () => materializeBeta22Rollback(root, destination, {
+      snapshotDirectory: snapshot.directory,
+      _testHooks: {
+        afterStorageValidation() {
+          fs.unlinkSync(redirect);
+          fs.symlinkSync(hostileParent, redirect, linkType);
+          retargeted = true;
+        },
+      },
+    }),
+    /destination changed during materialization/,
+  );
+  assert.equal(retargeted, true);
+  assert.equal(fs.existsSync(path.join(approvedParent, 'restored')), false);
+  assert.equal(fs.existsSync(path.join(hostileParent, 'restored')), false);
 });
 
 test('beta.22 rollback never accepts a substituted staging directory at final rename', () => {

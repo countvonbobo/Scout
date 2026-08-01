@@ -79,10 +79,16 @@ function captureRollbackDestination(workspaceRoot, target) {
   let current = parent;
   while (true) {
     const stat = fs.lstatSync(current, { bigint: true });
-    if (stat.isSymbolicLink() || !stat.isDirectory()) {
+    const physicalStat = fs.statSync(current, { bigint: true });
+    if (!physicalStat.isDirectory()) {
       throw new Error('beta.22 rollback destination ancestry is redirected');
     }
-    entries.push({ entry: current, physical: fs.realpathSync(current), stat });
+    entries.push({
+      entry: current,
+      physical: fs.realpathSync(current),
+      stat,
+      physicalStat,
+    });
     const next = path.dirname(current);
     if (next === current) break;
     current = next;
@@ -104,6 +110,8 @@ function verifyRollbackDestination(workspaceRoot, authority) {
       || entry.physical !== authority.entries[index].physical
       || entry.stat.dev !== authority.entries[index].stat.dev
       || entry.stat.ino !== authority.entries[index].stat.ino
+      || entry.physicalStat.dev !== authority.entries[index].physicalStat.dev
+      || entry.physicalStat.ino !== authority.entries[index].physicalStat.ino
     ))) {
     throw new Error('beta.22 rollback destination changed during materialization');
   }
