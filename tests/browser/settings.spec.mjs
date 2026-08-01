@@ -23,8 +23,12 @@ const establishedStatus = {
     ai: { provider: 'codex', model: null, models: { codex: null, claude: null } },
   },
   providers: {
-    codex: { installed: true, authenticated: true, capabilities: { structuredOutput: true } },
-    claude: { installed: true, authenticated: true, capabilities: { structuredOutput: true } },
+    codex: {
+      installed: true, authenticated: true, capabilities: { structuredOutput: true }, healthState: 'ready',
+    },
+    claude: {
+      installed: true, authenticated: true, capabilities: { structuredOutput: true }, healthState: 'ready',
+    },
   },
   adzunaConfigured: false,
   scanHealth: { healthy: true, lastRunAt: '2026-07-20T08:00:00.000Z' },
@@ -864,6 +868,7 @@ test('a durable remote authentication failure keeps reauthentication reachable',
 
 test('provider cards render every non-usable health state truthfully and disabled', async ({ page }) => {
   const expected = [
+    [null, 'provider status unavailable'],
     ['checking', 'checking provider status'],
     ['login-in-progress', 'sign-in in progress'],
     ['network-unavailable', 'network unavailable'],

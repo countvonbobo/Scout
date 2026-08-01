@@ -176,8 +176,7 @@ export function providerCardPresentation(provider = {}) {
   if (Object.hasOwn(blocked, provider.healthState)) {
     return { available: false, ...blocked[provider.healthState] };
   }
-  if (provider.healthState
-    && !['ready', 'credentials-present-unverified'].includes(provider.healthState)) {
+  if (!['ready', 'credentials-present-unverified'].includes(provider.healthState)) {
     return {
       available: false,
       label: 'Installed; provider status unavailable',

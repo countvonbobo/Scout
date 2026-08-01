@@ -336,6 +336,11 @@ test('provider cards fail closed with truthful health-state guidance', () => {
   assert.equal(providerCardPresentation({ ...base, healthState: 'ready' }).available, true);
   assert.equal(providerCardPresentation({ ...base, healthState: 'credentials-present-unverified' }).available, true);
   assert.equal(providerCardPresentation({ ...base, healthState: 'future-state' }).available, false);
+  for (const healthState of [undefined, null, '']) {
+    const presentation = providerCardPresentation({ ...base, healthState });
+    assert.equal(presentation.available, false, `missing health state ${String(healthState)}`);
+    assert.match(presentation.label, /status unavailable/);
+  }
 });
 
 test('provider login UI keeps its CSRF token and manual code out of browser storage', () => {
