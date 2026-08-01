@@ -13,6 +13,7 @@ const DEFAULT_DURATION_MS = 11 * 60 * 1000;
 const DEFAULT_WORK_DURATION_MS = 30 * 60 * 1000;
 const GUARD_STALE_MS = 15_000;
 const GUARD_ACQUIRE_TIMEOUT_MS = 2_000;
+const GUARD_HARD_TIMEOUT_MS = 6_000;
 const WORK_GUARD_ACQUIRE_ATTEMPTS = 3;
 const GUARD_RECORD = 'owner.json';
 const guardSleep = new Int32Array(new SharedArrayBuffer(4));
@@ -320,14 +321,21 @@ function createOwnedGuard(directory, acquiredAt) {
   return { candidate, token };
 }
 
-function withGuard(root, provider, now, callback, scheduler = setTimeout) {
+function withGuard(root, provider, now, callback, scheduler = setTimeout, timing = {}) {
+  const inactivityMs = timing.inactivityMs ?? GUARD_ACQUIRE_TIMEOUT_MS;
+  const hardTimeoutMs = timing.hardTimeoutMs ?? GUARD_HARD_TIMEOUT_MS;
+  if (!Number.isSafeInteger(inactivityMs) || inactivityMs <= 0
+    || !Number.isSafeInteger(hardTimeoutMs) || hardTimeoutMs < inactivityMs) {
+    throw new TypeError('provider authentication guard timing is invalid');
+  }
+  const hardDeadline = timing.hardDeadline ?? (performance.now() + hardTimeoutMs);
   const target = paths(root, provider, true);
   const acquiredAt = checkedNow(now);
   cleanupOrphanCandidates(target.guard, Date.now());
   const prepared = createOwnedGuard(target.guard, acquiredAt);
   // Platform process-identity probes and orphan housekeeping are setup work,
   // not lock contention. Give every prepared candidate the full retry budget.
-  let deadline = performance.now() + GUARD_ACQUIRE_TIMEOUT_MS;
+  let deadline = Math.min(hardDeadline, performance.now() + inactivityMs);
   let observedToken = null;
   let published = false;
   try {
@@ -344,10 +352,9 @@ function withGuard(root, provider, now, callback, scheduler = setTimeout) {
             // A new verified owner means contenders are making progress.
             // Bound only inactivity so several short critical sections can
             // serialize without later contenders being misreported as busy.
-            deadline = performance.now() + GUARD_ACQUIRE_TIMEOUT_MS;
+            deadline = Math.min(hardDeadline, performance.now() + inactivityMs);
           }
-          if (acquiredAt - observed.acquiredAt > GUARD_STALE_MS
-            && !processOwnerIsLiveOrAmbiguous(observed.owner)) {
+          if (!processOwnerIsLiveOrAmbiguous(observed.owner)) {
             const quarantine = `${target.guard}.stale-${randomUUID()}`;
             try {
               fs.renameSync(target.guard, quarantine);
@@ -440,7 +447,10 @@ export function acquireProviderAuthMutation(root, provider, {
     }, provider);
     atomicWriteFile(file, `${JSON.stringify(record)}\n`, { mode: 0o600 });
     return structuredClone(record);
-  }, _testHooks.cleanupScheduler || setTimeout);
+  }, _testHooks.cleanupScheduler || setTimeout, {
+    inactivityMs: _testHooks.guardInactivityMs,
+    hardTimeoutMs: _testHooks.guardHardTimeoutMs,
+  });
 }
 
 function updateProviderAuthMutationChild(root, capability, update, { now } = {}) {
@@ -512,6 +522,7 @@ export function acquireProviderWork(root, provider, {
     throw new TypeError('provider work authority settings are invalid');
   }
   let capability = null;
+  const hardDeadline = performance.now() + GUARD_HARD_TIMEOUT_MS;
   for (let attempt = 0; attempt < WORK_GUARD_ACQUIRE_ATTEMPTS && !capability; attempt += 1) {
     capability = withGuard(root, provider, at, (target) => {
       const current = readProviderAuthMutation(root, provider, { now: at });
@@ -532,7 +543,7 @@ export function acquireProviderWork(root, provider, {
       }, provider);
       atomicWriteFile(path.join(target.work, `${workId}.json`), `${JSON.stringify(record)}\n`, { mode: 0o600 });
       return structuredClone(record);
-    });
+    }, setTimeout, { hardDeadline });
   }
   if (!capability) throw new ProviderAuthMutationActiveError(provider, 'unknown');
   return capability;

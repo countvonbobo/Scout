@@ -584,6 +584,63 @@ test('verified guard ownership progress refreshes the contention retry budget', 
   assert.equal(releaseProviderAuthMutation(root, auth, { now: 1_001 }), true);
 });
 
+test('changing guard tokens cannot refresh contention beyond the absolute deadline', (t) => {
+  const root = workspace(t);
+  const guard = path.join(root, '.scout', 'provider-auth', 'v1', 'codex.guard');
+  const originalRename = fs.renameSync;
+  let owners = 0;
+  fs.renameSync = (source, destination) => {
+    if (path.resolve(String(destination)) === path.resolve(guard) && owners < 10) {
+      owners += 1;
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 75);
+      fs.mkdirSync(guard, { recursive: true });
+      fs.writeFileSync(path.join(guard, 'owner.json'), JSON.stringify({
+        token: `churning-owner-${String(owners).padStart(4, '0')}`,
+        owner,
+        acquiredAt: 1_000,
+      }));
+      throw Object.assign(new Error('synthetic token churn'), { code: 'EEXIST' });
+    }
+    if (path.resolve(String(destination)) === path.resolve(guard)) {
+      fs.rmSync(guard, { recursive: true, force: true });
+    }
+    return originalRename(source, destination);
+  };
+  let auth;
+  try {
+    auth = acquireProviderAuthMutation(root, 'codex', {
+      owner, now: 1_000, durationMs: 5_000, mutationId: 'bounded-churn-auth1',
+      _testHooks: { guardInactivityMs: 100, guardHardTimeoutMs: 250 },
+    });
+  } finally {
+    fs.renameSync = originalRename;
+    fs.rmSync(guard, { recursive: true, force: true });
+  }
+  assert.equal(auth, null);
+  assert.ok(owners < 10, 'absolute deadline must stop continuing token churn');
+});
+
+test('a freshly orphaned canonical guard is reclaimed by pinned dead-owner identity', (t) => {
+  const root = workspace(t);
+  const guard = path.join(root, '.scout', 'provider-auth', 'v1', 'codex.guard');
+  fs.mkdirSync(guard, { recursive: true });
+  fs.writeFileSync(path.join(guard, 'owner.json'), JSON.stringify({
+    token: 'freshly-orphaned-guard-0001',
+    owner: {
+      ...currentLeaseOwner(),
+      pid: 2_147_483_647,
+      processStart: 'definitely-dead-fresh-owner',
+    },
+    acquiredAt: Date.now(),
+  }));
+  const auth = acquireProviderAuthMutation(root, 'codex', {
+    owner, now: Date.now(), durationMs: 5_000, mutationId: 'fresh-orphan-auth01',
+    _testHooks: { guardInactivityMs: 100, guardHardTimeoutMs: 250 },
+  });
+  assert.ok(auth);
+  assert.equal(releaseProviderAuthMutation(root, auth), true);
+});
+
 test('expired authentication authority remains fenced by its surviving child', async (t) => {
   const root = workspace(t);
   const deadOwner = {
