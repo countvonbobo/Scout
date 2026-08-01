@@ -171,3 +171,29 @@ test('manual scan status and approximate remaining time stay visible on a narrow
   await expect(page.locator('#scan-status')).toBeVisible();
   await expect(page.locator('#scan-status')).toContainText(/about 4–7 min remaining/i);
 });
+
+test('transient operation polling failure keeps the active scan fenced and recovers', async ({ page }) => {
+  let requests = 0;
+  let releaseRecovery;
+  const recoveryAllowed = new Promise((resolve) => { releaseRecovery = resolve; });
+  await page.route('**/api/operations/scan-transient', async (route) => {
+    requests += 1;
+    if (requests === 1) {
+      await route.fulfill({ status: 503, contentType: 'application/json', body: '{"error":"temporarily unavailable"}' });
+      return;
+    }
+    await recoveryAllowed;
+    await route.fulfill({ contentType: 'application/json', body: JSON.stringify({
+      operation: {
+        id: 'scan-transient', type: 'scan', status: 'running', phase: 'Scoring candidates',
+        progress: { current: 2, total: 5 }, startedAt: new Date(Date.now() - 60_000).toISOString(),
+      },
+    }) });
+  });
+  await page.evaluate(() => window.Scout.watchScanOperation('scan-transient'));
+  await expect.poll(() => requests).toBe(2);
+  await expect(page.locator('#scan-now')).toBeDisabled();
+  await expect.poll(() => page.evaluate(() => window.Scout.scanRunning)).toBe(true);
+  releaseRecovery();
+  await expect(page.locator('#scan-status')).toContainText(/Scoring candidates/i);
+});

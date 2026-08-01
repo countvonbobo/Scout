@@ -525,11 +525,11 @@ const Scout = {
         this.scanRunning = false;
         if (button) { button.disabled = false; button.textContent = 'Scan now'; }
         if (body.operation.status === 'succeeded') await this.loadOpportunities();
-      } catch (error) {
-        this.scanOperationTimer = null;
-        this.scanRunning = false;
-        if (button) { button.disabled = false; button.textContent = 'Scan now'; }
-        document.getElementById('scan-status').textContent = error.message;
+      } catch {
+        // A transient transport or decoding failure is not evidence that the
+        // durable operation stopped. Keep the UI fenced and retry discovery;
+        // only a terminal operation response may re-enable submission.
+        this.scanOperationTimer = setTimeout(poll, 1000);
       }
     };
     this.scanOperationTimer = setTimeout(poll, 250);
