@@ -62,6 +62,9 @@ function harness({
   acquireAuthMutation,
   renewAuthMutation,
   releaseAuthMutation,
+  beginAuthMutationChild,
+  attachAuthMutationChild,
+  finishAuthMutationChild,
   authRenewalIntervalMs,
 } = {}) {
   const login = fakeChild({ closeOnKill });
@@ -103,6 +106,9 @@ function harness({
     ...(acquireAuthMutation === undefined ? {} : { acquireAuthMutation }),
     ...(renewAuthMutation === undefined ? {} : { renewAuthMutation }),
     ...(releaseAuthMutation === undefined ? {} : { releaseAuthMutation }),
+    ...(beginAuthMutationChild === undefined ? {} : { beginAuthMutationChild }),
+    ...(attachAuthMutationChild === undefined ? {} : { attachAuthMutationChild }),
+    ...(finishAuthMutationChild === undefined ? {} : { finishAuthMutationChild }),
     ...(authRenewalIntervalMs === undefined ? {} : { authRenewalIntervalMs }),
     onHealthSignal: async (name, signal) => {
       health.push([name, signal]);
@@ -440,6 +446,48 @@ test('login authority is released only after child closure and terminal health p
   h.login.close(null);
   await new Promise((resolve) => setImmediate(resolve));
   assert.deepEqual(events, ['acquire:codex:login', 'release']);
+});
+
+test('login durably fences each credential-mutating child before spawn until close', async () => {
+  const events = [];
+  let operation = 0;
+  const capability = { provider: 'codex', phase: 'login', mutationId: 'child-fenced-auth-01' };
+  const h = harness({
+    acquireAuthMutation: async () => capability,
+    beginAuthMutationChild: (current, phase) => {
+      assert.equal(current, capability);
+      const id = `child-operation-${++operation}`;
+      events.push(`begin:${phase}:${id}`);
+      return id;
+    },
+    attachAuthMutationChild: (current, id, pid) => {
+      assert.equal(current, capability);
+      events.push(`attach:${id}:${pid}`);
+    },
+    finishAuthMutationChild: (current, id) => {
+      assert.equal(current, capability);
+      events.push(`finish:${id}`);
+    },
+    releaseAuthMutation: async () => { events.push('release'); },
+  });
+  h.login.pid = 40_001;
+  h.validation.pid = 40_002;
+  const started = await h.manager.startProviderLogin('codex', OWNER);
+  assert.deepEqual(events, [
+    'begin:login:child-operation-1',
+    `attach:child-operation-1:${h.login.pid}`,
+  ]);
+  h.login.close(0);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(events.slice(2), [
+    'finish:child-operation-1',
+    'begin:login:child-operation-2',
+    `attach:child-operation-2:${h.validation.pid}`,
+  ]);
+  h.validation.close(0);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(h.manager.getProviderLoginSession(started.sessionId, OWNER).state, 'succeeded');
+  assert.deepEqual(events.slice(-2), ['finish:child-operation-2', 'release']);
 });
 
 test('stubborn login children keep renewing authentication authority until closure', async () => {

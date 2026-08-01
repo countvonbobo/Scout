@@ -6,6 +6,9 @@ import path from 'node:path';
 import test from 'node:test';
 import {
   acquireProviderAuthMutation,
+  attachProviderAuthMutationChild,
+  beginProviderAuthMutationChild,
+  finishProviderAuthMutationChild,
   acquireProviderWork,
   createProviderWorkSupervisor,
   readProviderAuthMutation,
@@ -497,6 +500,75 @@ test('expired authentication authority is recovered with a new capability', (t) 
   );
   assert.equal(releaseProviderAuthMutation(root, recovered, { now: 1_012 }), true);
   assert.equal(readProviderAuthMutation(root, 'codex', { now: 1_012 }), null);
+});
+
+test('guard setup time does not consume the contention retry budget', (t) => {
+  const root = workspace(t);
+  const directory = path.join(root, '.scout', 'provider-auth', 'v1');
+  const originalReadDirectory = fs.readdirSync;
+  const originalRename = fs.renameSync;
+  let delayed = false;
+  let contended = false;
+  fs.readdirSync = (target, ...args) => {
+    if (!delayed && path.resolve(String(target)) === path.resolve(directory)) {
+      delayed = true;
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 2_050);
+    }
+    return originalReadDirectory(target, ...args);
+  };
+  fs.renameSync = (source, destination) => {
+    if (!contended && String(destination).endsWith('codex.guard')) {
+      contended = true;
+      throw Object.assign(new Error('synthetic first-attempt contention'), { code: 'EEXIST' });
+    }
+    return originalRename(source, destination);
+  };
+  let auth;
+  try {
+    auth = acquireProviderAuthMutation(root, 'codex', {
+      owner, now: 1_000, durationMs: 5_000, mutationId: 'setup-budget-auth1',
+    });
+  } finally {
+    fs.readdirSync = originalReadDirectory;
+    fs.renameSync = originalRename;
+  }
+  assert.ok(auth);
+  assert.equal(releaseProviderAuthMutation(root, auth, { now: 1_001 }), true);
+});
+
+test('expired authentication authority remains fenced by its surviving child', async (t) => {
+  const root = workspace(t);
+  const deadOwner = {
+    ...currentLeaseOwner(),
+    pid: 2_147_483_647,
+    processStart: 'definitely-dead-parent',
+  };
+  const auth = acquireProviderAuthMutation(root, 'codex', {
+    owner: deadOwner, now: 1_000, durationMs: 10, mutationId: 'orphaned-child-auth1',
+  });
+  const operationId = beginProviderAuthMutationChild(root, auth, 'login');
+  assert.equal(
+    readProviderAuthMutation(root, 'codex', { now: 1_011 }).childOperation.state,
+    'starting',
+    'a crash before child attachment must fail closed',
+  );
+  const child = spawn(process.execPath, ['--input-type=module', '--eval', 'setTimeout(() => {}, 30000)'], {
+    stdio: 'ignore', windowsHide: true,
+  });
+  t.after(() => { try { child.kill('SIGKILL'); } catch {} });
+  attachProviderAuthMutationChild(root, auth, operationId, child.pid);
+  assert.throws(
+    () => releaseProviderAuthMutation(root, auth, { now: 1_011 }),
+    /child has not closed/,
+  );
+  assert.equal(acquireProviderAuthMutation(root, 'codex', {
+    owner: currentLeaseOwner(), now: 1_011, durationMs: 10, mutationId: 'unsafe-successor-01',
+  }), null);
+  child.kill('SIGKILL');
+  await new Promise((resolve) => child.once('close', resolve));
+  finishProviderAuthMutationChild(root, auth, operationId);
+  assert.equal(readProviderAuthMutation(root, 'codex', { now: 1_011 }), null);
+  assert.equal(releaseProviderAuthMutation(root, auth, { now: 1_011 }), true);
 });
 
 test('expired live auth and work records remain mutually exclusive and renewable', (t) => {

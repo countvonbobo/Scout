@@ -42,7 +42,8 @@ import {
   PROVIDER_HEALTH_STATES, providerPreflight, readProviderHealth,
 } from './lib/providerHealth.mjs';
 import {
-  acquireProviderAuthMutation, acquireProviderWork, releaseProviderAuthMutation,
+  acquireProviderAuthMutation, acquireProviderWork, attachProviderAuthMutationChild,
+  beginProviderAuthMutationChild, finishProviderAuthMutationChild, releaseProviderAuthMutation,
   releaseProviderWork, renewProviderAuthMutation,
 } from './lib/providerAuthMutation.mjs';
 import { createProviderLoginManager } from './lib/providerLogin.mjs';
@@ -865,6 +866,15 @@ const runtimeProviderLoginManager = createProviderLoginManager({
   releaseAuthMutation: async (capability) => releaseProviderAuthMutation(
     WORKSPACE_ROOT,
     capability,
+  ),
+  beginAuthMutationChild: (capability, phase) => beginProviderAuthMutationChild(
+    WORKSPACE_ROOT, capability, phase,
+  ),
+  attachAuthMutationChild: (capability, operationId, pid) => attachProviderAuthMutationChild(
+    WORKSPACE_ROOT, capability, operationId, pid,
+  ),
+  finishAuthMutationChild: (capability, operationId) => finishProviderAuthMutationChild(
+    WORKSPACE_ROOT, capability, operationId,
   ),
 });
 

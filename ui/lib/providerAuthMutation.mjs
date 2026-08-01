@@ -2,7 +2,9 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { atomicWriteFile } from './atomicWrite.mjs';
-import { currentLeaseOwner, processOwnerIsLiveOrAmbiguous } from './scanLease.mjs';
+import {
+  currentLeaseOwner, observeProcessOwner, processOwnerIsLiveOrAmbiguous,
+} from './scanLease.mjs';
 
 const PROVIDERS = new Set(['codex', 'claude']);
 const PHASES = new Set(['login', 'logout']);
@@ -78,7 +80,10 @@ function paths(root, provider, create = false) {
 
 function validate(record, provider) {
   const keys = Object.keys(record || {}).sort().join(',');
-  if (keys !== 'acquiredAt,expiresAt,mutationId,owner,phase,provider,schemaVersion'
+  if (![
+    'acquiredAt,expiresAt,mutationId,owner,phase,provider,schemaVersion',
+    'acquiredAt,childOperation,expiresAt,mutationId,owner,phase,provider,schemaVersion',
+  ].includes(keys)
     || record.schemaVersion !== SCHEMA_VERSION
     || record.provider !== provider
     || !PHASES.has(record.phase)
@@ -93,7 +98,35 @@ function validate(record, provider) {
     || record.expiresAt <= record.acquiredAt) {
     throw new Error('provider authentication mutation record is invalid');
   }
-  return record;
+  const childOperation = record.childOperation ?? null;
+  if (childOperation !== null) {
+    const childKeys = Object.keys(childOperation || {}).sort().join(',');
+    if (childKeys !== 'operationId,owner,phase,state'
+      || !/^[A-Za-z0-9_-]{16,128}$/.test(childOperation.operationId)
+      || !PHASES.has(childOperation.phase)
+      || !['starting', 'running'].includes(childOperation.state)
+      || (childOperation.state === 'starting' && childOperation.owner !== null)) {
+      throw new Error('provider authentication mutation record is invalid');
+    }
+    if (childOperation.state === 'running') {
+      const childOwner = childOperation.owner;
+      if (!childOwner
+        || Object.keys(childOwner).sort().join(',') !== 'host,pid,processStart'
+        || typeof childOwner.host !== 'string'
+        || !Number.isSafeInteger(childOwner.pid)
+        || (childOwner.processStart !== null && typeof childOwner.processStart !== 'string')) {
+        throw new Error('provider authentication mutation record is invalid');
+      }
+    }
+  }
+  return Object.hasOwn(record, 'childOperation') ? record : { ...record, childOperation: null };
+}
+
+function mutationMayStillRun(record, at) {
+  if (record.expiresAt > at || processOwnerIsLiveOrAmbiguous(record.owner)) return true;
+  if (record.childOperation === null) return false;
+  if (record.childOperation.state === 'starting' || record.childOperation.owner === null) return true;
+  return processOwnerIsLiveOrAmbiguous(record.childOperation.owner);
 }
 
 function validateWork(record, provider) {
@@ -289,9 +322,11 @@ function createOwnedGuard(directory, acquiredAt) {
 function withGuard(root, provider, now, callback, scheduler = setTimeout) {
   const target = paths(root, provider, true);
   const acquiredAt = checkedNow(now);
-  const deadline = performance.now() + GUARD_ACQUIRE_TIMEOUT_MS;
   cleanupOrphanCandidates(target.guard, Date.now());
   const prepared = createOwnedGuard(target.guard, acquiredAt);
+  // Platform process-identity probes and orphan housekeeping are setup work,
+  // not lock contention. Give every prepared candidate the full retry budget.
+  const deadline = performance.now() + GUARD_ACQUIRE_TIMEOUT_MS;
   let published = false;
   try {
     while (!published) {
@@ -351,7 +386,7 @@ export function readProviderAuthMutation(root, provider, { now } = {}) {
   const bytes = fs.readFileSync(file);
   if (bytes.length > 4_096) throw new Error('provider authentication mutation record is oversized');
   const record = validate(JSON.parse(bytes.toString('utf8')), provider);
-  return record.expiresAt > at || processOwnerIsLiveOrAmbiguous(record.owner)
+  return mutationMayStillRun(record, at)
     ? structuredClone(record)
     : null;
 }
@@ -390,12 +425,71 @@ export function acquireProviderAuthMutation(root, provider, {
         pid: Number(owner.pid),
         processStart: String(owner.processStart),
       },
+      childOperation: null,
       acquiredAt: at,
       expiresAt: at + durationMs,
     }, provider);
     atomicWriteFile(file, `${JSON.stringify(record)}\n`, { mode: 0o600 });
     return structuredClone(record);
   }, _testHooks.cleanupScheduler || setTimeout);
+}
+
+function updateProviderAuthMutationChild(root, capability, update, { now } = {}) {
+  const provider = checkedProvider(capability?.provider);
+  const at = checkedNow(now);
+  const changed = withGuard(root, provider, at, (target) => {
+    if (!fs.existsSync(target.file)) throw new Error('provider authentication mutation capability was lost');
+    const current = validate(JSON.parse(fs.readFileSync(target.file, 'utf8')), provider);
+    if (current.mutationId !== capability.mutationId) {
+      throw new Error('provider authentication mutation capability was lost');
+    }
+    const record = validate(update(current), provider);
+    atomicWriteFile(target.file, `${JSON.stringify(record)}\n`, { mode: 0o600 });
+    return structuredClone(record);
+  });
+  if (!changed) throw new Error('provider authentication mutation authority could not be updated');
+  return changed;
+}
+
+export function beginProviderAuthMutationChild(root, capability, phase, options = {}) {
+  if (!PHASES.has(phase)) throw new TypeError('provider authentication child phase is invalid');
+  const operationId = randomUUID();
+  updateProviderAuthMutationChild(root, capability, (current) => {
+    if (current.childOperation !== null) {
+      throw new Error('provider authentication mutation child is already active');
+    }
+    return {
+      ...current,
+      childOperation: { operationId, phase, state: 'starting', owner: null },
+    };
+  }, options);
+  return operationId;
+}
+
+export function attachProviderAuthMutationChild(root, capability, operationId, pid, options = {}) {
+  return updateProviderAuthMutationChild(root, capability, (current) => {
+    if (current.childOperation?.operationId !== operationId
+      || current.childOperation.state !== 'starting') {
+      throw new Error('provider authentication mutation child ownership changed');
+    }
+    return {
+      ...current,
+      childOperation: {
+        ...current.childOperation,
+        state: 'running',
+        owner: observeProcessOwner(pid),
+      },
+    };
+  }, options);
+}
+
+export function finishProviderAuthMutationChild(root, capability, operationId, options = {}) {
+  return updateProviderAuthMutationChild(root, capability, (current) => {
+    if (current.childOperation?.operationId !== operationId) {
+      throw new Error('provider authentication mutation child ownership changed');
+    }
+    return { ...current, childOperation: null };
+  }, options);
 }
 
 export function acquireProviderWork(root, provider, {
@@ -590,6 +684,11 @@ export function releaseProviderAuthMutation(root, capability, { now } = {}) {
     const current = validate(JSON.parse(fs.readFileSync(file, 'utf8')), provider);
     if (current.mutationId !== capability.mutationId) {
       throw new Error('provider authentication mutation capability was lost');
+    }
+    if (current.childOperation !== null
+      && (current.childOperation.state === 'starting'
+        || processOwnerIsLiveOrAmbiguous(current.childOperation.owner))) {
+      throw new Error('provider authentication mutation child has not closed');
     }
     fs.rmSync(file);
     return true;

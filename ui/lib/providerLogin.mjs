@@ -329,6 +329,9 @@ export function createProviderLoginManager({
   }),
   renewAuthMutation = async (capability) => capability,
   releaseAuthMutation = async () => true,
+  beginAuthMutationChild = () => randomUUID(),
+  attachAuthMutationChild = () => true,
+  finishAuthMutationChild = () => true,
   cwd = process.cwd(),
   env = process.env,
   platform = process.platform,
@@ -349,7 +352,10 @@ export function createProviderLoginManager({
 } = {}) {
   if (typeof acquireAuthMutation !== 'function'
     || typeof renewAuthMutation !== 'function'
-    || typeof releaseAuthMutation !== 'function') {
+    || typeof releaseAuthMutation !== 'function'
+    || typeof beginAuthMutationChild !== 'function'
+    || typeof attachAuthMutationChild !== 'function'
+    || typeof finishAuthMutationChild !== 'function') {
     throw new TypeError('provider authentication mutation authority is invalid');
   }
   const timeoutMs = checkedPositiveInteger(
@@ -736,9 +742,10 @@ export function createProviderLoginManager({
     });
   }
 
-  function monitorChild(session, child, phase) {
+  function monitorChild(session, child, phase, childOperation) {
     session.process = child;
     session.processRecord = trackChild(child);
+    session.authChildOperation = childOperation;
     let finished = false;
     child.stdout?.on('data', (chunk) => collectOutput(session, 'stdout', chunk));
     child.stderr?.on('data', (chunk) => collectOutput(session, 'stderr', chunk));
@@ -762,6 +769,13 @@ export function createProviderLoginManager({
     child.once('close', (status) => {
       if (finished) return;
       finished = true;
+      try {
+        finishAuthMutationChild(session.authLease.capability, childOperation);
+        if (session.authChildOperation === childOperation) session.authChildOperation = null;
+      } catch {
+        void terminal(session, 'failed', 'auth-authority-lost');
+        return;
+      }
       if (TERMINAL_STATES.has(session.state)) return;
       session.process = null;
       session.processRecord = null;
@@ -784,13 +798,23 @@ export function createProviderLoginManager({
     session.codeRequired = false;
     session.buffers = { stdout: '', stderr: '' };
     let child;
+    let childOperation;
     try {
+      childOperation = beginAuthMutationChild(session.authLease.capability, 'login');
       child = spawnFixed(session, STATUS_ARGUMENTS[session.provider], 'ignore');
     } catch {
+      if (childOperation) {
+        try { finishAuthMutationChild(session.authLease.capability, childOperation); } catch {}
+      }
       terminal(session, 'failed', 'validation-failed');
       return;
     }
-    monitorChild(session, child, 'validation');
+    monitorChild(session, child, 'validation', childOperation);
+    try {
+      attachAuthMutationChild(session.authLease.capability, childOperation, child.pid);
+    } catch {
+      void terminal(session, 'failed', 'auth-authority-lost', { kill: true });
+    }
   }
 
   function checkedPostAuthSignal(signal) {
@@ -959,6 +983,7 @@ export function createProviderLoginManager({
         retryInFlight: false,
         clearConsumed: false,
         timeout: null,
+        authChildOperation: null,
       };
       sessions.set(id, session);
       active.set(key, session);
@@ -972,17 +997,28 @@ export function createProviderLoginManager({
       session.timeout.unref?.();
 
       let child;
+      let childOperation;
       try {
+        childOperation = beginAuthMutationChild(authLease.capability, 'login');
         child = spawnFixed(
           session,
           LOGIN_ARGUMENTS[provider],
           provider === 'codex' ? 'ignore' : 'pipe',
         );
       } catch {
+        if (childOperation) {
+          try { finishAuthMutationChild(authLease.capability, childOperation); } catch {}
+        }
         terminal(session, 'failed', 'process-start-failed');
         return publicSnapshot(session);
       }
-      monitorChild(session, child, 'login');
+      monitorChild(session, child, 'login', childOperation);
+      try {
+        attachAuthMutationChild(authLease.capability, childOperation, child.pid);
+      } catch {
+        await terminal(session, 'failed', 'auth-authority-lost', { kill: true });
+        return publicSnapshot(session);
+      }
       emitHealth(session, { kind: 'login-started', source: 'post-auth' });
       return publicSnapshot(session);
     } finally {
@@ -1177,6 +1213,7 @@ export function createProviderLoginManager({
         env: environment,
         resolve: (value) => value,
       });
+      const childOperation = beginAuthMutationChild(authLease.capability, 'logout');
       const state = await new Promise((resolve) => {
         let child;
         let settled = false;
@@ -1207,12 +1244,19 @@ export function createProviderLoginManager({
             windowsVerbatimArguments: invocation.windowsVerbatimArguments,
           });
         } catch {
+          try { finishAuthMutationChild(authLease.capability, childOperation); } catch {}
           resolve('failed');
           return;
         }
         record = trackChild(child);
         clearRecord = record;
         pendingClearSettlers.set(record, () => settle('failed'));
+        try {
+          attachAuthMutationChild(authLease.capability, childOperation, child.pid);
+        } catch {
+          void settle('failed', { kill: true });
+          return;
+        }
         timer = setTimeout(() => { void settle('failed', { kill: true }); }, timeoutMs);
         timer.unref?.();
         const collect = (stream, chunk) => {
@@ -1241,7 +1285,10 @@ export function createProviderLoginManager({
         child.stderr?.on('data', (chunk) => collect('stderr', chunk));
         child.once('error', () => { void settle('failed', { kill: true }); });
         child.once('disconnect', () => { void settle('failed', { kill: true }); });
-        child.once('close', (statusCode) => { void settle(statusCode === 0 ? 'cleared' : 'failed'); });
+        child.once('close', (statusCode) => {
+          try { finishAuthMutationChild(authLease.capability, childOperation); } catch {}
+          void settle(statusCode === 0 ? 'cleared' : 'failed');
+        });
       });
       const reasonCode = state === 'cleared' ? null : 'logout-failed';
       try {
