@@ -525,7 +525,7 @@ test('guard setup time does not consume the contention retry budget', (t) => {
   fs.readdirSync = (target, ...args) => {
     if (!delayed && path.resolve(String(target)) === path.resolve(directory)) {
       delayed = true;
-      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 2_050);
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 300);
     }
     return originalReadDirectory(target, ...args);
   };
@@ -540,6 +540,7 @@ test('guard setup time does not consume the contention retry budget', (t) => {
   try {
     auth = acquireProviderAuthMutation(root, 'codex', {
       owner, now: 1_000, durationMs: 5_000, mutationId: 'setup-budget-auth1',
+      _testHooks: { guardInactivityMs: 100, guardHardTimeoutMs: 250 },
     });
   } finally {
     fs.readdirSync = originalReadDirectory;

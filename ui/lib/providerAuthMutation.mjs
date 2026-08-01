@@ -321,6 +321,16 @@ function createOwnedGuard(directory, acquiredAt) {
   return { candidate, token };
 }
 
+function ownerPidIsDefinitelyAbsent(owner) {
+  if (owner?.host !== currentLeaseOwner().host || !Number.isSafeInteger(owner?.pid)) return false;
+  try {
+    process.kill(owner.pid, 0);
+    return false;
+  } catch (error) {
+    return error?.code === 'ESRCH';
+  }
+}
+
 function withGuard(root, provider, now, callback, scheduler = setTimeout, timing = {}) {
   const inactivityMs = timing.inactivityMs ?? GUARD_ACQUIRE_TIMEOUT_MS;
   const hardTimeoutMs = timing.hardTimeoutMs ?? GUARD_HARD_TIMEOUT_MS;
@@ -328,11 +338,15 @@ function withGuard(root, provider, now, callback, scheduler = setTimeout, timing
     || !Number.isSafeInteger(hardTimeoutMs) || hardTimeoutMs < inactivityMs) {
     throw new TypeError('provider authentication guard timing is invalid');
   }
-  const hardDeadline = timing.hardDeadline ?? (performance.now() + hardTimeoutMs);
   const target = paths(root, provider, true);
   const acquiredAt = checkedNow(now);
   cleanupOrphanCandidates(target.guard, Date.now());
   const prepared = createOwnedGuard(target.guard, acquiredAt);
+  const budget = timing.budget || {};
+  if (!Number.isFinite(budget.hardDeadline)) {
+    budget.hardDeadline = performance.now() + hardTimeoutMs;
+  }
+  const { hardDeadline } = budget;
   // Platform process-identity probes and orphan housekeeping are setup work,
   // not lock contention. Give every prepared candidate the full retry budget.
   let deadline = Math.min(hardDeadline, performance.now() + inactivityMs);
@@ -348,14 +362,18 @@ function withGuard(root, provider, now, callback, scheduler = setTimeout, timing
         if (!['EEXIST', 'ENOTEMPTY', 'EBUSY', 'EPERM', 'EACCES'].includes(error?.code)) throw error;
         const observed = readGuardRecord(target.guard);
         if (observed) {
+          let reclaim = false;
           if (observed.token !== observedToken) {
             observedToken = observed.token;
             // A new verified owner means contenders are making progress.
             // Bound only inactivity so several short critical sections can
             // serialize without later contenders being misreported as busy.
             deadline = Math.min(hardDeadline, performance.now() + inactivityMs);
+            reclaim = ownerPidIsDefinitelyAbsent(observed.owner)
+              || (acquiredAt - observed.acquiredAt > GUARD_STALE_MS
+                && !processOwnerIsLiveOrAmbiguous(observed.owner));
           }
-          if (!processOwnerIsLiveOrAmbiguous(observed.owner)) {
+          if (reclaim) {
             const quarantine = `${target.guard}.stale-${randomUUID()}`;
             try {
               fs.renameSync(target.guard, quarantine);
@@ -523,7 +541,7 @@ export function acquireProviderWork(root, provider, {
     throw new TypeError('provider work authority settings are invalid');
   }
   let capability = null;
-  const hardDeadline = performance.now() + GUARD_HARD_TIMEOUT_MS;
+  const budget = {};
   for (let attempt = 0; attempt < WORK_GUARD_ACQUIRE_ATTEMPTS && !capability; attempt += 1) {
     capability = withGuard(root, provider, at, (target) => {
       const current = readProviderAuthMutation(root, provider, { now: at });
@@ -544,7 +562,7 @@ export function acquireProviderWork(root, provider, {
       }, provider);
       atomicWriteFile(path.join(target.work, `${workId}.json`), `${JSON.stringify(record)}\n`, { mode: 0o600 });
       return structuredClone(record);
-    }, setTimeout, { hardDeadline });
+    }, setTimeout, { budget });
   }
   if (!capability) throw new ProviderAuthMutationActiveError(provider, 'unknown');
   return capability;
