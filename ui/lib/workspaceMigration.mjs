@@ -130,6 +130,44 @@ function verifyTraversedDirectory(source, snapshot, relative, budget) {
   }
 }
 
+function verifySourceFile(record) {
+  const descriptor = fs.openSync(
+    record.file,
+    fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0) | (fs.constants.O_NONBLOCK || 0),
+  );
+  try {
+    const opened = fs.fstatSync(descriptor, { bigint: true });
+    const hash = crypto.createHash('sha256');
+    const buffer = Buffer.allocUnsafe(SNAPSHOT_COPY_CHUNK_BYTES);
+    let position = 0;
+    while (position < Number(opened.size)) {
+      const count = fs.readSync(
+        descriptor, buffer, 0, Math.min(buffer.length, Number(opened.size) - position), position,
+      );
+      if (count <= 0) throw new Error('beta.22 snapshot source changed after copy');
+      hash.update(buffer.subarray(0, count));
+      position += count;
+    }
+    const after = fs.fstatSync(descriptor, { bigint: true });
+    const pathAfter = fs.lstatSync(record.file, { bigint: true });
+    if (!sameSnapshotIdentity(opened, record.identity)
+      || !sameSnapshotIdentity(after, opened)
+      || !sameSnapshotIdentity(pathAfter, opened)
+      || hash.digest('hex') !== record.sha256) {
+      throw new Error(`beta.22 snapshot source changed after copy: ${slash(record.relative)}`);
+    }
+  } finally {
+    fs.closeSync(descriptor);
+  }
+}
+
+function verifySourceAuthority(authority, budget) {
+  for (const record of authority.files) verifySourceFile(record);
+  for (const record of authority.directories) {
+    verifyTraversedDirectory(record.source, record.snapshot, record.relative, budget);
+  }
+}
+
 function assertPhysicalTree(source, relative = '', budget = snapshotBudget(source), depth = 0) {
   const stat = inspectSnapshotEntry(source, relative, budget, depth);
   if (!stat.isDirectory()) return budget;
@@ -153,6 +191,7 @@ function copySnapshotEntry(
   renew = () => {},
   budget = snapshotBudget(source),
   depth = 0,
+  authority = null,
 ) {
   renew();
   const stat = inspectSnapshotEntry(source, relative, budget, depth);
@@ -169,9 +208,11 @@ function copySnapshotEntry(
         renew,
         budget,
         depth + 1,
+        authority,
       );
     }
     verifyTraversedDirectory(source, snapshot, relative, budget);
+    authority?.directories.push({ source, relative, snapshot });
     return;
   }
   fs.mkdirSync(path.dirname(target), { recursive: true });
@@ -187,6 +228,7 @@ function copySnapshotEntry(
     }
     output = fs.openSync(target, 'wx', Number(stat.mode) & 0o100 ? 0o700 : 0o600);
     const buffer = Buffer.allocUnsafe(SNAPSHOT_COPY_CHUNK_BYTES);
+    const hash = crypto.createHash('sha256');
     let position = 0;
     const size = Number(stat.size);
     while (position < size) {
@@ -195,6 +237,7 @@ function copySnapshotEntry(
       if (count <= 0) throw new Error(`beta.22 workspace snapshot file changed during copy: ${slash(relative)}`);
       let written = 0;
       while (written < count) written += fs.writeSync(output, buffer, written, count - written);
+      hash.update(buffer.subarray(0, count));
       position += count;
     }
     const openedAfter = fs.fstatSync(input, { bigint: true });
@@ -202,6 +245,12 @@ function copySnapshotEntry(
     if (!sameSnapshotIdentity(openedAfter, opened) || !sameSnapshotIdentity(pathAfter, opened)) {
       throw new Error(`beta.22 workspace snapshot file changed during copy: ${slash(relative)}`);
     }
+    authority?.files.push({
+      file: source,
+      relative,
+      identity: openedAfter,
+      sha256: hash.digest('hex'),
+    });
   } finally {
     fs.closeSync(input);
     if (output !== undefined) fs.closeSync(output);
@@ -209,7 +258,7 @@ function copySnapshotEntry(
   fs.chmodSync(target, Number(stat.mode) & 0o100 ? 0o700 : 0o600);
 }
 
-function beta22WorkspaceConfigBytes(file, budget = snapshotBudget(file)) {
+function beta22WorkspaceConfigBytes(file, budget = snapshotBudget(file), authority = null) {
   const stat = inspectSnapshotEntry(file, 'workspace.json', budget, 0);
   if (!stat.isFile()) throw new Error('beta.22 rollback workspace config must be a regular file');
   const descriptor = fs.openSync(
@@ -228,6 +277,12 @@ function beta22WorkspaceConfigBytes(file, budget = snapshotBudget(file)) {
     if (!sameSnapshotIdentity(openedAfter, opened) || !sameSnapshotIdentity(pathAfter, opened)) {
       throw new Error('beta.22 rollback workspace config changed during copy');
     }
+    authority?.files.push({
+      file,
+      relative: 'workspace.json',
+      identity: openedAfter,
+      sha256: digest(source),
+    });
   } finally {
     fs.closeSync(descriptor);
   }
@@ -383,6 +438,34 @@ function validatedSnapshotsDirectory(root, { create = false } = {}) {
   return snapshotsDirectory(workspaceRoot);
 }
 
+function captureSnapshotStorage(root) {
+  const workspaceRoot = path.resolve(root);
+  const directory = validatedSnapshotsDirectory(workspaceRoot);
+  const physicalRoot = fs.realpathSync(workspaceRoot);
+  const entries = [workspaceRoot, path.join(workspaceRoot, '.scout'), directory].map((entry) => {
+    const stat = fs.lstatSync(entry, { bigint: true });
+    const physical = fs.realpathSync(entry);
+    if (stat.isSymbolicLink() || !stat.isDirectory() || !within(physicalRoot, physical)) {
+      throw new Error('beta.22 snapshot storage is redirected outside the workspace');
+    }
+    return { entry, physical, stat };
+  });
+  return { directory, physicalDirectory: entries.at(-1).physical, entries };
+}
+
+function verifySnapshotStorage(root, authority) {
+  const current = captureSnapshotStorage(root);
+  if (current.directory !== authority.directory
+    || current.physicalDirectory !== authority.physicalDirectory
+    || current.entries.some((entry, index) => (
+      entry.entry !== authority.entries[index].entry
+      || entry.physical !== authority.entries[index].physical
+      || !sameSnapshotIdentity(entry.stat, authority.entries[index].stat)
+    ))) {
+    throw new Error('beta.22 snapshot storage changed during rollback');
+  }
+}
+
 export function latestBeta22WorkspaceSnapshot(root) {
   const directory = validatedSnapshotsDirectory(root);
   if (!fs.existsSync(directory)) return null;
@@ -425,6 +508,7 @@ function createBeta22WorkspaceSnapshotUnderAuthority(root, {
   try {
     fs.mkdirSync(staging, { recursive: false, mode: 0o700 });
     const budget = snapshotBudget(workspaceRoot);
+    const sourceAuthority = { files: [], directories: [] };
     for (const relative of SNAPSHOT_PATHS) {
       renew();
       _testHooks.beforeCopy?.(relative);
@@ -433,13 +517,14 @@ function createBeta22WorkspaceSnapshotUnderAuthority(root, {
       if (relative === 'workspace.json') {
         atomicWriteFile(
           path.join(staging, relative),
-          beta22WorkspaceConfigBytes(source, budget),
+          beta22WorkspaceConfigBytes(source, budget, sourceAuthority),
           { mode: 0o600 },
         );
       } else {
-        copySnapshotEntry(source, path.join(staging, relative), relative, renew, budget);
+        copySnapshotEntry(source, path.join(staging, relative), relative, renew, budget, 0, sourceAuthority);
       }
     }
+    verifySourceAuthority(sourceAuthority, budget);
     const entries = snapshotEntries(staging, renew);
     const currentTreeDigest = treeDigest(entries);
     if (existing
@@ -493,7 +578,10 @@ export function createBeta22WorkspaceSnapshot(root, options = {}) {
   return withBeta22MigrationAuthority(root, ({ createSnapshot }) => createSnapshot(options));
 }
 
-export function materializeBeta22Rollback(root, destination, { snapshotDirectory = null } = {}) {
+export function materializeBeta22Rollback(root, destination, {
+  snapshotDirectory = null,
+  _testHooks = {},
+} = {}) {
   const workspaceRoot = path.resolve(root);
   const target = path.resolve(destination);
   const physicalRoot = fs.realpathSync(workspaceRoot);
@@ -507,20 +595,26 @@ export function materializeBeta22Rollback(root, destination, { snapshotDirectory
     ? { directory: path.resolve(snapshotDirectory) }
     : latestBeta22WorkspaceSnapshot(workspaceRoot);
   if (!chosen) throw new Error('no verified beta.22-compatible workspace snapshot is available');
-  if (!within(snapshotsDirectory(workspaceRoot), chosen.directory)
-    || !within(fs.realpathSync(snapshotsDirectory(workspaceRoot)), fs.realpathSync(chosen.directory))) {
+  const storage = captureSnapshotStorage(workspaceRoot);
+  if (!within(storage.directory, chosen.directory)
+    || !within(storage.physicalDirectory, fs.realpathSync(chosen.directory))) {
     throw new Error('beta.22 rollback snapshot must belong to this workspace');
   }
+  verifySnapshotStorage(workspaceRoot, storage);
+  _testHooks.afterStorageValidation?.();
   const manifest = verifySnapshotDirectory(chosen.directory);
+  verifySnapshotStorage(workspaceRoot, storage);
   const staging = `${target}.scout-rollback-${crypto.randomUUID()}`;
   if (fs.existsSync(staging)) throw new Error('beta.22 rollback staging destination already exists');
   try {
     copySnapshotEntry(chosen.directory, staging, '', () => {});
+    verifySnapshotStorage(workspaceRoot, storage);
     const copiedEntries = snapshotEntries(staging);
     if (JSON.stringify(copiedEntries) !== JSON.stringify(manifest.entries)
       || treeDigest(copiedEntries) !== manifest.treeDigest) {
       throw new Error('beta.22 rollback copy verification failed');
     }
+    verifySnapshotStorage(workspaceRoot, storage);
     fs.renameSync(staging, target);
     return {
       compatibleVersion: BETA22_COMPATIBLE_VERSION,

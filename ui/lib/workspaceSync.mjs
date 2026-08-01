@@ -78,24 +78,39 @@ function delay(milliseconds) {
   return new Promise((resolve) => setTimeout(resolve, milliseconds));
 }
 
-function waitForAuxiliaryProcess(child) {
+function waitForAuxiliaryProcess(child, timeoutMs = PROCESS_TREE_KILL_GRACE_MS) {
   return new Promise((resolve) => {
-    child.once('error', () => resolve(null));
-    child.once('close', (status) => resolve(status));
+    let settled = false;
+    const finish = (status) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve(status);
+    };
+    child.once('error', () => finish(null));
+    child.once('close', (status) => finish(status));
+    const timer = setTimeout(() => {
+      try { child.kill?.('SIGKILL'); } catch {}
+      finish(null);
+    }, timeoutMs);
+    timer.unref?.();
   });
 }
 
-async function terminateProcessTree(child) {
+async function terminateProcessTree(child, {
+  spawnAuxiliary = spawn,
+  auxiliaryTimeoutMs = PROCESS_TREE_KILL_GRACE_MS,
+} = {}) {
   if (!child?.pid) {
     try { child?.kill('SIGKILL'); } catch {}
     return;
   }
   if (process.platform === 'win32') {
-    const killer = spawn('taskkill.exe', ['/pid', String(child.pid), '/T', '/F'], {
+    const killer = spawnAuxiliary('taskkill.exe', ['/pid', String(child.pid), '/T', '/F'], {
       windowsHide: true,
       stdio: 'ignore',
     });
-    const status = await waitForAuxiliaryProcess(killer);
+    const status = await waitForAuxiliaryProcess(killer, auxiliaryTimeoutMs);
     if (status !== 0 && child.exitCode === null && child.signalCode === null) {
       try { child.kill('SIGKILL'); } catch {}
     }
@@ -120,7 +135,7 @@ async function terminateProcessTree(child) {
   }
 }
 
-function collectChildProcess(child, timeoutMs) {
+function collectChildProcess(child, timeoutMs, terminationOptions = {}) {
   return new Promise((resolve) => {
     let stdout = '';
     let stderr = '';
@@ -130,10 +145,12 @@ function collectChildProcess(child, timeoutMs) {
     let spawnError = null;
     let timedOut = false;
     let terminationComplete = true;
+    let unresolvedTimer;
     const finish = (result) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
+      clearTimeout(unresolvedTimer);
       resolve(result);
     };
     const finishAfterClose = () => {
@@ -163,17 +180,27 @@ function collectChildProcess(child, timeoutMs) {
       timedOut = true;
       terminationComplete = false;
       Promise.resolve()
-        .then(() => terminateProcessTree(child))
+        .then(() => terminateProcessTree(child, terminationOptions))
         .finally(() => {
           terminationComplete = true;
           finishAfterClose();
+          if (!closed) {
+            unresolvedTimer = setTimeout(() => finish({
+              status: null,
+              stdout,
+              stderr: 'command timed out and child termination was not confirmed',
+              timedOut: true,
+              terminationUnresolved: true,
+            }), terminationOptions.closeTimeoutMs ?? PROCESS_TREE_KILL_GRACE_MS);
+            unresolvedTimer.unref?.();
+          }
         });
     }, timeoutMs);
     timer.unref?.();
   });
 }
 
-function defaultSpawnAsync(command, args, spawnOptions, timeoutMs, onSpawn) {
+function defaultSpawnAsync(command, args, spawnOptions, timeoutMs, onSpawn, terminationOptions = {}) {
   const child = spawn(command, args, {
     ...spawnOptions,
     detached: process.platform !== 'win32',
@@ -181,10 +208,12 @@ function defaultSpawnAsync(command, args, spawnOptions, timeoutMs, onSpawn) {
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   onSpawn?.(child);
-  return collectChildProcess(child, timeoutMs);
+  return collectChildProcess(child, timeoutMs, terminationOptions);
 }
 
-async function adapterSpawnAsync(spawnAdapter, command, args, spawnOptions, timeoutMs, onSpawn) {
+async function adapterSpawnAsync(
+  spawnAdapter, command, args, spawnOptions, timeoutMs, onSpawn, terminationOptions = {},
+) {
   const startedAt = Date.now();
   let timer;
   let value;
@@ -212,7 +241,11 @@ async function adapterSpawnAsync(spawnAdapter, command, args, spawnOptions, time
   }
   if (!isChildProcess(value)) return value;
   onSpawn?.(value);
-  return collectChildProcess(value, Math.max(1, timeoutMs - (Date.now() - startedAt)));
+  return collectChildProcess(
+    value,
+    Math.max(1, timeoutMs - (Date.now() - startedAt)),
+    terminationOptions,
+  );
 }
 
 async function runGitAsync(cwd, args, options = {}) {
@@ -231,6 +264,11 @@ async function runGitAsync(cwd, args, options = {}) {
     ? undefined
     : (child) => options.mutationCoordinator.attachChild(childOperation, child.pid);
   try {
+    const terminationOptions = {
+      spawnAuxiliary: options._testHooks?.spawnAuxiliary,
+      auxiliaryTimeoutMs: options._testHooks?.auxiliaryTimeoutMs,
+      closeTimeoutMs: options._testHooks?.closeTimeoutMs,
+    };
     if (options.spawnAsync || options.spawn) {
       result = await adapterSpawnAsync(
         options.spawnAsync || options.spawn,
@@ -239,9 +277,12 @@ async function runGitAsync(cwd, args, options = {}) {
         spawnOptions,
         timeoutMs,
         onSpawn,
+        terminationOptions,
       );
     } else {
-      result = await defaultSpawnAsync('git', args, spawnOptions, timeoutMs, onSpawn);
+      result = await defaultSpawnAsync(
+        'git', args, spawnOptions, timeoutMs, onSpawn, terminationOptions,
+      );
     }
   } finally {
     if (childOperation !== undefined) options.mutationCoordinator.finishChild(childOperation);

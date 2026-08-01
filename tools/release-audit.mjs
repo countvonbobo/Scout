@@ -545,7 +545,11 @@ function readAuditedRegularFile(root, file) {
       || ancestorsAfter !== ancestorsBefore) {
       throw new Error(`release audit input identity changed while reading: ${file}`);
     }
-    return content;
+    return {
+      content,
+      identity: openedAfterRead,
+      sha256: crypto.createHash('sha256').update(content).digest('hex'),
+    };
   } finally {
     fs.closeSync(descriptor);
   }
@@ -595,9 +599,12 @@ export function auditRelease({
     .filter((file) => file !== excluded)
     .sort((a, b) => normaliseRelative(absoluteRoot, a).localeCompare(normaliseRelative(absoluteRoot, b), 'en'));
   const findings = [];
+  const scannedFiles = [];
   let filesScanned = 0;
   for (const file of files) {
-    const content = readAuditedRegularFile(absoluteRoot, file);
+    const scanned = readAuditedRegularFile(absoluteRoot, file);
+    const { content } = scanned;
+    scannedFiles.push({ file, identity: scanned.identity, sha256: scanned.sha256 });
     filesScanned += 1;
     const relative = normaliseRelative(absoluteRoot, file);
     const privateRuntime = privateRuntimeArtifact(relative);
@@ -658,6 +665,14 @@ export function auditRelease({
       dependency: dependencyArtifact(relative),
     })) {
       findings.push({ file: publicFile, ...finding });
+    }
+  }
+  for (const scanned of scannedFiles) {
+    const current = readAuditedRegularFile(absoluteRoot, scanned.file);
+    if (!sameDirectoryIdentity(scanned.identity, current.identity)
+      || scanned.identity.size !== current.identity.size
+      || scanned.sha256 !== current.sha256) {
+      throw new Error(`release audit input changed after scan: ${scanned.file}`);
     }
   }
   for (const snapshot of traversalSnapshots) verifyDirectorySnapshot(snapshot);

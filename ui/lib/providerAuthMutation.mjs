@@ -161,7 +161,7 @@ function readGuardRecord(directory) {
   }
 }
 
-function removeOwnedGuard(directory, token) {
+function removeOwnedGuard(directory, token, scheduler = setTimeout) {
   const current = readGuardRecord(directory);
   if (!current || current.token !== token) return false;
   // Detach the still-verifiable identity before recursive deletion. Windows
@@ -184,20 +184,22 @@ function removeOwnedGuard(directory, token) {
     fs.rmSync(quarantine, { recursive: true, force: true });
   } catch (error) {
     if (!['EBUSY', 'EPERM', 'EACCES'].includes(error?.code)) throw error;
-    scheduleQuarantineCleanup(quarantine, token);
+    scheduleQuarantineCleanup(quarantine, token, scheduler);
   }
   return true;
 }
 
-function scheduleQuarantineCleanup(directory, token) {
-  const deadline = performance.now() + GUARD_ACQUIRE_TIMEOUT_MS;
+function scheduleQuarantineCleanup(directory, token, scheduler = setTimeout) {
+  let delay = 25;
   const retry = () => {
     try {
+      if (!fs.existsSync(directory)) return;
       const pending = readGuardRecord(directory);
       if (pending?.token === token) {
         fs.rmSync(directory, { recursive: true, force: true });
         return;
       }
+      if (pending) return;
       // A prior verified recursive delete may have removed owner.json before
       // Windows refused the final directory removal. Only an empty, ordinary
       // quarantine at this unguessable identity path is safe to finish.
@@ -207,25 +209,27 @@ function scheduleQuarantineCleanup(directory, token) {
       }
       return;
     } catch {}
-    if (performance.now() >= deadline) return;
-    const timer = setTimeout(retry, 25);
+    delay = Math.min(delay * 2, 1_000);
+    const timer = scheduler(retry, delay);
     timer.unref?.();
   };
-  const timer = setTimeout(retry, 25);
+  const timer = scheduler(retry, 25);
   timer.unref?.();
 }
 
-function scheduleOwnedGuardCleanup(directory, token) {
+function scheduleOwnedGuardCleanup(directory, token, scheduler = setTimeout) {
   let delay = 25;
   const retry = () => {
+    const current = readGuardRecord(directory);
+    if (!current || current.token !== token) return;
     let removed = false;
-    try { removed = removeOwnedGuard(directory, token); } catch {}
+    try { removed = removeOwnedGuard(directory, token, scheduler); } catch {}
     if (removed || !fs.existsSync(directory)) return;
     delay = Math.min(delay * 2, 1_000);
-    const timer = setTimeout(retry, delay);
+    const timer = scheduler(retry, delay);
     timer.unref?.();
   };
-  const timer = setTimeout(retry, 25);
+  const timer = scheduler(retry, 25);
   timer.unref?.();
 }
 
@@ -264,7 +268,7 @@ function createOwnedGuard(directory, acquiredAt) {
   return { candidate, token };
 }
 
-function withGuard(root, provider, now, callback) {
+function withGuard(root, provider, now, callback, scheduler = setTimeout) {
   const target = paths(root, provider, true);
   const acquiredAt = checkedNow(now);
   const deadline = performance.now() + GUARD_ACQUIRE_TIMEOUT_MS;
@@ -313,8 +317,8 @@ function withGuard(root, provider, now, callback) {
   } finally {
     if (published) {
       let removed = false;
-      try { removed = removeOwnedGuard(target.guard, prepared.token); } catch {}
-      if (!removed) scheduleOwnedGuardCleanup(target.guard, prepared.token);
+      try { removed = removeOwnedGuard(target.guard, prepared.token, scheduler); } catch {}
+      if (!removed) scheduleOwnedGuardCleanup(target.guard, prepared.token, scheduler);
     }
     else {
       try { fs.rmSync(prepared.candidate, { recursive: true, force: true }); } catch {}
@@ -346,6 +350,7 @@ export function acquireProviderAuthMutation(root, provider, {
   now,
   owner = currentLeaseOwner(),
   phase = 'login',
+  _testHooks = {},
 } = {}) {
   const at = checkedNow(now);
   if (!Number.isSafeInteger(durationMs) || durationMs <= 0 || durationMs > DEFAULT_DURATION_MS
@@ -372,7 +377,7 @@ export function acquireProviderAuthMutation(root, provider, {
     }, provider);
     atomicWriteFile(file, `${JSON.stringify(record)}\n`, { mode: 0o600 });
     return structuredClone(record);
-  });
+  }, _testHooks.cleanupScheduler || setTimeout);
 }
 
 export function acquireProviderWork(root, provider, {

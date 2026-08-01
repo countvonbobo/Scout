@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { spawn, spawnSync } from 'node:child_process';
+import { EventEmitter } from 'node:events';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -527,6 +528,50 @@ test('runtime command timeout terminates the process tree and awaits parent clos
     terminateTestProcessTree(commandProcess);
     fs.rmSync(f.base, { recursive: true, force: true });
   }
+});
+
+test('Windows runtime timeout remains bounded when taskkill never closes', async (t) => {
+  if (process.platform !== 'win32') {
+    t.diagnostic('taskkill is Windows-specific');
+    return;
+  }
+  const f = fixture();
+  git(f.root, 'init');
+  const commandChild = new EventEmitter();
+  commandChild.pid = 2_147_483_000;
+  commandChild.exitCode = null;
+  commandChild.signalCode = null;
+  commandChild.stdout = new EventEmitter();
+  commandChild.stderr = new EventEmitter();
+  let commandKilled = false;
+  commandChild.kill = () => {
+    commandKilled = true;
+    commandChild.exitCode = 1;
+    setImmediate(() => commandChild.emit('close', 1));
+    return true;
+  };
+  const killer = new EventEmitter();
+  let killerKilled = false;
+  killer.kill = () => { killerKilled = true; return true; };
+  const spawnAsync = async (command, args, options) => (
+    args[0] === 'commit' ? commandChild : spawnSync(command, args, options)
+  );
+
+  const result = await runWorkspaceSync(f.root, 'hung taskkill checkpoint', {
+    commandTimeoutMs: 5,
+    spawnAsync,
+    _testHooks: {
+      spawnAuxiliary: () => killer,
+      auxiliaryTimeoutMs: 1,
+      closeTimeoutMs: 5,
+    },
+  });
+
+  assert.equal(result.state, 'needs-attention');
+  assert.equal(result.pending, true);
+  assert.equal(killerKilled, true);
+  assert.equal(commandKilled, true);
+  fs.rmSync(f.base, { recursive: true, force: true });
 });
 
 test('a stale runtime sync fence prevents the first local mutation', async () => {

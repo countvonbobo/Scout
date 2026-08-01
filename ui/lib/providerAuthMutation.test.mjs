@@ -301,7 +301,7 @@ test('canonical cleanup never strands a guard after partial Windows removal', (t
   assert.equal(releaseProviderAuthMutation(root, auth), true);
 });
 
-test('committed authority schedules identity-checked cleanup after persistent Windows contention', async (t) => {
+test('committed authority schedules identity-checked cleanup after persistent Windows contention', (t) => {
   const root = workspace(t);
   const originalRemove = fs.rmSync;
   const originalRename = fs.renameSync;
@@ -317,25 +317,35 @@ test('committed authority schedules identity-checked cleanup after persistent Wi
     }
     return originalRename(source, destination);
   };
+  const scheduled = [];
+  const cleanupScheduler = (callback) => {
+    scheduled.push(callback);
+    return { unref() {} };
+  };
   let auth;
   try {
     auth = acquireProviderAuthMutation(root, 'codex', {
       owner: currentLeaseOwner(), now: Date.now(), durationMs: 5_000,
       mutationId: 'cleanup-pending-0001',
+      _testHooks: { cleanupScheduler },
     });
-    await new Promise((resolve) => setTimeout(resolve, 2_200));
+    for (let attempt = 0; attempt < 100; attempt += 1) {
+      assert.equal(scheduled.length, 1);
+      scheduled.shift()();
+    }
   } finally {
     fs.rmSync = originalRemove;
     fs.renameSync = originalRename;
   }
   assert.ok(auth);
-  await new Promise((resolve) => setTimeout(resolve, 1_200));
+  assert.equal(scheduled.length, 1);
+  scheduled.shift()();
   assert.equal(fs.existsSync(path.join(root, '.scout', 'provider-auth', 'v1', 'codex.guard')), false);
   assert.equal(releaseProviderAuthMutation(root, auth), true);
   assert.equal(fs.existsSync(path.join(root, '.scout', 'provider-auth', 'v1', 'codex.guard')), false);
 });
 
-test('detached cleanup finishes an empty quarantine after partial Windows removal', async (t) => {
+test('detached cleanup finishes an empty quarantine after partial Windows removal', (t) => {
   const root = workspace(t);
   const originalRemove = fs.rmSync;
   let injected = false;
@@ -347,19 +357,70 @@ test('detached cleanup finishes an empty quarantine after partial Windows remova
     }
     return originalRemove(target, options);
   };
+  const scheduled = [];
+  const cleanupScheduler = (callback) => {
+    scheduled.push(callback);
+    return { unref() {} };
+  };
   let auth;
   try {
     auth = acquireProviderAuthMutation(root, 'codex', {
       owner: currentLeaseOwner(), now: Date.now(), durationMs: 5_000,
       mutationId: 'partial-quarantine-01',
+      _testHooks: { cleanupScheduler },
     });
   } finally {
     fs.rmSync = originalRemove;
   }
   assert.ok(auth);
-  await new Promise((resolve) => setTimeout(resolve, 75));
+  assert.equal(scheduled.length, 1);
+  scheduled.shift()();
   const directory = path.join(root, '.scout', 'provider-auth', 'v1');
   assert.equal(fs.readdirSync(directory).some((name) => name.includes('codex.guard.cleanup-')), false);
+  assert.equal(releaseProviderAuthMutation(root, auth), true);
+});
+
+test('owned cleanup stops when canonical guard ownership changes', (t) => {
+  const root = workspace(t);
+  const originalRemove = fs.rmSync;
+  const originalRename = fs.renameSync;
+  const scheduled = [];
+  const cleanupScheduler = (callback) => {
+    scheduled.push(callback);
+    return { unref() {} };
+  };
+  fs.rmSync = (target, options) => {
+    if (String(target).endsWith('codex.guard')) {
+      throw Object.assign(new Error('injected cleanup contention'), { code: 'EPERM' });
+    }
+    return originalRemove(target, options);
+  };
+  fs.renameSync = (source, destination) => {
+    if (String(source).endsWith('codex.guard') && String(destination).includes('.cleanup-')) {
+      throw Object.assign(new Error('injected rename contention'), { code: 'EPERM' });
+    }
+    return originalRename(source, destination);
+  };
+  let auth;
+  try {
+    auth = acquireProviderAuthMutation(root, 'codex', {
+      owner: currentLeaseOwner(), now: Date.now(), durationMs: 5_000,
+      mutationId: 'cleanup-successor-01', _testHooks: { cleanupScheduler },
+    });
+  } finally {
+    fs.rmSync = originalRemove;
+    fs.renameSync = originalRename;
+  }
+  const guard = path.join(root, '.scout', 'provider-auth', 'v1', 'codex.guard');
+  const ownerFile = path.join(guard, 'owner.json');
+  const successor = JSON.parse(fs.readFileSync(ownerFile, 'utf8'));
+  successor.token = ['successor', 'token', '00000001'].join('-');
+  fs.writeFileSync(ownerFile, `${JSON.stringify(successor)}\n`);
+  assert.equal(scheduled.length, 1);
+  scheduled.shift()();
+  assert.equal(scheduled.length, 0);
+  assert.equal(JSON.parse(fs.readFileSync(ownerFile, 'utf8')).token, successor.token);
+  fs.rmSync(guard, { recursive: true, force: true });
   assert.equal(releaseProviderAuthMutation(root, auth), true);
 });
 

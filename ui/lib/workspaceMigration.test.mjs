@@ -263,6 +263,27 @@ test('beta.22 snapshot rejects directory membership changes during descendant co
   assert.equal(inserted, true);
 });
 
+test('beta.22 snapshot rejects mutation of an earlier top-level source during later copying', () => {
+  const root = productionShapedWorkspace();
+  const earlier = path.join(root, 'data', 'opportunities.json');
+  let mutated = false;
+  assert.throws(
+    () => createBeta22WorkspaceSnapshot(root, {
+      now: () => NOW,
+      _testHooks: {
+        beforeCopy(relative) {
+          if (!mutated && relative === 'reports') {
+            mutated = true;
+            fs.writeFileSync(earlier, '{"updated":"during-copy","opportunities":[]}\n');
+          }
+        },
+      },
+    }),
+    /source changed after copy/,
+  );
+  assert.equal(mutated, true);
+});
+
 test('beta.22 snapshot rejects trees deeper than its traversal bound', () => {
   const root = productionShapedWorkspace();
   let directory = path.join(root, 'logs');
@@ -312,6 +333,55 @@ test('beta.22 snapshot rejects redirected backup storage before writing protecte
     /snapshot storage is redirected outside the workspace/,
   );
   assert.deepEqual(fs.readdirSync(outside), []);
+});
+
+test('explicit beta.22 rollback rejects a pre-existing redirected snapshot root', (t) => {
+  const root = productionShapedWorkspace();
+  const snapshot = createBeta22WorkspaceSnapshot(root, { now: () => NOW });
+  const outside = temporaryRoot('scout-beta22-redirected-snapshots-');
+  fs.rmSync(outside, { recursive: true });
+  const backups = path.join(root, '.scout', 'backups');
+  fs.renameSync(backups, outside);
+  try {
+    fs.symlinkSync(outside, backups, process.platform === 'win32' ? 'junction' : 'dir');
+  } catch (error) {
+    t.diagnostic(`redirect fixture unavailable: ${error.code || error.message}`);
+    return;
+  }
+  const destination = temporaryRoot('scout-beta22-rejected-explicit-');
+  fs.rmSync(destination, { recursive: true });
+  assert.throws(
+    () => materializeBeta22Rollback(root, destination, { snapshotDirectory: snapshot.directory }),
+    /storage is redirected outside the workspace/,
+  );
+  assert.equal(fs.existsSync(destination), false);
+});
+
+test('beta.22 rollback rejects snapshot-root substitution after validation', (t) => {
+  if (process.platform === 'win32') {
+    t.diagnostic('live parent substitution fixture is not portable to Windows');
+    return;
+  }
+  const root = productionShapedWorkspace();
+  const snapshot = createBeta22WorkspaceSnapshot(root, { now: () => NOW });
+  const outside = temporaryRoot('scout-beta22-substituted-snapshots-');
+  fs.rmSync(outside, { recursive: true });
+  const backups = path.join(root, '.scout', 'backups');
+  const destination = temporaryRoot('scout-beta22-rejected-substitution-');
+  fs.rmSync(destination, { recursive: true });
+  assert.throws(
+    () => materializeBeta22Rollback(root, destination, {
+      snapshotDirectory: snapshot.directory,
+      _testHooks: {
+        afterStorageValidation() {
+          fs.renameSync(backups, outside);
+          fs.symlinkSync(outside, backups, 'dir');
+        },
+      },
+    }),
+    /storage is redirected outside the workspace|storage changed during rollback/,
+  );
+  assert.equal(fs.existsSync(destination), false);
 });
 
 test('snapshot verification rejects tampering before creating a rollback workspace', () => {

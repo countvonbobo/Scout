@@ -851,6 +851,34 @@ test('stage mode fails closed when a file appears after directory enumeration', 
   assert.equal(inserted, true);
 });
 
+test('stage mode fails closed when an earlier file changes after its scan', () => {
+  const root = fixture();
+  fs.mkdirSync(path.join(root, 'app'), { recursive: true });
+  const first = path.join(root, 'app', 'a-first.txt');
+  fs.writeFileSync(first, 'initial public bytes\n');
+  fs.writeFileSync(path.join(root, 'app', 'z-second.txt'), 'second public bytes\n');
+  const originalRead = fs.readFileSync;
+  let descriptorReads = 0;
+  fs.readFileSync = (target, ...args) => {
+    if (typeof target === 'number') {
+      descriptorReads += 1;
+      if (descriptorReads === 2) fs.writeFileSync(first, 'Synthetic Rescan Private Marker\n');
+    }
+    return originalRead(target, ...args);
+  };
+  try {
+    assert.throws(
+      () => main(['--root', root, '--stage'], {
+        SCOUT_RELEASE_MARKERS: 'Synthetic Rescan Private Marker',
+      }),
+      /input changed after scan/,
+    );
+  } finally {
+    fs.readFileSync = originalRead;
+  }
+  assert.ok(descriptorReads >= 2);
+});
+
 test('ranked discovery production sources stay neutral and release bundles omit raw observation caches', () => {
   const productionText = RANKED_DISCOVERY_SOURCES
     .map((relative) => fs.readFileSync(path.join(ROOT, relative), 'utf8')).join('\n');
