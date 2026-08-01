@@ -205,6 +205,37 @@ test('run history is idempotent and retirement is repeated, explicit and reversi
   assert.equal(restored.lanes[0].retirement, null);
 });
 
+test('retirement rejects fewer than three completed unproductive runs', () => {
+  const generated = generateSearchLanePlan(profile({ primaryTitles: ['Archivist'] }));
+  const lane = generated.lanes[0];
+  let plan = generated;
+  for (let attempt = 1; attempt <= 2; attempt += 1) {
+    plan = recordSearchLaneRun(plan, {
+      runId: `run-too-soon-${attempt}`,
+      recordedAt: `2026-08-0${attempt}T10:00:00.000Z`,
+      results: [{
+        laneId: lane.id, returned: 0, parsed: 0, new: 0,
+        eligible: 0, selected: 0, promising: 0,
+      }],
+    });
+  }
+
+  assert.throws(
+    () => retireUnproductiveSearchLanes(plan, { minimumRuns: 2 }),
+    /at least three runs/,
+  );
+
+  const forged = structuredClone(plan);
+  forged.lanes[0].state = 'retired';
+  forged.lanes[0].retirement = {
+    reason: 'consistently-unproductive',
+    retiredAt: '2026-08-03T10:00:00.000Z',
+    minimumRuns: 2,
+    reversible: true,
+  };
+  assert.throws(() => validateSearchLanePlan(forged), /retired lane metadata/);
+});
+
 test('lane metrics reconcile exact query returns with persisted discovery and assessment evidence', () => {
   const generated = generateSearchLanePlan(profile({
     primaryTitles: ['Platform engineer'],

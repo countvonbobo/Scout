@@ -99,6 +99,32 @@ function mixedContender(root, kind) {
   });
 }
 
+function temporaryLiveGuard(root, holdMs = 100) {
+  const scanLeaseUrl = new URL('./scanLease.mjs', import.meta.url).href;
+  const source = `
+    import fs from 'node:fs';
+    import path from 'node:path';
+    import { currentLeaseOwner } from ${JSON.stringify(scanLeaseUrl)};
+    const guard = path.join(process.env.SCOUT_AUTH_ROOT, '.scout', 'provider-auth', 'v1', 'codex.guard');
+    fs.mkdirSync(guard, { recursive: true });
+    fs.writeFileSync(path.join(guard, 'owner.json'), JSON.stringify({
+      token: 'temporary-live-guard-0001', owner: currentLeaseOwner(), acquiredAt: Date.now(),
+    }));
+    process.stdout.write('ready\\n');
+    setTimeout(() => fs.rmSync(guard, { recursive: true, force: true }), Number(process.env.HOLD_MS));
+  `;
+  const child = spawn(process.execPath, ['--input-type=module', '--eval', source], {
+    env: { ...process.env, SCOUT_AUTH_ROOT: root, HOLD_MS: String(holdMs) },
+    stdio: ['ignore', 'pipe', 'pipe'],
+    windowsHide: true,
+  });
+  return new Promise((resolve, reject) => {
+    child.once('error', reject);
+    child.stderr.once('data', (chunk) => reject(new Error(String(chunk))));
+    child.stdout.once('data', () => resolve(child));
+  });
+}
+
 test('authentication mutation authority blocks only the same provider', (t) => {
   const root = workspace(t);
   const codex = acquireProviderAuthMutation(root, 'codex', {
@@ -175,6 +201,103 @@ test('transient guard publication contention retries before reporting an auth re
   assert.ok(auth);
   assert.equal(publicationAttempts, 2);
   assert.equal(releaseProviderAuthMutation(root, auth, { now: 1_001 }), true);
+});
+
+test('release waits for a temporary live guard instead of abandoning durable authority', async (t) => {
+  const root = workspace(t);
+  const auth = acquireProviderAuthMutation(root, 'codex', {
+    owner: currentLeaseOwner(), now: Date.now(), durationMs: 5_000,
+    mutationId: 'release-after-guard-01',
+  });
+  const child = await temporaryLiveGuard(root);
+  assert.equal(releaseProviderAuthMutation(root, auth), true);
+  await new Promise((resolve, reject) => {
+    child.once('close', (status) => (status === 0 ? resolve() : reject(new Error(`guard child exited ${status}`))));
+  });
+  assert.equal(readProviderAuthMutation(root, 'codex'), null);
+});
+
+test('release reports bounded guard timeout and preserves durable authority', (t) => {
+  const root = workspace(t);
+  const auth = acquireProviderAuthMutation(root, 'codex', {
+    owner: currentLeaseOwner(), now: Date.now(), durationMs: 5_000,
+    mutationId: 'release-timeout-guard1',
+  });
+  const guard = path.join(root, '.scout', 'provider-auth', 'v1', 'codex.guard');
+  fs.mkdirSync(guard, { recursive: true });
+  fs.writeFileSync(path.join(guard, 'owner.json'), JSON.stringify({
+    token: 'live-release-timeout-0001', owner: currentLeaseOwner(), acquiredAt: Date.now(),
+  }));
+  assert.throws(
+    () => releaseProviderAuthMutation(root, auth),
+    /could not be released/,
+  );
+  assert.equal(readProviderAuthMutation(root, 'codex').mutationId, auth.mutationId);
+  fs.rmSync(guard, { recursive: true, force: true });
+  assert.equal(releaseProviderAuthMutation(root, auth), true);
+});
+
+test('simultaneous provider work acquisitions are serialized but all admitted', async (t) => {
+  const root = workspace(t);
+  const results = await Promise.all(Array.from({ length: 4 }, () => mixedContender(root, 'work')));
+  assert.deepEqual(results, ['acquired', 'acquired', 'acquired', 'acquired']);
+});
+
+test('committed authority survives transient canonical guard cleanup contention', async (t) => {
+  const root = workspace(t);
+  const originalRemove = fs.rmSync;
+  let injected = false;
+  fs.rmSync = (target, options) => {
+    if (!injected && String(target).endsWith('codex.guard')) {
+      injected = true;
+      throw Object.assign(new Error('injected Windows cleanup contention'), { code: 'EPERM' });
+    }
+    return originalRemove(target, options);
+  };
+  let auth;
+  try {
+    auth = acquireProviderAuthMutation(root, 'codex', {
+      owner: currentLeaseOwner(), now: Date.now(), durationMs: 5_000,
+      mutationId: 'cleanup-contention-01',
+    });
+  } finally {
+    fs.rmSync = originalRemove;
+  }
+  assert.ok(auth);
+  assert.equal(readProviderAuthMutation(root, 'codex').mutationId, auth.mutationId);
+  assert.equal(releaseProviderAuthMutation(root, auth), true);
+});
+
+test('committed authority schedules identity-checked cleanup after persistent Windows contention', async (t) => {
+  const root = workspace(t);
+  const originalRemove = fs.rmSync;
+  const originalRename = fs.renameSync;
+  fs.rmSync = (target, options) => {
+    if (String(target).endsWith('codex.guard')) {
+      throw Object.assign(new Error('injected persistent cleanup contention'), { code: 'EPERM' });
+    }
+    return originalRemove(target, options);
+  };
+  fs.renameSync = (source, destination) => {
+    if (String(source).endsWith('codex.guard') && String(destination).includes('.cleanup-')) {
+      throw Object.assign(new Error('injected persistent cleanup rename contention'), { code: 'EPERM' });
+    }
+    return originalRename(source, destination);
+  };
+  let auth;
+  try {
+    auth = acquireProviderAuthMutation(root, 'codex', {
+      owner: currentLeaseOwner(), now: Date.now(), durationMs: 5_000,
+      mutationId: 'cleanup-pending-0001',
+    });
+  } finally {
+    fs.rmSync = originalRemove;
+    fs.renameSync = originalRename;
+  }
+  assert.ok(auth);
+  await new Promise((resolve) => setTimeout(resolve, 75));
+  assert.equal(fs.existsSync(path.join(root, '.scout', 'provider-auth', 'v1', 'codex.guard')), false);
+  assert.equal(releaseProviderAuthMutation(root, auth), true);
 });
 
 test('expired authentication authority is recovered with a new capability', (t) => {
@@ -257,6 +380,8 @@ test('an orphaned guard candidate never blocks the published guard path', (t) =>
   );
   fs.mkdirSync(candidate, { recursive: true });
   fs.writeFileSync(path.join(candidate, 'owner.json'), '{}');
+  const old = new Date(Date.now() - 20_000);
+  fs.utimesSync(candidate, old, old);
   const auth = acquireProviderAuthMutation(root, 'codex', {
     owner: currentLeaseOwner(),
     now: 1_000,
@@ -264,7 +389,7 @@ test('an orphaned guard candidate never blocks the published guard path', (t) =>
     mutationId: 'candidate-safe-auth1',
   });
   assert.ok(auth);
-  assert.equal(fs.existsSync(candidate), true);
+  assert.equal(fs.existsSync(candidate), false);
   releaseProviderAuthMutation(root, auth, { now: 1_001 });
 });
 

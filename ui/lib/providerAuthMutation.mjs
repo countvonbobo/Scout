@@ -164,8 +164,85 @@ function readGuardRecord(directory) {
 function removeOwnedGuard(directory, token) {
   const current = readGuardRecord(directory);
   if (!current || current.token !== token) return false;
-  fs.rmSync(directory, { recursive: true, force: true });
+  try {
+    fs.rmSync(directory, { recursive: true, force: true });
+    return true;
+  } catch (error) {
+    if (!['EBUSY', 'EPERM', 'EACCES'].includes(error?.code)) throw error;
+  }
+
+  // Windows can refuse recursive deletion briefly while an indexer or virus
+  // scanner has a handle open. Move only the identity we still own away from
+  // the canonical path so a committed operation remains authoritative and a
+  // successor can acquire the guard; deletion of the private quarantine may
+  // then be retried without risking a successor's guard.
+  const quarantine = `${directory}.cleanup-${token}`;
+  try {
+    fs.renameSync(directory, quarantine);
+  } catch (error) {
+    if (!['ENOENT', 'EBUSY', 'EPERM', 'EACCES'].includes(error?.code)) throw error;
+    return false;
+  }
+  const moved = readGuardRecord(quarantine);
+  if (!moved || moved.token !== token) {
+    if (!fs.existsSync(directory)) fs.renameSync(quarantine, directory);
+    return false;
+  }
+  try {
+    fs.rmSync(quarantine, { recursive: true, force: true });
+  } catch (error) {
+    if (!['EBUSY', 'EPERM', 'EACCES'].includes(error?.code)) throw error;
+    scheduleQuarantineCleanup(quarantine, token);
+  }
   return true;
+}
+
+function scheduleQuarantineCleanup(directory, token) {
+  const deadline = performance.now() + GUARD_ACQUIRE_TIMEOUT_MS;
+  const retry = () => {
+    try {
+      const pending = readGuardRecord(directory);
+      if (!pending || pending.token !== token) return;
+      fs.rmSync(directory, { recursive: true, force: true });
+      return;
+    } catch {}
+    if (performance.now() >= deadline) return;
+    const timer = setTimeout(retry, 25);
+    timer.unref?.();
+  };
+  const timer = setTimeout(retry, 25);
+  timer.unref?.();
+}
+
+function scheduleOwnedGuardCleanup(directory, token) {
+  const deadline = performance.now() + GUARD_ACQUIRE_TIMEOUT_MS;
+  const retry = () => {
+    let removed = false;
+    try { removed = removeOwnedGuard(directory, token); } catch {}
+    if (removed || !fs.existsSync(directory) || performance.now() >= deadline) return;
+    const timer = setTimeout(retry, 25);
+    timer.unref?.();
+  };
+  const timer = setTimeout(retry, 25);
+  timer.unref?.();
+}
+
+function cleanupOrphanCandidates(guard, now) {
+  const parent = path.dirname(guard);
+  const prefix = `${path.basename(guard)}.candidate-`;
+  let names;
+  try { names = fs.readdirSync(parent); } catch { return; }
+  for (const name of names) {
+    if (!name.startsWith(prefix)) continue;
+    const candidate = path.join(parent, name);
+    try {
+      const stat = fs.lstatSync(candidate);
+      if (stat.isSymbolicLink() || !stat.isDirectory() || now - stat.mtimeMs <= GUARD_STALE_MS) continue;
+      const record = readGuardRecord(candidate);
+      if (record && processOwnerIsLiveOrAmbiguous(record.owner)) continue;
+      fs.rmSync(candidate, { recursive: true, force: true });
+    } catch {}
+  }
 }
 
 function createOwnedGuard(directory, acquiredAt) {
@@ -189,6 +266,7 @@ function withGuard(root, provider, now, callback) {
   const target = paths(root, provider, true);
   const acquiredAt = checkedNow(now);
   const deadline = performance.now() + GUARD_ACQUIRE_TIMEOUT_MS;
+  cleanupOrphanCandidates(target.guard, Date.now());
   const prepared = createOwnedGuard(target.guard, acquiredAt);
   let published = false;
   try {
@@ -200,23 +278,25 @@ function withGuard(root, provider, now, callback) {
         if (!['EEXIST', 'ENOTEMPTY', 'EBUSY', 'EPERM', 'EACCES'].includes(error?.code)) throw error;
         const observed = readGuardRecord(target.guard);
         if (observed) {
-          if (acquiredAt - observed.acquiredAt <= GUARD_STALE_MS
-            || processOwnerIsLiveOrAmbiguous(observed.owner)) return null;
-          const quarantine = `${target.guard}.stale-${randomUUID()}`;
-          try {
-            fs.renameSync(target.guard, quarantine);
-            const moved = readGuardRecord(quarantine);
-            if (!moved || moved.token !== observed.token) {
-              if (!fs.existsSync(target.guard)) fs.renameSync(quarantine, target.guard);
-              return null;
-            }
-            fs.rmSync(quarantine, { recursive: true, force: true });
-            continue;
-          } catch {
-            return null;
+          if (acquiredAt - observed.acquiredAt > GUARD_STALE_MS
+            && !processOwnerIsLiveOrAmbiguous(observed.owner)) {
+            const quarantine = `${target.guard}.stale-${randomUUID()}`;
+            try {
+              fs.renameSync(target.guard, quarantine);
+              const moved = readGuardRecord(quarantine);
+              if (!moved || moved.token !== observed.token) {
+                if (!fs.existsSync(target.guard)) fs.renameSync(quarantine, target.guard);
+              } else {
+                fs.rmSync(quarantine, { recursive: true, force: true });
+                continue;
+              }
+            } catch {}
           }
+          const remaining = deadline - performance.now();
+          if (remaining <= 0) return null;
+          Atomics.wait(guardSleep, 0, 0, Math.min(5, remaining));
+          continue;
         }
-        if (fs.existsSync(target.guard)) return null;
         const remaining = deadline - performance.now();
         if (remaining <= 0) return null;
         Atomics.wait(guardSleep, 0, 0, Math.min(5, remaining));
@@ -224,7 +304,11 @@ function withGuard(root, provider, now, callback) {
     }
     return callback(target);
   } finally {
-    if (published) removeOwnedGuard(target.guard, prepared.token);
+    if (published) {
+      let removed = false;
+      try { removed = removeOwnedGuard(target.guard, prepared.token); } catch {}
+      if (!removed) scheduleOwnedGuardCleanup(target.guard, prepared.token);
+    }
     else {
       try { fs.rmSync(prepared.candidate, { recursive: true, force: true }); } catch {}
     }
@@ -471,7 +555,7 @@ export function releaseProviderWork(root, capability, { now } = {}) {
 export function releaseProviderAuthMutation(root, capability, { now } = {}) {
   const provider = checkedProvider(capability?.provider);
   const at = checkedNow(now);
-  return withGuard(root, provider, at, ({ file }) => {
+  const released = withGuard(root, provider, at, ({ file }) => {
     if (!fs.existsSync(file)) return false;
     const current = validate(JSON.parse(fs.readFileSync(file, 'utf8')), provider);
     if (current.mutationId !== capability.mutationId) {
@@ -480,4 +564,6 @@ export function releaseProviderAuthMutation(root, capability, { now } = {}) {
     fs.rmSync(file);
     return true;
   });
+  if (released === null) throw new Error('provider authentication mutation authority could not be released');
+  return released;
 }

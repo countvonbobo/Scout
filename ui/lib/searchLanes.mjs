@@ -428,7 +428,7 @@ function validateLane(lane, states = ['active', 'retired']) {
     lane.retirement?.reason !== 'consistently-unproductive'
     || lane.retirement?.reversible !== true
     || !Number.isSafeInteger(lane.retirement?.minimumRuns)
-    || lane.retirement.minimumRuns < 2
+    || lane.retirement.minimumRuns < 3
   )) {
     throw new TypeError('retired lane metadata is invalid');
   }
@@ -735,7 +735,7 @@ export function retireUnproductiveSearchLanes(plan, {
   now = () => new Date().toISOString(),
 } = {}) {
   validateSearchLanePlan(plan);
-  if (!Number.isSafeInteger(minimumRuns) || minimumRuns < 2) throw new TypeError('lane retirement minimum must be at least two runs');
+  if (!Number.isSafeInteger(minimumRuns) || minimumRuns < 3) throw new TypeError('lane retirement minimum must be at least three runs');
   const retiredAt = now();
   let changed = false;
   const lanes = plan.lanes.map((lane) => {
