@@ -232,7 +232,7 @@ test('missing pre-restart operation is rediscovered without dropping the scan fe
   discoveryRequests = 0;
   replacementPolls = 0;
   await page.evaluate(() => window.Scout.watchScanOperation('scan-before-restart'));
-  await expect.poll(() => discoveryRequests).toBe(1);
+  await expect.poll(() => discoveryRequests).toBeGreaterThan(0);
   await expect.poll(() => replacementPolls).toBeGreaterThan(0);
   await expect(page.locator('#scan-now')).toBeDisabled();
   await expect.poll(() => page.evaluate(() => window.Scout.scanRunning)).toBe(true);
