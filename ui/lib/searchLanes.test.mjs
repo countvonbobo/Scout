@@ -234,6 +234,9 @@ test('retirement rejects fewer than three completed unproductive runs', () => {
     reversible: true,
   };
   assert.throws(() => validateSearchLanePlan(forged), /retired lane metadata/);
+
+  forged.lanes[0].retirement.minimumRuns = 3;
+  assert.throws(() => validateSearchLanePlan(forged), /retired lane metadata/);
 });
 
 test('lane metrics reconcile exact query returns with persisted discovery and assessment evidence', () => {

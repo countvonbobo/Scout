@@ -429,6 +429,7 @@ function validateLane(lane, states = ['active', 'retired']) {
     || lane.retirement?.reversible !== true
     || !Number.isSafeInteger(lane.retirement?.minimumRuns)
     || lane.retirement.minimumRuns < 3
+    || lane.consecutiveUnproductiveRuns < lane.retirement.minimumRuns
   )) {
     throw new TypeError('retired lane metadata is invalid');
   }

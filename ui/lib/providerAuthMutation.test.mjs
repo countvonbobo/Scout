@@ -247,14 +247,15 @@ test('simultaneous provider work acquisitions are serialized but all admitted', 
 
 test('committed authority survives transient canonical guard cleanup contention', async (t) => {
   const root = workspace(t);
-  const originalRemove = fs.rmSync;
+  const originalRename = fs.renameSync;
   let injected = false;
-  fs.rmSync = (target, options) => {
-    if (!injected && String(target).endsWith('codex.guard')) {
+  fs.renameSync = (source, destination) => {
+    if (!injected && String(source).endsWith('codex.guard')
+      && String(destination).includes('.cleanup-')) {
       injected = true;
       throw Object.assign(new Error('injected Windows cleanup contention'), { code: 'EPERM' });
     }
-    return originalRemove(target, options);
+    return originalRename(source, destination);
   };
   let auth;
   try {
@@ -263,10 +264,40 @@ test('committed authority survives transient canonical guard cleanup contention'
       mutationId: 'cleanup-contention-01',
     });
   } finally {
-    fs.rmSync = originalRemove;
+    fs.renameSync = originalRename;
   }
   assert.ok(auth);
   assert.equal(readProviderAuthMutation(root, 'codex').mutationId, auth.mutationId);
+  await new Promise((resolve) => setTimeout(resolve, 75));
+  assert.equal(releaseProviderAuthMutation(root, auth), true);
+});
+
+test('canonical cleanup never strands a guard after partial Windows removal', (t) => {
+  const root = workspace(t);
+  const originalRemove = fs.rmSync;
+  let injected = false;
+  fs.rmSync = (target, options) => {
+    if (!injected && String(target).endsWith('codex.guard')) {
+      injected = true;
+      fs.unlinkSync(path.join(target, 'owner.json'));
+      throw Object.assign(new Error('injected partial Windows cleanup'), { code: 'EPERM' });
+    }
+    return originalRemove(target, options);
+  };
+  let auth;
+  try {
+    auth = acquireProviderAuthMutation(root, 'codex', {
+      owner: currentLeaseOwner(), now: Date.now(), durationMs: 5_000,
+      mutationId: 'partial-cleanup-0001',
+    });
+  } finally {
+    fs.rmSync = originalRemove;
+  }
+  assert.ok(auth);
+  assert.equal(
+    fs.existsSync(path.join(root, '.scout', 'provider-auth', 'v1', 'codex.guard')),
+    false,
+  );
   assert.equal(releaseProviderAuthMutation(root, auth), true);
 });
 
@@ -299,6 +330,34 @@ test('committed authority schedules identity-checked cleanup after persistent Wi
   assert.ok(auth);
   await new Promise((resolve) => setTimeout(resolve, 75));
   assert.equal(fs.existsSync(path.join(root, '.scout', 'provider-auth', 'v1', 'codex.guard')), false);
+  assert.equal(releaseProviderAuthMutation(root, auth), true);
+});
+
+test('detached cleanup finishes an empty quarantine after partial Windows removal', async (t) => {
+  const root = workspace(t);
+  const originalRemove = fs.rmSync;
+  let injected = false;
+  fs.rmSync = (target, options) => {
+    if (!injected && String(target).includes('codex.guard.cleanup-')) {
+      injected = true;
+      fs.unlinkSync(path.join(target, 'owner.json'));
+      throw Object.assign(new Error('injected partial quarantine cleanup'), { code: 'EPERM' });
+    }
+    return originalRemove(target, options);
+  };
+  let auth;
+  try {
+    auth = acquireProviderAuthMutation(root, 'codex', {
+      owner: currentLeaseOwner(), now: Date.now(), durationMs: 5_000,
+      mutationId: 'partial-quarantine-01',
+    });
+  } finally {
+    fs.rmSync = originalRemove;
+  }
+  assert.ok(auth);
+  await new Promise((resolve) => setTimeout(resolve, 75));
+  const directory = path.join(root, '.scout', 'provider-auth', 'v1');
+  assert.equal(fs.readdirSync(directory).some((name) => name.includes('codex.guard.cleanup-')), false);
   assert.equal(releaseProviderAuthMutation(root, auth), true);
 });
 

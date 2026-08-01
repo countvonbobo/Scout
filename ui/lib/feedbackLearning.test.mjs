@@ -348,6 +348,27 @@ test('malformed or non-monotonic learning histories fail closed', () => {
     ],
   }), /duplicated|ancestry/);
 
+  const branched = {
+    ...initial,
+    activeVersionId: 'learning-version-2',
+    versions: [
+      ...initial.versions,
+      {
+        ...initial.versions[0],
+        id: 'learning-version-1',
+        parentId: 'learning-baseline',
+        version: 1,
+      },
+      {
+        ...initial.versions[0],
+        id: 'learning-version-2',
+        parentId: 'learning-baseline',
+        version: 2,
+      },
+    ],
+  };
+  assert.throws(() => validateLearningLedger(branched), /ancestry/);
+
   const recorded = recordFeedback(initial, event());
   assert.throws(() => validateLearningLedger({
     ...recorded,

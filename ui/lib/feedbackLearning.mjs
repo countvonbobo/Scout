@@ -190,22 +190,18 @@ export function validateLearningLedger(value) {
   }
   const versionIds = new Set(result.versions.map(({ id }) => id));
   if (!versionIds.has(result.activeVersionId)) throw new TypeError('active learning version is unavailable');
-  const versionNumbers = new Set();
   const rootVersions = result.versions.filter(({ parentId }) => parentId === null);
-  for (const item of result.versions) {
-    if (!Number.isSafeInteger(item.version) || item.version < 0) throw new TypeError('learning version number is invalid');
-    if (versionNumbers.has(item.version)) throw new TypeError('learning version number is duplicated');
-    versionNumbers.add(item.version);
-    if (item.parentId !== null && !versionIds.has(item.parentId)) throw new TypeError('learning parent version is unavailable');
-    const parent = result.versions.find(({ id }) => id === item.parentId);
-    if (parent && parent.version >= item.version) throw new TypeError('learning version ancestry is invalid');
+  for (const [index, item] of result.versions.entries()) {
+    if (item.version !== index) throw new TypeError('learning version ancestry is invalid');
+    const expectedParent = index === 0 ? null : result.versions[index - 1].id;
+    if (item.parentId !== expectedParent) throw new TypeError('learning version ancestry is invalid');
   }
   if (rootVersions.length !== 1 || rootVersions[0].id !== 'learning-baseline'
     || rootVersions[0].version !== 0 || rootVersions[0].changes.length !== 0) {
     throw new TypeError('learning baseline version is invalid');
   }
-  const active = result.versions.find(({ id }) => id === result.activeVersionId);
-  if (active.version !== Math.max(...result.versions.map(({ version: number }) => number))) {
+  const active = result.versions.at(-1);
+  if (active.id !== result.activeVersionId) {
     throw new TypeError('active learning version is stale');
   }
   const eventIds = new Set(result.feedbackEvents.map(({ id }) => id));
@@ -222,6 +218,22 @@ export function validateLearningLedger(value) {
   for (const item of result.versions) {
     if (item.sourceProposalIds.some((id) => !proposalIds.has(id))) {
       throw new TypeError('learning version proposal is unavailable');
+    }
+    for (const id of item.sourceProposalIds) {
+      const source = result.proposals.find((proposalItem) => proposalItem.id === id);
+      if (source.status !== 'published' || source.publishedVersionId !== item.id
+        || !item.changes.some(({ proposalId }) => proposalId === id)) {
+        throw new TypeError('learning version proposal provenance is inconsistent');
+      }
+    }
+    if (item.changes.some(({ proposalId }) => proposalId && !proposalIds.has(proposalId))) {
+      throw new TypeError('learning change proposal is unavailable');
+    }
+  }
+  for (const item of result.proposals.filter(({ status }) => status === 'published')) {
+    const published = result.versions.filter(({ sourceProposalIds }) => sourceProposalIds.includes(item.id));
+    if (published.length !== 1 || published[0].id !== item.publishedVersionId) {
+      throw new TypeError('learning proposal publication provenance is inconsistent');
     }
   }
   return result;

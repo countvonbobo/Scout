@@ -164,18 +164,10 @@ function readGuardRecord(directory) {
 function removeOwnedGuard(directory, token) {
   const current = readGuardRecord(directory);
   if (!current || current.token !== token) return false;
-  try {
-    fs.rmSync(directory, { recursive: true, force: true });
-    return true;
-  } catch (error) {
-    if (!['EBUSY', 'EPERM', 'EACCES'].includes(error?.code)) throw error;
-  }
-
-  // Windows can refuse recursive deletion briefly while an indexer or virus
-  // scanner has a handle open. Move only the identity we still own away from
-  // the canonical path so a committed operation remains authoritative and a
-  // successor can acquire the guard; deletion of the private quarantine may
-  // then be retried without risking a successor's guard.
+  // Detach the still-verifiable identity before recursive deletion. Windows
+  // may partially delete a directory and then report EPERM/EBUSY; doing that
+  // at the canonical path could erase owner.json and leave an unrecoverable
+  // guard. A detached quarantine can be retried without blocking successors.
   const quarantine = `${directory}.cleanup-${token}`;
   try {
     fs.renameSync(directory, quarantine);
@@ -202,8 +194,17 @@ function scheduleQuarantineCleanup(directory, token) {
   const retry = () => {
     try {
       const pending = readGuardRecord(directory);
-      if (!pending || pending.token !== token) return;
-      fs.rmSync(directory, { recursive: true, force: true });
+      if (pending?.token === token) {
+        fs.rmSync(directory, { recursive: true, force: true });
+        return;
+      }
+      // A prior verified recursive delete may have removed owner.json before
+      // Windows refused the final directory removal. Only an empty, ordinary
+      // quarantine at this unguessable identity path is safe to finish.
+      const stat = fs.lstatSync(directory);
+      if (!stat.isSymbolicLink() && stat.isDirectory() && fs.readdirSync(directory).length === 0) {
+        fs.rmdirSync(directory);
+      }
       return;
     } catch {}
     if (performance.now() >= deadline) return;
@@ -287,7 +288,12 @@ function withGuard(root, provider, now, callback) {
               if (!moved || moved.token !== observed.token) {
                 if (!fs.existsSync(target.guard)) fs.renameSync(quarantine, target.guard);
               } else {
-                fs.rmSync(quarantine, { recursive: true, force: true });
+                try {
+                  fs.rmSync(quarantine, { recursive: true, force: true });
+                } catch (cleanupError) {
+                  if (!['EBUSY', 'EPERM', 'EACCES'].includes(cleanupError?.code)) throw cleanupError;
+                  scheduleQuarantineCleanup(quarantine, observed.token);
+                }
                 continue;
               }
             } catch {}
