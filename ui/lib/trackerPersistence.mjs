@@ -15,10 +15,23 @@ export function trackerRevision(content) {
   return createHash('sha256').update(content).digest('hex');
 }
 
+export function embedTrackerMutationMarker(content, marker) {
+  const data = JSON.parse(content);
+  data._scoutMutation = structuredClone(marker);
+  return `${JSON.stringify(data, null, 2)}\n`;
+}
+
+export function readTrackerMutationMarker(content) {
+  const data = JSON.parse(content);
+  return data?._scoutMutation ?? null;
+}
+
 export function readTrackerSnapshot(file) {
   const content = fs.readFileSync(file, 'utf8');
   try {
-    return { data: JSON.parse(content), revision: trackerRevision(content) };
+    const data = JSON.parse(content);
+    delete data._scoutMutation;
+    return { data, revision: trackerRevision(content) };
   } catch (error) {
     if (error instanceof SyntaxError) {
       error.message = `The tracker file is corrupted but your data is likely intact. A backup is available in the workspace backup repository. Error: ${error.message}`;

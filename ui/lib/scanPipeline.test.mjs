@@ -4,15 +4,66 @@ import os from 'node:os';
 import path from 'node:path';
 import { test } from 'node:test';
 import {
-  compactCandidates, DEFAULT_CANDIDATE_LIMIT, gateAssessment, inboxRecheckCandidates, prepareRankedDiscovery, promptCandidate,
-  filterVacancies, validateAssessments, validateWrittenScanArtifacts, verificationCandidates, writeScanArtifacts,
+  assessScanCandidates, assessmentCandidatesForSelection, buildAssessmentPrompt, compactCandidates, createRankedDiscoveryStages, DEFAULT_CANDIDATE_LIMIT, durableScanProjection, gateAssessment, inboxRecheckCandidates, prepareRankedDiscovery, promptCandidate,
+  filterVacancies, PipelineInterruptedError, readVacancyDecisionHistory, runScanPipeline, validateAssessments, validateWrittenScanArtifacts,
+  verificationCandidates, writeScanArtifacts,
 } from './scanPipeline.mjs';
+import { claimNextScanRequest, enqueueScanRequest, projectScanQueue } from './scanQueue.mjs';
+import { acquireScanLease, currentLeaseOwner, readScanLease, releaseScanLease } from './scanLease.mjs';
+import {
+  appendRunEvent, openRunJournal, replayRunJournal, validateRunJournal,
+} from './runJournal.mjs';
+import { ProviderLifecycleUnclosedError } from './structuredTurn.mjs';
+import { applyPreparedMutation, prepareMutation } from './mutationCoordinator.mjs';
+import {
+  runLogAppendRecipe, scanReportRecipe, trackerMergeRecipe,
+} from './scanMutationProjection.mjs';
+import { profileRuleId } from './searchProfile.mjs';
+import { createEmployerRegistry, employerRegistryRevision } from './employerRegistry.mjs';
+import { partitionVacanciesForAssessment } from './vacancyLifecycle.mjs';
 
 const dimensions = [{ name: 'Fit', score: 90, maximum: 100, evidence: 'Advert and profile' }];
 const assessment = (status = 'met') => ({
-  candidateId: 'candidate-001', categoryId: 'software', summary: 'Synthetic fit', hardExclusionMatches: [],
+  candidateId: 'candidate-001',
+  summary: 'Synthetic fit',
+  responsibilityFit: {
+    rating: 'strong',
+    advertEvidence: 'The advert requires systems delivery.',
+    profileEvidence: 'Built production systems.',
+    explanation: 'The responsibility evidence aligns.',
+  },
   mandatoryRequirements: [{ requirement: 'AWS', advertEvidence: 'AWS is required', advertEvidenceId: 'provider-aws', status, profileEvidence: status === 'met' ? 'Built systems on AWS' : null }],
-  dimensions, recommendation: 'keep',
+  transferableExperience: [{
+    advertNeed: 'Deliver reliable services.',
+    profileEvidence: 'Delivered a related service.',
+    relevance: 'strong',
+    explanation: 'The operating constraints transfer directly.',
+  }],
+  uncertainties: ['Team scale is not stated.'],
+  strengths: [{
+    point: 'Direct systems evidence.',
+    advertEvidence: 'The advert requires systems delivery.',
+    profileEvidence: 'Built production systems.',
+  }],
+  concerns: [{
+    point: 'Team scale remains unknown.',
+    advertEvidence: 'The advert does not state team size.',
+    profileEvidence: null,
+  }],
+  recommendation: 'keep',
+});
+
+test('assessment prompt confines providers to nuanced evidence and recommendations', () => {
+  const context = { candidates: [{ candidateId: 'candidate-001' }] };
+  const prompt = buildAssessmentPrompt(context);
+  assert.match(prompt, /already normalised, deduplicated, filtered, ranked and selected/);
+  assert.match(prompt, /responsibility fit/);
+  assert.match(prompt, /transferable experience/);
+  assert.match(prompt, /uncertainty/);
+  assert.match(prompt, /strengths and concerns/);
+  assert.doesNotMatch(prompt, /Use a 100-point evidence-led breakdown/);
+  assert.doesNotMatch(prompt, /Apply hard exclusions before scoring/);
+  assert.deepEqual(JSON.parse(prompt.split('\n\n').at(-1)), context);
 });
 
 test('candidate input is deduplicated, capped and descriptions are bounded', () => {
@@ -40,6 +91,559 @@ test('ranked discovery is independent of source and portal order', () => {
   assert.deepEqual(forward.candidates.map((item) => item.candidateId), ['candidate-001', 'candidate-002']);
 });
 
+test('ranked discovery preserves role-family and location metadata for soft diversification', () => {
+  const profile = {
+    version: 1, status: 'published', id: 'profile-diversity',
+    target: { primaryTitles: [{ value: 'Ideal Role', strength: 'mandatory', provenance: 'explicit' }] },
+    negative: {},
+    compensation: {
+      currency: null, period: 'year', minimum: null, minimumStrength: 'neutral', unknownPolicy: 'include',
+    },
+  };
+  const job = (id, { roleFamily = 'engineering', location = 'London' } = {}) => ({
+    company: 'Shared Employer',
+    title: 'Ideal Role',
+    url: `https://example.test/${id}`,
+    providerId: id,
+    roleFamily,
+    location,
+  });
+  const dominantFamilies = Array.from({ length: 12 }, (_, index) => job(`family-a-${index}`));
+  const alternativeFamilies = Array.from({ length: 6 }, (_, index) => job(`family-z-${index}`, {
+    roleFamily: index % 2 ? 'operations' : 'research',
+  }));
+  const familyResult = prepareRankedDiscovery({
+    sources: { ats: { count: 18, jobs: [...dominantFamilies, ...alternativeFamilies] } },
+    profile, tracker: { opportunities: [] }, runId: 'role-family-diversity', limit: 10,
+  });
+
+  assert.ok(familyResult.ranked.every(({ roleFamily }) => roleFamily));
+  assert.ok(familyResult.selection.selected.filter(({ roleFamily }) => roleFamily === 'engineering').length <= 5);
+  assert.equal(familyResult.selection.constraintsRelaxed.includes('roleFamily'), false);
+
+  const dominantLocations = Array.from({ length: 12 }, (_, index) => job(`location-a-${index}`));
+  const alternativeLocations = Array.from({ length: 6 }, (_, index) => job(`location-z-${index}`, {
+    location: index % 2 ? 'Manchester' : 'Bristol',
+  }));
+  const locationResult = prepareRankedDiscovery({
+    sources: { ats: { count: 18, jobs: [...dominantLocations, ...alternativeLocations] } },
+    profile, tracker: { opportunities: [] }, runId: 'location-diversity', limit: 10,
+  });
+
+  assert.ok(locationResult.selection.selected.filter(({ location }) => location === 'London').length <= 5);
+  assert.equal(locationResult.selection.constraintsRelaxed.includes('location'), false);
+});
+
+test('URL-less provider vacancies retain distinct stable identities through selection', () => {
+  const profile = {
+    version: 1, status: 'published', id: 'profile-url-less-identities',
+    target: {},
+    negative: {},
+    compensation: {
+      currency: null, period: 'year', minimum: null,
+      minimumStrength: 'neutral', unknownPolicy: 'include',
+    },
+  };
+  const sources = {
+    provider: {
+      count: 2,
+      jobs: [
+        {
+          company: 'Example Co', title: 'Engineer',
+          providerId: 'provider-reference-1', description: 'Build service one.',
+        },
+        {
+          company: 'Example Co', title: 'Engineer',
+          providerId: 'provider-reference-2', description: 'Build service two.',
+        },
+      ],
+    },
+  };
+  const forward = prepareRankedDiscovery({
+    sources, profile, runId: 'url-less-forward', relevanceThreshold: 0,
+  });
+  const reverse = prepareRankedDiscovery({
+    sources: { provider: { ...sources.provider, jobs: [...sources.provider.jobs].reverse() } },
+    profile,
+    runId: 'url-less-reverse',
+    relevanceThreshold: 0,
+  });
+
+  assert.equal(forward.ranked.length, 2);
+  assert.equal(new Set(forward.ranked.map(({ vacancyId }) => vacancyId)).size, 2);
+  assert.ok(forward.ranked.every(({ vacancyId }) => /^vacancy-ref-[a-f0-9]{24}$/.test(vacancyId)));
+  assert.deepEqual(
+    forward.ranked.map(({ vacancyId }) => vacancyId),
+    reverse.ranked.map(({ vacancyId }) => vacancyId),
+  );
+  assert.ok(forward.selection.reasons.every(({ vacancyId }) => vacancyId !== 'unknown-vacancy'));
+
+  const firstScan = prepareRankedDiscovery({
+    sources: { provider: { count: 1, jobs: [sources.provider.jobs[0]] } },
+    profile, runId: 'url-less-first-scan', relevanceThreshold: 0,
+  }).ranked[0];
+  const distinctLaterScan = prepareRankedDiscovery({
+    sources: { provider: { count: 1, jobs: [sources.provider.jobs[1]] } },
+    profile,
+    decisionHistory: [{
+      ...firstScan,
+      outcome: 'below_threshold',
+      profileId: profile.id,
+    }],
+    runId: 'url-less-distinct-later',
+    relevanceThreshold: 0,
+  }).ranked[0];
+  assert.notEqual(distinctLaterScan.vacancyId, firstScan.vacancyId);
+
+  const coverageLaterScan = prepareRankedDiscovery({
+    sources: {
+      provider: { count: 1, jobs: [sources.provider.jobs[0]] },
+      other: {
+        count: 1,
+        jobs: [{
+          ...sources.provider.jobs[0],
+          source: 'other',
+          providerId: 'other-provider-reference',
+        }],
+      },
+    },
+    profile,
+    decisionHistory: [{
+      ...firstScan,
+      outcome: 'below_threshold',
+      profileId: profile.id,
+    }],
+    runId: 'url-less-coverage-later',
+    relevanceThreshold: 0,
+  }).ranked[0];
+  assert.equal(coverageLaterScan.vacancyId, firstScan.vacancyId);
+});
+
+test('durable reviewed rejections are seen for novelty and lane productivity', () => {
+  const profile = {
+    version: 1, status: 'published', id: 'profile-reviewed-history',
+    target: {}, negative: {},
+    selection: { breadth: 'balanced' },
+    compensation: {
+      currency: null, period: 'year', minimum: null,
+      minimumStrength: 'neutral', unknownPolicy: 'include',
+    },
+  };
+  const url = 'https://example.test/reviewed-opening';
+  const result = prepareRankedDiscovery({
+    sources: {
+      reviewed_lane: {
+        count: 1,
+        jobs: [{ company: 'Example Co', title: 'Engineer', url, providerId: 'reviewed-1' }],
+      },
+    },
+    profile,
+    tracker: { opportunities: [] },
+    decisionHistory: [{
+      vacancyId: url,
+      company: 'Example Co',
+      role: 'Engineer',
+      url,
+      outcome: 'provider_discarded',
+    }],
+    relevanceThreshold: 0,
+  });
+
+  assert.deepEqual(result.discoveryCounts, []);
+  assert.equal(
+    result.ranked[0].dimensions.find(({ name }) => name === 'novelty').evidence[0].comparison,
+    'seen-exact',
+  );
+});
+
+test('durable pre-assessment exclusions are seen for novelty and lane productivity', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'scout-pre-assessment-history-'));
+  fs.mkdirSync(path.join(root, 'data'), { recursive: true });
+  fs.writeFileSync(path.join(root, 'data', 'opportunities.json'), '{"updated":"2026-07-01","opportunities":[]}\n');
+  const excluded = {
+    vacancyId: 'vacancy-ref-excluded',
+    company: 'Example Co',
+    role: 'Engineer',
+    source: 'reviewed_lane',
+    laneIds: ['reviewed_lane'],
+    sourceReferences: [{ source: 'reviewed_lane', providerId: 'excluded-1', url: '' }],
+    code: 'hard-title-exclusion',
+  };
+  writeScanArtifacts(root, {
+    provider: 'codex',
+    mode: 'primary',
+    sources: { reviewed_lane: { configured: true, status: 'healthy', count: 1 } },
+    candidates: [],
+    assessmentResult: { assessments: [] },
+    policy: {},
+    startedAt: '2026-07-14T10:00:00Z',
+    ranked: [],
+    exclusions: [excluded],
+    hardExcluded: [excluded],
+  });
+  const history = readVacancyDecisionHistory(root);
+  assert.equal(history.length, 1);
+  assert.equal(history[0].outcome, 'hard-title-exclusion');
+
+  const profile = {
+    version: 1, status: 'published', id: 'profile-exclusion-history',
+    target: {}, negative: {},
+    selection: { breadth: 'balanced' },
+    compensation: {
+      currency: null, period: 'year', minimum: null,
+      minimumStrength: 'neutral', unknownPolicy: 'include',
+    },
+  };
+  const result = prepareRankedDiscovery({
+    sources: {
+      reviewed_lane: {
+        count: 1,
+        jobs: [{
+          company: 'Example Co', title: 'Engineer',
+          source: 'reviewed_lane', providerId: 'excluded-1',
+        }],
+      },
+    },
+    profile,
+    tracker: { opportunities: [] },
+    decisionHistory: history,
+    relevanceThreshold: 0,
+  });
+  assert.deepEqual(result.discoveryCounts, []);
+  assert.equal(
+    result.ranked[0].dimensions.find(({ name }) => name === 'novelty').evidence[0].comparison,
+    'seen-exact',
+  );
+});
+
+test('privacy projection cannot collapse distinct query-addressed provider vacancies', () => {
+  const profile = {
+    version: 1, status: 'published', id: 'profile-query-identity-collision',
+    target: {},
+    negative: {},
+    compensation: {
+      currency: null, period: 'year', minimum: null,
+      minimumStrength: 'neutral', unknownPolicy: 'include',
+    },
+  };
+  const sources = durableScanProjection({
+    provider: {
+      count: 2,
+      jobs: [
+        {
+          company: 'Example Co',
+          title: 'Platform Engineer',
+          providerId: 'query-job-one',
+          url: 'https://jobs.example.test/apply?job=one',
+        },
+        {
+          company: 'Example Co',
+          title: 'Platform Engineer',
+          providerId: 'query-job-two',
+          url: 'https://jobs.example.test/apply?job=two',
+        },
+      ],
+    },
+  });
+  const result = prepareRankedDiscovery({
+    sources,
+    profile,
+    runId: 'query-identity-collision',
+    relevanceThreshold: 0,
+  });
+  assert.equal(result.vacancies.length, 2);
+  assert.equal(new Set(result.vacancies.map(({ vacancyId }) => vacancyId)).size, 2);
+  assert.equal(result.funnel.uniqueVacancies, 2);
+});
+
+test('durable ranked stages preserve the established ranked discovery result', async () => {
+  const profile = {
+    version: 1, status: 'published', id: 'profile-durable',
+    target: { primaryTitles: [{ value: 'Ideal Role', strength: 'strong-preference', provenance: 'explicit' }] },
+    negative: {}, compensation: { currency: null, period: 'year', minimum: null, minimumStrength: 'neutral', unknownPolicy: 'include' },
+  };
+  const sources = {
+    ats: {
+      count: 2,
+      jobs: [
+        { company: 'Able', title: 'Ideal Role', url: 'https://example.test/able', providerId: 'able' },
+        { company: 'Baker', title: 'Other Role', url: 'https://example.test/baker', providerId: 'baker' },
+      ],
+    },
+  };
+  const options = { profile, tracker: { opportunities: [] }, runId: 'durable-run', limit: 60 };
+  const expected = prepareRankedDiscovery({ sources, ...options });
+  const stages = createRankedDiscoveryStages({
+    collect: async () => ({ generatedAt: '2026-07-27T10:00:00.000Z', queries: ['ideal'], sources }),
+    profile,
+    tracker: options.tracker,
+    limit: options.limit,
+  });
+  let priorArtifact = null;
+  for (const stageId of DURABLE_STAGES) {
+    priorArtifact = await stages[stageId]({
+      run: { runId: options.runId },
+      lease: { runId: options.runId },
+      priorArtifact,
+    });
+  }
+
+  assert.deepEqual(priorArtifact, {
+    discoveryCounts: expected.discoveryCounts,
+    exclusions: expected.exclusions,
+    reconsidered: expected.reconsidered,
+    ranked: expected.ranked,
+    selection: expected.selection,
+    funnel: expected.funnel,
+    candidates: expected.candidates,
+  });
+});
+
+test('production deduplicate stage reuses URL-less tracker identity as source coverage changes', async () => {
+  const profile = {
+    version: 1,
+    status: 'published',
+    id: 'profile-durable-id',
+    target: {},
+    negative: {},
+    compensation: {
+      currency: null,
+      period: 'year',
+      minimum: null,
+      minimumStrength: 'neutral',
+      unknownPolicy: 'include',
+    },
+  };
+  const initialSources = {
+    provider_z: {
+      jobs: [{
+        company: 'Synthetic Company',
+        title: 'Platform Engineer',
+        providerId: 'opening-z',
+        description: 'Operate reliable services and improve production resilience.',
+      }],
+    },
+  };
+  const runDeduplicate = async (sources, tracker) => {
+    const stages = createRankedDiscoveryStages({
+      collect: async () => ({ sources }),
+      profile,
+      tracker,
+    });
+    const collect = await stages.collect({ run: { runId: 'durable-id-run' } });
+    const normalised = stages.normalise({ priorArtifact: collect });
+    return stages.deduplicate({ priorArtifact: normalised });
+  };
+  const first = await runDeduplicate(initialSources, { opportunities: [] });
+  const prior = first.vacancies[0];
+  const enriched = await runDeduplicate({
+    provider_z: initialSources.provider_z,
+    provider_a: {
+      jobs: [{
+        company: 'Synthetic Company',
+        title: 'Platform Engineer',
+        providerId: 'opening-a',
+        description: 'Operate reliable services and improve production resilience.',
+      }],
+    },
+  }, { opportunities: [prior] });
+
+  assert.equal(enriched.vacancies.length, 1);
+  assert.equal(enriched.vacancies[0].vacancyId, prior.vacancyId);
+});
+
+test('query-addressed vacancy identity is identical live and after collect or normalise replay', async () => {
+  const profile = {
+    version: 1,
+    status: 'published',
+    id: 'profile-query-recovery',
+    target: {},
+    negative: {},
+    compensation: {
+      currency: null,
+      period: 'year',
+      minimum: null,
+      minimumStrength: 'neutral',
+      unknownPolicy: 'include',
+    },
+  };
+  const stages = createRankedDiscoveryStages({
+    collect: async () => ({
+      generatedAt: '2026-07-31T10:00:00.000Z',
+      queries: ['platform engineer'],
+      sources: {
+        provider: {
+          configured: true,
+          status: 'healthy',
+          jobs: [{
+            company: 'Example Co',
+            title: 'Platform Engineer',
+            providerId: 'query-opening-one',
+            url: 'https://jobs.example.test/apply?job=one',
+          }],
+        },
+      },
+    }),
+    profile,
+  });
+  const collected = await stages.collect({ run: { runId: 'query-recovery' } });
+  const liveCollect = stages.collect.artifactCodec.transient(collected);
+  const recoveredCollect = stages.collect.artifactCodec.decode(
+    stages.collect.artifactCodec.encode(collected),
+  );
+  const liveNormalised = stages.normalise({ priorArtifact: liveCollect });
+  const recoveredNormalised = stages.normalise({ priorArtifact: recoveredCollect });
+  const replayedNormalised = stages.normalise.artifactCodec.decode(
+    stages.normalise.artifactCodec.encode(liveNormalised),
+  );
+  const vacancyIds = [liveNormalised, recoveredNormalised, replayedNormalised].map(
+    (priorArtifact) => stages.deduplicate({ priorArtifact }).vacancies[0].vacancyId,
+  );
+  assert.equal(new Set(vacancyIds).size, 1);
+  assert.match(vacancyIds[0], /^vacancy-url-[a-f0-9]{24}$/);
+  assert.doesNotMatch(
+    JSON.stringify(stages.collect.artifactCodec.encode(collected)),
+    /job=one/,
+  );
+});
+
+test('ranked collect replay preserves configured collection source separately from vendor source', async () => {
+  const stages = createRankedDiscoveryStages({
+    collect: async () => ({
+      generatedAt: '2026-07-31T10:00:00.000Z',
+      queries: ['platform engineer'],
+      sources: {
+        adzuna: {
+          configured: true,
+          status: 'healthy',
+          jobs: [{
+            company: 'Example Co',
+            title: 'Platform Engineer',
+            source: 'greenhouse',
+            providerId: 'query-opening-one',
+            url: 'https://jobs.example.test/apply?job=one',
+          }],
+        },
+      },
+    }),
+    profile: {
+      version: 1, status: 'published', id: 'profile-collection-source-recovery',
+      target: {}, negative: {},
+      compensation: {
+        currency: null, period: 'year', minimum: null,
+        minimumStrength: 'neutral', unknownPolicy: 'include',
+      },
+    },
+  });
+  const collected = await stages.collect({ run: { runId: 'collection-source-recovery' } });
+  for (const priorArtifact of [
+    stages.collect.artifactCodec.transient(collected),
+    stages.collect.artifactCodec.decode(stages.collect.artifactCodec.encode(collected)),
+  ]) {
+    const normalised = stages.normalise({ priorArtifact });
+    const vacancy = stages.deduplicate({ priorArtifact: normalised }).vacancies[0];
+    assert.equal(vacancy.sourceReferences[0].source, 'greenhouse');
+    assert.deepEqual(vacancy.collectionSources, ['adzuna']);
+  }
+});
+
+test('durable collection preserves bounded employer monitoring evidence for finalisation', async () => {
+  const registry = createEmployerRegistry([], { now: () => '2026-07-31T09:00:00.000Z' });
+  const stages = createRankedDiscoveryStages({
+    collect: async () => ({
+      generatedAt: '2026-07-31T09:30:00.000Z',
+      queries: [],
+      sources: {
+        employer_registry: {
+          configured: true,
+          status: 'healthy',
+          count: 0,
+          jobs: [],
+          checks: Array.from({ length: 32 }, (_, index) => ({
+            employerId: `employer-${String(index).padStart(16, '0')}`,
+            adapter: 'structured-data',
+            status: 'healthy',
+            returned: 0,
+            parsed: 0,
+            checkedAt: '2026-07-31T09:30:00.000Z',
+          })),
+          registryRevision: employerRegistryRevision(registry),
+          registrySnapshot: registry,
+        },
+      },
+    }),
+    profile: {
+      version: 1, status: 'published', id: 'profile-monitoring',
+      target: {}, negative: {},
+      compensation: {
+        currency: null, period: 'year', minimum: null,
+        minimumStrength: 'neutral', unknownPolicy: 'include',
+      },
+    },
+    tracker: { opportunities: [] },
+  });
+
+  const collected = await stages.collect({
+    run: { runId: 'monitoring-run' },
+    lease: { runId: 'monitoring-run' },
+    priorArtifact: null,
+  });
+  const durable = stages.collect.artifactCodec.decode(
+    stages.collect.artifactCodec.encode(collected),
+  );
+  assert.deepEqual(durable.sources.employer_registry.registrySnapshot, registry);
+  assert.equal(
+    durable.sources.employer_registry.registryRevision,
+    employerRegistryRevision(registry),
+  );
+  assert.equal(durable.sources.employer_registry.checks.length, 32);
+});
+
+test('actual collect codec fingerprints unbounded credential-shaped provider identifiers', async () => {
+  const profile = {
+    version: 1, status: 'published', id: 'profile-source-identity',
+    target: {}, negative: {},
+    compensation: {
+      currency: null, period: 'year', minimum: null,
+      minimumStrength: 'neutral', unknownPolicy: 'include',
+    },
+  };
+  const privateId = `${['access', 'token'].join('_')}=${['TOP', 'SECRET'].join('')}1234567890-${'x'.repeat(200_000)}`;
+  const stages = createRankedDiscoveryStages({
+    collect: async () => ({
+      generatedAt: '2026-07-31T09:30:00.000Z',
+      queries: [],
+      sources: {
+        fixture: {
+          configured: true,
+          status: 'healthy',
+          count: 1,
+          jobs: [{
+            providerId: privateId,
+            title: 'Engineer',
+            company: 'Example',
+            description: 'Build stable services.',
+          }],
+        },
+      },
+    }),
+    profile,
+  });
+  const raw = await stages.collect({
+    run: { runId: 'source-identity-run' },
+    lease: { runId: 'source-identity-run' },
+    priorArtifact: null,
+  });
+  const encoded = stages.collect.artifactCodec.encode(raw);
+  const stored = JSON.stringify(encoded);
+  assert.match(
+    encoded.sources.fixture.observations[0].sourceRecordId,
+    /^provider-[a-f0-9]{32}$/,
+  );
+  assert.ok(stored.length < 20_000);
+  assert.doesNotMatch(stored, /TOPSECRET|access_token/i);
+});
+
 test('ranked discovery excludes zero-score unrelated vacancies below the configured relevance threshold', () => {
   const profile = {
     version: 1, status: 'published', id: 'profile-123456789abc',
@@ -65,6 +669,160 @@ test('ranked discovery excludes zero-score unrelated vacancies below the configu
   assert.equal(result.funnel.ranked, 2);
   assert.equal(result.funnel.aboveThreshold, 1);
   assert.equal(result.funnel.selected, 1);
+});
+
+test('ranked discovery backfills assessment capacity instead of re-assessing an unchanged rejection', () => {
+  const profile = {
+    version: 1, status: 'published', id: 'profile-current',
+    target: { primaryTitles: [{ value: 'Ideal Role', strength: 'strong-preference', provenance: 'explicit' }] },
+    negative: {},
+    compensation: {
+      currency: null, period: 'year', minimum: null, minimumStrength: 'neutral', unknownPolicy: 'include',
+    },
+  };
+  const sources = { ats: { count: 2, jobs: [
+    {
+      company: 'Already Reviewed',
+      title: 'Ideal Role',
+      url: 'https://example.test/rejected',
+      providerId: 'rejected',
+      description: 'Deliver the ideal role responsibilities.',
+    },
+    {
+      company: 'Fresh Candidate',
+      title: 'Ideal Role',
+      url: 'https://example.test/fresh',
+      providerId: 'fresh',
+      description: 'Deliver the ideal role responsibilities.',
+    },
+  ] } };
+  const initial = prepareRankedDiscovery({
+    sources, profile, tracker: { opportunities: [] }, runId: 'initial', limit: 2,
+  });
+  const rejected = initial.ranked.find((item) => item.company === 'Already Reviewed');
+  const result = prepareRankedDiscovery({
+    sources,
+    profile,
+    tracker: { opportunities: [] },
+    decisionHistory: [{
+      company: rejected.company,
+      role: rejected.role,
+      url: rejected.url,
+      source: rejected.source,
+      outcome: 'below_threshold',
+      profileId: profile.id,
+      contentFingerprint: rejected.contentFingerprint,
+    }],
+    runId: 'repeat',
+    limit: 1,
+  });
+
+  assert.equal(result.ranked.length, 2);
+  assert.equal(Object.hasOwn(result.ranked[0], 'observations'), false);
+  assert.deepEqual(result.selection.selected.map((item) => item.company), ['Fresh Candidate']);
+  assert.deepEqual(result.selection.assessmentSkipped.map((item) => ({
+    company: item.company,
+    reason: item.lifecycle.reason,
+  })), [{ company: 'Already Reviewed', reason: 'unchanged-rejection' }]);
+  assert.equal(result.candidates.length, 1);
+  assert.equal(result.funnel.selected, 1);
+});
+
+test('published learning reranks unassessed jobs, reconsiders scoped exclusions and reuses prior decisions', () => {
+  const profile = {
+    version: 1, status: 'published', id: 'profile-learning-flow',
+    target: {
+      primaryTitles: [{
+        value: 'Data Engineer',
+        strength: 'mandatory',
+        provenance: 'explicit',
+      }],
+    },
+    negative: {},
+    compensation: {
+      currency: null, period: 'year', minimum: null,
+      minimumStrength: 'neutral', unknownPolicy: 'include',
+    },
+  };
+  const sources = { ats: { count: 3, jobs: [
+    {
+      company: 'Reviewed Co', title: 'Data Engineer', location: 'London',
+      roleFamily: 'Data Engineering',
+      url: 'https://example.test/reviewed', providerId: 'reviewed',
+    },
+    {
+      company: 'Preferred Co', title: 'Data Engineer', location: 'Manchester',
+      roleFamily: 'Data Engineering',
+      url: 'https://example.test/preferred', providerId: 'preferred',
+    },
+    {
+      company: 'Adjacent Co', title: 'Software Engineer', location: 'Bristol',
+      roleFamily: 'Software Engineering',
+      url: 'https://example.test/adjacent', providerId: 'adjacent',
+    },
+  ] } };
+  const initial = prepareRankedDiscovery({
+    sources, profile, tracker: { opportunities: [] }, runId: 'learning-initial', limit: 3,
+  });
+  const reviewed = initial.ranked.find(({ company }) => company === 'Reviewed Co');
+  const result = prepareRankedDiscovery({
+    sources,
+    profile,
+    tracker: { opportunities: [] },
+    decisionHistory: [{
+      company: reviewed.company,
+      role: reviewed.role,
+      url: reviewed.url,
+      source: reviewed.source,
+      outcome: 'below_threshold',
+      profileId: profile.id,
+      contentFingerprint: reviewed.contentFingerprint,
+    }],
+    learningPolicy: {
+      id: 'learning-reviewed',
+      version: 1,
+      changes: [
+        {
+          kind: 'rank-adjustment',
+          field: 'location',
+          value: 'Manchester',
+          weight: 8,
+          scope: 'profile-wide',
+          proposalId: 'proposal-location',
+        },
+        {
+          kind: 'reconsider-rule',
+          profileRuleId: profileRuleId('target', 'primaryTitles', profile.target.primaryTitles[0]),
+          scope: 'role-family',
+          value: 'Software Engineering',
+          proposalId: 'proposal-adjacent',
+        },
+        {
+          kind: 'rank-adjustment',
+          field: 'title',
+          value: 'Software Engineer',
+          weight: 8,
+          scope: 'role-family',
+          scopeValue: 'Software Engineering',
+          proposalId: 'proposal-adjacent-rank',
+        },
+      ],
+    },
+    runId: 'learning-published',
+    limit: 2,
+  });
+
+  assert.equal(result.ranked[0].company, 'Preferred Co');
+  assert.equal(result.ranked[0].learningAdjustment, 8);
+  assert.deepEqual(result.reconsidered.map(({ vacancyId }) => vacancyId), [
+    result.ranked.find(({ company }) => company === 'Adjacent Co').vacancyId,
+  ]);
+  assert.deepEqual(result.selection.selected.map(({ company }) => company), [
+    'Preferred Co', 'Adjacent Co',
+  ]);
+  assert.deepEqual(result.selection.assessmentSkipped.map(({ company, lifecycle }) => ({
+    company, reason: lifecycle.reason,
+  })), [{ company: 'Reviewed Co', reason: 'unchanged-rejection' }]);
 });
 
 test('deterministic exclusion accounting counts unique vacancies while retaining every rule explanation', () => {
@@ -110,7 +868,11 @@ test('deterministic exclusion accounting counts unique vacancies while retaining
     profileId: profile.id,
   });
   assert.equal(artifacts.run.discarded.hard_exclusion, 1);
-  assert.equal(artifacts.run.explanations.length, 2);
+  assert.equal(artifacts.run.explanations.length, 1);
+  assert.deepEqual(
+    artifacts.run.explanations[0].deterministic_exclusions.sort(),
+    ['excluded-employer', 'excluded-title'],
+  );
 });
 
 test('explicit provider compensation remains comparable through ranked discovery', () => {
@@ -190,6 +952,66 @@ test('mandatory advert language is assigned stable signals that assessments cann
   assert.equal(validateAssessments({ assessments: [covered] }, candidates).assessments.length, 1);
 });
 
+test('candidate codec preserves more than the former mandatory and responsibility limits', () => {
+  const mandatory = Array.from({ length: 13 }, (_, index) => ({
+    id: `mandatory-${String(index + 1).padStart(2, '0')}`,
+    fact: `requirement number ${index + 1}`,
+  }));
+  const responsibilities = Array.from(
+    { length: 8 },
+    (_, index) => `responsibility number ${index + 1}`,
+  );
+  const { candidates } = compactCandidates({ one: { jobs: [{
+    company: 'Capacity Example',
+    title: 'Evidence Lead',
+    url: 'https://example.test/capacity',
+    description: 'Full advert was normalised.',
+    semanticEvidence: {
+      descriptionPresent: true,
+      descriptionLength: 500,
+      mandatorySignals: mandatory,
+      responsibilityFacts: responsibilities,
+    },
+  }] } });
+  assert.equal(candidates[0].mandatorySignals.length, 13);
+  for (const fact of responsibilities) assert.match(candidates[0].description, new RegExp(fact));
+});
+
+test('candidate codec rejects mandatory and responsibility overflow instead of losing clauses', () => {
+  const base = {
+    company: 'Capacity Example',
+    title: 'Evidence Lead',
+    url: 'https://example.test/capacity-overflow',
+    description: 'Full advert was normalised.',
+  };
+  assert.throws(() => compactCandidates({ one: { jobs: [{
+    ...base,
+    semanticEvidence: {
+      descriptionPresent: true,
+      descriptionLength: 10_000,
+      mandatorySignals: Array.from({ length: 65 }, (_, index) => ({
+        id: `mandatory-${index + 1}`,
+        fact: `requirement ${index + 1}`,
+      })),
+      responsibilityFacts: [],
+    },
+  }] } }), /mandatory evidence exceeds the supported limit/);
+
+  assert.throws(() => compactCandidates({ one: { jobs: [{
+    ...base,
+    url: 'https://example.test/responsibility-overflow',
+    semanticEvidence: {
+      descriptionPresent: true,
+      descriptionLength: 10_000,
+      mandatorySignals: [],
+      responsibilityFacts: Array.from(
+        { length: 65 },
+        (_, index) => `distinct platform responsibility ${index + 1}`,
+      ),
+    },
+  }] } }), /responsibility evidence exceeds the supported limit/);
+});
+
 test('normalized source requirement summaries are mandatory without keyword heuristics', () => {
   const { candidates } = compactCandidates({ one: { jobs: [{
     company: 'Example', title: 'Senior Rust Engineer', url: 'https://example.test/rust',
@@ -208,21 +1030,28 @@ test('normalized source requirement summaries are mandatory without keyword heur
     ],
   };
   assert.equal(validateAssessments({ assessments: [missingRust] }, candidates).assessments.length, 1);
-  assert.equal(gateAssessment(missingRust, { actionScore: 70, checkScore: 55 }).score, 69);
-  assert.equal(gateAssessment(missingRust, { actionScore: 70, checkScore: 55 }).eligibility, 'check');
+  assert.equal(gateAssessment(missingRust, { actionScore: 70, checkScore: 55 }, { preRankScore: 90 }).score, 69);
+  assert.equal(gateAssessment(missingRust, { actionScore: 70, checkScore: 55 }, { preRankScore: 90 }).eligibility, 'check');
 });
 
-test('mandatory and exclusion gates recompute trusted scores and bands', () => {
-  assert.deepEqual(gateAssessment(assessment('unmet'), { actionScore: 70, checkScore: 55 }), {
+test('mandatory and recommendation gates use Scout deterministic scores and bands', () => {
+  const candidate = { candidateId: 'candidate-001', preRankScore: 90 };
+  assert.deepEqual(gateAssessment(assessment('unmet'), { actionScore: 70, checkScore: 55 }, candidate), {
     eligibility: 'ineligible', score: 54, keep: false, reasons: ['AWS'],
   });
-  assert.deepEqual(gateAssessment(assessment('unknown'), { actionScore: 70, checkScore: 55 }), {
+  assert.deepEqual(gateAssessment(assessment('unknown'), { actionScore: 70, checkScore: 55 }, candidate), {
     eligibility: 'check', score: 69, keep: true, reasons: ['AWS'],
   });
-  const excluded = assessment('met');
-  excluded.hardExclusionMatches = ['gambling'];
-  assert.equal(gateAssessment(excluded, { actionScore: 70, checkScore: 55 }).keep, false);
-  assert.throws(() => validateAssessments({ assessments: [{ ...assessment('met'), dimensions: [{ ...dimensions[0], score: 101 }] }] }, [{ candidateId: 'candidate-001' }]), /invalid score/);
+  const discarded = { ...assessment('met'), recommendation: 'discard' };
+  assert.equal(gateAssessment(discarded, { actionScore: 70, checkScore: 55 }, candidate).keep, false);
+  assert.equal(gateAssessment(assessment('met'), { actionScore: 70, checkScore: 55 }, { preRankScore: 82 }).score, 82);
+  assert.throws(
+    () => validateAssessments(
+      { assessments: [{ ...assessment('met'), dimensions }] },
+      [{ candidateId: 'candidate-001' }],
+    ),
+    /assessment validation failed/,
+  );
   assert.throws(() => validateAssessments({ assessments: [] }, [{ candidateId: 'candidate-001' }]), /covered 0 of 1/);
 });
 
@@ -240,7 +1069,7 @@ test('runtime writes canonical scan records and preserves user tracker state', (
     sources: { hiring_cafe: { configured: true, status: 'healthy', count: 1, jobs: [] } },
     assessmentResult: { assessments: [assessment('met')] }, policy: { actionScore: 70, checkScore: 55 },
   });
-  assert.equal(artifacts.run.schemaVersion, 4);
+  assert.equal(artifacts.run.schemaVersion, 5);
   assert.deepEqual(artifacts.run.sources_checked, ['hiring_cafe']);
   assert.deepEqual(artifacts.run.queries_checked, ['engineer']);
   assert.equal(artifacts.run.candidates_found, 1);
@@ -254,32 +1083,99 @@ test('runtime writes canonical scan records and preserves user tracker state', (
   assert.equal(validateWrittenScanArtifacts(root, artifacts.run).run.agent, 'codex');
 });
 
+test('scan artifact builder sanitises source reasons and failure text before persistence', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'scout-sanitised-scan-reasons-'));
+  fs.mkdirSync(path.join(root, 'data'), { recursive: true });
+  fs.writeFileSync(path.join(root, 'data', 'opportunities.json'), '{"updated":"2026-07-01","opportunities":[]}\n');
+  const artifacts = writeScanArtifacts(root, {
+    provider: 'codex',
+    mode: 'primary',
+    sources: {
+      ats: {
+        configured: true,
+        status: 'failed',
+        count: 0,
+        reason: `raw provider response at ${['C:', 'Users', 'private', 'response.json'].join('\\')} https://user:pass@example.test/debug?utm_source=private#body`,
+      },
+    },
+    candidates: [],
+    assessmentResult: null,
+    policy: {},
+    startedAt: '2026-07-14T10:00:00Z',
+    error: `full private prompt saved at ${['', 'home', 'private', 'prompt.txt'].join('/')}`,
+  });
+  const persisted = [
+    JSON.stringify(artifacts.run),
+    fs.readFileSync(artifacts.report, 'utf8'),
+    fs.readFileSync(path.join(root, 'data', 'scan-runs.jsonl'), 'utf8'),
+  ].join('\n');
+
+  assert.doesNotMatch(persisted, /raw provider response|full private prompt|C:\\Users|\/home\/private|user:pass|utm_source|#body/i);
+  assert.match(artifacts.run.source_health.ats.reason, /redacted/i);
+  assert.match(artifacts.run.errors[0], /redacted/i);
+});
+
 test('scan artifact exposes a reconciled funnel without claiming all jobs were assessed', () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'scout-ranked-scan-artifact-'));
   fs.mkdirSync(path.join(root, 'data'), { recursive: true });
   fs.writeFileSync(path.join(root, 'data', 'opportunities.json'), '{"updated":"2026-07-01","opportunities":[]}\n');
   const candidates = Array.from({ length: 60 }, (_, index) => ({
     candidateId: `candidate-${String(index + 1).padStart(3, '0')}`, company: `Company ${index + 1}`,
-    role: 'Engineer', url: `https://example.test/jobs/${index + 1}`, source: 'ats',
+    vacancyId: `vacancy-${index + 1}`, role: 'Engineer',
+    url: `https://example.test/jobs/${index + 1}`, source: 'ats',
     preRank: { vacancyId: `vacancy-${index + 1}`, score: 80, positive: ['title'], negative: [] },
     selectionReason: 'score-band',
   }));
+  const exclusion = {
+    vacancyId: 'vacancy-excluded', company: 'Excluded Company', role: 'Engineer',
+    exclusionCode: 'confirmed-location', source: 'ats', url: 'https://example.test/excluded',
+  };
   const artifacts = writeScanArtifacts(root, {
     provider: 'codex', mode: 'primary', sources: { ats: { configured: true, status: 'healthy', count: 2532 } },
     candidates, assessmentResult: { assessments: candidates.slice(0, 59).map((candidate) => ({ ...assessment('met'), candidateId: candidate.candidateId })) },
     policy: {}, startedAt: '2026-07-26T09:00:00Z', profileId: 'profile-123456789abc', discoveryEngine: 'ranked-discovery',
-    funnel: { sourceRecords: 2532, uniqueVacancies: 120, deterministicallyExcluded: 60, eligible: 60, ranked: 60, aboveThreshold: 60, selected: 60, assessed: 59, assessmentFailed: 1 },
-    selection: [{ vacancyId: 'vacancy-1', score: 80, selectionReason: 'score-band', source: 'ats', sourceUrl: 'https://example.test/jobs/1' }],
-    exclusions: [{ vacancyId: 'vacancy-excluded', exclusionCode: 'confirmed-location', source: 'ats', sourceUrl: 'https://example.test/excluded' }],
+    funnel: {
+      sourceRecords: 2532, sourceErrors: 0, failedSourceRecords: 0, parsed: 2532,
+      normalised: 2532, duplicateObservations: 2471, uniqueVacancies: 61,
+      deterministicallyExcluded: 1, eligible: 60, ranked: 60, aboveThreshold: 60,
+      selected: 60, assessed: 59, assessmentFailed: 1,
+      added: 0, updated: 0, unchanged: 0, closed: 0,
+      bySource: { ats: { count: 2532, failedRecords: 0, sourceErrors: 0 } },
+    },
+    ranked: candidates,
+    selection: candidates.map((candidate) => ({
+      vacancyId: candidate.vacancyId, score: 80, reason: 'deterministic-rank',
+    })),
+    selectionDecision: {
+      threshold: 40, selected: candidates,
+      reasons: candidates.map((candidate) => ({ vacancyId: candidate.vacancyId, reason: 'deterministic-rank' })),
+      notSelected: [], assessmentSkipped: [],
+    },
+    exclusions: [exclusion],
   });
   assert.equal(artifacts.run.funnel.sourceRecords, 2532);
   assert.equal(artifacts.run.funnel.selected, 60);
   assert.equal(artifacts.run.funnel.assessed, 59);
   assert.equal(artifacts.run.funnel.assessmentFailed, 1);
+  assert.equal(artifacts.run.funnel.added, artifacts.run.keepers_added);
+  assert.equal(
+    artifacts.run.funnel.bySource.ats.added,
+    artifacts.run.keepers_added,
+  );
+  assert.ok(artifacts.run.funnel.added > 0);
   assert.equal(artifacts.run.candidates_found, 60);
   assert.equal(artifacts.run.profile_id, 'profile-123456789abc');
   assert.equal(artifacts.run.selection_summary.selected, 60);
-  assert.deepEqual(Object.keys(artifacts.run.explanations[0]).sort(), ['assessment_status', 'deterministic_exclusion', 'pre_rank', 'selection_reason', 'source', 'sourceUrl', 'vacancy_id'].sort());
+  assert.equal(artifacts.run.explanations.length, 61);
+  assert.deepEqual(Object.keys(artifacts.run.explanations[0]).sort(), [
+    'above_threshold', 'assessment_status', 'company', 'deterministic_exclusion',
+    'deterministic_exclusions', 'dimensions', 'outcome', 'pre_rank', 'reason_code',
+    'role', 'selection_reason', 'source', 'sourceReferences', 'sourceUrl', 'stages', 'tracker_outcome',
+    'vacancy_id',
+  ].sort());
+  assert.equal(artifacts.run.funnel.bySource.ats.uniqueVacancies, 61);
+  assert.equal(artifacts.run.funnel.bySource.ats.duplicateObservations, 2471);
+  assert.equal(artifacts.run.coverage.provider[0].assessed, 59);
   assert.doesNotMatch(JSON.stringify(artifacts.run), /description|profileEvidence/);
 });
 
@@ -318,8 +1214,332 @@ test('forty zero-keeper candidates produce a bounded sanitised audit without tra
   assert.equal(artifacts.tracker.opportunities.length, 0);
   assert.deepEqual(artifacts.run.discarded, { hard_exclusion: 0, mandatory_unmet: 16, below_threshold: 0, provider_discarded: 24, advert_closed: 0 });
   assert.equal(artifacts.run.reviewed.length, 40);
-  assert.deepEqual(Object.keys(artifacts.run.reviewed[0]).sort(), ['categoryId', 'company', 'outcome', 'reasons', 'role', 'score', 'source', 'sourceUrl'].sort());
+  assert.deepEqual(Object.keys(artifacts.run.reviewed[0]).sort(), [
+    'categoryId', 'company', 'contentFingerprint', 'learningVersionId', 'outcome', 'profileId', 'reasons',
+    'role', 'score', 'source', 'sourceReferences', 'sourceUrl', 'vacancyId',
+  ].sort());
   assert.doesNotMatch(JSON.stringify(artifacts.run.reviewed), /full advert|profileEvidence|Built systems/);
+
+  const history = readVacancyDecisionHistory(root, { limit: 1 });
+  assert.equal(history.length, 1);
+  assert.equal(history[0].outcome, 'provider_discarded');
+  assert.match(history[0].contentFingerprint, /^[a-f0-9]{64}$/);
+  assert.deepEqual(Object.keys(history[0]).sort(), [
+    'assessedAt', 'company', 'contentFingerprint', 'learningVersionId', 'outcome', 'profileId',
+    'role', 'source', 'sourceReferences', 'url', 'vacancyId',
+  ].sort());
+});
+
+test('bounded decision history always preserves reviewed outcomes ahead of pre-assessment explanations', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'scout-reviewed-history-priority-'));
+  fs.mkdirSync(path.join(root, 'data'), { recursive: true });
+  const run = {
+    timestamp: '2026-07-31T10:00:00.000Z',
+    profile_id: 'profile-current',
+    reviewed: [{
+      vacancyId: 'reviewed-vacancy',
+      company: 'Reviewed Company',
+      role: 'Reviewed Role',
+      outcome: 'provider_discarded',
+    }],
+    explanations: Array.from({ length: 512 }, (_, index) => ({
+      vacancy_id: `pre-${index}`,
+      company: `Pre Company ${index}`,
+      role: `Pre Role ${index}`,
+      reason_code: 'below-threshold',
+      stages: { assessed: false },
+    })),
+  };
+  fs.writeFileSync(path.join(root, 'data', 'scan-runs.jsonl'), `${JSON.stringify(run)}\n`);
+  const history = readVacancyDecisionHistory(root);
+  assert.equal(history.length, 512);
+  assert.equal(history[0].vacancyId, 'reviewed-vacancy');
+  assert.equal(history.some(({ vacancyId }) => vacancyId === 'reviewed-vacancy'), true);
+  assert.equal(history.some(({ vacancyId }) => vacancyId?.startsWith('pre-')), true);
+});
+
+test('bounded decision history reserves space for a newest pre-assessment outcome', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'scout-pre-history-reserve-'));
+  fs.mkdirSync(path.join(root, 'data'), { recursive: true });
+  const run = {
+    timestamp: '2026-07-31T10:00:00.000Z',
+    reviewed: Array.from({ length: 512 }, (_, index) => ({
+      vacancyId: `reviewed-${index}`,
+      company: `Reviewed Company ${index}`,
+      role: `Reviewed Role ${index}`,
+      outcome: 'provider_discarded',
+    })),
+    explanations: [{
+      vacancy_id: 'newest-pre-assessment',
+      company: 'Pre Company',
+      role: 'Pre Role',
+      reason_code: 'below-threshold',
+      stages: { assessed: false },
+    }],
+  };
+  fs.writeFileSync(path.join(root, 'data', 'scan-runs.jsonl'), `${JSON.stringify(run)}\n`);
+  const history = readVacancyDecisionHistory(root);
+  assert.equal(history.length, 512);
+  assert.equal(history.some(({ vacancyId }) => vacancyId === 'newest-pre-assessment'), true);
+});
+
+test('collect-to-history projection keeps distinct 129-character provider openings assessable', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'scout-provider-reference-history-'));
+  fs.mkdirSync(path.join(root, 'data'), { recursive: true });
+  const firstProviderId = 'a'.repeat(129);
+  const nextProviderId = 'b'.repeat(129);
+  const profile = {
+    version: 1, status: 'published', id: 'profile-provider-reference-history',
+    target: {
+      primaryTitles: [{
+        value: 'Platform Engineer',
+        strength: 'strong-preference',
+        provenance: 'explicit',
+      }],
+    },
+    negative: {},
+    compensation: {
+      currency: null, period: 'year', minimum: null,
+      minimumStrength: 'neutral', unknownPolicy: 'include',
+    },
+  };
+  const first = prepareRankedDiscovery({
+    sources: {
+      provider_z: {
+        configured: true,
+        status: 'healthy',
+        jobs: [{
+          company: 'Synthetic Company',
+          title: 'Platform Engineer',
+          providerId: firstProviderId,
+        }],
+      },
+    },
+    profile,
+    tracker: { opportunities: [] },
+  }).selection.selected[0];
+  const projected = runLogAppendRecipe({
+    timestamp: '2026-07-31T10:00:00.000Z',
+    reviewed: [{
+      vacancyId: first.vacancyId,
+      company: first.company,
+      role: first.role,
+      source: first.source,
+      sourceReferences: first.sourceReferences,
+      outcome: 'provider_discarded',
+    }],
+  }).record;
+  fs.writeFileSync(path.join(root, 'data', 'scan-runs.jsonl'), `${JSON.stringify(projected)}\n`);
+  const history = readVacancyDecisionHistory(root);
+  assert.equal(history[0].sourceReferences[0].source, 'provider z');
+  assert.equal(history[0].sourceReferences[0].providerId, firstProviderId);
+  const next = prepareRankedDiscovery({
+    sources: {
+      provider_z: {
+        configured: true,
+        status: 'healthy',
+        jobs: [{
+          company: 'Synthetic Company',
+          title: 'Platform Engineer',
+          providerId: nextProviderId,
+        }],
+      },
+    },
+    profile,
+    tracker: { opportunities: [] },
+    decisionHistory: history,
+  });
+  assert.equal(next.selection.assessmentSkipped.length, 0);
+  assert.equal(next.candidates.length, 1);
+});
+
+test('collect-codec history reuses query identity across provider URL credential churn', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'scout-provider-url-churn-history-'));
+  fs.mkdirSync(path.join(root, 'data'), { recursive: true });
+  const privateParameter = ['to', 'ken'].join('');
+  const queryUrl = (host, marker) => {
+    const url = new URL(`https://${host}/apply`);
+    url.searchParams.set('job', '42');
+    url.searchParams.set(privateParameter, `fixture-${marker}`);
+    url.searchParams.set(['utm', 'source'].join('_'), marker);
+    return url.toString();
+  };
+  const profile = {
+    version: 1, status: 'published', id: 'profile-provider-url-churn',
+    target: {
+      primaryTitles: [{
+        value: 'Platform Engineer',
+        strength: 'strong-preference',
+        provenance: 'explicit',
+      }],
+    },
+    negative: {},
+    compensation: {
+      currency: null, period: 'year', minimum: null,
+      minimumStrength: 'neutral', unknownPolicy: 'include',
+    },
+  };
+  const runThroughRecoveredCollect = async (marker, decisionHistory = []) => {
+    const stages = createRankedDiscoveryStages({
+      collect: async () => ({
+        generatedAt: '2026-07-31T10:00:00.000Z',
+        queries: ['platform engineer'],
+        sources: {
+          aggregator: {
+            configured: true,
+            status: 'healthy',
+            jobs: [{
+              company: 'Synthetic Company',
+              title: 'Platform Engineer',
+              source: 'vendor_ats',
+              providerId: queryUrl('vendor.example.test', marker),
+              url: queryUrl('jobs.example.test', marker),
+            }],
+          },
+        },
+      }),
+      profile,
+      decisionHistory,
+    });
+    const collected = await stages.collect({ run: { runId: `provider-churn-${marker}` } });
+    let value = stages.collect.artifactCodec.decode(
+      stages.collect.artifactCodec.encode(collected),
+    );
+    for (const stageId of ['normalise', 'deduplicate', 'filter', 'rank']) {
+      value = stages[stageId]({ priorArtifact: value });
+    }
+    return stages.select({
+      run: { runId: `provider-churn-${marker}` },
+      priorArtifact: value,
+    });
+  };
+  const first = await runThroughRecoveredCollect('first');
+  const firstVacancy = first.selection.selected[0];
+  const projected = runLogAppendRecipe({
+    timestamp: '2026-07-31T10:00:00.000Z',
+    reviewed: [{
+      vacancyId: firstVacancy.vacancyId,
+      company: firstVacancy.company,
+      role: firstVacancy.role,
+      source: firstVacancy.source,
+      sourceReferences: firstVacancy.sourceReferences,
+      contentFingerprint: firstVacancy.contentFingerprint,
+      profileId: profile.id,
+      learningVersionId: 'learning-baseline',
+      outcome: 'provider_discarded',
+    }],
+  }).record;
+  fs.writeFileSync(path.join(root, 'data', 'scan-runs.jsonl'), `${JSON.stringify(projected)}\n`);
+  const history = readVacancyDecisionHistory(root);
+  const second = await runThroughRecoveredCollect('second', history);
+  assert.equal(history[0].vacancyId, firstVacancy.vacancyId);
+  assert.equal(
+    second.selection.assessmentSkipped.length,
+    1,
+    JSON.stringify({
+      history,
+      selected: second.selection.selected,
+      skipped: second.selection.assessmentSkipped,
+    }),
+  );
+  assert.equal(second.candidates.length, 0);
+  assert.equal(second.selection.assessmentSkipped[0].vacancyId, firstVacancy.vacancyId);
+});
+
+test('tracker and run-log projection preserve distinct legacy query-addressed vacancy IDs', () => {
+  const privateParameter = ['to', 'ken'].join('');
+  const legacyQueryUrl = (job, marker) => {
+    const url = new URL('https://jobs.example.test/apply');
+    url.searchParams.set(['utm', 'source'].join('_'), `fixture-${marker}`);
+    url.searchParams.set('job', job);
+    url.searchParams.set(privateParameter, `fixture-${marker}`);
+    return url.toString();
+  };
+  const vacancyIds = [
+    legacyQueryUrl('one', 'first'),
+    legacyQueryUrl('two', 'second'),
+  ];
+  const reviewed = vacancyIds.map((vacancyId, index) => ({
+    vacancyId,
+    company: 'Synthetic Company',
+    role: 'Platform Engineer',
+    outcome: 'provider_discarded',
+    sourceReferences: [],
+    index,
+  }));
+  const durableReviewed = durableScanProjection(reviewed);
+  const runIds = runLogAppendRecipe({
+    timestamp: '2026-07-31T10:00:00.000Z',
+    reviewed: durableReviewed,
+  }).record.reviewed.map((item) => item.vacancyId);
+  const durableTracker = durableScanProjection({
+    updated: '2026-07-31',
+    opportunities: reviewed.map((item, index) => ({
+      id: `legacy-query-${index}`,
+      company: item.company,
+      role: item.role,
+      vacancyId: item.vacancyId,
+      status: 'new',
+    })),
+  });
+  const trackerIds = trackerMergeRecipe(
+    '{"updated":"2026-07-30","opportunities":[]}',
+    JSON.stringify(durableTracker),
+  ).upserts.map((item) => item.vacancyId);
+  assert.deepEqual(runIds, trackerIds);
+  assert.equal(new Set(runIds).size, 2);
+  assert.equal(runIds.every((value) => /^vacancy-url-[a-f0-9]{24}$/.test(value)), true);
+  assert.doesNotMatch(JSON.stringify({ runIds, trackerIds }), /secret|utm_source|job=/);
+});
+
+test('durable URL-less decision history preserves provider identity across changing source coverage', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'scout-url-less-history-'));
+  fs.mkdirSync(path.join(root, 'data'), { recursive: true });
+  fs.writeFileSync(path.join(root, 'data', 'opportunities.json'), '{"updated":"2026-07-01","opportunities":[]}\n');
+  writeScanArtifacts(root, {
+    provider: 'codex',
+    mode: 'primary',
+    sources: { provider_a: { configured: true, status: 'healthy', count: 1 } },
+    candidates: [{
+      candidateId: 'candidate-001',
+      vacancyId: 'vacancy-ref-stable',
+      company: 'Synthetic Company',
+      role: 'Platform Engineer',
+      source: 'provider-a',
+      sourceReferences: [{ source: 'provider-a', providerId: 'opening-1', url: '' }],
+      description: 'Operate reliable services and improve production resilience.',
+    }],
+    assessmentResult: {
+      assessments: [{
+        ...assessment('met'),
+        candidateId: 'candidate-001',
+        recommendation: 'discard',
+      }],
+    },
+    policy: {},
+    startedAt: '2026-07-14T10:00:00Z',
+  });
+  const history = readVacancyDecisionHistory(root);
+  assert.deepEqual(history[0].sourceReferences, [{
+    source: 'provider a', providerId: 'opening-1', url: '',
+  }]);
+  const crossSource = partitionVacanciesForAssessment([{
+    vacancyId: 'vacancy-ref-stable',
+    company: 'Synthetic Company',
+    role: 'Platform Engineer',
+    sourceReferences: [{ source: 'provider-b', providerId: 'other-1', url: '' }],
+    description: 'Operate reliable services and improve production resilience.',
+  }], history);
+  assert.equal(crossSource.skipped[0].lifecycle.reason, 'unchanged-rejection');
+  const distinctOpening = partitionVacanciesForAssessment([{
+    vacancyId: 'vacancy-ref-stable',
+    company: 'Synthetic Company',
+    role: 'Platform Engineer',
+    sourceReferences: [{ source: 'provider-a', providerId: 'opening-2', url: '' }],
+    description: 'Operate reliable services and improve production resilience.',
+  }], history);
+  assert.equal(distinctOpening.skipped.length, 0);
+  assert.equal(distinctOpening.eligible[0].lifecycle.reason, 'new-vacancy');
 });
 
 test('two same-day providers remain visible in one combined report', () => {
@@ -515,4 +1735,2146 @@ test('scan artifacts archive only stale untriaged jobs', () => {
   assert.equal(artifacts.tracker.opportunities.find((item) => item.id === 'chosen').status, 'shortlist');
   assert.equal(artifacts.run.inbox_rechecked, 1);
   assert.equal(artifacts.run.inbox_archived, 1);
+});
+
+const DURABLE_STAGES = ['collect', 'normalise', 'deduplicate', 'filter', 'rank', 'select'];
+const RECOVERY_COMPATIBILITY = Object.freeze({
+  schemaVersion: 1,
+  mode: 'primary',
+  purpose: 'manual-discovery',
+  profileVersion: 'profile-v1',
+  sourceConfigFingerprint: 'a'.repeat(64),
+  journalSchemaVersion: 1,
+  artifactSchemaVersion: 1,
+  pipelineVersion: 'pipeline-v1',
+  rankingVersion: 'ranking-v1',
+  promptVersion: 'prompt-v2',
+  assessmentSchemaVersion: 2,
+  provider: 'codex',
+  model: 'provider-default',
+  mutationSchemaVersion: 1,
+  targetRevision: 'tracker-v1',
+});
+
+function durableStageHarness(calls) {
+  return Object.fromEntries(DURABLE_STAGES.map((stageId) => [stageId, async ({
+    run, lease, priorArtifact,
+  }) => {
+    assert.equal(run.runId, lease.runId);
+    calls.set(stageId, (calls.get(stageId) || 0) + 1);
+    return {
+      stageId,
+      stableIds: [...(priorArtifact?.stableIds || []), `${stageId}-1`],
+    };
+  }]));
+}
+
+test('legacy collect recovery preserves distinct sanitized query-addressed vacancies', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'scout-legacy-query-recovery-'));
+  let now = Date.parse('2026-07-31T10:00:00.000Z');
+  let collectCalls = 0;
+  const privateParameter = ['to', 'ken'].join('');
+  const firstPrivateProvider = `sk-${'A'.repeat(32)}`;
+  const firstPrivateSource = `ghp_${'B'.repeat(30)}`;
+  const legacyQueryUrl = (job, marker) => {
+    const url = new URL('https://jobs.example.test/apply');
+    url.searchParams.set(['utm', 'source'].join('_'), `fixture-${marker}`);
+    url.searchParams.set('job', job);
+    url.searchParams.set(privateParameter, `fixture-${marker}`);
+    return url.toString();
+  };
+  const collected = {
+    generatedAt: '2026-07-31T10:00:00.000Z',
+    queries: ['platform engineer'],
+    sources: {
+      provider_z: {
+        configured: true,
+        status: 'healthy',
+        jobs: [
+          {
+            company: 'Synthetic Company',
+            title: 'Platform Engineer',
+            source: firstPrivateSource,
+            providerId: firstPrivateProvider,
+            url: legacyQueryUrl('one', 'first'),
+          },
+          {
+            company: 'Synthetic Company',
+            title: 'Platform Engineer',
+            providerId: 'query-opening-two',
+            url: legacyQueryUrl('two', 'second'),
+          },
+        ],
+      },
+    },
+  };
+  const normalise = ({ priorArtifact }) => compactCandidates(
+    priorArtifact.sources,
+    DEFAULT_CANDIDATE_LIMIT,
+    { trustedStageArtifact: true },
+  );
+  const stages = {
+    collect: async () => {
+      collectCalls += 1;
+      return collected;
+    },
+    normalise,
+    deduplicate: ({ priorArtifact }) => priorArtifact,
+    filter: ({ priorArtifact }) => priorArtifact,
+    rank: ({ priorArtifact }) => priorArtifact,
+    select: ({ priorArtifact }) => priorArtifact,
+  };
+  const leaseOptions = {
+    wallNow: () => now,
+    monotonicNow: () => now,
+    leaseDurationMs: 1_000,
+    takeoverMarginMs: 0,
+  };
+  try {
+    assert.equal(compactCandidates(collected.sources, DEFAULT_CANDIDATE_LIMIT).candidates.length, 2);
+    await assert.rejects(
+      runScanPipeline({
+        root,
+        compatibility: RECOVERY_COMPATIBILITY,
+        stages,
+        leaseOptions,
+        onStageCommitted({ stageId }) {
+          if (stageId !== 'collect') return;
+          now += 1_001;
+          throw new PipelineInterruptedError('synthetic stop after durable legacy collect');
+        },
+      }),
+      PipelineInterruptedError,
+    );
+    const recovered = await runScanPipeline({
+      root,
+      compatibility: RECOVERY_COMPATIBILITY,
+      stages,
+      leaseOptions,
+    });
+    assert.equal(collectCalls, 1);
+    assert.equal(recovered.outcome, 'complete');
+    assert.equal(recovered.stageOutputs.normalise.candidates.length, 2);
+    assert.equal(
+      new Set(recovered.stageOutputs.normalise.candidates.map((item) => item.urlIdentityDigest)).size,
+      2,
+    );
+    assert.match(recovered.stageOutputs.normalise.candidates[0].providerId, /^provider-[a-f0-9]{32}$/);
+    assert.match(recovered.stageOutputs.normalise.candidates[0].source, /^source-[a-f0-9]{32}$/);
+    const persisted = fs.readdirSync(path.join(
+      root,
+      '.scout',
+      'runs',
+      recovered.runId,
+      'artifacts',
+    )).map((name) => fs.readFileSync(path.join(
+      root,
+      '.scout',
+      'runs',
+      recovered.runId,
+      'artifacts',
+      name,
+    ), 'utf8')).join('\n');
+    assert.doesNotMatch(
+      persisted,
+      new RegExp(`${firstPrivateProvider}|${firstPrivateSource}|utm_source|job=one|job=two`),
+    );
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('committed durable stage boundaries let the existing heartbeat run between synchronous stages', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'scout-stage-boundary-heartbeat-'));
+  let now = Date.parse('2026-07-30T08:00:00.000Z');
+  const calls = new Map();
+  const baseStages = durableStageHarness(calls);
+  const stages = Object.fromEntries(DURABLE_STAGES.map((stageId) => [stageId, async (context) => {
+    now += 20;
+    return baseStages[stageId](context);
+  }]));
+  try {
+    const result = await runScanPipeline({
+      root,
+      compatibility: RECOVERY_COMPATIBILITY,
+      stages,
+      leaseOptions: {
+        wallNow: () => now,
+        monotonicNow: () => now,
+        leaseDurationMs: 50,
+        takeoverMarginMs: 0,
+      },
+      heartbeatOptions: {
+        intervalMs: 10,
+        wallNow: () => now,
+        monotonicNow: () => now,
+        setTimeoutFn(callback) { return setImmediate(callback); },
+        clearTimeoutFn(timer) { clearImmediate(timer); },
+      },
+    });
+
+    assert.equal(result.outcome, 'complete', JSON.stringify(result.failures));
+    assert.deepEqual([...calls.keys()], DURABLE_STAGES);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('pipeline heartbeat inherits the injected lease clock unless explicitly overridden', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'scout-pipeline-shared-clock-'));
+  let now = Date.parse('2026-07-30T08:00:00.000Z');
+  let heartbeatTick = null;
+  const calls = new Map();
+  const baseStages = durableStageHarness(calls);
+  const stages = {
+    ...baseStages,
+    collect: async (context) => {
+      await new Promise((resolve) => setTimeout(resolve, 15));
+      now += 20;
+      heartbeatTick();
+      assert.equal(
+        readScanLease(root).expiresAt,
+        new Date(now + 100).toISOString(),
+      );
+      return baseStages.collect(context);
+    },
+  };
+  try {
+    const result = await runScanPipeline({
+      root,
+      compatibility: RECOVERY_COMPATIBILITY,
+      stages,
+      leaseOptions: {
+        wallNow: () => now,
+        monotonicNow: () => now,
+        leaseDurationMs: 100,
+        takeoverMarginMs: 0,
+      },
+      heartbeatOptions: {
+        intervalMs: 10,
+        setTimeoutFn(callback) {
+          heartbeatTick = callback;
+          return { unref() {} };
+        },
+        clearTimeoutFn() {},
+      },
+    });
+
+    assert.equal(result.outcome, 'complete', JSON.stringify(result.failures));
+    assert.deepEqual([...calls.keys()], DURABLE_STAGES);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('durable scan finalisation assesses real candidates in recoverable batches with partial repair', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'scout-real-assessment-batches-'));
+  const candidates = Array.from({ length: 12 }, (_, index) => ({
+    candidateId: `candidate-${String(index + 1).padStart(3, '0')}`,
+    company: `Synthetic ${index + 1}`,
+    role: 'Engineer',
+    url: `https://example.test/jobs/${index + 1}`,
+    description: 'Advert responsibility: build synthetic systems.',
+    mandatorySignals: [{ id: 'mandatory-01', text: 'Advert mandatory requirement: systems evidence.' }],
+  }));
+  const makeAssessment = (candidateId, valid = true) => ({
+    candidateId,
+    summary: 'Evidence-led fit.',
+    responsibilityFit: {
+      rating: 'strong',
+      advertEvidence: 'The advert requires systems delivery.',
+      profileEvidence: 'The profile supplies systems evidence.',
+      explanation: 'The responsibility evidence aligns.',
+    },
+    mandatoryRequirements: valid ? [{
+      requirement: 'Systems evidence',
+      advertEvidence: 'The advert requires systems evidence.',
+      advertEvidenceId: 'mandatory-01',
+      status: 'met',
+      profileEvidence: 'The profile supplies systems evidence.',
+    }] : [],
+    transferableExperience: [],
+    uncertainties: [],
+    strengths: [{
+      point: 'Direct systems evidence.',
+      advertEvidence: 'The advert requires systems delivery.',
+      profileEvidence: 'The profile supplies systems evidence.',
+    }],
+    concerns: [],
+    recommendation: 'keep',
+  });
+  const calls = [];
+  try {
+    const durable = await runScanPipeline({
+      root,
+      compatibility: RECOVERY_COMPATIBILITY,
+      stages: durableStageHarness(new Map()),
+      async finalize({ run, lease }) {
+        return assessScanCandidates({
+          run,
+          lease,
+          candidates,
+          compatibility: RECOVERY_COMPATIBILITY,
+          contextBudgetCharacters: 100_000,
+          contextOverheadCharacters: 1_000,
+          contextDigests: {
+            scoringConfigDigest: '1'.repeat(64),
+            profileDigest: '2'.repeat(64),
+            calibrationDigest: '3'.repeat(64),
+            masterCvDigest: '4'.repeat(64),
+          },
+          async invokeProvider({ kind, jobs }) {
+            calls.push({ kind, ids: jobs.map((job) => job.candidateId) });
+            return {
+              assessments: jobs.map((job) => makeAssessment(
+                job.candidateId,
+                !(kind === 'batch' && job.candidateId === 'candidate-012'),
+              )),
+            };
+          },
+        });
+      },
+    });
+    assert.equal(durable.outcome, 'complete');
+    assert.equal(durable.stageOutputs.finalize.assessments.length, 12);
+    assert.equal(durable.stageOutputs.finalize.failures.length, 0);
+    assert.deepEqual(calls.map((call) => call.ids.length), [10, 2, 1]);
+    assert.deepEqual(calls.at(-1), { kind: 'repair', ids: ['candidate-012'] });
+    assert.equal(durable.manifest.assessmentBatches.length, 2);
+    assert.equal(durable.manifest.assessmentJobs.length, 12);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+for (const interruptedAfter of DURABLE_STAGES) {
+  test(`recovery reuses every committed artifact after interruption following ${interruptedAfter}`, async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'scout-durable-pipeline-'));
+    const calls = new Map();
+    let interruptedRunId;
+    let now = Date.parse('2026-07-27T10:00:00.000Z');
+    const leaseOptions = {
+      wallNow: () => now,
+      monotonicNow: () => now,
+      leaseDurationMs: 1_000,
+      takeoverMarginMs: 0,
+    };
+    try {
+      await assert.rejects(
+        runScanPipeline({
+          root,
+          compatibility: RECOVERY_COMPATIBILITY,
+          stages: durableStageHarness(calls),
+          leaseOptions,
+          onStageCommitted({ stageId, run }) {
+            if (stageId === interruptedAfter) {
+              interruptedRunId = run.runId;
+              now += 1_001;
+              throw new PipelineInterruptedError(`stopped after ${stageId}`);
+            }
+          },
+        }),
+        PipelineInterruptedError,
+      );
+      assert.equal(readScanLease(root)?.runId, interruptedRunId);
+
+      const beforeRecovery = Object.fromEntries(calls);
+      const recovered = await runScanPipeline({
+        root,
+        compatibility: RECOVERY_COMPATIBILITY,
+        stages: durableStageHarness(calls),
+        leaseOptions,
+      });
+
+      assert.equal(recovered.runId, interruptedRunId);
+      assert.equal(recovered.outcome, 'complete');
+      assert.deepEqual(Object.keys(recovered).sort(), ['failures', 'manifest', 'outcome', 'runId']);
+      const stopIndex = DURABLE_STAGES.indexOf(interruptedAfter);
+      for (const stageId of DURABLE_STAGES.slice(0, stopIndex + 1)) {
+        assert.equal(calls.get(stageId), beforeRecovery[stageId], `${stageId} must be reused`);
+      }
+      for (const stageId of DURABLE_STAGES.slice(stopIndex + 1)) {
+        assert.equal(calls.get(stageId), 1, `${stageId} must execute once after recovery`);
+      }
+      assert.deepEqual(recovered.manifest.completedWork.map((work) => work.stageId), DURABLE_STAGES);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+}
+
+test('pipeline selection admits a valid journal prefix so fenced recovery can quarantine its torn tail', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'scout-torn-pipeline-journal-'));
+  let now = Date.parse('2026-07-27T10:00:00.000Z');
+  let interruptedRun;
+  const leaseOptions = {
+    wallNow: () => now,
+    monotonicNow: () => now,
+    leaseDurationMs: 1_000,
+    takeoverMarginMs: 0,
+  };
+  try {
+    await assert.rejects(
+      runScanPipeline({
+        root,
+        compatibility: RECOVERY_COMPATIBILITY,
+        stages: durableStageHarness(new Map()),
+        leaseOptions,
+        onStageCommitted({ stageId, run }) {
+          if (stageId !== 'collect') return;
+          interruptedRun = run;
+          now += 1_001;
+          throw new PipelineInterruptedError('stopped before torn append');
+        },
+      }),
+      PipelineInterruptedError,
+    );
+    fs.appendFileSync(interruptedRun.file, '{"schemaVersion":');
+
+    const recovered = await runScanPipeline({
+      root,
+      compatibility: RECOVERY_COMPATIBILITY,
+      stages: durableStageHarness(new Map()),
+      leaseOptions,
+    });
+
+    assert.equal(recovered.runId, interruptedRun.runId);
+    assert.equal(recovered.outcome, 'complete');
+    assert.equal(validateRunJournal(interruptedRun.file).truncatedTail, false);
+    assert.equal(
+      fs.readdirSync(interruptedRun.directory)
+        .filter((name) => name.startsWith('journal.truncated.')).length,
+      1,
+    );
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('a corrupt recovery candidate is durably skipped outside its damaged run', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'scout-corrupt-recovery-candidate-'));
+  const damagedRunId = 'damaged-recovery-run';
+  const damagedDirectory = path.join(root, '.scout', 'runs', damagedRunId);
+  fs.mkdirSync(damagedDirectory, { recursive: true });
+  fs.writeFileSync(path.join(damagedDirectory, 'journal.jsonl'), '{"schemaVersion":1,"private":"damaged');
+  try {
+    const result = await runScanPipeline({
+      root,
+      compatibility: RECOVERY_COMPATIBILITY,
+      stages: durableStageHarness(new Map()),
+    });
+
+    assert.equal(result.outcome, 'complete');
+    assert.notEqual(result.runId, damagedRunId);
+    const selections = fs.readFileSync(
+      path.join(root, '.scout', 'recovery-selections.jsonl'),
+      'utf8',
+    ).trimEnd().split(/\r?\n/).map((line) => JSON.parse(line));
+    const skipped = selections.at(-1).skipped.find((item) => item.runId === damagedRunId);
+    assert.deepEqual(skipped, {
+      runId: damagedRunId,
+      outcome: 'abandoned',
+      reasons: ['compatibility-missing'],
+    });
+    assert.equal(fs.readFileSync(path.join(damagedDirectory, 'journal.jsonl'), 'utf8'), '{"schemaVersion":1,"private":"damaged');
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('a stale pipeline worker cannot commit another artifact or terminal event after takeover', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'scout-stale-pipeline-'));
+  let now = Date.parse('2026-07-27T10:00:00.000Z');
+  let takeover;
+  const leaseOptions = {
+    wallNow: () => now,
+    monotonicNow: () => now,
+    leaseDurationMs: 10_000,
+    takeoverMarginMs: 0,
+  };
+  try {
+    const result = await runScanPipeline({
+      root,
+      compatibility: RECOVERY_COMPATIBILITY,
+      leaseOptions,
+      stages: durableStageHarness(new Map()),
+      onStageCommitted({ stageId }) {
+        if (stageId !== 'collect') return;
+        now += 10_001;
+        takeover = acquireScanLease(
+          root,
+          currentLeaseOwner(),
+          { kind: 'scan', runId: 'successor-run', provider: 'codex', model: 'provider-default', mode: 'primary', phase: 'collect' },
+          leaseOptions,
+        );
+        assert.ok(takeover);
+      },
+    });
+
+    assert.equal(result.outcome, 'lease-lost');
+    assert.equal(result.failures.length, 1);
+    const events = replayRunJournal(path.join(root, '.scout', 'runs', result.runId, 'journal.jsonl'));
+    assert.deepEqual(events.map((event) => event.type), ['run.started', 'stage.completed']);
+    assert.equal(events.at(-1).stageId, 'collect');
+  } finally {
+    if (takeover) releaseScanLease(takeover);
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('terminal release drains the next queued request under a newer genuine fence', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'scout-pipeline-queue-'));
+  const queueCompatibility = {
+    profileFingerprint: 'b'.repeat(64),
+    configFingerprint: 'c'.repeat(64),
+    schemaVersion: 1,
+  };
+  let activeGeneration;
+  let primaryRunId;
+  const drained = [];
+  try {
+    const result = await runScanPipeline({
+      root,
+      compatibility: RECOVERY_COMPATIBILITY,
+      stages: {
+        ...durableStageHarness(new Map()),
+        collect: async ({ run, lease }) => {
+          primaryRunId = run.runId;
+          activeGeneration = lease.generation;
+          for (const request of [
+            {
+              id: 'manual-request-1', key: 'manual-key-1',
+              requestedAt: '2026-07-27T10:00:00.000Z', expiresAt: '2026-07-28T10:00:00.000Z',
+              requester: 'manual', windowAt: null,
+            },
+            {
+              id: 'manual-request-2', key: 'manual-key-2',
+              requestedAt: '2026-07-27T10:01:00.000Z', expiresAt: '2026-07-28T10:01:00.000Z',
+              requester: 'manual', windowAt: null,
+            },
+            {
+              id: 'scheduled-request-1', key: 'scheduled-key-1',
+              requestedAt: '2026-07-27T10:02:00.000Z', expiresAt: '2026-07-27T20:00:00.000Z',
+              requester: 'scheduled', windowAt: '2026-07-27T20:00:00.000Z',
+            },
+          ]) enqueueScanRequest(root, {
+            ...request,
+            purpose: 'manual-discovery',
+            compatibility: queueCompatibility,
+            lease,
+          });
+          return { stageId: 'collect', stableIds: ['collect-1'] };
+        },
+      },
+      queue: {
+        compatibility: queueCompatibility,
+        now: new Date('2026-07-27T10:05:00.000Z'),
+        async run(request, context) {
+          const events = replayRunJournal(path.join(root, '.scout', 'runs', primaryRunId, 'journal.jsonl'));
+          assert.equal(events.at(-1).type, 'run.completed');
+          assert.equal(readScanLease(root)?.leaseId, context.lease.leaseId);
+          drained.push({ id: request.id, generation: context.lease.generation });
+          if (request.id === 'manual-request-1') throw new Error('synthetic queued scan failure');
+          return (await runScanPipeline({
+            root,
+            compatibility: RECOVERY_COMPATIBILITY,
+            stages: durableStageHarness(new Map()),
+            claimedLease: context.lease,
+          })).outcome;
+        },
+      },
+    });
+
+    assert.equal(result.outcome, 'complete');
+    assert.deepEqual(drained.map((item) => item.id), [
+      'manual-request-1',
+      'manual-request-2',
+      'scheduled-request-1',
+    ]);
+    assert.ok(drained.every((item, index) => (
+      item.generation > activeGeneration
+      && (index === 0 || item.generation > drained[index - 1].generation)
+    )));
+    assert.equal(readScanLease(root), null);
+    for (const requestId of ['manual-request-1', 'manual-request-2', 'scheduled-request-1']) {
+      const requestRun = drained.find((item) => item.id === requestId);
+      const runDirectories = fs.readdirSync(path.join(root, '.scout', 'runs'));
+      const journal = runDirectories
+        .map((runId) => path.join(root, '.scout', 'runs', runId, 'journal.jsonl'))
+        .find((file) => replayRunJournal(file).some((event) => event.fencingGeneration === requestRun.generation));
+      assert.ok(journal, `${requestId} must execute a journalled scan`);
+      const requestEvents = replayRunJournal(journal);
+      assert.equal(requestEvents.at(-1).type, 'run.completed');
+      if (requestId === 'manual-request-1') {
+        const failure = requestEvents.find((event) => event.type === 'run.failure-recorded');
+        assert.equal(failure.payload.code, 'queue-run-failed-before-pipeline');
+        assert.doesNotMatch(JSON.stringify(failure), /synthetic queued scan failure/);
+      }
+    }
+    assert.deepEqual(
+      projectScanQueue(root).requests.map((request) => [request.id, request.status]),
+      [
+        ['manual-request-1', 'failed'],
+        ['manual-request-2', 'succeeded'],
+        ['scheduled-request-1', 'succeeded'],
+      ],
+    );
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('failed scheduled coverage never drains an equivalent queued request', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'scout-pipeline-coverage-failure-'));
+  const queueCompatibility = {
+    profileFingerprint: 'b'.repeat(64),
+    configFingerprint: 'c'.repeat(64),
+    schemaVersion: 1,
+  };
+  let coverCalls = 0;
+  let runCalls = 0;
+  try {
+    const result = await runScanPipeline({
+      root,
+      compatibility: RECOVERY_COMPATIBILITY,
+      stages: {
+        ...durableStageHarness(new Map()),
+        collect: async ({ lease }) => {
+          enqueueScanRequest(root, {
+            id: 'scheduled-equivalent',
+            key: 'scheduled-equivalent-key',
+            requestedAt: '2026-07-31T08:00:00.000Z',
+            expiresAt: '2026-07-31T20:00:00.000Z',
+            requester: 'scheduled',
+            windowAt: '2026-07-31T20:00:00.000Z',
+            purpose: 'scheduled-discovery',
+            compatibility: queueCompatibility,
+            lease,
+          });
+          return { stageId: 'collect', stableIds: ['collect-coverage'] };
+        },
+      },
+      queue: {
+        compatibility: queueCompatibility,
+        async cover() {
+          coverCalls += 1;
+          throw new Error('synthetic durable coverage failure');
+        },
+        async run() {
+          runCalls += 1;
+          throw new Error('covered scheduled work must not rerun');
+        },
+      },
+    });
+
+    assert.equal(result.outcome, 'failed', JSON.stringify(result));
+    assert.equal(coverCalls, 3);
+    assert.equal(runCalls, 0);
+    assert.ok(result.failures.some(({ code, message }) => (
+      code === 'stage-failed' && /coverage/i.test(message)
+    )));
+    assert.equal(projectScanQueue(root).requests[0].status, 'queued');
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('a blocked queued provider is skipped while the next healthy provider still runs', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'scout-provider-health-queue-isolation-'));
+  const queueCompatibility = {
+    profileFingerprint: 'b'.repeat(64),
+    configFingerprint: 'c'.repeat(64),
+    schemaVersion: 1,
+  };
+  const healthChecks = [];
+  const stageCalls = [];
+  const queueLeaseOperations = [];
+  try {
+    const result = await runScanPipeline({
+      root,
+      compatibility: RECOVERY_COMPATIBILITY,
+      stages: {
+        ...durableStageHarness(new Map()),
+        collect: async ({ lease }) => {
+          for (const [id, requestedAt] of [
+            ['claude-blocked', '2026-07-27T10:01:00.000Z'],
+            ['codex-healthy', '2026-07-27T10:00:00.000Z'],
+          ]) {
+            enqueueScanRequest(root, {
+              id,
+              key: id,
+              requestedAt,
+              expiresAt: new Date(new Date(requestedAt).getTime() + 12 * 60 * 60 * 1000).toISOString(),
+              requester: 'scheduled',
+              windowAt: '2026-07-28T10:00:00.000Z',
+              purpose: 'manual-discovery',
+              compatibility: queueCompatibility,
+              lease,
+            });
+          }
+          return { stageId: 'collect', stableIds: ['direct'] };
+        },
+      },
+      queue: {
+        compatibility: queueCompatibility,
+        now: new Date('2026-07-27T10:05:00.000Z'),
+        async run(request, context) {
+          const provider = request.id.startsWith('claude') ? 'claude' : 'codex';
+          queueLeaseOperations.push(readScanLease(root).operation);
+          const queued = await runScanPipeline({
+            root,
+            compatibility: { ...RECOVERY_COMPATIBILITY, provider },
+            claimedLease: context.lease,
+            healthPreflight({ provider: checkedProvider }) {
+              healthChecks.push(checkedProvider);
+              return checkedProvider === 'claude'
+                ? { ok: false, state: 'sign-in-required' }
+                : { ok: true, state: 'ready' };
+            },
+            stages: Object.fromEntries(DURABLE_STAGES.map((stageId) => [stageId, async () => {
+              stageCalls.push(`${provider}:${stageId}`);
+              return { stageId, stableIds: [`${provider}:${stageId}`] };
+            }])),
+          });
+          return queued.outcome === 'abandoned' ? 'skipped' : queued.outcome;
+        },
+      },
+    });
+
+    assert.equal(result.outcome, 'complete');
+    assert.deepEqual(healthChecks, ['claude', 'codex']);
+    assert.deepEqual(
+      queueLeaseOperations.map((operation) => ({
+        kind: operation.kind,
+        phase: operation.phase,
+        provider: operation.provider ?? null,
+        model: operation.model ?? null,
+        mode: operation.mode ?? null,
+      })),
+      [
+        { kind: 'scan', phase: 'queue-drain', provider: null, model: null, mode: null },
+        { kind: 'scan', phase: 'queue-drain', provider: null, model: null, mode: null },
+      ],
+    );
+    assert.equal(stageCalls.some((call) => call.startsWith('claude:')), false);
+    assert.equal(stageCalls.filter((call) => call.startsWith('codex:')).length, DURABLE_STAGES.length);
+    assert.deepEqual(
+      projectScanQueue(root).requests.map((request) => [request.id, request.status]),
+      [['claude-blocked', 'skipped'], ['codex-healthy', 'succeeded']],
+    );
+    const journals = fs.readdirSync(path.join(root, '.scout', 'runs'))
+      .map((runId) => replayRunJournal(path.join(root, '.scout', 'runs', runId, 'journal.jsonl')));
+    const blocked = journals.find((events) => events.some((event) => (
+      event.type === 'run.failure-recorded'
+      && event.payload.code === 'provider-health-blocked'
+    )));
+    assert.deepEqual(blocked.map((event) => event.type), [
+      'run.started',
+      'run.failure-recorded',
+      'run.completed',
+    ]);
+    assert.equal(blocked.at(-1).payload.outcome, 'abandoned');
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('a transient provider-health lease is retried without queueing or stranding the scan', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'scout-provider-health-lease-race-'));
+  const queueCompatibility = {
+    profileFingerprint: 'b'.repeat(64),
+    configFingerprint: 'c'.repeat(64),
+    schemaVersion: 1,
+  };
+  const healthLease = acquireScanLease(
+    root,
+    currentLeaseOwner(),
+    {
+      kind: 'provider-health',
+      runId: 'provider-health-codex',
+      provider: 'codex',
+      phase: 'periodic',
+    },
+  );
+  let waits = 0;
+  let queueRuns = 0;
+  try {
+    const result = await runScanPipeline({
+      root,
+      compatibility: RECOVERY_COMPATIBILITY,
+      stages: durableStageHarness(new Map()),
+      async waitForTransientLease() {
+        waits += 1;
+        releaseScanLease(healthLease);
+      },
+      queue: {
+        compatibility: queueCompatibility,
+        request: {
+          id: 'manual-health-race',
+          key: 'manual-health-race',
+          requestedAt: '2026-07-29T08:00:00.000Z',
+          expiresAt: '2026-07-29T20:00:00.000Z',
+          requester: 'manual',
+          windowAt: null,
+          purpose: 'manual-discovery',
+          compatibility: queueCompatibility,
+        },
+        async run() {
+          queueRuns += 1;
+          throw new Error('provider-health race must not create queue work');
+        },
+      },
+    });
+
+    assert.equal(result.outcome, 'complete');
+    assert.equal(waits, 1);
+    assert.equal(queueRuns, 0);
+    assert.deepEqual(projectScanQueue(root).requests, []);
+    assert.equal(readScanLease(root), null);
+  } finally {
+    try { releaseScanLease(healthLease); } catch {}
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('idle startup drains older compatible FIFO work before beginning an unqueued run', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'scout-pipeline-startup-fifo-'));
+  const queueCompatibility = {
+    profileFingerprint: 'b'.repeat(64),
+    configFingerprint: 'c'.repeat(64),
+    schemaVersion: 1,
+  };
+  const seed = acquireScanLease(
+    root,
+    currentLeaseOwner(),
+    { kind: 'scan', runId: 'seed-queue', provider: 'codex', mode: 'primary', phase: 'queue' },
+  );
+  enqueueScanRequest(root, {
+    id: 'older-request',
+    key: 'older-request',
+    requestedAt: '2026-07-27T10:00:00.000Z',
+    expiresAt: '2026-07-28T10:00:00.000Z',
+    requester: 'manual',
+    windowAt: null,
+    purpose: 'manual-discovery',
+    compatibility: queueCompatibility,
+    lease: seed,
+  });
+  releaseScanLease(seed);
+  const order = [];
+  try {
+    const result = await runScanPipeline({
+      root,
+      compatibility: RECOVERY_COMPATIBILITY,
+      stages: {
+        ...durableStageHarness(new Map()),
+        collect: async () => {
+          order.push('direct');
+          return { stageId: 'collect', stableIds: ['direct'] };
+        },
+      },
+      queue: {
+        compatibility: queueCompatibility,
+        now: new Date('2026-07-27T10:05:00.000Z'),
+        async run(_request, context) {
+          order.push('queued');
+          return (await runScanPipeline({
+            root,
+            compatibility: RECOVERY_COMPATIBILITY,
+            stages: durableStageHarness(new Map()),
+            claimedLease: context.lease,
+          })).outcome;
+        },
+      },
+    });
+
+    assert.equal(result.outcome, 'complete');
+    assert.deepEqual(order, ['queued', 'direct']);
+    assert.equal(projectScanQueue(root).requests[0].status, 'succeeded');
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('a claimed request whose complete live compatibility changed becomes durably stale without execution', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'scout-pipeline-claimed-stale-'));
+  const queueCompatibility = {
+    profileFingerprint: 'b'.repeat(64),
+    configFingerprint: 'c'.repeat(64),
+    schemaVersion: 1,
+  };
+  const seed = acquireScanLease(root, currentLeaseOwner(), {
+    kind: 'scan', runId: 'seed-stale', provider: 'codex', mode: 'primary', phase: 'queue',
+  });
+  enqueueScanRequest(root, {
+    id: 'stale-before-run',
+    key: 'stale-before-run',
+    requestedAt: '2026-07-27T10:00:00.000Z',
+    expiresAt: '2026-07-28T10:00:00.000Z',
+    requester: 'manual',
+    windowAt: null,
+    purpose: 'manual-discovery',
+    compatibility: queueCompatibility,
+    lease: seed,
+  });
+  releaseScanLease(seed);
+  let executions = 0;
+  try {
+    await runScanPipeline({
+      root,
+      compatibility: RECOVERY_COMPATIBILITY,
+      stages: durableStageHarness(new Map()),
+      queue: {
+        compatibility: queueCompatibility,
+        now: new Date('2026-07-27T10:05:00.000Z'),
+        verify: async (_request, { phase }) => phase !== 'claim',
+        async run() {
+          executions += 1;
+          return 'succeeded';
+        },
+      },
+    });
+
+    assert.equal(executions, 0);
+    assert.equal(projectScanQueue(root).requests[0].status, 'stale');
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('a queued request is revalidated after its terminal evidence is durable', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'scout-pipeline-terminal-stale-'));
+  const queueCompatibility = {
+    profileFingerprint: 'b'.repeat(64),
+    configFingerprint: 'c'.repeat(64),
+    schemaVersion: 1,
+  };
+  const seed = acquireScanLease(root, currentLeaseOwner(), {
+    kind: 'scan', runId: 'seed-terminal-stale', provider: 'codex', mode: 'primary', phase: 'queue',
+  });
+  enqueueScanRequest(root, {
+    id: 'stale-after-run',
+    key: 'stale-after-run',
+    requestedAt: '2026-07-27T10:00:00.000Z',
+    expiresAt: '2026-07-28T10:00:00.000Z',
+    requester: 'manual',
+    windowAt: null,
+    purpose: 'manual-discovery',
+    compatibility: queueCompatibility,
+    lease: seed,
+  });
+  releaseScanLease(seed);
+  const phases = [];
+  let executions = 0;
+  try {
+    await runScanPipeline({
+      root,
+      compatibility: RECOVERY_COMPATIBILITY,
+      stages: durableStageHarness(new Map()),
+      queue: {
+        compatibility: queueCompatibility,
+        now: new Date('2026-07-27T10:05:00.000Z'),
+        verify: async (_request, { phase, manifest }) => {
+          phases.push(phase);
+          if (phase === 'terminal') {
+            assert.equal(manifest.outcome, 'complete');
+            return false;
+          }
+          return true;
+        },
+        async run(_request, context) {
+          executions += 1;
+          return (await runScanPipeline({
+            root,
+            compatibility: RECOVERY_COMPATIBILITY,
+            stages: durableStageHarness(new Map()),
+            claimedLease: context.lease,
+          })).outcome;
+        },
+      },
+    });
+
+    assert.equal(executions, 1);
+    assert.deepEqual(phases, ['claim', 'terminal']);
+    assert.equal(projectScanQueue(root).requests[0].status, 'stale');
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('a terminal queued run is reconciled after its queue completion response is lost', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'scout-queue-terminal-reconcile-'));
+  const queueCompatibility = {
+    profileFingerprint: 'b'.repeat(64),
+    configFingerprint: 'c'.repeat(64),
+    schemaVersion: 1,
+  };
+  const oldLease = acquireScanLease(
+    root,
+    currentLeaseOwner(),
+    { kind: 'scan', runId: 'orphan-terminal-run', provider: 'codex', model: 'provider-default', mode: 'primary', phase: 'queue-drain' },
+  );
+  try {
+    enqueueScanRequest(root, {
+      id: 'lost-completion',
+      key: 'lost-completion',
+      requestedAt: '2026-07-27T10:00:00.000Z',
+      expiresAt: '2026-07-28T10:00:00.000Z',
+      requester: 'manual',
+      windowAt: null,
+      purpose: 'manual-discovery',
+      compatibility: queueCompatibility,
+      lease: oldLease,
+    });
+    claimNextScanRequest(
+      root,
+      { ...queueCompatibility, purpose: 'manual-discovery' },
+      oldLease,
+      new Date('2026-07-27T10:01:00.000Z'),
+    );
+    const orphanRun = openRunJournal(root, oldLease.runId);
+    appendRunEvent(orphanRun, {
+      type: 'run.started',
+      stageId: 'initialise',
+      idempotencyKey: 'orphan-started',
+      payload: { schemaVersion: 1, compatibility: RECOVERY_COMPATIBILITY },
+    }, oldLease);
+    appendRunEvent(orphanRun, {
+      type: 'run.completed',
+      stageId: 'finalise',
+      idempotencyKey: 'orphan-completed',
+      payload: { schemaVersion: 1, outcome: 'complete' },
+    }, oldLease);
+    releaseScanLease(oldLease);
+
+    let reruns = 0;
+    const primary = await runScanPipeline({
+      root,
+      compatibility: RECOVERY_COMPATIBILITY,
+      stages: durableStageHarness(new Map()),
+      queue: {
+        compatibility: queueCompatibility,
+        now: new Date('2026-07-27T10:02:00.000Z'),
+        async run() {
+          reruns += 1;
+          return 'succeeded';
+        },
+      },
+    });
+
+    assert.equal(primary.outcome, 'complete');
+    assert.equal(reruns, 0);
+    assert.equal(projectScanQueue(root).requests[0].status, 'succeeded');
+    assert.equal(readScanLease(root), null);
+  } finally {
+    try { releaseScanLease(oldLease); } catch {}
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+async function assertOrphanedBackupOutcome(postSuccess, expectedQueueOutcome) {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), `scout-queue-${expectedQueueOutcome}-reconcile-`));
+  const queueCompatibility = {
+    profileFingerprint: 'b'.repeat(64),
+    configFingerprint: 'c'.repeat(64),
+    schemaVersion: 1,
+  };
+  const seed = acquireScanLease(
+    root,
+    currentLeaseOwner(),
+    { kind: 'scan', runId: `seed-${expectedQueueOutcome}`, provider: 'codex', mode: 'primary', phase: 'queue' },
+  );
+  let orphanLease;
+  try {
+    enqueueScanRequest(root, {
+      id: `lost-${expectedQueueOutcome}`,
+      key: `lost-${expectedQueueOutcome}`,
+      requestedAt: '2026-07-27T10:00:00.000Z',
+      expiresAt: '2026-07-28T10:00:00.000Z',
+      requester: 'manual',
+      windowAt: null,
+      purpose: 'manual-discovery',
+      compatibility: queueCompatibility,
+      lease: seed,
+    });
+    releaseScanLease(seed);
+
+    await assert.rejects(
+      runScanPipeline({
+        root,
+        compatibility: RECOVERY_COMPATIBILITY,
+        stages: durableStageHarness(new Map()),
+        queue: {
+          compatibility: queueCompatibility,
+          now: new Date('2026-07-27T10:01:00.000Z'),
+          async verify(_request, { phase }) {
+            if (phase === 'terminal') throw new Error('synthetic lost queue completion response');
+            return true;
+          },
+          async run(_request, context) {
+            orphanLease = context.lease;
+            const result = await runScanPipeline({
+              root,
+              compatibility: RECOVERY_COMPATIBILITY,
+              stages: durableStageHarness(new Map()),
+              claimedLease: context.lease,
+              finalize: async () => ({
+                schemaVersion: 1,
+                result: { ok: true },
+                mutationReceipt: {
+                  schemaVersion: 1,
+                  id: 'scan-tracker-report',
+                  digest: 'f'.repeat(64),
+                },
+              }),
+              postTerminalSuccess: async () => postSuccess,
+            });
+            return result.failures.some((failure) => failure.code === 'backup-partial')
+              ? 'succeeded-partial'
+              : result.failures.some((failure) => failure.code === 'backup-pending')
+                ? 'succeeded-pending'
+                : 'succeeded';
+          },
+        },
+      }),
+      /synthetic lost queue completion response/,
+    );
+    releaseScanLease(orphanLease);
+
+    let reruns = 0;
+    await runScanPipeline({
+      root,
+      compatibility: RECOVERY_COMPATIBILITY,
+      stages: durableStageHarness(new Map()),
+      queue: {
+        compatibility: queueCompatibility,
+        now: new Date('2026-07-27T10:02:00.000Z'),
+        async run() {
+          reruns += 1;
+          return 'succeeded';
+        },
+      },
+    });
+
+    assert.equal(reruns, 0);
+    assert.equal(projectScanQueue(root).requests[0].status, expectedQueueOutcome);
+  } finally {
+    try { releaseScanLease(orphanLease); } catch {}
+    try { releaseScanLease(seed); } catch {}
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+}
+
+test('orphan reconciliation preserves a terminal succeeded-pending backup outcome', async () => {
+  await assertOrphanedBackupOutcome(
+    { status: 'pending', reason: 'backup-offline' },
+    'succeeded-pending',
+  );
+});
+
+test('orphan reconciliation preserves a terminal succeeded-partial backup outcome', async () => {
+  await assertOrphanedBackupOutcome(
+    { status: 'partial', reason: 'backup-needs-attention' },
+    'succeeded-partial',
+  );
+});
+
+test('startup resumes an interrupted orphan claim under its original run id and reuses committed stages', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'scout-queue-orphan-resume-'));
+  const queueCompatibility = {
+    profileFingerprint: 'b'.repeat(64),
+    configFingerprint: 'c'.repeat(64),
+    schemaVersion: 1,
+  };
+  const calls = new Map();
+  let resumedResult;
+  const oldLease = acquireScanLease(
+    root,
+    currentLeaseOwner(),
+    { kind: 'scan', runId: 'orphan-partial-run', provider: 'claude', model: 'provider-default', mode: 'primary', phase: 'queue-drain' },
+  );
+  enqueueScanRequest(root, {
+    id: 'orphan-partial-request',
+    key: 'orphan-partial-request',
+    requestedAt: '2026-07-27T10:00:00.000Z',
+    expiresAt: '2026-07-28T10:00:00.000Z',
+    requester: 'manual',
+    windowAt: null,
+    purpose: 'manual-discovery',
+    compatibility: queueCompatibility,
+    lease: oldLease,
+  });
+  claimNextScanRequest(
+    root,
+    { ...queueCompatibility, purpose: 'manual-discovery' },
+    oldLease,
+    new Date('2026-07-27T10:01:00.000Z'),
+  );
+  try {
+    await assert.rejects(
+      runScanPipeline({
+        root,
+        compatibility: { ...RECOVERY_COMPATIBILITY, provider: 'claude' },
+        stages: durableStageHarness(calls),
+        claimedLease: oldLease,
+        onStageCommitted({ stageId }) {
+          if (stageId === 'collect') throw new PipelineInterruptedError();
+        },
+      }),
+      PipelineInterruptedError,
+    );
+    releaseScanLease(oldLease);
+
+    const resumedRunIds = [];
+    const direct = await runScanPipeline({
+      root,
+      compatibility: RECOVERY_COMPATIBILITY,
+      stages: durableStageHarness(new Map()),
+      queue: {
+        compatibility: queueCompatibility,
+        now: new Date('2026-07-27T10:02:00.000Z'),
+        async run(_request, context) {
+          resumedRunIds.push(context.runId);
+          resumedResult = await runScanPipeline({
+            root,
+            compatibility: { ...RECOVERY_COMPATIBILITY, provider: 'claude' },
+            stages: durableStageHarness(calls),
+            claimedLease: context.lease,
+          });
+          return resumedResult.outcome;
+        },
+      },
+    });
+
+    assert.equal(direct.outcome, 'complete');
+    assert.deepEqual(resumedRunIds, ['orphan-partial-run']);
+    assert.equal(calls.get('collect'), 1);
+    assert.equal(projectScanQueue(root).requests[0].status, 'succeeded', JSON.stringify(resumedResult));
+  } finally {
+    try { releaseScanLease(oldLease); } catch {}
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('ranked stage artifacts contain semantic facts and no complete advert, diagnostic secret, or tracking content', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'scout-private-ranked-artifacts-'));
+  const privateTail = `PRIVATE_TAIL_${'x'.repeat(4_000)}`;
+  const profile = {
+    version: 1, status: 'published', id: 'profile-private-artifacts',
+    target: { primaryTitles: [{ value: 'Platform Engineer', strength: 'strong-preference', provenance: 'explicit' }] },
+    negative: {},
+    compensation: { currency: null, period: 'year', minimum: null, minimumStrength: 'neutral', unknownPolicy: 'include' },
+  };
+  try {
+    const result = await runScanPipeline({
+      root,
+      compatibility: RECOVERY_COMPATIBILITY,
+      stages: createRankedDiscoveryStages({
+        collect: async () => ({
+          generatedAt: '2026-07-27T10:00:00.000Z',
+          queries: ['platform'],
+          sources: {
+            ats: {
+              configured: true,
+              status: 'healthy',
+              count: 1,
+              [['access', 'Token'].join('')]: 'PRIVATE_ACCESS_TOKEN',
+              response: { body: privateTail },
+              jobs: [{
+                company: 'Able',
+                title: 'Platform Engineer',
+                providerId: 'able-1',
+                url: 'https://PRIVATE_USER:PRIVATE_PASSWORD@example.test/jobs/able'
+                  + '?session=PRIVATE_SESSION&jwt=PRIVATE_JWT&code=PRIVATE_CODE&key=PRIVATE_KEY'
+                  + '&sig=PRIVATE_SIG&ref=PRIVATE_REF&source=PRIVATE_SOURCE'
+                  + '&redirect=https%3A%2F%2Fnested-user%3Anested-pass%40private.test%2Fsecret'
+                  + '&utm_source=private&access_token=secret#PRIVATE_FRAGMENT',
+                description: `Public bounded opening. ${privateTail}`,
+                requirements: `AWS required. ${privateTail}`,
+                rawHtml: `<html>${privateTail}</html>`,
+                payload: privateTail,
+                cookies: ['PRIVATE_COOKIE'],
+              }],
+              note: `request failed at https://example.test/debug?${'token'}=PRIVATE_DIAGNOSTIC_TOKEN&utm_source=private`,
+              errors: ['Authorization Bearer PRIVATE_DIAGNOSTIC_TOKEN'],
+            },
+          },
+        }),
+        profile,
+      }),
+    });
+
+    assert.equal(result.outcome, 'complete');
+    const artifactDirectory = path.join(root, '.scout', 'runs', result.runId, 'artifacts');
+    const persisted = fs.readdirSync(artifactDirectory)
+      .map((name) => fs.readFileSync(path.join(artifactDirectory, name), 'utf8'))
+      .join('\n');
+    assert.doesNotMatch(
+      persisted,
+      /PRIVATE_ACCESS_TOKEN|PRIVATE_COOKIE|rawHtml|accessToken|utm_source|access_token/,
+    );
+    assert.doesNotMatch(
+      persisted,
+      /PRIVATE_USER|PRIVATE_PASSWORD|PRIVATE_SESSION|PRIVATE_JWT|PRIVATE_CODE|PRIVATE_KEY|PRIVATE_SIG|PRIVATE_REF|PRIVATE_SOURCE|PRIVATE_FRAGMENT|nested-user|nested-pass|redirect/,
+    );
+    assert.match(persisted, /https:\/\/example\.test\/jobs\/able/);
+    assert.doesNotMatch(persisted, /PRIVATE_DIAGNOSTIC_TOKEN|Authorization|Bearer|request failed at/);
+    assert.doesNotMatch(persisted, new RegExp(privateTail.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+    assert.doesNotMatch(persisted, /"description"|"requirements"/);
+    assert.doesNotMatch(persisted, /advertExcerpt|requirementExcerpt/);
+    assert.match(persisted, /descriptionDigest|profileRuleMatches/);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('legacy stage artifacts preserve source order with exact semantic evidence and no advert prose', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'scout-private-legacy-artifacts-'));
+  const privateAdvert = 'PRIVATE_LEGACY_ADVERT AWS is mandatory for this role';
+  const collected = {
+    generatedAt: '2026-07-27T10:00:00.000Z',
+    queries: ['engineer'],
+    sources: {
+      first_source: {
+        configured: true,
+        status: 'healthy',
+        count: 1,
+        jobs: [{
+          company: 'First Co',
+          title: 'Engineer',
+          url: 'https://example.test/jobs/first?utm_source=private',
+          description: privateAdvert,
+        }],
+      },
+      second_source: {
+        configured: true,
+        status: 'healthy',
+        count: 1,
+        jobs: [{
+          company: 'Second Co',
+          title: 'Engineer',
+          url: 'https://example.test/jobs/second',
+          requirements: 'Kubernetes required',
+        }],
+      },
+    },
+  };
+  try {
+    const result = await runScanPipeline({
+      root,
+      compatibility: RECOVERY_COMPATIBILITY,
+      stages: {
+        collect: async () => collected,
+        normalise: ({ priorArtifact }) => compactCandidates(priorArtifact.sources),
+        deduplicate: ({ priorArtifact }) => priorArtifact,
+        filter: ({ priorArtifact }) => priorArtifact,
+        rank: ({ priorArtifact }) => priorArtifact,
+        select: ({ priorArtifact }) => priorArtifact,
+      },
+    });
+
+    assert.deepEqual(
+      result.stageOutputs.select.candidates.map((candidate) => candidate.company),
+      ['First Co', 'Second Co'],
+    );
+    assert.equal(result.stageOutputs.select.candidates[0].mandatorySignals.length, 1);
+    assert.equal(
+      result.stageOutputs.select.candidates[0].mandatorySignals[0].text,
+      'Advert mandatory requirement: aws.',
+    );
+    const artifactDirectory = path.join(root, '.scout', 'runs', result.runId, 'artifacts');
+    const persisted = fs.readdirSync(artifactDirectory)
+      .map((name) => fs.readFileSync(path.join(artifactDirectory, name), 'utf8'))
+      .join('\n');
+    assert.doesNotMatch(persisted, /PRIVATE_LEGACY_ADVERT|private legacy advert|Kubernetes required|utm_source/i);
+    assert.doesNotMatch(persisted, /"description"|"requirements"/);
+    assert.match(persisted, /descriptionDigest|mandatorySignals/);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('semantic artifacts provide bounded readable assessment facts without complete advert sentences', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'scout-readable-semantic-evidence-'));
+  const description = 'Build distributed platforms for public services.';
+  const requirement = 'Kubernetes is mandatory for production clusters.';
+  const profile = {
+    version: 1, status: 'published', id: 'profile-readable-evidence',
+    target: {
+      primaryTitles: [{ value: 'Platform Engineer', strength: 'strong-preference', provenance: 'explicit' }],
+      sectors: [{ value: 'distributed platforms', strength: 'nice-to-have', provenance: 'explicit' }],
+    },
+    negative: {},
+    compensation: { currency: null, period: 'year', minimum: null, minimumStrength: 'neutral', unknownPolicy: 'include' },
+  };
+  try {
+    const result = await runScanPipeline({
+      root,
+      compatibility: RECOVERY_COMPATIBILITY,
+      stages: createRankedDiscoveryStages({
+        collect: async () => ({
+          generatedAt: '2026-07-28T09:00:00.000Z',
+          queries: [],
+          sources: {
+            ats: {
+              configured: true,
+              status: 'healthy',
+              count: 1,
+              jobs: [{
+                company: 'Readable Co',
+                title: 'Platform Engineer',
+                url: 'https://example.test/jobs/readable',
+                description,
+                requirements: requirement,
+              }],
+            },
+          },
+        }),
+        profile,
+      }),
+    });
+
+    const candidate = assessmentCandidatesForSelection(result.stageOutputs.select.selection.selected)[0];
+    assert.match(candidate.description, /Advert responsibility: distributed platforms\./);
+    assert.equal(
+      candidate.mandatorySignals[0].text,
+      'Advert mandatory requirement: kubernetes production clusters.',
+    );
+    const artifactDirectory = path.join(root, '.scout', 'runs', result.runId, 'artifacts');
+    const persisted = fs.readdirSync(artifactDirectory)
+      .map((name) => fs.readFileSync(path.join(artifactDirectory, name), 'utf8'))
+      .join('\n');
+    assert.doesNotMatch(persisted, new RegExp(description.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+    assert.doesNotMatch(persisted, new RegExp(requirement.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+    assert.match(persisted, /distributed platforms|kubernetes production clusters/);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('fresh scan refuses storage pressure before its first lease, queue or journal append', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'scout-storage-refusal-'));
+  let executions = 0;
+  let healthChecks = 0;
+  try {
+    await assert.rejects(
+      runScanPipeline({
+        root,
+        compatibility: RECOVERY_COMPATIBILITY,
+        storagePolicy: {
+          maximumBytes: { runs: 0, artifacts: 0, queue: 0 },
+          reserveBytes: 1,
+        },
+        stages: durableStageHarness(new Map()),
+        healthPreflight() {
+          healthChecks += 1;
+          return { ok: true, state: 'ready' };
+        },
+        onStageCommitted() { executions += 1; },
+      }),
+      (error) => error?.code === 'SCOUT_STORAGE_PRESSURE',
+    );
+    assert.equal(executions, 0);
+    assert.equal(healthChecks, 0);
+    assert.equal(fs.existsSync(path.join(root, '.scout', 'scan-lease.json')), false);
+    assert.equal(fs.existsSync(path.join(root, '.scout', 'scan-queue.jsonl')), false);
+    assert.equal(fs.existsSync(path.join(root, '.scout', 'runs')), false);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('credential-shaped semantic values are redacted while operators and accountability remain exact', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'scout-safe-semantic-clauses-'));
+  const profile = {
+    version: 1, status: 'published', id: 'profile-safe-semantic-clauses',
+    target: {
+      primaryTitles: [{ value: 'Platform Engineer', strength: 'strong-preference', provenance: 'explicit' }],
+    },
+    negative: {},
+    compensation: { currency: null, period: 'year', minimum: null, minimumStrength: 'neutral', unknownPolicy: 'include' },
+  };
+  const privateValues = [
+    'hunter2',
+    'PRIVATE_BEARER',
+    'PRIVATE_TOKEN',
+    'eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJwcml2YXRlIn0.PRIVATE_SIGNATURE',
+    'credential-user',
+    'credential-pass',
+    'STANDALONE_KEY_VALUE',
+    'PRIVATE_KEY_VALUE',
+    'PRIVATE_DASH_KEY_VALUE',
+    'PRIVATE_SPACE_KEY_VALUE',
+    'SESSION_UNDERSCORE_VALUE',
+    ['sk', 'proj', 'PRIVATEWHITESPACEVALUE'].join('-'),
+  ];
+  try {
+    const result = await runScanPipeline({
+      root,
+      compatibility: RECOVERY_COMPATIBILITY,
+      stages: createRankedDiscoveryStages({
+        collect: async () => ({
+          generatedAt: '2026-07-28T09:00:00.000Z',
+          queries: [],
+          sources: {
+            ats: {
+              configured: true,
+              status: 'healthy',
+              count: 1,
+              jobs: [{
+                company: 'Safe Evidence Co',
+                title: 'Platform Engineer',
+                url: 'https://example.test/jobs/safe-evidence',
+                description: 'Accountability for incident response. Non-technical applicants required.',
+                requirements: [
+                  `${['pass', 'word'].join('')}: ${['hunter', '2'].join('')}`,
+                  ['Authorization:', 'Bearer', 'PRIVATE_BEARER'].join(' '),
+                  `${['api', 'token'].join('_')}=${['PRIVATE', 'TOKEN'].join('_')}`,
+                  'JWT eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJwcml2YXRlIn0.PRIVATE_SIGNATURE required',
+                  'credential URL https://credential-user:credential-pass@example.test/private is required',
+                  'key: STANDALONE_KEY_VALUE',
+                  `${['PRIVATE', 'KEY'].join('_')}=${['PRIVATE', 'KEY', 'VALUE'].join('_')}`,
+                  `${['private', 'key'].join('-')}: ${['PRIVATE', 'DASH', 'KEY', 'VALUE'].join('_')}`,
+                  'Private Key = PRIVATE_SPACE_KEY_VALUE',
+                  'session_id=SESSION_UNDERSCORE_VALUE',
+                  `API token ${['sk', 'proj', 'PRIVATEWHITESPACEVALUE'].join('-')}`,
+                ].join('; '),
+              }],
+            },
+          },
+        }),
+        profile,
+      }),
+    });
+
+    const candidate = assessmentCandidatesForSelection(result.stageOutputs.select.selection.selected)[0];
+    assert.match(candidate.description, /Advert responsibility: accountability incident response\./);
+    assert.ok(candidate.mandatorySignals.some((signal) => /non technical applicants/.test(signal.text)));
+    assert.equal(
+      candidate.mandatorySignals.filter((signal) => /sensitive requirement redacted/.test(signal.text)).length,
+      11,
+    );
+    const artifactDirectory = path.join(root, '.scout', 'runs', result.runId, 'artifacts');
+    const persisted = fs.readdirSync(artifactDirectory)
+      .map((name) => fs.readFileSync(path.join(artifactDirectory, name), 'utf8'))
+      .join('\n');
+    for (const value of privateValues) {
+      assert.doesNotMatch(persisted, new RegExp(value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+    }
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('semantic recovery preserves a hard exclusion found after the old advert prefix bound', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'scout-semantic-late-exclusion-'));
+  const profile = {
+    version: 1, status: 'published', id: 'profile-late-exclusion',
+    target: {},
+    negative: {
+      excludedResponsibilities: [{
+        value: 'operate gambling products',
+        strength: 'hard-exclusion',
+        provenance: 'explicit',
+      }],
+    },
+    compensation: { currency: null, period: 'year', minimum: null, minimumStrength: 'neutral', unknownPolicy: 'include' },
+  };
+  const calls = new Map();
+  let now = Date.parse('2026-07-27T10:00:00.000Z');
+  const leaseOptions = {
+    wallNow: () => now,
+    monotonicNow: () => now,
+    leaseDurationMs: 1_000,
+    takeoverMarginMs: 0,
+  };
+  const heartbeatOptions = {
+    wallNow: () => now,
+    monotonicNow: () => now,
+  };
+  const stages = createRankedDiscoveryStages({
+    collect: async () => ({
+      generatedAt: '2026-07-27T10:00:00.000Z',
+      queries: [],
+      sources: {
+        ats: {
+          configured: true,
+          status: 'healthy',
+          count: 1,
+          jobs: [{
+            company: 'Able',
+            title: 'Platform Engineer',
+            providerId: 'late-1',
+            url: 'https://example.test/jobs/late',
+            description: `${'Neutral platform work. '.repeat(100)} You must operate gambling products.`,
+          }],
+        },
+      },
+    }),
+    profile,
+  });
+  for (const [id, execute] of Object.entries(stages)) {
+    stages[id] = Object.assign(async (context) => {
+      calls.set(id, (calls.get(id) || 0) + 1);
+      return execute(context);
+    }, { artifactCodec: execute.artifactCodec });
+  }
+  let runId;
+  try {
+    await assert.rejects(
+      runScanPipeline({
+        root,
+        compatibility: RECOVERY_COMPATIBILITY,
+        stages,
+        leaseOptions,
+        heartbeatOptions,
+        onStageCommitted({ stageId, run }) {
+          runId = run.runId;
+          if (stageId === 'collect') {
+            now += 1_001;
+            throw new PipelineInterruptedError();
+          }
+        },
+      }),
+      PipelineInterruptedError,
+    );
+    const recovered = await runScanPipeline({
+      root,
+      compatibility: RECOVERY_COMPATIBILITY,
+      stages,
+      leaseOptions,
+      heartbeatOptions,
+    });
+    assert.equal(recovered.outcome, 'complete', JSON.stringify(recovered.failures));
+    assert.equal(recovered.stageOutputs.select.selection.selected.length, 0);
+    assert.equal(recovered.stageOutputs.select.exclusions[0].code, 'excluded-responsibility');
+    assert.equal(calls.get('collect'), 1);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('persisted filtering keeps bounded source evidence from every canonical duplicate', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'scout-duplicate-exclusion-evidence-'));
+  const profile = {
+    version: 1, status: 'published', id: 'profile-duplicate-exclusion',
+    target: {},
+    negative: {
+      excludedResponsibilities: [{
+        value: 'operate gambling products',
+        strength: 'hard-exclusion',
+        provenance: 'explicit',
+      }],
+    },
+    compensation: {
+      currency: null, period: 'year', minimum: null,
+      minimumStrength: 'neutral', unknownPolicy: 'include',
+    },
+  };
+  try {
+    const result = await runScanPipeline({
+      root,
+      compatibility: RECOVERY_COMPATIBILITY,
+      stages: createRankedDiscoveryStages({
+        collect: async () => ({
+          generatedAt: '2026-07-31T08:00:00.000Z',
+          queries: [],
+          sources: {
+            adzuna: {
+              configured: true,
+              status: 'healthy',
+              count: 1,
+              jobs: [{
+                company: 'Example Co',
+                title: 'Platform Engineer',
+                providerId: 'short-exclusion',
+                url: 'https://example.test/jobs/shared',
+                description: 'Operate gambling products.',
+              }],
+            },
+            greenhouse: {
+              configured: true,
+              status: 'healthy',
+              count: 1,
+              jobs: [{
+                company: 'Example Co',
+                title: 'Platform Engineer',
+                providerId: 'long-neutral',
+                url: 'https://example.test/jobs/shared',
+                description: 'Build and operate reliable public-interest platforms. '.repeat(20),
+              }],
+            },
+          },
+        }),
+        profile,
+      }),
+    });
+
+    assert.equal(result.stageOutputs.select.funnel.uniqueVacancies, 1);
+    assert.equal(result.stageOutputs.select.exclusions.length, 1);
+    const evidence = result.stageOutputs.select.exclusions[0].evidence.vacancy;
+    assert.deepEqual(evidence.sources.map(({ source, providerId, provenance }) => ({
+      source, providerId, provenance,
+    })), [{
+      source: 'adzuna',
+      providerId: 'short-exclusion',
+      provenance: 'deterministic-extraction',
+    }]);
+    assert.ok(evidence.sources.length <= 8);
+    assert.match(evidence.sources[0].descriptionDigest, /^[a-f0-9]{64}$/);
+
+    const persisted = fs.readdirSync(path.join(root, '.scout', 'runs', result.runId, 'artifacts'))
+      .map((name) => fs.readFileSync(path.join(root, '.scout', 'runs', result.runId, 'artifacts', name), 'utf8'))
+      .join('\n');
+    assert.match(persisted, /short-exclusion/);
+    assert.match(persisted, /deterministic-extraction/);
+    assert.doesNotMatch(persisted, /Operate gambling products|Build and operate reliable public-interest platforms/);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('a failed canonical failure recorder cannot prevent the terminal run event', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'scout-failure-recorder-'));
+  try {
+    const result = await runScanPipeline({
+      root,
+      compatibility: RECOVERY_COMPATIBILITY,
+      stages: {
+        ...durableStageHarness(new Map()),
+        collect: async () => {
+          throw new Error('collection failed');
+        },
+      },
+      recordFailure: async () => {
+        throw new Error('failure report unavailable');
+      },
+    });
+
+    assert.equal(result.outcome, 'failed');
+    assert.deepEqual(result.failures.map((failure) => failure.code), [
+      'stage-failed',
+      'failure-record-failed',
+    ]);
+    const events = replayRunJournal(path.join(root, '.scout', 'runs', result.runId, 'journal.jsonl'));
+    assert.equal(events.at(-1).type, 'run.completed');
+    assert.equal(events.at(-1).payload.outcome, 'failed');
+    assert.equal(readScanLease(root), null);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('an unclosed provider lifecycle remains auditable without stopping heartbeat or releasing its fence', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'scout-provider-unclosed-'));
+  let heartbeatStops = 0;
+  const closure = new Promise(() => {});
+  try {
+    const result = await runScanPipeline({
+      root,
+      compatibility: RECOVERY_COMPATIBILITY,
+      stages: durableStageHarness(new Map()),
+      heartbeatOptions: {
+        intervalMs: 100,
+        setTimeoutFn() { return { unref() {} }; },
+        clearTimeoutFn() { heartbeatStops += 1; },
+      },
+      finalize: async () => {
+        throw new ProviderLifecycleUnclosedError(
+          'provider process did not close',
+          closure,
+        );
+      },
+    });
+
+    assert.equal(result.outcome, 'in-progress');
+    assert.deepEqual(result.failures, [{
+      code: 'provider-lifecycle-unclosed',
+      stage: 'finalise',
+      reason: 'operator-intervention-required',
+    }]);
+    assert.equal(heartbeatStops, 0);
+    const lease = readScanLease(root);
+    assert.ok(lease, 'the unresolved external call must retain fenced authority');
+    assert.equal(lease.runId, result.runId);
+    const events = replayRunJournal(openRunJournal(root, result.runId).file);
+    assert.ok(events.some((event) => (
+      event.type === 'run.failure-recorded'
+      && event.payload.code === 'provider-lifecycle-unclosed'
+      && event.payload.reason === 'operator-intervention-required'
+    )));
+    assert.equal(events.some((event) => event.type === 'run.completed'), false);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('terminal evidence validation failure retains the lease for fenced recovery', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'scout-terminal-evidence-retained-'));
+  let runId;
+  try {
+    await assert.rejects(
+      runScanPipeline({
+        root,
+        compatibility: RECOVERY_COMPATIBILITY,
+        stages: durableStageHarness(new Map()),
+        onStageCommitted({ stageId, run }) {
+          runId = run.runId;
+          if (stageId === 'select') fs.renameSync(run.directory, `${run.directory}.unavailable`);
+        },
+      }),
+      /ENOENT|no such file|cannot find/i,
+    );
+    assert.equal(readScanLease(root)?.runId, runId);
+  } finally {
+    const retained = readScanLease(root);
+    if (retained) {
+      // The retained hydrated lease belongs to the pipeline invocation and is
+      // intentionally not available to this test process as a forged handle.
+      fs.rmSync(path.join(root, '.scout', 'scan-lease.json'), { force: true });
+    }
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('post-success work requires a durable mutation receipt and remains under the live scan fence', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'scout-receipted-post-success-'));
+  let hookCalls = 0;
+  try {
+    const result = await runScanPipeline({
+      root,
+      compatibility: RECOVERY_COMPATIBILITY,
+      stages: durableStageHarness(new Map()),
+      finalize: async () => ({
+        schemaVersion: 1,
+        result: { ok: true },
+        mutationReceipt: {
+          schemaVersion: 1,
+          id: 'scan-tracker-report',
+          digest: 'd'.repeat(64),
+        },
+      }),
+      async postTerminalSuccess({ lease, manifest, mutationReceipt }) {
+        hookCalls += 1;
+        const current = readScanLease(root);
+        assert.equal(current.leaseId, lease.leaseId);
+        assert.equal(current.generation, lease.generation);
+        assert.equal(manifest.outcome, 'complete');
+        assert.deepEqual(manifest.receipts, [{
+          sequence: 8,
+          stageId: 'finalise',
+          reference: { kind: 'mutation', id: 'scan-tracker-report' },
+          digest: 'd'.repeat(64),
+        }]);
+        assert.equal(mutationReceipt.digest, 'd'.repeat(64));
+      },
+    });
+
+    assert.equal(result.outcome, 'complete');
+    assert.equal(hookCalls, 1);
+    assert.deepEqual(result.failures, []);
+    assert.equal(readScanLease(root), null);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('pipeline accepts a coordinator-journalled receipt without projecting a duplicate mutation', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'scout-coordinated-receipt-'));
+  fs.mkdirSync(path.join(root, 'reports'), { recursive: true });
+  fs.writeFileSync(path.join(root, 'reports', '2026-07-28.md'), '# Report\n\n## Headline\n\nBefore.\n');
+  try {
+    const result = await runScanPipeline({
+      root,
+      compatibility: RECOVERY_COMPATIBILITY,
+      stages: durableStageHarness(new Map()),
+      finalize: async ({ run, lease }) => {
+        const plan = prepareMutation({ handle: run, lease }, {
+          id: 'coordinated-report',
+          schemaVersion: 1,
+          files: [{ kind: 'report', key: 'report:2026-07-28' }],
+        }, {
+          'report:2026-07-28': scanReportRecipe({
+            date: '2026-07-28',
+            degraded: false,
+            coverage: [],
+            actions: [],
+            checks: [],
+            keeperCount: 0,
+            discarded: {},
+            nearMisses: [],
+            errors: [],
+            runs: [],
+          }),
+        });
+        return {
+          schemaVersion: 1,
+          result: { ok: true },
+          mutationReceipt: applyPreparedMutation(plan, lease),
+        };
+      },
+    });
+
+    assert.equal(result.outcome, 'complete');
+    const receipts = replayRunJournal(openRunJournal(root, result.runId).file)
+      .filter((event) => event.type === 'mutation.receipted');
+    assert.equal(receipts.length, 1);
+    assert.equal(result.manifest.receipts.length, 1);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('post-success backup is not attempted without receipt evidence', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'scout-unreceipted-post-success-'));
+  let hookCalls = 0;
+  try {
+    const result = await runScanPipeline({
+      root,
+      compatibility: RECOVERY_COMPATIBILITY,
+      stages: durableStageHarness(new Map()),
+      finalize: async () => ({ ok: true }),
+      postTerminalSuccess: async () => { hookCalls += 1; },
+    });
+
+    assert.equal(result.outcome, 'complete');
+    assert.equal(hookCalls, 0);
+    assert.deepEqual(result.failures, [{
+      code: 'backup-pending',
+      stage: 'post-success',
+      reason: 'mutation-receipt-missing',
+    }]);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('post-success backup failure preserves the successful scan and reports pending backup state', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'scout-failed-post-success-'));
+  try {
+    const result = await runScanPipeline({
+      root,
+      compatibility: RECOVERY_COMPATIBILITY,
+      stages: durableStageHarness(new Map()),
+      finalize: async () => ({
+        schemaVersion: 1,
+        result: { ok: true },
+        mutationReceipt: {
+          schemaVersion: 1,
+          id: 'scan-tracker-report',
+          digest: 'e'.repeat(64),
+        },
+      }),
+      postTerminalSuccess: async () => {
+        throw new Error('PRIVATE_BACKUP_TRANSPORT_FAILURE');
+      },
+    });
+
+    assert.equal(result.outcome, 'complete');
+    assert.deepEqual(result.failures, [{
+      code: 'backup-pending',
+      stage: 'post-success',
+      reason: 'backup-failed',
+    }]);
+    assert.doesNotMatch(JSON.stringify(result), /PRIVATE_BACKUP_TRANSPORT_FAILURE/);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('a malformed mutation receipt preserves scan success and reports backup pending', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'scout-malformed-receipt-'));
+  let hookCalls = 0;
+  try {
+    const result = await runScanPipeline({
+      root,
+      compatibility: RECOVERY_COMPATIBILITY,
+      stages: durableStageHarness(new Map()),
+      finalize: async () => ({
+        schemaVersion: 1,
+        result: { ok: true },
+        mutationReceipt: {
+          schemaVersion: 1,
+          id: 'scan-tracker-report',
+          digest: 'not-a-sha256-digest',
+        },
+      }),
+      postTerminalSuccess: async () => {
+        hookCalls += 1;
+        return { status: 'complete' };
+      },
+    });
+
+    assert.equal(result.outcome, 'complete');
+    assert.equal(hookCalls, 0);
+    assert.deepEqual(result.failures, [{
+      code: 'backup-pending',
+      stage: 'post-success',
+      reason: 'mutation-receipt-invalid',
+    }]);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('an explicit pending post-success result preserves scan success', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'scout-explicit-backup-pending-'));
+  try {
+    const result = await runScanPipeline({
+      root,
+      compatibility: RECOVERY_COMPATIBILITY,
+      stages: durableStageHarness(new Map()),
+      finalize: async () => ({
+        schemaVersion: 1,
+        result: { ok: true },
+        mutationReceipt: {
+          schemaVersion: 1,
+          id: 'scan-tracker-report',
+          digest: 'a'.repeat(64),
+        },
+      }),
+      postTerminalSuccess: async () => ({
+        status: 'pending',
+        reason: 'backup-offline',
+      }),
+    });
+
+    assert.equal(result.outcome, 'complete');
+    assert.deepEqual(result.failures, [{
+      code: 'backup-pending',
+      stage: 'post-success',
+      reason: 'backup-offline',
+    }]);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('an explicit partial post-success result preserves scan success', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'scout-explicit-backup-partial-'));
+  try {
+    const result = await runScanPipeline({
+      root,
+      compatibility: RECOVERY_COMPATIBILITY,
+      stages: durableStageHarness(new Map()),
+      finalize: async () => ({
+        schemaVersion: 1,
+        result: { ok: true },
+        mutationReceipt: {
+          schemaVersion: 1,
+          id: 'scan-tracker-report',
+          digest: 'b'.repeat(64),
+        },
+      }),
+      postTerminalSuccess: async () => ({
+        status: 'partial',
+        reason: 'backup-needs-attention',
+      }),
+    });
+
+    assert.equal(result.outcome, 'complete');
+    assert.deepEqual(result.failures, [{
+      code: 'backup-partial',
+      stage: 'post-success',
+      reason: 'backup-needs-attention',
+    }]);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('provider health preflight durably abandons a blocked run before any scan work', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'scout-provider-health-blocked-'));
+  const calls = [];
+  try {
+    const result = await runScanPipeline({
+      root,
+      compatibility: RECOVERY_COMPATIBILITY,
+      stages: Object.fromEntries(DURABLE_STAGES.map((stageId) => [stageId, async () => {
+        calls.push(stageId);
+        return { stageId, stableIds: [] };
+      }])),
+      async healthPreflight(context) {
+        calls.push('health');
+        assert.equal(context.root, root);
+        assert.equal(context.provider, 'codex');
+        assert.equal(context.purpose, 'manual-discovery');
+        assert.equal(context.lease.runId, context.runId);
+        return {
+          ok: false,
+          state: 'sign-in-required',
+          reason: 'remote-auth-failure',
+        };
+      },
+      async prepare() { calls.push('prepare'); },
+      async finalize() { calls.push('finalize'); },
+      async postTerminalSuccess() { calls.push('post-success'); },
+      queue: {
+        compatibility: {
+          profileFingerprint: 'b'.repeat(64),
+          configFingerprint: 'c'.repeat(64),
+          schemaVersion: 1,
+        },
+        async run() { throw new Error('queue drain should have no work'); },
+        async cover() { calls.push('queue-cover'); },
+      },
+    });
+
+    assert.equal(result.outcome, 'abandoned');
+    assert.deepEqual(result.failures, [{
+      code: 'provider-health-blocked',
+      stage: 'initialise',
+      reason: 'sign-in-required',
+    }]);
+    assert.deepEqual(calls, ['health']);
+    const events = replayRunJournal(openRunJournal(root, result.runId).file);
+    assert.deepEqual(events.map((event) => event.type), [
+      'run.started',
+      'run.failure-recorded',
+      'run.completed',
+    ]);
+    assert.deepEqual(events[1].payload, {
+      schemaVersion: 1,
+      code: 'provider-health-blocked',
+      reason: 'sign-in-required',
+    });
+    assert.deepEqual(events[2].payload, {
+      schemaVersion: 1,
+      outcome: 'abandoned',
+    });
+    assert.equal(readScanLease(root), null);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('a provider health preflight exception records a bounded blocked run and releases authority', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'scout-provider-health-preflight-error-'));
+  try {
+    const result = await runScanPipeline({
+      root,
+      compatibility: RECOVERY_COMPATIBILITY,
+      stages: durableStageHarness(new Map()),
+      async healthPreflight() {
+        throw new Error('PRIVATE_PROVIDER_HEALTH_STORAGE_DETAIL');
+      },
+    });
+
+    assert.equal(result.outcome, 'abandoned');
+    assert.deepEqual(result.failures, [{
+      code: 'provider-health-blocked',
+      stage: 'initialise',
+      reason: 'provider-error',
+    }]);
+    assert.doesNotMatch(JSON.stringify(result), /PRIVATE_PROVIDER_HEALTH_STORAGE_DETAIL/);
+    const events = replayRunJournal(openRunJournal(root, result.runId).file);
+    assert.deepEqual(events.map((event) => event.type), [
+      'run.started',
+      'run.failure-recorded',
+      'run.completed',
+    ]);
+    assert.equal(readScanLease(root), null);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
 });

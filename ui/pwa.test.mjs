@@ -24,10 +24,13 @@ test('service worker caches shell assets but never private APIs or workspace con
 
 test('service worker uses exact build caches and network-first navigation', () => {
   assert.match(worker, /const BUILD = '__SCOUT_UI_BUILD__'/);
-  assert.match(worker, /const CACHE = `scout-shell-\$\{BUILD\}`/);
+  assert.match(worker, /const CACHE_PREFIX = 'scout-shell-'/);
+  assert.match(worker, /const CACHE = `\$\{CACHE_PREFIX\}\$\{BUILD\}`/);
   assert.match(worker, /scout-found\.png\?v=\$\{BUILD\}/);
   assert.match(worker, /request\.mode === 'navigate'/);
-  assert.match(worker, /fetch\(request\)[\s\S]*catch\(\(\) => caches\.match\('\/'\)\)/);
-  assert.match(worker, /caches\.match\(request\)[\s\S]*fetch\(request\)/);
+  assert.match(worker, /fetch\(request\)[\s\S]*catch\([\s\S]*caches\.open\(CACHE\)/);
+  assert.match(worker, /previousCache[\s\S]*new Set\(\[CACHE, previousCache\]/);
+  assert.match(worker, /requestedBuild[\s\S]*`\$\{CACHE_PREFIX\}\$\{requestedBuild\}`/);
+  assert.doesNotMatch(worker, /keys\.filter\(\(key\) => key !== CACHE\)/);
   assert.doesNotMatch(worker, /service-worker\.js['"`]/);
 });

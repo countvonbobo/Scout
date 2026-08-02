@@ -1,13 +1,30 @@
 import assert from 'node:assert/strict';
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import {
-  assertScanReady, broadenSearchQueries, collectScanSources, migrateLegacyWorkspace, runScanWith, shouldAutoBroaden,
+  assertScanReady, broadenSearchQueries, collectScanSources, migrateLegacyWorkspace, runScan, runScanWith, shouldAutoBroaden,
+  workspaceQueryPlan,
 } from './scout.mjs';
-import { DEFAULT_WORKSPACE_CONFIG, writeWorkspaceConfig } from '../ui/lib/workspace.mjs';
+import { DEFAULT_WORKSPACE_CONFIG, loadWorkspaceConfig, writeWorkspaceConfig } from '../ui/lib/workspace.mjs';
 import { publishSearchProfile } from '../ui/lib/searchProfile.mjs';
+import { openRunJournal, replayRunJournal } from '../ui/lib/runJournal.mjs';
+import { projectScanQueue } from '../ui/lib/scanQueue.mjs';
+import { acquireScanLease, currentLeaseOwner, readScanLease, releaseScanLease } from '../ui/lib/scanLease.mjs';
+import { ProviderLifecycleUnclosedError } from '../ui/lib/structuredTurn.mjs';
+import { loadPreparedMutation, reconcileMutation } from '../ui/lib/mutationCoordinator.mjs';
+import {
+  generateSearchLanePlan, loadSearchLanePlan, recordSearchLaneRun,
+  retireUnproductiveSearchLanes, writeSearchLanePlan,
+} from '../ui/lib/searchLanes.mjs';
+import {
+  createEmployerRegistry, writeEmployerRegistry,
+} from '../ui/lib/employerRegistry.mjs';
+import {
+  acquireProviderAuthMutation, releaseProviderAuthMutation,
+} from '../ui/lib/providerAuthMutation.mjs';
 
 function scanRoot() {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'scout-runtime-scan-'));
@@ -18,6 +35,7 @@ function scanRoot() {
 }
 
 const authenticated = () => ({ installed: true, authenticated: true, executable: 'codex', capabilities: { structuredOutput: true } });
+const fixtureToken = (value) => value;
 
 function publishedRankingProfile() {
   return publishSearchProfile({
@@ -47,7 +65,19 @@ function readyScanRoot({ opportunities = [] } = {}) {
   fs.writeFileSync(path.join(root, 'profile', 'context.md'), 'Synthetic profile evidence. '.repeat(12));
   fs.writeFileSync(path.join(root, 'profile', 'calibration.md'), 'Synthetic calibration evidence. '.repeat(8));
   fs.writeFileSync(path.join(root, 'cv', 'master-cv.md'), 'Synthetic CV evidence. '.repeat(30));
-  fs.writeFileSync(path.join(root, '.scout', 'onboarding', 'activated.json'), '{"approved":true}\n');
+  fs.writeFileSync(path.join(root, 'data', 'search-categories.json'), '{"categories":[]}\n');
+  const activatedFiles = [
+    'workspace.json', 'profile/context.md', 'profile/calibration.md',
+    'cv/master-cv.md', 'data/search-categories.json',
+  ];
+  const activatedHashes = Object.fromEntries(activatedFiles.map((relative) => [
+    relative,
+    crypto.createHash('sha256').update(fs.readFileSync(path.join(root, relative))).digest('hex'),
+  ]));
+  fs.writeFileSync(
+    path.join(root, '.scout', 'onboarding', 'activated.json'),
+    `${JSON.stringify({ activatedHashes })}\n`,
+  );
   fs.writeFileSync(path.join(root, 'data', 'opportunities.json'), `${JSON.stringify({ updated: '2026-07-27', opportunities })}\n`);
   return root;
 }
@@ -58,12 +88,33 @@ function enableRankedDiscovery(root) {
   fs.writeFileSync(path.join(root, 'profile', 'search', 'published.json'), `${JSON.stringify(profile)}\n`);
 }
 
+function nuancedAssessment(candidateId, overrides = {}) {
+  return {
+    candidateId,
+    summary: 'Synthetic assessment',
+    responsibilityFit: {
+      rating: 'strong',
+      advertEvidence: 'The advert requires delivery of reliable systems.',
+      profileEvidence: 'The profile records reliable systems delivery.',
+      explanation: 'The responsibility and profile evidence align.',
+    },
+    mandatoryRequirements: [],
+    transferableExperience: [],
+    uncertainties: [],
+    strengths: [{
+      point: 'Direct delivery evidence.',
+      advertEvidence: 'The advert requires reliable systems.',
+      profileEvidence: 'The profile records reliable systems delivery.',
+    }],
+    concerns: [],
+    recommendation: 'keep',
+    ...overrides,
+  };
+}
+
 function assessmentFor(candidates) {
   return {
-    assessments: candidates.map((candidate) => ({
-      candidateId: candidate.candidateId, categoryId: null, summary: 'Synthetic assessment', hardExclusionMatches: [],
-      mandatoryRequirements: [], dimensions: [{ name: 'fit', score: 80, maximum: 100, evidence: 'Synthetic evidence' }], recommendation: 'keep',
-    })),
+    assessments: candidates.map((candidate) => nuancedAssessment(candidate.candidateId)),
   };
 }
 
@@ -77,7 +128,7 @@ function scanHarness(sources, seenCandidates) {
       validate(value);
       return { value, usage: {} };
     },
-    acquireLockFn: () => ({ ok: true, lock: { token: 'ranked-discovery-test' } }),
+    acquireLockFn: () => ({ ok: true, lock: { token: fixtureToken('ranked-discovery-test') } }),
     releaseLockFn: () => ({ ok: true }),
     checkLivenessFn: async (candidates) => ({ live: candidates, removed: [], summary: { checked: candidates.length, gone: 0, unverified: 0 } }),
   };
@@ -122,6 +173,257 @@ test('an absent ATS configuration does not degrade a healthy configured source',
   assert.equal(collected.sources.hiring_cafe.configured, true);
   assert.equal(collected.sources.hiring_cafe.status, 'healthy');
   assert.equal(collected.sources.adzuna.configured, false);
+});
+
+test('published search lanes replace legacy categories and annotate collected jobs', async () => {
+  const root = scanRoot();
+  const config = {
+    ...structuredClone(DEFAULT_WORKSPACE_CONFIG),
+    search: {
+      ...DEFAULT_WORKSPACE_CONFIG.search,
+      roleFamilies: ['Legacy query must not run'],
+    },
+  };
+  writeWorkspaceConfig(root, config);
+  fs.writeFileSync(path.join(root, 'data', 'search-categories.json'), JSON.stringify({
+    categories: [{ queries: ['Legacy category must not run'] }],
+  }));
+  const published = publishSearchProfile({
+    version: 1,
+    status: 'draft',
+    target: {
+      primaryTitles: [{ value: 'Research coordinator', strength: 'strong-preference', provenance: 'explicit' }],
+      adjacentTitles: [{ value: 'Evidence manager', strength: 'nice-to-have', provenance: 'explicit' }],
+      skills: [{ value: 'Evidence synthesis', strength: 'nice-to-have', provenance: 'explicit' }],
+    },
+    negative: {},
+    compensation: {
+      currency: null, period: 'year', minimum: null,
+      minimumStrength: 'neutral', unknownPolicy: 'include',
+    },
+    selection: { breadth: 'balanced', relevanceThreshold: 45, exploration: 0 },
+  }, { publishedAt: '2026-07-30T16:00:00.000Z' });
+  writeSearchLanePlan(root, generateSearchLanePlan(published));
+
+  const queryPlan = workspaceQueryPlan(root);
+  assert.equal(queryPlan.source, 'published-search-lanes');
+  assert.ok(queryPlan.queries.includes('Research coordinator'));
+  assert.ok(queryPlan.queries.includes('Evidence manager'));
+  assert.equal(queryPlan.queries.includes('Legacy query must not run'), false);
+  assert.equal(queryPlan.queries.includes('Legacy category must not run'), false);
+  assert.equal(queryPlan.generation, 1);
+  assert.match(queryPlan.revision, /^[a-f0-9]{64}$/);
+  assert.match(queryPlan.selectionFingerprint, /^[a-f0-9]{64}$/);
+  assert.ok(queryPlan.lanes.every(({ queryFingerprint }) => /^[a-f0-9]{64}$/.test(queryFingerprint)));
+  assert.equal(
+    queryPlan.lanes.find(({ query }) => query === 'Evidence manager')?.roleFamily,
+    'Evidence manager',
+  );
+
+  let seenQueries;
+  const collected = await collectScanSources(root, config, {
+    fetchAts: async () => ({
+      status: 'unavailable', count: 0, reason: 'no supported ATS portals enabled', jobs: [],
+    }),
+    fetchCafe: async (queries) => {
+      seenQueries = queries;
+      return {
+        status: 'healthy',
+        count: 1,
+        sources: { [queries[0]]: 1 },
+        jobs: [{
+          providerId: 'lane-job-1',
+          title: 'Research coordinator',
+          company: 'Example',
+          url: 'https://example.test/lane-job',
+          searchQueries: [queries[0]],
+        }],
+      };
+    },
+    fetchAdzunaFn: async () => ({
+      status: 'unavailable', count: 0, reason: 'not configured', jobs: [],
+    }),
+  });
+  assert.deepEqual(seenQueries, queryPlan.queries);
+  assert.deepEqual(collected.lanes.map(({ id }) => id), queryPlan.lanes.map(({ id }) => id));
+  assert.deepEqual(collected.sources.hiring_cafe.jobs[0].laneIds, [queryPlan.lanes[0].id]);
+  assert.deepEqual(collected.sources.hiring_cafe.queryCounts, { [queryPlan.queries[0]]: 1 });
+});
+
+test('a lane retirement racing scan start stales queued work and binds collection to the fenced plan', async () => {
+  const root = scanRoot();
+  const profile = publishedRankingProfile();
+  fs.mkdirSync(path.join(root, 'profile', 'search'), { recursive: true });
+  fs.writeFileSync(
+    path.join(root, 'profile', 'search', 'published.json'),
+    `${JSON.stringify(profile)}\n`,
+  );
+  let plan = generateSearchLanePlan(profile);
+  writeSearchLanePlan(root, plan);
+  const retiredLane = plan.lanes[0];
+  const blocker = acquireScanLease(root, currentLeaseOwner(), {
+    kind: 'scan',
+    runId: 'lane-retirement-race',
+    provider: 'claude',
+    mode: 'primary',
+    phase: 'collect',
+  });
+  assert.ok(blocker);
+  try {
+    const queued = await runScanWith(root, 'codex', 'primary', {
+      providerStatusFn: authenticated,
+      collectSourcesFn: async () => assert.fail('queued stale plan must not collect'),
+    });
+    assert.equal(queued.status, 'queued');
+
+    for (let attempt = 1; attempt <= 3; attempt += 1) {
+      plan = recordSearchLaneRun(plan, {
+        runId: `lane-retirement-${attempt}`,
+        recordedAt: `2026-07-${String(26 + attempt).padStart(2, '0')}T10:00:00.000Z`,
+        results: [{
+          laneId: retiredLane.id,
+          returned: 0,
+          parsed: 0,
+          new: 0,
+          eligible: 0,
+          selected: 0,
+          promising: 0,
+        }],
+      });
+    }
+    plan = retireUnproductiveSearchLanes(plan, {
+      now: () => '2026-07-30T10:00:00.000Z',
+    });
+    writeSearchLanePlan(root, plan);
+  } finally {
+    releaseScanLease(blocker);
+  }
+
+  const collectedPlans = [];
+  try {
+    const result = await runScanWith(root, 'codex', 'primary', {
+      providerStatusFn: authenticated,
+      collectSourcesFn: async (_root, _config, { queryPlan }) => {
+        collectedPlans.push(queryPlan);
+        return {
+          generatedAt: '2026-07-30T10:05:00.000Z',
+          queries: queryPlan.queries,
+          lanes: queryPlan.lanes,
+          sources: {
+            hiring_cafe: {
+              configured: true,
+              status: 'healthy',
+              count: 0,
+              queryCounts: Object.fromEntries(queryPlan.queries.map((query) => [query, 0])),
+              jobs: [],
+            },
+          },
+        };
+      },
+      queueWorkspaceSyncFn: async () => ({ state: 'disabled', enabled: false }),
+    });
+
+    assert.equal(result.ok, true, result.error);
+    assert.equal(collectedPlans.length, 1);
+    assert.equal(collectedPlans[0].lanes.some(({ id }) => id === retiredLane.id), false);
+    assert.equal(projectScanQueue(root).requests[0].status, 'stale');
+    const started = replayRunJournal(path.join(
+      root, '.scout', 'runs', result.runId, 'journal.jsonl',
+    )).find(({ type }) => type === 'run.started');
+    assert.equal(started.payload.compatibility.lanePlanRevision, collectedPlans[0].revision);
+    assert.equal(
+      started.payload.compatibility.laneSelectionFingerprint,
+      collectedPlans[0].selectionFingerprint,
+    );
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('employer monitoring is selected fairly at collection but remains a durable write intent', async () => {
+  const root = scanRoot();
+  const registry = createEmployerRegistry([{
+    canonicalName: 'Priority Example',
+    userPriority: 'priority',
+    careersUrl: 'https://careers.example.test/jobs',
+    access: {
+      terms: 'allowed', robots: 'allowed', genericEnabled: false, minIntervalMinutes: 60,
+    },
+    origin: {
+      kind: 'manual', recordedAt: '2026-07-30T10:00:00.000Z', reference: 'settings',
+    },
+  }], { now: () => '2026-07-30T10:00:00.000Z' });
+  writeEmployerRegistry(root, registry);
+  let atsCalls = 0;
+  const collected = await collectScanSources(root, DEFAULT_WORKSPACE_CONFIG, {
+    fetchAts: async () => { atsCalls += 1; return { jobs: [] }; },
+    collectEmployersFn: async (employers) => ({
+      jobs: [{
+        title: 'Research lead', company: 'Priority Example',
+        url: 'https://careers.example.test/jobs/research-lead',
+        employerId: employers[0].id,
+      }],
+      checks: [{
+        employerId: employers[0].id, adapter: 'structured-data',
+        status: 'healthy', returned: 1, parsed: 1,
+      }],
+      results: [],
+    }),
+    fetchCafe: async () => ({ status: 'unavailable', jobs: [] }),
+    fetchAdzunaFn: async () => ({ status: 'unavailable', jobs: [] }),
+  });
+
+  assert.equal(atsCalls, 0, 'legacy ATS collection must not duplicate registry collection');
+  assert.equal(collected.sources.employer_registry.status, 'healthy');
+  assert.equal(collected.sources.employer_registry.jobs.length, 1);
+  assert.deepEqual(collected.sources.employer_registry.selectedEmployerIds, [registry.employers[0].id]);
+  assert.equal(
+    JSON.parse(fs.readFileSync(path.join(root, 'data', 'employers.json'), 'utf8'))
+      .employers[0].history.length,
+    0,
+    'collection must not mutate the private registry',
+  );
+});
+
+test('collection reports exact degraded capacity when priority employers exceed the hard bound', async () => {
+  const root = scanRoot();
+  const discoveries = Array.from({ length: 33 }, (_, index) => ({
+    canonicalName: `Priority Example ${String(index + 1).padStart(2, '0')}`,
+    userPriority: 'priority',
+    careersUrl: `https://careers-${index + 1}.example.test/jobs`,
+    access: {
+      terms: 'allowed', robots: 'allowed', genericEnabled: false, minIntervalMinutes: 60,
+    },
+    origin: {
+      kind: 'manual', recordedAt: '2026-07-30T10:00:00.000Z', reference: 'settings',
+    },
+  }));
+  writeEmployerRegistry(root, createEmployerRegistry(discoveries, {
+    now: () => '2026-07-30T10:00:00.000Z',
+  }));
+  const collected = await collectScanSources(root, DEFAULT_WORKSPACE_CONFIG, {
+    collectEmployersFn: async (employers) => {
+      assert.equal(employers.length, 32);
+      return { jobs: [], checks: [], results: [] };
+    },
+    fetchCafe: async () => ({ status: 'unavailable', jobs: [] }),
+    fetchAdzunaFn: async () => ({ status: 'unavailable', jobs: [] }),
+  });
+
+  assert.equal(collected.sources.employer_registry.status, 'degraded');
+  assert.equal(
+    collected.sources.employer_registry.reason,
+    'priority employer monitoring capacity was exceeded',
+  );
+  assert.deepEqual(collected.sources.employer_registry.monitoringCapacity, {
+    limit: 12,
+    priorityLimit: 32,
+    eligible: 33,
+    eligiblePriority: 33,
+    omitted: 1,
+    omittedPriority: 1,
+  });
+  assert.equal(collected.sources.employer_registry.selectedEmployerIds.length, 32);
 });
 
 test('legacy migration overwrites generic seed placeholders and preserves user trees', () => {
@@ -179,6 +481,392 @@ test('runtime scan skips AI for a healthy empty source result and needs no Git r
   assert.equal(released, true);
   assert.equal(fs.existsSync(path.join(root, '.git')), false);
 });
+
+test('runtime preflight labels manual and scheduled scans and never requeues a blocked window', async () => {
+  const nextScheduledWindow = new Date(Date.now() + 60 * 60 * 1000).toISOString();
+  for (const scenario of [
+    { requester: 'manual', purpose: 'manual-run' },
+    {
+      requester: 'scheduled',
+      purpose: 'scheduled-job',
+      scheduleId: 'codex-primary',
+      logicalWindowId: '2026-07-29T07:30:00.000Z',
+      windowAt: nextScheduledWindow,
+    },
+  ]) {
+    const root = scanRoot();
+    let collections = 0;
+    const preflights = [];
+    try {
+      const result = await runScanWith(root, 'codex', 'primary', {
+        providerStatusFn: authenticated,
+        collectSourcesFn: async () => {
+          collections += 1;
+          return {
+            generatedAt: '2026-07-29T08:00:00.000Z',
+            queries: [],
+            sources: {},
+          };
+        },
+        providerPreflightFn: async (scanRoot, provider, purpose, options) => {
+          preflights.push({
+            scanRoot,
+            provider,
+            purpose,
+            fenced: Boolean(options.lease),
+            source: options.source,
+          });
+          return { ok: false, state: 'sign-in-required' };
+        },
+        requester: scenario.requester,
+        scheduleId: scenario.scheduleId,
+        logicalWindowId: scenario.logicalWindowId,
+        windowAt: scenario.windowAt,
+      });
+
+      assert.equal(result.ok, false);
+      assert.equal(result.status, 'skipped');
+      assert.equal(result.reason, 'sign-in-required');
+      assert.equal(result.durable.outcome, 'abandoned');
+      assert.equal(collections, 0);
+      assert.deepEqual(preflights, [{
+        scanRoot: root,
+        provider: 'codex',
+        purpose: scenario.purpose,
+        fenced: true,
+        source: scenario.requester === 'scheduled' ? 'scheduled-preflight' : 'manual-preflight',
+      }]);
+      assert.deepEqual(projectScanQueue(root).requests, []);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  }
+});
+
+async function seedQueuedScan(root, provider, mode, providerStatusFn) {
+  const active = acquireScanLease(root, currentLeaseOwner(), {
+    kind: 'scan',
+    runId: `provider-state-queue-seed-${mode}`,
+    provider: 'codex',
+    mode: 'primary',
+    phase: 'collect',
+  });
+  try {
+    const queued = await runScanWith(root, provider, mode, {
+      providerStatusFn,
+      collectSourcesFn: async () => {
+        throw new Error('overlap loser must not collect');
+      },
+    });
+    assert.equal(queued.status, 'queued');
+  } finally {
+    releaseScanLease(active);
+  }
+}
+
+test('scheduled direct scan re-detects sign-out after startup queue drain without resending its window', async () => {
+  const root = scanRoot();
+  const authenticatedCodex = {
+    installed: true,
+    authenticated: true,
+    executable: 'codex-before-drain',
+    capabilities: { structuredOutput: true },
+  };
+  const signedOutCodex = {
+    installed: true,
+    authenticated: false,
+    executable: 'codex-after-drain',
+    capabilities: { structuredOutput: true },
+  };
+  const authenticatedClaude = {
+    installed: true,
+    authenticated: true,
+    executable: 'claude',
+    capabilities: { structuredOutput: true },
+  };
+  let codexStatus = authenticatedCodex;
+  let collections = 0;
+  let providerCalls = 0;
+  const detected = [];
+  const providerStatusFn = (provider) => {
+    const status = provider === 'codex' ? codexStatus : authenticatedClaude;
+    detected.push({ provider, status });
+    return status;
+  };
+  try {
+    for (const mode of ['primary', 'second-pass', 'broadened']) {
+      await seedQueuedScan(root, 'claude', mode, providerStatusFn);
+    }
+    const result = await runScanWith(root, 'codex', 'primary', {
+      providerStatusFn,
+      requester: 'scheduled',
+      scheduleId: 'codex-primary',
+      logicalWindowId: '2026-07-30T07:30:00.000Z',
+      windowAt: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
+      collectSourcesFn: async () => {
+        collections += 1;
+        if (collections === 3) codexStatus = signedOutCodex;
+        return {
+          generatedAt: '2026-07-30T08:00:00.000Z',
+          queries: [],
+          sources: { hiring_cafe: { configured: true, status: 'healthy', count: 0, jobs: [] } },
+        };
+      },
+      runStructuredTurnFn: async () => {
+        providerCalls += 1;
+        throw new Error('signed-out direct scan must not call the provider');
+      },
+      queueWorkspaceSyncFn: async () => ({ state: 'disabled', enabled: false }),
+    });
+
+    assert.equal(result.status, 'skipped');
+    assert.equal(result.reason, 'sign-in-required');
+    assert.equal(result.durable.outcome, 'abandoned');
+    assert.equal(collections, 3);
+    assert.equal(providerCalls, 0);
+    assert.equal(projectScanQueue(root).requests.length, 3);
+    assert.ok(projectScanQueue(root).requests.every(({ status }) => status === 'succeeded'));
+    assert.equal(detected.filter(({ provider }) => provider === 'codex').at(-1).status, signedOutCodex);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('direct scan uses the same freshly signed-in provider status detected after startup queue drain', async () => {
+  const root = scanRoot();
+  const signedOutCodex = {
+    installed: true,
+    authenticated: false,
+    executable: 'codex-before-drain',
+    capabilities: { structuredOutput: true },
+  };
+  const freshCodex = {
+    installed: true,
+    authenticated: true,
+    executable: '/trusted/codex-after-drain',
+    env: { SCOUT_PROVIDER_RUNTIME: 'fresh-after-drain' },
+    capabilities: { structuredOutput: true },
+  };
+  const authenticatedClaude = {
+    installed: true,
+    authenticated: true,
+    executable: 'claude',
+    capabilities: { structuredOutput: true },
+  };
+  let codexStatus = signedOutCodex;
+  let collections = 0;
+  const providerStatuses = [];
+  const providerStatusFn = (provider) => (
+    provider === 'codex' ? codexStatus : authenticatedClaude
+  );
+  try {
+    for (const mode of ['primary', 'second-pass', 'broadened']) {
+      await seedQueuedScan(root, 'claude', mode, providerStatusFn);
+    }
+    const result = await runScanWith(root, 'codex', 'primary', {
+      providerStatusFn,
+      collectSourcesFn: async () => {
+        collections += 1;
+        if (collections <= 3) {
+          if (collections === 3) codexStatus = freshCodex;
+          return {
+            generatedAt: '2026-07-30T08:00:00.000Z',
+            queries: [],
+            sources: { hiring_cafe: { configured: true, status: 'healthy', count: 0, jobs: [] } },
+          };
+        }
+        return {
+          generatedAt: '2026-07-30T08:01:00.000Z',
+          queries: ['engineer'],
+          sources: {
+            hiring_cafe: {
+              configured: true,
+              status: 'healthy',
+              count: 1,
+              jobs: [{ company: 'Acme', title: 'Engineer', url: 'https://example.test/fresh-provider' }],
+            },
+          },
+        };
+      },
+      runStructuredTurnFn: async ({ status, validate }) => {
+        providerStatuses.push(status);
+        const value = assessmentFor([{ candidateId: 'candidate-001' }]);
+        validate(value);
+        return { value, usage: {} };
+      },
+      checkLivenessFn: async (candidates) => ({
+        live: candidates,
+        removed: [],
+        summary: { checked: candidates.length, gone: 0, unverified: 0 },
+      }),
+      queueWorkspaceSyncFn: async () => ({ state: 'disabled', enabled: false }),
+    });
+
+    assert.equal(result.ok, true);
+    assert.equal(result.status, 'completed');
+    assert.equal(collections, 4);
+    assert.deepEqual(providerStatuses, [freshCodex]);
+    assert.equal(providerStatuses[0].executable, '/trusted/codex-after-drain');
+    assert.equal(providerStatuses[0].env.SCOUT_PROVIDER_RUNTIME, 'fresh-after-drain');
+    assert.equal(projectScanQueue(root).requests.length, 3);
+    assert.ok(projectScanQueue(root).requests.every(({ status }) => status === 'succeeded'));
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('candidate assessment holds provider-work authority across every provider retry', async () => {
+  const root = scanRoot();
+  enableRankedDiscovery(root);
+  const events = [];
+  let postRunAuth = null;
+  try {
+    const result = await runScanWith(root, 'codex', 'primary', {
+      providerStatusFn: authenticated,
+      collectSourcesFn: async () => ({
+        generatedAt: '2026-07-31T10:00:00.000Z',
+        queries: [],
+        sources: {
+          ats: {
+            configured: true,
+            status: 'healthy',
+            count: 1,
+            jobs: [{
+              company: 'Authority Co',
+              title: 'Ideal Role',
+              url: 'https://example.test/provider-authority',
+              providerId: 'provider-authority',
+            }],
+          },
+        },
+      }),
+      checkLivenessFn: async (candidates) => ({
+        live: candidates,
+        removed: [],
+        summary: { checked: candidates.length, gone: 0, unverified: 0 },
+      }),
+      runStructuredTurnFn: async ({ validate }) => {
+        events.push('provider');
+        assert.equal(acquireProviderAuthMutation(root, 'codex', {
+          mutationId: 'auth-during-assessment',
+        }), null);
+        const value = assessmentFor([{ candidateId: 'candidate-001' }]);
+        validate(value);
+        return { value, usage: {} };
+      },
+      acquireLockFn: () => ({ ok: true, lock: { token: fixtureToken('provider-authority-test') } }),
+      releaseLockFn: () => ({ ok: true }),
+    });
+
+    assert.equal(result.ok, true, result.error);
+    assert.deepEqual(events, ['provider']);
+    postRunAuth = acquireProviderAuthMutation(root, 'codex', {
+      mutationId: 'auth-after-assessment',
+    });
+    assert.ok(postRunAuth);
+  } finally {
+    if (postRunAuth) releaseProviderAuthMutation(root, postRunAuth);
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('unclosed assessment provider work remains an auth barrier until process closure', async () => {
+  const root = scanRoot();
+  enableRankedDiscovery(root);
+  let closeProvider;
+  const closure = new Promise((resolve) => { closeProvider = resolve; });
+  let postClosureAuth = null;
+  try {
+    const result = await runScanWith(root, 'codex', 'primary', {
+      providerStatusFn: authenticated,
+      collectSourcesFn: async () => ({
+        generatedAt: '2026-07-31T10:00:00.000Z',
+        queries: [],
+        sources: {
+          ats: {
+            configured: true,
+            status: 'healthy',
+            count: 1,
+            jobs: [{
+              company: 'Authority Co',
+              title: 'Ideal Role',
+              url: 'https://example.test/provider-unclosed',
+              providerId: 'provider-unclosed',
+            }],
+          },
+        },
+      }),
+      checkLivenessFn: async (candidates) => ({
+        live: candidates,
+        removed: [],
+        summary: { checked: candidates.length, gone: 0, unverified: 0 },
+      }),
+      runStructuredTurnFn: async () => {
+        throw new ProviderLifecycleUnclosedError('provider remains open', closure);
+      },
+    });
+
+    assert.equal(result.status, 'in-progress');
+    assert.equal(acquireProviderAuthMutation(root, 'codex', {
+      mutationId: 'auth-before-provider-closure',
+    }), null);
+    closeProvider();
+    await new Promise((resolve) => setImmediate(resolve));
+    postClosureAuth = acquireProviderAuthMutation(root, 'codex', {
+      mutationId: 'auth-after-provider-closure',
+    });
+    assert.ok(postClosureAuth);
+  } finally {
+    closeProvider?.();
+    if (postClosureAuth) releaseProviderAuthMutation(root, postClosureAuth);
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+for (const failedTarget of [2, 3]) {
+  test(`runtime finalisation preserves the prepared plan when target ${failedTarget} replacement fails`, async () => {
+    const root = scanRoot();
+    let replacements = 0;
+    try {
+      const result = await runScanWith(root, 'codex', 'primary', {
+        providerStatusFn: authenticated,
+        collectSourcesFn: async () => ({
+          generatedAt: '2026-07-28T10:00:00Z',
+          queries: ['rare role'],
+          sources: { hiring_cafe: { configured: true, status: 'healthy', count: 0, jobs: [] } },
+        }),
+        runStructuredTurnFn: async () => { throw new Error('must not run'); },
+        acquireLockFn: () => ({ ok: true, lock: { token: `partial-${failedTarget}` } }),
+        releaseLockFn: () => ({ ok: true }),
+        mutationHooks: {
+          beforeReplacement() {
+            replacements += 1;
+            if (replacements === failedTarget) throw new Error(`synthetic target ${failedTarget} replacement failure`);
+          },
+        },
+      });
+
+      assert.equal(result.ok, false);
+      assert.match(result.error, new RegExp(`target ${failedTarget} replacement failure`));
+      const runId = fs.readdirSync(path.join(root, '.scout', 'runs'), { withFileTypes: true })
+        .find((entry) => entry.isDirectory()).name;
+      const run = openRunJournal(root, runId);
+      const prepared = run.events.find((event) => event.type === 'mutation.prepared');
+      assert.ok(prepared, 'real finalisation must durably prepare before replacing targets');
+      const plan = loadPreparedMutation(run, prepared.payload.reference.id);
+      const reconciled = reconcileMutation(plan);
+      assert.equal(reconciled.status, 'partially-applied');
+      assert.deepEqual(
+        reconciled.states,
+        failedTarget === 2 ? ['applied', 'pending', 'pending'] : ['applied', 'applied', 'pending'],
+      );
+      assert.equal(run.events.filter((event) => event.type === 'mutation.prepared').length, 1);
+      assert.equal(run.events.filter((event) => event.type === 'mutation.receipted').length, 0);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+}
 
 test('fresh scan readiness stages a reviewable search-profile draft and requires publication', () => {
   const root = readyScanRoot();
@@ -242,9 +930,9 @@ test('runtime scan filters from the published profile before provider assessment
       hiring_cafe: { configured: true, status: 'healthy', count: 1, jobs: [{ company: 'Acme', title: 'Engineer', url: 'https://example.test/job', description: 'Perform coding.' }] },
     } }),
     runStructuredTurnFn: async () => { providerCalls += 1; throw new Error('excluded vacancy must not be assessed'); },
-    acquireLockFn: () => ({ ok: true, lock: { token: 'filter-test' } }), releaseLockFn: () => ({ ok: true }),
+    acquireLockFn: () => ({ ok: true, lock: { token: fixtureToken('filter-test') } }), releaseLockFn: () => ({ ok: true }),
   });
-  assert.equal(result.ok, true);
+  assert.equal(result.ok, true, result.error);
   assert.equal(result.scan.candidates_found, 0);
   assert.equal(result.scan.discarded.hard_exclusion, 1);
   assert.equal(providerCalls, 0);
@@ -288,7 +976,7 @@ test('runtime ranks every unique job but does not pad assessment with zero-score
     ...scanHarness({ ats: { configured: true, status: 'healthy', count: jobs.length, jobs } }, () => candidates),
     checkLivenessFn: async (items) => { candidates = items; return { live: items, removed: [], summary: { checked: items.length, gone: 0, unverified: 0 } }; },
   });
-  assert.equal(result.ok, true);
+  assert.equal(result.ok, true, result.error);
   assert.equal(result.scan.funnel.uniqueVacancies, 2500);
   assert.equal(result.scan.funnel.ranked, result.scan.funnel.eligible);
   assert.equal(result.scan.funnel.selected, 1);
@@ -314,12 +1002,13 @@ test('closed selected adverts are replaced by the next ranked eligible vacancy',
       summary: { checked: items.length, gone: items.some((item) => item.url.endsWith('/0')) ? 1 : 0, unverified: 0 },
     }),
     runStructuredTurnFn: async ({ prompt, validate }) => {
-      assessed = JSON.parse(prompt.split('\n\n').at(-1)).candidates;
-      const value = assessmentFor(assessed);
+      const batch = JSON.parse(prompt.split('\n\n').at(-1)).candidates;
+      assessed.push(...batch);
+      const value = assessmentFor(batch);
       validate(value);
       return { value, usage: {} };
     },
-    acquireLockFn: () => ({ ok: true, lock: { token: 'liveness-backfill-test' } }),
+    acquireLockFn: () => ({ ok: true, lock: { token: fixtureToken('liveness-backfill-test') } }),
     releaseLockFn: () => ({ ok: true }),
     onProgress: () => {},
   });
@@ -357,17 +1046,21 @@ test('a failed ranked scan retains its discovery engine and available orchestrat
     } }),
     checkLivenessFn: async (items) => ({ live: items, removed: [], summary: { checked: items.length, gone: 0, unverified: 0 } }),
     runStructuredTurnFn: async () => { throw new Error('ranked provider failure'); },
-    acquireLockFn: () => ({ ok: true, lock: { token: 'failed-ranked-test' } }),
+    acquireLockFn: () => ({ ok: true, lock: { token: fixtureToken('failed-ranked-test') } }),
     releaseLockFn: () => ({ ok: true }),
   });
   assert.equal(result.ok, false);
   assert.equal(result.scan.discovery_engine, 'ranked-discovery');
   assert.equal(result.scan.funnel.selected, 1);
-  assert.deepEqual(result.scan.selection.map((item) => item.url), ['https://example.test/failed-ranked']);
+  assert.ok(result.scan.explanations.every((item) => /^vacancy-[a-f0-9]{32}$/.test(item.vacancy_id)));
+  assert.deepEqual(
+    result.scan.explanations.filter((item) => item.selection_reason).map((item) => item.sourceUrl),
+    ['https://example.test/failed-ranked'],
+  );
   assert.equal(result.scan.profile_id, published.id);
   assert.equal(result.scan.discarded.hard_exclusion, 1);
   assert.deepEqual(
-    result.scan.explanations.filter((item) => item.deterministic_exclusion).map((item) => item.deterministic_exclusion).sort(),
+    result.scan.explanations.flatMap((item) => item.deterministic_exclusions || []).sort(),
     ['excluded-employer', 'excluded-title'],
   );
   assert.equal(result.scan.adverts_checked, 1);
@@ -398,15 +1091,128 @@ test('ranked second-pass candidates are renumbered and match persisted selection
       validate(value);
       return { value, usage: {} };
     },
-    acquireLockFn: () => ({ ok: true, lock: { token: 'second-pass-ranked-test' } }),
+    acquireLockFn: () => ({ ok: true, lock: { token: fixtureToken('second-pass-ranked-test') } }),
     releaseLockFn: () => ({ ok: true }),
   });
   assert.equal(result.ok, true);
   assert.deepEqual(prompted.map((item) => item.candidateId), ['candidate-001']);
   assert.deepEqual(prompted.map((item) => item.url), ['https://example.test/baker']);
-  assert.deepEqual(result.scan.selection.map((item) => item.url), prompted.map((item) => item.url));
+  assert.deepEqual(
+    result.scan.explanations.filter((item) => item.stages?.selected).map((item) => item.sourceUrl),
+    prompted.map((item) => item.url),
+  );
+  assert.equal(
+    result.scan.explanations.find((item) => item.sourceUrl === 'https://example.test/able').reason_code,
+    'verification-scope',
+  );
   assert.equal(result.scan.funnel.selected, prompted.length);
   assert.equal(result.scan.funnel.assessed, prompted.length);
+});
+
+test('real scan execution uses stable assessment batches of at most ten', async () => {
+  const root = readyScanRoot();
+  const sourceJobs = Array.from({ length: 12 }, (_, index) => ({
+    company: `Synthetic ${index + 1}`,
+    title: 'Engineer',
+    url: `https://example.test/jobs/${index + 1}`,
+    providerId: `job-${index + 1}`,
+    description: 'Build synthetic systems.',
+  }));
+  const batchSizes = [];
+  try {
+    const result = await runScanWith(root, 'codex', 'primary', {
+      providerStatusFn: authenticated,
+      collectSourcesFn: async () => ({
+        generatedAt: '2026-07-28T10:00:00Z',
+        queries: ['engineer'],
+        sources: {
+          synthetic: {
+            configured: true,
+            status: 'healthy',
+            count: sourceJobs.length,
+            jobs: sourceJobs,
+          },
+        },
+      }),
+      checkLivenessFn: async (items) => ({
+        live: items,
+        removed: [],
+        summary: { checked: items.length, gone: 0, unverified: 0 },
+      }),
+      runStructuredTurnFn: async ({ prompt, validate }) => {
+        const batch = JSON.parse(prompt.split('\n\n').at(-1)).candidates;
+        batchSizes.push(batch.length);
+        const value = assessmentFor(batch);
+        validate(value);
+        return { value, usage: { input_tokens: batch.length } };
+      },
+      acquireLockFn: () => ({ ok: true, lock: { token: fixtureToken('assessment-batch-test') } }),
+      releaseLockFn: () => ({ ok: true }),
+      queueWorkspaceSyncFn: async () => ({ ok: true }),
+    });
+    assert.equal(result.ok, true, result.error);
+    assert.deepEqual(batchSizes, [10, 2]);
+    assert.equal(result.scan.candidates_found, 12);
+    assert.equal(result.scan.reviewed.length, 12);
+    assert.equal(result.durable.manifest.assessmentBatches.length, 2);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('real scan execution keeps valid siblings and reports exhausted jobs precisely', async () => {
+  const root = readyScanRoot();
+  try {
+    const result = await runScanWith(root, 'codex', 'primary', {
+      providerStatusFn: authenticated,
+      collectSourcesFn: async () => ({
+        generatedAt: '2026-07-28T10:00:00Z',
+        queries: ['engineer'],
+        sources: {
+          synthetic: {
+            configured: true,
+            status: 'healthy',
+            count: 2,
+            jobs: [
+              { company: 'Able', title: 'Engineer', url: 'https://example.test/jobs/able', providerId: 'able' },
+              { company: 'Baker', title: 'Engineer', url: 'https://example.test/jobs/baker', providerId: 'baker' },
+            ],
+          },
+        },
+      }),
+      checkLivenessFn: async (items) => ({
+        live: items,
+        removed: [],
+        summary: { checked: items.length, gone: 0, unverified: 0 },
+      }),
+      runStructuredTurnFn: async ({ prompt, validate }) => {
+        const batch = JSON.parse(prompt.split('\n\n').at(-1)).candidates;
+        const value = assessmentFor(batch);
+        for (const item of value.assessments) {
+          if (item.candidateId === 'candidate-002') item.responsibilityFit = {};
+        }
+        validate(value);
+        return { value, usage: {} };
+      },
+      acquireLockFn: () => ({ ok: true, lock: { token: fixtureToken('assessment-partial-test') } }),
+      releaseLockFn: () => ({ ok: true }),
+      queueWorkspaceSyncFn: async () => ({ ok: true }),
+    });
+    assert.equal(result.ok, true, result.error);
+    assert.equal(result.status, 'degraded');
+    assert.equal(result.scan.reviewed.length, 1);
+    assert.deepEqual(result.scan.assessment_failures, [{
+      jobId: 'candidate-002',
+      code: 'assessment-validation-exhausted',
+      attempts: 3,
+      validationFailures: ['responsibility-fit-shape-invalid'],
+    }]);
+    const tracker = JSON.parse(fs.readFileSync(path.join(root, 'data', 'opportunities.json'), 'utf8'));
+    assert.equal(tracker.opportunities.length, 1);
+    assert.equal(tracker.opportunities[0].company, 'Able');
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test('runtime scan model is independent from the job-work model', async () => {
@@ -425,16 +1231,18 @@ test('runtime scan model is independent from the job-work model', async () => {
     }),
     runStructuredTurnFn: async ({ model: selected }) => {
       seen.push(selected);
-      return { value: { assessments: [{
-        candidateId: 'candidate-001', categoryId: null, summary: 'Match', hardExclusionMatches: [], mandatoryRequirements: [],
-        dimensions: [{ name: 'fit', score: 80, maximum: 100, evidence: 'Evidence' }], recommendation: 'keep',
-      }] }, usage: {} };
+      return {
+        value: { assessments: [nuancedAssessment('candidate-001', { summary: 'Match' })] },
+        usage: {},
+      };
     },
     acquireLockFn: () => ({ ok: true, lock: { token: `lock-${seen.length}` } }),
     releaseLockFn: () => ({ ok: true }),
   });
-  assert.equal((await run(null)).ok, true);
-  assert.equal((await run('gpt-scan')).ok, true);
+  const defaultModel = await run(null);
+  assert.equal(defaultModel.ok, true, defaultModel.error);
+  const explicitModel = await run('gpt-scan');
+  assert.equal(explicitModel.ok, true, explicitModel.error);
   assert.deepEqual(seen, [null, 'gpt-scan']);
 });
 
@@ -467,9 +1275,920 @@ test('runtime scan records provider failure truthfully and always releases its l
   assert.equal(result.ok, false);
   assert.equal(result.status, 'failed');
   assert.equal(result.scan.degraded, true);
-  assert.deepEqual(result.scan.errors, ['bounded provider failed']);
+  assert.deepEqual(result.scan.errors, ['assessment-retries-exhausted']);
   assert.equal(released, true);
-  assert.match(fs.readFileSync(path.join(root, 'data', 'scan-runs.jsonl'), 'utf8'), /bounded provider failed/);
+  const events = replayRunJournal(path.join(root, '.scout', 'runs', result.runId, 'journal.jsonl'));
+  assert.equal(events.at(-1).type, 'run.completed');
+  assert.equal(events.at(-1).payload.outcome, 'failed');
+  assert.equal(fs.existsSync(path.join(root, '.scout', 'scan-lease.json')), false);
+  const persisted = fs.readFileSync(path.join(root, 'data', 'scan-runs.jsonl'), 'utf8');
+  assert.match(persisted, /assessment-retries-exhausted/);
+  assert.doesNotMatch(persisted, /all candidate assessments exhausted/);
+});
+
+test('runtime records a canonical failure when collection fails before finalization', async () => {
+  const root = scanRoot();
+  try {
+    const profile = publishedRankingProfile();
+    fs.mkdirSync(path.join(root, 'profile', 'search'), { recursive: true });
+    fs.writeFileSync(
+      path.join(root, 'profile', 'search', 'published.json'),
+      `${JSON.stringify(profile)}\n`,
+    );
+    writeSearchLanePlan(root, generateSearchLanePlan(profile));
+    const result = await runScanWith(root, 'codex', 'primary', {
+      providerStatusFn: authenticated,
+      collectSourcesFn: async () => {
+        throw new Error('synthetic collection failure');
+      },
+    });
+
+    assert.equal(result.ok, false);
+    assert.equal(result.status, 'failed');
+    assert.equal(result.error, 'synthetic collection failure');
+    assert.equal(result.scan.errors[0], 'redacted-diagnostic');
+    const events = replayRunJournal(path.join(root, '.scout', 'runs', result.runId, 'journal.jsonl'));
+    assert.equal(events.at(-1).type, 'run.completed');
+    assert.equal(events.at(-1).payload.outcome, 'failed');
+    assert.equal(fs.existsSync(path.join(root, '.scout', 'scan-lease.json')), false);
+    const lane = loadSearchLanePlan(root).lanes[0];
+    assert.equal(lane.runCount, 1);
+    assert.equal(lane.failureCount, 1);
+    assert.equal(lane.consecutiveUnproductiveRuns, 0);
+    assert.deepEqual(lane.history[0].failures, [{
+      source: 'scan',
+      code: 'scan-failed',
+    }]);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('runtime allocates and journals a genuine durable run before source collection', async () => {
+  const root = scanRoot();
+  let observedRunId = null;
+  const result = await runScanWith(root, 'codex', 'primary', {
+    providerStatusFn: authenticated,
+    collectSourcesFn: async () => {
+      const lease = JSON.parse(fs.readFileSync(path.join(root, '.scout', 'scan-lease.json'), 'utf8'));
+      observedRunId = lease.runId;
+      const journal = path.join(root, '.scout', 'runs', observedRunId, 'journal.jsonl');
+      assert.equal(replayRunJournal(journal).at(-1).type, 'run.started');
+      return {
+        generatedAt: '2026-07-27T10:00:00.000Z',
+        queries: ['synthetic engineer'],
+        sources: { hiring_cafe: { configured: true, status: 'healthy', count: 0, jobs: [] } },
+      };
+    },
+  });
+
+  assert.equal(result.ok, true);
+  assert.equal(result.runId, observedRunId);
+  assert.equal(result.durable.outcome, 'complete');
+  assert.deepEqual(
+    result.durable.manifest.completedWork.map((work) => work.stageId),
+    ['collect', 'normalise', 'deduplicate', 'filter', 'rank', 'select'],
+  );
+  assert.equal(fs.existsSync(path.join(root, '.scout', 'scan-lease.json')), false);
+});
+
+test('an overlap loser only appends its queue request and performs no managed or log mutation', async () => {
+  const root = scanRoot();
+  const ignore = path.join(root, '.gitignore');
+  const agents = path.join(root, 'AGENTS.md');
+  fs.writeFileSync(ignore, 'synthetic-ignore\n', 'utf8');
+  fs.writeFileSync(agents, 'synthetic managed instructions sentinel\n', 'utf8');
+  const active = acquireScanLease(root, currentLeaseOwner(), {
+    kind: 'scan',
+    runId: 'active-overlap-owner',
+    provider: 'claude',
+    mode: 'primary',
+    phase: 'collect',
+  });
+  try {
+    const result = await runScanWith(root, 'codex', 'primary', {
+      providerStatusFn: authenticated,
+      collectSourcesFn: async () => {
+        throw new Error('overlap loser must not collect');
+      },
+    });
+
+    assert.equal(result.status, 'queued');
+    assert.equal(fs.readFileSync(ignore, 'utf8'), 'synthetic-ignore\n');
+    assert.equal(fs.readFileSync(agents, 'utf8'), 'synthetic managed instructions sentinel\n');
+    assert.equal(fs.existsSync(path.join(root, 'logs')), false);
+    assert.equal(projectScanQueue(root).ready.length, 1);
+  } finally {
+    releaseScanLease(active);
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('runScan delegates backup authority to the fenced runtime and never backs up a queued result itself', async () => {
+  const root = readyScanRoot();
+  enableRankedDiscovery(root);
+  const reasons = [];
+  let delegatedBackup = null;
+  const queueWorkspaceSyncFn = async (_root, reason) => {
+    reasons.push(reason);
+  };
+  const queued = await runScan(root, 'codex', 'primary', {
+    assertScanReadyFn: () => {},
+    runScanWithFn: async (_root, _provider, _mode, options) => {
+      delegatedBackup = options.queueWorkspaceSyncFn;
+      return { ok: false, status: 'queued', durable: { outcome: 'queued' } };
+    },
+    queueWorkspaceSyncFn,
+  });
+  assert.equal(queued.status, 'queued');
+  assert.equal(delegatedBackup, queueWorkspaceSyncFn);
+  assert.deepEqual(reasons, []);
+
+  const complete = await runScan(root, 'codex', 'primary', {
+    assertScanReadyFn: () => {},
+    runScanWithFn: async () => ({
+      ok: true,
+      status: 'healthy-empty',
+      scan: { funnel: { selected: 0 }, degraded: false },
+      durable: { outcome: 'complete' },
+    }),
+    queueWorkspaceSyncFn,
+  });
+  assert.equal(complete.ok, true);
+  assert.deepEqual(reasons, []);
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+test('runtime backup consumes a mutation receipt while the successful scan fence is current', async () => {
+  const root = scanRoot();
+  let backupCalls = 0;
+  try {
+    const result = await runScanWith(root, 'codex', 'primary', {
+      providerStatusFn: authenticated,
+      collectSourcesFn: async () => ({
+        generatedAt: '2026-07-28T09:00:00.000Z',
+        queries: [],
+        sources: { hiring_cafe: { configured: true, status: 'healthy', count: 0, jobs: [] } },
+      }),
+      async queueWorkspaceSyncFn(_root, reason) {
+        backupCalls += 1;
+        const lease = readScanLease(root);
+        assert.ok(lease);
+        const events = replayRunJournal(path.join(root, '.scout', 'runs', lease.runId, 'journal.jsonl'));
+        assert.equal(events.at(-3).type, 'mutation.prepared');
+        assert.equal(events.at(-2).type, 'mutation.receipted');
+        assert.equal(events.at(-1).type, 'run.completed');
+        assert.equal(events.at(-1).payload.outcome, 'complete');
+        assert.equal(reason, 'complete primary scan');
+      },
+    });
+
+    assert.equal(result.ok, true);
+    assert.equal(result.durable.outcome, 'complete');
+    assert.deepEqual(result.durable.failures, []);
+    assert.equal(backupCalls, 1);
+    assert.ok(JSON.parse(fs.readFileSync(path.join(root, 'data', 'opportunities.json'), 'utf8'))._scoutMutation);
+    assert.match(fs.readFileSync(path.join(root, 'reports', `${result.scan.timestamp.slice(0, 10)}.md`), 'utf8'), /scout-mutation:/);
+    assert.ok(JSON.parse(fs.readFileSync(path.join(root, 'data', 'scan-runs.jsonl'), 'utf8').trim())._scoutMutation);
+    assert.equal(readScanLease(root), null);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('runtime backup failure leaves the receipted scan successful with pending backup state', async () => {
+  const root = scanRoot();
+  try {
+    const result = await runScanWith(root, 'codex', 'primary', {
+      providerStatusFn: authenticated,
+      collectSourcesFn: async () => ({
+        generatedAt: '2026-07-28T09:00:00.000Z',
+        queries: [],
+        sources: { hiring_cafe: { configured: true, status: 'healthy', count: 0, jobs: [] } },
+      }),
+      queueWorkspaceSyncFn: async () => {
+        throw new Error('PRIVATE_BACKUP_FAILURE');
+      },
+    });
+
+    assert.equal(result.ok, true);
+    assert.equal(result.durable.outcome, 'complete');
+    assert.deepEqual(result.durable.failures, [{
+      code: 'backup-pending',
+      stage: 'post-success',
+      reason: 'backup-failed',
+    }]);
+    assert.doesNotMatch(JSON.stringify(result), /PRIVATE_BACKUP_FAILURE/);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('runtime offline backup status leaves the successful scan explicitly pending', async () => {
+  const root = scanRoot();
+  try {
+    const result = await runScanWith(root, 'codex', 'primary', {
+      providerStatusFn: authenticated,
+      collectSourcesFn: async () => ({
+        generatedAt: '2026-07-28T09:00:00.000Z',
+        queries: [],
+        sources: { hiring_cafe: { configured: true, status: 'healthy', count: 0, jobs: [] } },
+      }),
+      queueWorkspaceSyncFn: async () => ({
+        state: 'offline',
+        enabled: true,
+        pending: true,
+        error: 'PRIVATE_OFFLINE_DETAIL',
+      }),
+    });
+
+    assert.equal(result.ok, true);
+    assert.equal(result.durable.outcome, 'complete');
+    assert.deepEqual(result.durable.failures, [{
+      code: 'backup-pending',
+      stage: 'post-success',
+      reason: 'backup-offline',
+    }]);
+    assert.doesNotMatch(JSON.stringify(result), /PRIVATE_OFFLINE_DETAIL/);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('runtime needs-attention backup with pending work leaves the successful scan explicitly pending', async () => {
+  const root = scanRoot();
+  try {
+    const result = await runScanWith(root, 'codex', 'primary', {
+      providerStatusFn: authenticated,
+      collectSourcesFn: async () => ({
+        generatedAt: '2026-07-28T09:00:00.000Z',
+        queries: [],
+        sources: { hiring_cafe: { configured: true, status: 'healthy', count: 0, jobs: [] } },
+      }),
+      queueWorkspaceSyncFn: async () => ({
+        state: 'needs-attention',
+        enabled: true,
+        pending: true,
+        error: 'PRIVATE_RECONCILIATION_DETAIL',
+      }),
+    });
+
+    assert.equal(result.ok, true);
+    assert.equal(result.durable.outcome, 'complete');
+    assert.deepEqual(result.durable.failures, [{
+      code: 'backup-pending',
+      stage: 'post-success',
+      reason: 'backup-offline',
+    }]);
+    assert.doesNotMatch(JSON.stringify(result), /PRIVATE_RECONCILIATION_DETAIL/);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('runtime needs-attention backup without pending work leaves the successful scan explicitly partial', async () => {
+  const root = scanRoot();
+  try {
+    const result = await runScanWith(root, 'codex', 'primary', {
+      providerStatusFn: authenticated,
+      collectSourcesFn: async () => ({
+        generatedAt: '2026-07-28T09:00:00.000Z',
+        queries: [],
+        sources: { hiring_cafe: { configured: true, status: 'healthy', count: 0, jobs: [] } },
+      }),
+      queueWorkspaceSyncFn: async () => ({
+        state: 'needs-attention',
+        enabled: true,
+        pending: false,
+        error: 'PRIVATE_RECONCILIATION_DETAIL',
+      }),
+    });
+
+    assert.equal(result.ok, true);
+    assert.equal(result.durable.outcome, 'complete');
+    assert.deepEqual(result.durable.failures, [{
+      code: 'backup-partial',
+      stage: 'post-success',
+      reason: 'backup-needs-attention',
+    }]);
+    assert.doesNotMatch(JSON.stringify(result), /PRIVATE_RECONCILIATION_DETAIL/);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('a queued backup-pending success remains visibly pending in durable queue state', async () => {
+  const root = scanRoot();
+  let collectionCalls = 0;
+  let overlap;
+  const options = {
+    providerStatusFn: authenticated,
+    collectSourcesFn: async () => {
+      collectionCalls += 1;
+      if (collectionCalls === 1) overlap = await runScanWith(root, 'codex', 'primary', options);
+      return {
+        generatedAt: '2026-07-28T09:00:00.000Z',
+        queries: [],
+        sources: { hiring_cafe: { configured: true, status: 'healthy', count: 0, jobs: [] } },
+      };
+    },
+    queueWorkspaceSyncFn: async () => ({
+      state: 'offline',
+      enabled: true,
+      pending: true,
+      error: 'PRIVATE_QUEUE_OFFLINE_DETAIL',
+    }),
+  };
+  try {
+    const primary = await runScanWith(root, 'codex', 'primary', options);
+
+    assert.equal(primary.ok, true);
+    assert.equal(overlap.status, 'queued');
+    assert.equal(collectionCalls, 2);
+    assert.equal(projectScanQueue(root).requests[0].status, 'succeeded-pending');
+    assert.doesNotMatch(
+      fs.readFileSync(path.join(root, '.scout', 'scan-queue.jsonl'), 'utf8'),
+      /PRIVATE_QUEUE_OFFLINE_DETAIL/,
+    );
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('a real queued unclosed provider remains claimed with a live fence and coherent public status', async () => {
+  const root = readyScanRoot();
+  enableRankedDiscovery(root);
+  const active = acquireScanLease(root, currentLeaseOwner(), {
+    kind: 'scan',
+    runId: 'queue-unclosed-seed',
+    provider: 'claude',
+    model: 'provider-default',
+    mode: 'primary',
+    phase: 'collect',
+  });
+  const sourceResult = {
+    generatedAt: '2026-07-28T09:00:00.000Z',
+    queries: [],
+    sources: {
+      hiring_cafe: {
+        configured: true,
+        status: 'healthy',
+        count: 1,
+        jobs: [{
+          company: 'Able',
+          title: 'Ideal Role',
+          providerId: 'queue-unclosed-1',
+          url: 'https://example.test/jobs/queue-unclosed',
+          description: 'Ideal role responsibility.',
+        }],
+      },
+    },
+  };
+  const activeHeartbeatTimers = new Set();
+  let nextHeartbeatTimer = 0;
+  const options = {
+    providerStatusFn: authenticated,
+    collectSourcesFn: async () => sourceResult,
+    runStructuredTurnFn: () => Promise.reject(new ProviderLifecycleUnclosedError(
+      'provider process did not close',
+      new Promise(() => {}),
+    )),
+    checkLivenessFn: async (candidates) => ({
+      live: candidates,
+      removed: [],
+      summary: { checked: candidates.length, gone: 0, unverified: 0 },
+    }),
+    heartbeatOptions: {
+      intervalMs: 100,
+      setTimeoutFn() {
+        const timer = { id: ++nextHeartbeatTimer, unref() {} };
+        activeHeartbeatTimers.add(timer.id);
+        return timer;
+      },
+      clearTimeoutFn(timer) {
+        activeHeartbeatTimers.delete(timer.id);
+      },
+    },
+  };
+  try {
+    const first = await runScanWith(root, 'codex', 'primary', options);
+    const successor = await runScanWith(root, 'codex', 'broadened', options);
+    assert.equal(first.status, 'queued');
+    assert.equal(successor.status, 'queued');
+  } finally {
+    releaseScanLease(active);
+  }
+
+  try {
+    const result = await runScanWith(root, 'codex', 'second-pass', options);
+
+    assert.equal(result.ok, false);
+    assert.equal(result.status, 'in-progress');
+    assert.equal(result.reason, 'operator-intervention-required');
+    assert.equal(result.durable.outcome, 'in-progress');
+    assert.deepEqual(result.durable.failures, [{
+      code: 'provider-lifecycle-unclosed',
+      stage: 'finalise',
+      reason: 'operator-intervention-required',
+    }]);
+
+    const queue = projectScanQueue(root).requests;
+    assert.equal(queue.length, 2);
+    assert.equal(queue[0].status, 'claimed');
+    assert.equal(queue[1].status, 'queued');
+    assert.equal(queue[1].claim, null);
+    const lease = readScanLease(root);
+    assert.ok(lease);
+    assert.equal(lease.runId, queue[0].claim.runId);
+    assert.equal(activeHeartbeatTimers.size, 1);
+
+    const events = replayRunJournal(path.join(
+      root, '.scout', 'runs', queue[0].claim.runId, 'journal.jsonl',
+    ));
+    assert.equal(events.some((event) => event.type === 'run.completed'), false);
+    assert.ok(events.some((event) => (
+      event.type === 'run.failure-recorded'
+      && event.payload.reason === 'operator-intervention-required'
+    )));
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('a post-terminal queue drain surfaces unresolved provider authority through the supervised scan result', async () => {
+  const root = readyScanRoot();
+  enableRankedDiscovery(root);
+  const emptySourceResult = {
+    generatedAt: '2026-07-28T09:00:00.000Z',
+    queries: [],
+    sources: {
+      hiring_cafe: {
+        configured: true,
+        status: 'healthy',
+        count: 0,
+        jobs: [],
+      },
+    },
+  };
+  const queuedSourceResult = {
+    generatedAt: '2026-07-28T09:01:00.000Z',
+    queries: [],
+    sources: {
+      hiring_cafe: {
+        configured: true,
+        status: 'healthy',
+        count: 1,
+        jobs: [{
+          company: 'Able',
+          title: 'Ideal Role',
+          providerId: 'post-terminal-unclosed-1',
+          url: 'https://example.test/jobs/post-terminal-unclosed',
+          description: 'Ideal role responsibility.',
+        }],
+      },
+    },
+  };
+  const activeHeartbeatTimers = new Set();
+  let nextHeartbeatTimer = 0;
+  let collectionCalls = 0;
+  let directRunId = null;
+  let overlap = null;
+  let successor = null;
+  const options = {
+    providerStatusFn: authenticated,
+    async collectSourcesFn() {
+      collectionCalls += 1;
+      if (collectionCalls === 1) {
+        directRunId = readScanLease(root)?.runId || null;
+        overlap = await runScanWith(root, 'codex', 'broadened', options);
+        successor = await runScanWith(root, 'codex', 'second-pass', options);
+        return emptySourceResult;
+      }
+      return queuedSourceResult;
+    },
+    runStructuredTurnFn: () => Promise.reject(new ProviderLifecycleUnclosedError(
+      'provider process did not close',
+      new Promise(() => {}),
+    )),
+    checkLivenessFn: async (candidates) => ({
+      live: candidates,
+      removed: [],
+      summary: { checked: candidates.length, gone: 0, unverified: 0 },
+    }),
+    queueWorkspaceSyncFn: async () => undefined,
+    heartbeatOptions: {
+      intervalMs: 100,
+      setTimeoutFn() {
+        const timer = { id: ++nextHeartbeatTimer, unref() {} };
+        activeHeartbeatTimers.add(timer.id);
+        return timer;
+      },
+      clearTimeoutFn(timer) {
+        activeHeartbeatTimers.delete(timer.id);
+      },
+    },
+  };
+
+  try {
+    const result = await runScan(root, 'codex', 'primary', {
+      assertScanReadyFn: () => ({ ready: true }),
+      runScanWithFn: (scanRoot, provider, mode, runtimeOptions) => runScanWith(
+        scanRoot,
+        provider,
+        mode,
+        { ...runtimeOptions, ...options },
+      ),
+    });
+
+    assert.equal(overlap.status, 'queued');
+    assert.equal(successor.status, 'queued');
+    assert.equal(collectionCalls, 2);
+    assert.ok(directRunId);
+    assert.equal(result.ok, false);
+    assert.equal(result.status, 'in-progress');
+    assert.equal(result.reason, 'operator-intervention-required');
+    assert.equal(result.durable.outcome, 'in-progress');
+    assert.deepEqual(result.durable.failures, [{
+      code: 'provider-lifecycle-unclosed',
+      stage: 'finalise',
+      reason: 'operator-intervention-required',
+    }]);
+    assert.equal(result.scan.candidates_found, 0);
+
+    const queue = projectScanQueue(root).requests;
+    assert.equal(queue.length, 2);
+    assert.equal(queue[0].status, 'claimed');
+    assert.equal(queue[1].status, 'queued');
+    assert.equal(queue[1].claim, null);
+    assert.equal(result.runId, queue[0].claim.runId);
+    assert.notEqual(result.runId, directRunId);
+    const lease = readScanLease(root);
+    assert.ok(lease);
+    assert.equal(lease.runId, queue[0].claim.runId);
+    assert.equal(activeHeartbeatTimers.size, 1);
+
+    const queuedEvents = replayRunJournal(path.join(
+      root, '.scout', 'runs', queue[0].claim.runId, 'journal.jsonl',
+    ));
+    assert.equal(queuedEvents.some((event) => event.type === 'run.completed'), false);
+    assert.ok(queuedEvents.some((event) => (
+      event.type === 'run.failure-recorded'
+      && event.payload.code === 'provider-lifecycle-unclosed'
+      && event.payload.reason === 'operator-intervention-required'
+    )));
+
+    const directEvents = replayRunJournal(path.join(
+      root, '.scout', 'runs', directRunId, 'journal.jsonl',
+    ));
+    assert.ok(directEvents.some((event) => (
+      event.type === 'run.completed'
+      && event.payload.outcome === 'complete'
+    )));
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('each terminally successful manual overlap run receives its own fenced backup', async () => {
+  const root = scanRoot();
+  let collectionCalls = 0;
+  let overlap;
+  const backedUpRuns = [];
+  const options = {
+    providerStatusFn: authenticated,
+    collectSourcesFn: async () => {
+      collectionCalls += 1;
+      if (collectionCalls === 1) overlap = await runScanWith(root, 'codex', 'primary', options);
+      return {
+        generatedAt: '2026-07-28T09:00:00.000Z',
+        queries: [],
+        sources: { hiring_cafe: { configured: true, status: 'healthy', count: 0, jobs: [] } },
+      };
+    },
+    async queueWorkspaceSyncFn() {
+      const lease = readScanLease(root);
+      assert.ok(lease);
+      backedUpRuns.push(lease.runId);
+    },
+  };
+  try {
+    const primary = await runScanWith(root, 'codex', 'primary', options);
+
+    assert.equal(primary.ok, true);
+    assert.equal(overlap.status, 'queued');
+    assert.equal(collectionCalls, 2);
+    assert.equal(new Set(backedUpRuns).size, 2);
+    assert.equal(projectScanQueue(root).requests[0].status, 'succeeded');
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('startup-drained success is backed up even when the following direct run fails', async () => {
+  const root = scanRoot();
+  const active = acquireScanLease(root, currentLeaseOwner(), {
+    kind: 'scan',
+    runId: 'startup-backup-seed',
+    provider: 'claude',
+    mode: 'primary',
+    phase: 'collect',
+  });
+  try {
+    const queued = await runScanWith(root, 'codex', 'primary', {
+      providerStatusFn: authenticated,
+      collectSourcesFn: async () => {
+        throw new Error('overlap loser must not collect');
+      },
+    });
+    assert.equal(queued.status, 'queued');
+  } finally {
+    releaseScanLease(active);
+  }
+
+  let collectionCalls = 0;
+  const backedUpRuns = [];
+  try {
+    const result = await runScanWith(root, 'codex', 'primary', {
+      providerStatusFn: authenticated,
+      collectSourcesFn: async () => {
+        collectionCalls += 1;
+        if (collectionCalls === 2) throw new Error('direct collection failed');
+        return {
+          generatedAt: '2026-07-28T09:00:00.000Z',
+          queries: [],
+          sources: { hiring_cafe: { configured: true, status: 'healthy', count: 0, jobs: [] } },
+        };
+      },
+      async queueWorkspaceSyncFn() {
+        const lease = readScanLease(root);
+        assert.ok(lease);
+        backedUpRuns.push(lease.runId);
+      },
+    });
+
+    assert.equal(result.ok, false);
+    assert.equal(collectionCalls, 2);
+    assert.equal(backedUpRuns.length, 1);
+    assert.equal(projectScanQueue(root).requests[0].status, 'succeeded');
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('a real scheduled success durably covers its same-window overlap without rerunning it', async () => {
+  const root = scanRoot();
+  let collectionCalls = 0;
+  let overlap;
+  const options = {
+    requester: 'scheduled',
+    windowAt: new Date(Date.now() + 10 * 60 * 60 * 1000).toISOString(),
+    scheduleId: 'codex-primary',
+    logicalWindowId: new Date(Date.now() - 60 * 1000).toISOString(),
+    providerStatusFn: authenticated,
+    collectSourcesFn: async () => {
+      collectionCalls += 1;
+      if (collectionCalls === 1) {
+        overlap = await runScanWith(root, 'codex', 'primary', options);
+      }
+      return {
+        generatedAt: '2026-07-28T09:00:00.000Z',
+        queries: [],
+        sources: { hiring_cafe: { configured: true, status: 'healthy', count: 0, jobs: [] } },
+      };
+    },
+    runStructuredTurnFn: async () => {
+      throw new Error('empty queued scans must not call the provider');
+    },
+    checkLivenessFn: async (candidates) => ({
+      live: candidates,
+      removed: [],
+      summary: { checked: candidates.length, gone: 0, unverified: 0 },
+    }),
+  };
+
+  try {
+    const primary = await runScanWith(root, 'codex', 'primary', options);
+
+    assert.equal(overlap.status, 'queued');
+    assert.equal(primary.ok, true);
+    assert.equal(collectionCalls, 1);
+    const queued = projectScanQueue(root).requests[0];
+    assert.equal(queued.status, 'skipped');
+    assert.equal(queued.requester, 'scheduled');
+    assert.equal(queued.execution.scheduleId, 'codex-primary');
+    assert.equal(queued.execution.logicalWindowId, options.logicalWindowId);
+    assert.equal(
+      Date.parse(queued.expiresAt),
+      Math.min(Date.parse(queued.requestedAt) + 12 * 60 * 60 * 1000, Date.parse(queued.windowAt)),
+    );
+    const runs = fs.readdirSync(path.join(root, '.scout', 'runs'));
+    assert.equal(runs.length, 1);
+    for (const runId of runs) {
+      const events = replayRunJournal(path.join(root, '.scout', 'runs', runId, 'journal.jsonl'));
+      assert.equal(events[0].type, 'run.started');
+      assert.equal(events[0].payload.compatibility.scheduleJobId, 'codex-primary');
+      assert.equal(events[0].payload.compatibility.logicalWindowId, options.logicalWindowId);
+      assert.equal(events.at(-1).type, 'run.completed');
+    }
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('a scheduled queued run remains bound to its claimed inputs when workspace config changes during execution', async () => {
+  const root = scanRoot();
+  let collectionCalls = 0;
+  let overlap;
+  const options = {
+    requester: 'scheduled',
+    windowAt: new Date(Date.now() + 10 * 60 * 60 * 1000).toISOString(),
+    scheduleId: 'codex-primary',
+    logicalWindowId: new Date(Date.now() - 60 * 1000).toISOString(),
+    providerStatusFn: authenticated,
+    collectSourcesFn: async () => {
+      collectionCalls += 1;
+      if (collectionCalls === 1) {
+        overlap = await runScanWith(root, 'codex', 'primary', {
+          ...options,
+          logicalWindowId: new Date(Date.now() - 2 * 60 * 1000).toISOString(),
+        });
+      } else {
+        const config = loadWorkspaceConfig(root);
+        // Simulate an out-of-band legacy writer. Supported config writers are
+        // now excluded by the scan authority, but claim binding must still be
+        // robust to bytes changed outside Scout's coordinated APIs.
+        fs.writeFileSync(path.join(root, 'workspace.json'), `${JSON.stringify({
+          ...config,
+          triage: { ...config.triage, checkScore: Number(config.triage.checkScore) + 1 },
+        }, null, 2)}\n`);
+      }
+      return {
+        generatedAt: '2026-07-28T09:00:00.000Z',
+        queries: [],
+        sources: { hiring_cafe: { configured: true, status: 'healthy', count: 0, jobs: [] } },
+      };
+    },
+    runStructuredTurnFn: async () => {
+      throw new Error('empty queued scans must not call the provider');
+    },
+    checkLivenessFn: async (candidates) => ({
+      live: candidates,
+      removed: [],
+      summary: { checked: candidates.length, gone: 0, unverified: 0 },
+    }),
+  };
+
+  try {
+    const primary = await runScanWith(root, 'codex', 'primary', options);
+
+    assert.equal(overlap.status, 'queued');
+    assert.equal(primary.ok, true);
+    assert.equal(collectionCalls, 2);
+    assert.equal(projectScanQueue(root).requests[0].status, 'succeeded');
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('a queued keeper run completes against its claim-time tracker input instead of staling on its own mutation', async () => {
+  const root = scanRoot();
+  enableRankedDiscovery(root);
+  let collectionCalls = 0;
+  let overlap;
+  const options = {
+    providerStatusFn: authenticated,
+    collectSourcesFn: async () => {
+      collectionCalls += 1;
+      if (collectionCalls === 1) {
+        overlap = await runScanWith(root, 'codex', 'primary', options);
+        return {
+          generatedAt: '2026-07-28T09:00:00.000Z',
+          queries: [],
+          sources: { hiring_cafe: { configured: true, status: 'healthy', count: 0, jobs: [] } },
+        };
+      }
+      return {
+        generatedAt: '2026-07-28T09:01:00.000Z',
+        queries: [],
+        sources: {
+          hiring_cafe: {
+            configured: true,
+            status: 'healthy',
+            count: 1,
+            registrySnapshot: { privateRegistrySentinel: 'PRIVATE_REGISTRY_SNAPSHOT' },
+            jobs: [{
+              company: 'Keeper Co',
+              title: 'Ideal Role',
+              url: 'https://PRIVATE_USER:PRIVATE_PASSWORD@example.test/jobs/keeper'
+                + '?session=PRIVATE_SESSION&redirect=https%3A%2F%2Fnested-user%3Anested-pass%40private.test%2Fpath'
+                + '#PRIVATE_FRAGMENT',
+            }],
+          },
+        },
+      };
+    },
+    runStructuredTurnFn: async ({ prompt, validate }) => {
+      const context = JSON.parse(prompt.split('\n\n').at(-1));
+      const value = assessmentFor(context.candidates);
+      validate(value);
+      return { value, usage: {} };
+    },
+    checkLivenessFn: async (candidates) => ({
+      live: candidates,
+      removed: [],
+      summary: { checked: candidates.length, gone: 0, unverified: 0 },
+    }),
+    queueWorkspaceSyncFn: async () => {},
+  };
+  try {
+    const primary = await runScanWith(root, 'codex', 'primary', options);
+
+    assert.equal(primary.ok, true);
+    assert.equal(overlap.status, 'queued');
+    assert.equal(collectionCalls, 2);
+    assert.equal(projectScanQueue(root).requests[0].status, 'succeeded');
+    const tracker = JSON.parse(fs.readFileSync(path.join(root, 'data', 'opportunities.json'), 'utf8'));
+    assert.equal(tracker.opportunities[0].company, 'Keeper Co');
+    const scanInput = fs.readdirSync(path.join(root, '.scout', 'scan-input'))
+      .map((name) => fs.readFileSync(path.join(root, '.scout', 'scan-input', name), 'utf8'))
+      .join('\n');
+    assert.match(scanInput, /https:\/\/example\.test\/jobs\/keeper/);
+    assert.doesNotMatch(
+      scanInput,
+      /PRIVATE_USER|PRIVATE_PASSWORD|PRIVATE_SESSION|PRIVATE_FRAGMENT|PRIVATE_REGISTRY_SNAPSHOT|nested-user|nested-pass|[?#]session=/,
+    );
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('fresh liveness keeps a transient query URL while every persisted scan projection is canonical', async () => {
+  const root = scanRoot();
+  enableRankedDiscovery(root);
+  const sourceUrl = 'https://example.test/jobs/query-only'
+    + '?posting=stable-query-id&session=PRIVATE_TRANSIENT_SESSION#PRIVATE_TRANSIENT_FRAGMENT';
+  let checkedUrl = null;
+  try {
+    const result = await runScanWith(root, 'codex', 'primary', {
+      providerStatusFn: authenticated,
+      collectSourcesFn: async () => ({
+        generatedAt: '2026-07-28T09:00:00.000Z',
+        queries: [],
+        sources: {
+          hiring_cafe: {
+            configured: true,
+            status: 'healthy',
+            count: 1,
+            jobs: [{
+              company: 'Query Identity Co',
+              title: 'Ideal Role',
+              url: sourceUrl,
+            }],
+          },
+        },
+      }),
+      runStructuredTurnFn: async ({ prompt, validate }) => {
+        const context = JSON.parse(prompt.split('\n\n').at(-1));
+        const value = assessmentFor(context.candidates);
+        validate(value);
+        return { value, usage: {} };
+      },
+      checkLivenessFn: async (candidates) => {
+        checkedUrl = candidates[0]?.url;
+        return {
+          live: candidates,
+          removed: [],
+          summary: { checked: candidates.length, gone: 0, unverified: 0 },
+        };
+      },
+      queueWorkspaceSyncFn: async () => ({ state: 'disabled', enabled: false }),
+    });
+
+    assert.equal(result.ok, true);
+    assert.equal(checkedUrl, sourceUrl.replace(/#.*$/, ''));
+    const persisted = [
+      ...fs.readdirSync(path.join(root, '.scout', 'runs'), { withFileTypes: true })
+        .filter((entry) => entry.isDirectory())
+        .flatMap((entry) => fs.readdirSync(path.join(root, '.scout', 'runs', entry.name, 'artifacts'))
+          .map((name) => fs.readFileSync(
+            path.join(root, '.scout', 'runs', entry.name, 'artifacts', name),
+            'utf8',
+          ))),
+      ...fs.readdirSync(path.join(root, '.scout', 'scan-input'))
+        .map((name) => fs.readFileSync(path.join(root, '.scout', 'scan-input', name), 'utf8')),
+      fs.readFileSync(path.join(root, 'data', 'scan-runs.jsonl'), 'utf8'),
+      fs.readFileSync(path.join(root, 'data', 'opportunities.json'), 'utf8'),
+      ...fs.readdirSync(path.join(root, 'reports'))
+        .map((name) => fs.readFileSync(path.join(root, 'reports', name), 'utf8')),
+    ].join('\n');
+    assert.match(persisted, /https:\/\/example\.test\/jobs\/query-only/);
+    assert.doesNotMatch(
+      persisted,
+      /stable-query-id|PRIVATE_TRANSIENT_SESSION|PRIVATE_TRANSIENT_FRAGMENT|[?#]posting=/,
+    );
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test('runtime scan preserves an evidence-rich profile larger than the former per-file limit', async () => {
@@ -490,11 +2209,9 @@ test('runtime scan preserves an evidence-rich profile larger than the former per
       const context = JSON.parse(prompt.split('\n\n').at(-1));
       profileLength = context.profile.length;
       return {
-        value: { assessments: [{
-          candidateId: 'candidate-001', categoryId: null, summary: 'Evidence-backed match',
-          hardExclusionMatches: [], mandatoryRequirements: [],
-          dimensions: [{ name: 'fit', score: 80, maximum: 100, evidence: 'Profile evidence' }], recommendation: 'keep',
-        }] },
+        value: {
+          assessments: [nuancedAssessment('candidate-001', { summary: 'Evidence-backed match' })],
+        },
         usage: { input_tokens: 12_000 },
       };
     },

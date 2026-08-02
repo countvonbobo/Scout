@@ -13,7 +13,11 @@ test('Typst resolution reports the managed source and version', () => {
   const result = resolveTypstRuntime({
     appRoot: 'C:/Scout/app', platform: 'win32', env: {},
     exists: (file) => file.endsWith('.scout-runtime\\typst.exe') || file.endsWith('.scout-runtime/typst.exe'),
-    spawn: (command) => ({ status: command.includes('.scout-runtime') ? 0 : 1, stdout: 'typst 0.14.2\n', stderr: '' }),
+    spawn: (command, args, options) => {
+      assert.deepEqual(args, ['--version']);
+      assert.equal(options.timeout, 5_000);
+      return { status: command.includes('.scout-runtime') ? 0 : 1, stdout: 'typst 0.14.2\n', stderr: '' };
+    },
   });
   assert.equal(result.available, true);
   assert.equal(result.source, 'managed');

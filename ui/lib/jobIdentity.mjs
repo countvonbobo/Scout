@@ -79,6 +79,9 @@ export function jobIdentity(job) {
     || (job?.mandatoryRequirements || []).map((item) => `${item.requirement || ''} ${item.advertEvidence || ''}`).join(' ');
   const location = fieldValue(job?.location) || job?.jobIdentity?.location || '';
   const seniority = fieldValue(job?.seniority) || job?.jobIdentity?.seniority || '';
+  const suppliedEvidenceDigests = Array.isArray(job?.jobIdentity?.evidenceTokenDigests)
+    ? job.jobIdentity.evidenceTokenDigests.map(String).filter((value) => /^[a-f0-9]{64}$/.test(value))
+    : null;
   const identity = {
     company: companyKey(fieldValue(job?.company) || fieldValue(job?.employer) || job?.jobIdentity?.company),
     title: titleKey(role || job?.jobIdentity?.title),
@@ -86,8 +89,8 @@ export function jobIdentity(job) {
     location: normaliseIdentityText(location),
     locationTokens: locationTokens(location),
     seniority: normaliseIdentityText(seniority),
-    advertFingerprint: evidenceTokens(description).join(' '),
-    evidenceTokens: evidenceTokens(description),
+    advertFingerprint: suppliedEvidenceDigests?.join(' ') || evidenceTokens(description).join(' '),
+    evidenceTokens: suppliedEvidenceDigests || evidenceTokens(description),
     references: sourceReferencesOf(job),
   };
   if (job && typeof job === 'object') IDENTITY_CACHE.set(job, identity);

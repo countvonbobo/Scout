@@ -4,6 +4,7 @@ import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
 const DEFAULT_APP_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
+const TYPST_PROBE_TIMEOUT_MS = 5_000;
 
 function executableName(platform) {
   return platform === 'win32' ? 'typst.exe' : 'typst';
@@ -33,7 +34,7 @@ export function resolveTypstRuntime({
   for (const candidate of typstCandidates({ appRoot, env, platform })) {
     if (candidate.source !== 'system' && !exists(candidate.command)) continue;
     const result = spawn(candidate.command, ['--version'], {
-      encoding: 'utf8', windowsHide: true, shell: false,
+      encoding: 'utf8', windowsHide: true, shell: false, timeout: TYPST_PROBE_TIMEOUT_MS,
     });
     if (result.status === 0) {
       return {

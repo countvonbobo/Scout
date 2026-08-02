@@ -6,10 +6,11 @@ First-run setup offers only the provider selected for the workspace, for example
 
 ## Choosing which days a job runs
 
-Each job runs on a set of weekdays. **Days** offers four choices:
+Each job runs on a set of weekdays. **Days** offers five choices:
 
 - **Every day** — the default, and what existing schedules keep after an upgrade.
 - **Alternating with the other provider** — the primary job runs Sunday, Monday, Wednesday and Friday; the verification pass runs Tuesday, Thursday and Saturday. The two providers never scan on the same day, which halves daily provider usage and gives each scan a fresh day of postings to find.
+- **Alternating weekdays (no weekends)** — the primary job runs Monday, Wednesday and Friday; the verification pass runs Tuesday and Thursday.
 - **Weekdays only** — Monday to Friday.
 - **Custom days** — tick individual days.
 
@@ -22,7 +23,7 @@ An optional two-provider VPS schedule is:
 - `claude-primary` at 07:30 in `primary` mode;
 - `codex-second-pass` at 08:30 in `second-pass` mode.
 
-Run both every day for the fastest turnaround, or select **Alternating** on each job to spread them across the week.
+Run both every day for the fastest turnaround, select **Alternating with the other provider** to spread them across the full week, or select **Alternating weekdays (no weekends)** to use Monday to Friday only.
 
 Linux timers pin the workspace IANA timezone (normally `Europe/London`) in `OnCalendar`, so daylight-saving changes do not shift the intended wall-clock time even when the VPS itself runs UTC.
 

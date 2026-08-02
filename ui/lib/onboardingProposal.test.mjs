@@ -6,8 +6,14 @@ import { test } from 'node:test';
 import {
   ONBOARDING_FILES, activateOnboardingProposal, buildOnboardingEvidence, createOnboardingProposal,
   activatedProposalRecovery, discardOnboardingProposal, readOnboardingProposal, recoverActivatedProposal,
-  validateOnboardingProposal,
+  recoverOnboardingActivationAtStartup, validateOnboardingProposal,
 } from './onboardingProposal.mjs';
+import { readProviderHealth } from './providerHealth.mjs';
+import { ProviderLifecycleUnclosedError } from './structuredTurn.mjs';
+import {
+  acquireProviderAuthMutation, releaseProviderAuthMutation,
+} from './providerAuthMutation.mjs';
+import { acquireScanLease, currentLeaseOwner } from './scanLease.mjs';
 import { DEFAULT_WORKSPACE_CONFIG, writeWorkspaceConfig } from './workspace.mjs';
 
 function root() {
@@ -55,6 +61,19 @@ test('onboarding evidence has stable IDs and oversized imports are never truncat
   assert.throws(() => buildOnboardingEvidence(dir, config, 10), /reduce it below/);
 });
 
+test('onboarding evidence refuses import symlinks before reading provider input', () => {
+  if (process.platform === 'win32') return;
+  const dir = root();
+  const outside = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'scout-host-secret-')), 'secret.txt');
+  fs.writeFileSync(outside, 'SYNTHETIC_HOST_SECRET');
+  fs.symlinkSync(outside, path.join(dir, 'imports', 'escaped.txt'));
+  const config = JSON.parse(fs.readFileSync(path.join(dir, 'workspace.json')));
+  assert.throws(
+    () => buildOnboardingEvidence(dir, config),
+    /symlink|junction/,
+  );
+});
+
 test('proposal validation rejects invented evidence IDs and bad score arithmetic', () => {
   const valid = proposal();
   const evidence = [{ id: 'config-roles' }];
@@ -81,6 +100,133 @@ test('proposal staging, explicit zero-AI activation and discard are isolated', a
   assert.equal(fs.existsSync(path.join(dir, '.scout', 'onboarding', 'activated.json')), true);
 });
 
+test('activation holds the shared backup lease across every active-file replacement', async () => {
+  const dir = root();
+  const staged = await createOnboardingProposal(dir, 'codex', {
+    providerStatusFn: status,
+    runStructuredTurnFn: run,
+  });
+  let checked = false;
+  activateOnboardingProposal(dir, staged.proposalId, true, {
+    doctorFn: healthyDoctor,
+    _testHooks: {
+      beforeWrite(relative) {
+        if (checked || relative !== 'workspace.json') return;
+        checked = true;
+        const backup = acquireScanLease(dir, currentLeaseOwner(), {
+          kind: 'backup',
+          runId: 'activation-backup',
+          phase: 'checkpoint',
+        });
+        assert.equal(backup, null);
+      },
+    },
+  });
+  assert.equal(checked, true);
+});
+
+test('ordinary failure after activation-marker publication removes the marker before rollback', async () => {
+  const dir = root();
+  const original = Object.fromEntries(ONBOARDING_FILES.map((relative) => [
+    relative, fs.existsSync(path.join(dir, relative))
+      ? fs.readFileSync(path.join(dir, relative), 'utf8')
+      : null,
+  ]));
+  const staged = await createOnboardingProposal(dir, 'codex', {
+    providerStatusFn: status,
+    runStructuredTurnFn: run,
+  });
+  assert.throws(
+    () => activateOnboardingProposal(dir, staged.proposalId, true, {
+      doctorFn: healthyDoctor,
+      _testHooks: {
+        afterActivatedMarker() { throw new Error('synthetic terminal write failure'); },
+      },
+    }),
+    /synthetic terminal write failure/,
+  );
+  assert.equal(fs.existsSync(path.join(dir, '.scout', 'onboarding', 'activated.json')), false);
+  assert.equal(fs.existsSync(path.join(dir, '.scout', 'onboarding', 'activation.json')), false);
+  for (const relative of ONBOARDING_FILES) {
+    if (original[relative] === null) assert.equal(fs.existsSync(path.join(dir, relative)), false);
+    else assert.equal(fs.readFileSync(path.join(dir, relative), 'utf8'), original[relative]);
+  }
+});
+
+test('onboarding records remote-auth failure without resending proposal generation', async () => {
+  const dir = root();
+  let invocations = 0;
+  const remoteAuthFailure = async () => {
+    invocations += 1;
+    const error = new Error('codex structured turn failed: authentication is required');
+    Object.defineProperty(error, 'reasonCode', { value: 'authentication-required' });
+    throw error;
+  };
+
+  await assert.rejects(
+    createOnboardingProposal(dir, 'codex', {
+      providerStatusFn: status,
+      runStructuredTurnFn: remoteAuthFailure,
+    }),
+    /authentication is required/,
+  );
+
+  assert.equal(invocations, 1);
+  assert.equal(readProviderHealth(dir, 'codex').state, 'sign-in-required');
+  assert.equal(readProviderHealth(dir, 'codex').remoteAuthBarrier, true);
+  assert.equal(readOnboardingProposal(dir), null);
+});
+
+test('onboarding proposal generation obeys the durable per-provider auth barrier', async () => {
+  const dir = root();
+  const mutation = acquireProviderAuthMutation(dir, 'codex', {
+    owner: { host: 'synthetic-host', pid: 42, processStart: 'synthetic-start' },
+    mutationId: 'onboarding-auth-mutation',
+  });
+  let invocations = 0;
+  await assert.rejects(createOnboardingProposal(dir, 'codex', {
+    providerStatusFn: status,
+    runStructuredTurnFn: async () => {
+      invocations += 1;
+      return { value: proposal(), usage: {} };
+    },
+  }), (error) => error.reasonCode === 'provider-auth-in-progress');
+  assert.equal(invocations, 0);
+  assert.equal(readOnboardingProposal(dir), null);
+
+  const claude = await createOnboardingProposal(dir, 'claude', {
+    providerStatusFn: status,
+    runStructuredTurnFn: async () => {
+      invocations += 1;
+      return { value: proposal(), usage: {} };
+    },
+  });
+  assert.equal(claude.provider, 'claude');
+  assert.equal(invocations, 1);
+  releaseProviderAuthMutation(dir, mutation);
+});
+
+test('onboarding transfers provider-work fencing until an unclosed turn really closes', async () => {
+  const dir = root();
+  let close;
+  const closure = new Promise((resolve) => { close = resolve; });
+  let releases = 0;
+  await assert.rejects(createOnboardingProposal(dir, 'codex', {
+    providerStatusFn: status,
+    runStructuredTurnFn: async () => {
+      throw new ProviderLifecycleUnclosedError('provider child remains open', closure);
+    },
+    recordProviderResultHealthFn: async () => {},
+    acquireProviderWorkFn: () => ({ provider: 'codex', workId: 'onboarding-work-01' }),
+    renewProviderWorkFn: (_root, capability) => capability,
+    releaseProviderWorkFn: () => { releases += 1; },
+  }), /provider child remains open/);
+  assert.equal(releases, 0);
+  close();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(releases, 1);
+});
+
 test('activation rejects stale targets and rolls back every active file if doctor fails', async () => {
   const dir = root();
   let staged = await createOnboardingProposal(dir, 'codex', { providerStatusFn: status, runStructuredTurnFn: run });
@@ -103,6 +249,84 @@ test('activation rejects stale targets and rolls back every active file if docto
   }
 });
 
+test('startup reconciles a prepared activation after process death at every replacement', async () => {
+  for (const interruptedAfter of ONBOARDING_FILES) {
+    const dir = root();
+    const staged = await createOnboardingProposal(dir, 'codex', {
+      providerStatusFn: status, runStructuredTurnFn: run,
+    });
+    const crash = new Error(`synthetic process death after ${interruptedAfter}`);
+    crash.simulateProcessDeath = true;
+    assert.throws(() => activateOnboardingProposal(dir, staged.proposalId, true, {
+      doctorFn: healthyDoctor,
+      now: () => '2026-07-14T10:05:00.000Z',
+      _testHooks: {
+        afterWrite(relative) {
+          if (relative === interruptedAfter) throw crash;
+        },
+      },
+    }), /synthetic process death/);
+    assert.equal(fs.existsSync(path.join(dir, '.scout', 'onboarding', 'activation.json')), true);
+    const recovered = recoverOnboardingActivationAtStartup(dir, { doctorFn: healthyDoctor });
+    assert.equal(recovered.ok, true);
+    assert.equal(fs.existsSync(path.join(dir, '.scout', 'onboarding', 'activation.json')), false);
+    assert.equal(JSON.parse(fs.readFileSync(path.join(dir, 'workspace.json'))).setup.completedAt,
+      '2026-07-14T10:05:00.000Z');
+  }
+});
+
+test('activation recovery preserves conflicting post-crash user state and its intent', async () => {
+  const dir = root();
+  const staged = await createOnboardingProposal(dir, 'codex', {
+    providerStatusFn: status, runStructuredTurnFn: run,
+  });
+  const crash = new Error('synthetic process death');
+  crash.simulateProcessDeath = true;
+  assert.throws(() => activateOnboardingProposal(dir, staged.proposalId, true, {
+    doctorFn: healthyDoctor,
+    _testHooks: {
+      afterWrite(relative) {
+        if (relative === 'workspace.json') throw crash;
+      },
+    },
+  }), /synthetic process death/);
+  const context = path.join(dir, 'profile', 'context.md');
+  fs.mkdirSync(path.dirname(context), { recursive: true });
+  fs.writeFileSync(context, 'a legitimate post-crash user mutation\n');
+
+  assert.throws(
+    () => recoverOnboardingActivationAtStartup(dir, { doctorFn: healthyDoctor }),
+    /conflicts with prepared onboarding activation/,
+  );
+  assert.equal(fs.readFileSync(context, 'utf8'), 'a legitimate post-crash user mutation\n');
+  assert.equal(fs.existsSync(path.join(dir, '.scout', 'onboarding', 'activation.json')), true);
+  assert.throws(() => discardOnboardingProposal(dir), /requires recovery/);
+  await assert.rejects(createOnboardingProposal(dir, 'codex', {
+    providerStatusFn: status, runStructuredTurnFn: run,
+  }), /requires recovery/);
+});
+
+test('startup finalises activation after death in each terminal cleanup window', async () => {
+  for (const hook of ['afterActivatedMarker', 'afterProposalRemoval']) {
+    const dir = root();
+    const staged = await createOnboardingProposal(dir, 'codex', {
+      providerStatusFn: status, runStructuredTurnFn: run,
+    });
+    const crash = new Error(`synthetic process death at ${hook}`);
+    crash.simulateProcessDeath = true;
+    assert.throws(() => activateOnboardingProposal(dir, staged.proposalId, true, {
+      doctorFn: healthyDoctor,
+      now: () => '2026-07-14T10:05:00.000Z',
+      _testHooks: { [hook]: () => { throw crash; } },
+    }), /synthetic process death/);
+    assert.equal(fs.existsSync(path.join(dir, '.scout', 'onboarding', 'activation.json')), true);
+    const recovered = recoverOnboardingActivationAtStartup(dir, { doctorFn: healthyDoctor });
+    assert.equal(recovered.ok, true);
+    assert.equal(fs.existsSync(path.join(dir, '.scout', 'onboarding', 'activation.json')), false);
+    assert.equal(readOnboardingProposal(dir), null);
+  }
+});
+
 test('activated empty master CV recovery is narrow, backed up, and integrity checked', async () => {
   const dir = root();
   const staged = await createOnboardingProposal(dir, 'codex', { providerStatusFn: status, runStructuredTurnFn: run });
@@ -117,6 +341,45 @@ test('activated empty master CV recovery is narrow, backed up, and integrity che
   assert.equal(fs.readFileSync(active, 'utf8'), reviewed);
   assert.equal(fs.statSync(path.join(recovered.backupDir, 'cv', 'master-cv.md')).size, 0);
   assert.equal(activatedProposalRecovery(dir).available, false);
+});
+
+test('activated CV recovery cannot overlap another workspace mutation owner', async () => {
+  const dir = root();
+  const staged = await createOnboardingProposal(dir, 'codex', {
+    providerStatusFn: status, runStructuredTurnFn: run,
+  });
+  activateOnboardingProposal(dir, staged.proposalId, true, { doctorFn: healthyDoctor });
+  fs.writeFileSync(path.join(dir, 'cv', 'master-cv.md'), '');
+  const lease = acquireScanLease(dir, currentLeaseOwner(), {
+    kind: 'backup', runId: 'recovery-overlap', phase: 'checkpoint',
+  });
+  assert.throws(
+    () => recoverActivatedProposal(dir, true, { doctorFn: healthyDoctor }),
+    /mutation|progress|authority|lease/i,
+  );
+  assert.ok(lease);
+});
+
+test('activated CV recovery never rolls back after its mutation fence is lost during doctor', async () => {
+  const dir = root();
+  const staged = await createOnboardingProposal(dir, 'codex', {
+    providerStatusFn: status, runStructuredTurnFn: run,
+  });
+  activateOnboardingProposal(dir, staged.proposalId, true, { doctorFn: healthyDoctor });
+  const active = path.join(dir, 'cv', 'master-cv.md');
+  fs.writeFileSync(active, '');
+  const successorContent = '# Successor-owned master CV\n\nThis content belongs to the new mutation owner.\n';
+  assert.throws(
+    () => recoverActivatedProposal(dir, true, {
+      doctorFn: () => {
+        fs.rmSync(path.join(dir, '.scout', 'scan-lease.json'), { force: true });
+        fs.writeFileSync(active, successorContent);
+        return healthyDoctor();
+      },
+    }),
+    /mutation|progress|authority|lease/i,
+  );
+  assert.equal(fs.readFileSync(active, 'utf8'), successorContent);
 });
 
 test('activated master CV recovery refuses unrelated active-file drift', async () => {

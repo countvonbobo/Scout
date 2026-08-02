@@ -11,13 +11,270 @@ const previousDeviceSettings = process.env.SCOUT_DEVICE_SETTINGS;
 const testWorkspace = fs.mkdtempSync(path.join(os.tmpdir(), 'scout-server-test-'));
 process.env.SCOUT_WORKSPACE = testWorkspace;
 process.env.SCOUT_DEVICE_SETTINGS = path.join(testWorkspace, 'device-settings.json');
-const { APP_ROOT, APP_VERSION, UI_BUILD_ID, WORKSPACE_ROOT, createServer, operations, providerDetection, restartControl, shutdownControl } = await import('./server.mjs');
+const {
+  APP_ROOT, APP_VERSION, UI_BUILD_FILES, UI_BUILD_ID, WORKSPACE_ROOT,
+  canAutoDownloadUpdate, checkStartupProviderHealth, confirmProviderLoginHealth, createRuntimeProviderHealthMonitor,
+  closeServerSafely, codexDeepLinkDetection, computeUiBuildId, createServer,
+  inspectCodexDeepLinkHandler, operations, providerDetection, providerLoginControl,
+  publicApiError, publicCvImportError, publicDeviceSettings, publicProviderStatus,
+  publicSetupConfigError, recoverProfilePublicationsAtStartup, requestAccess,
+  restartControl, runtimeProviderPreflight, shutdownControl,
+  routes,
+  stageSearchProfileReviewAtStartup, scheduleCheckpoint, drainScheduledCheckpoints,
+  drainRuntimeWork,
+} = await import('./server.mjs');
 const { seedWorkspace, loadWorkspaceConfig, workspacePaths, writeWorkspaceConfig } = await import('./lib/workspace.mjs');
-const { profileFingerprint } = await import('./lib/searchProfile.mjs');
+const {
+  loadPublishedSearchProfile, profileFingerprint, profileRuleId, publishSearchProfile,
+} = await import('./lib/searchProfile.mjs');
+const {
+  recordSearchLaneRun, searchLanePlanRevision, writeSearchLanePlan,
+} = await import('./lib/searchLanes.mjs');
 const { acquireScanLock, releaseScanLock } = await import('../tools/scan-lock.mjs');
+const { appendRunEvent, openRunJournal } = await import('./lib/runJournal.mjs');
+const { acquireScanLease, currentLeaseOwner, releaseScanLease } = await import('./lib/scanLease.mjs');
+const { enqueueScanRequest } = await import('./lib/scanQueue.mjs');
+const {
+  acquireProviderAuthMutation, releaseProviderAuthMutation,
+} = await import('./lib/providerAuthMutation.mjs');
+
+test('server startup and periodic provider health use the configured runtime entry points', async () => {
+  const config = {
+    ai: { provider: 'codex' },
+    schedule: {
+      jobs: [
+        { id: 'claude-primary', enabled: true, provider: 'claude' },
+        { id: 'claude-second', enabled: true, provider: 'claude' },
+        { id: 'codex-disabled', enabled: false, provider: 'codex' },
+      ],
+    },
+  };
+  const calls = [];
+  const preflight = async (root, provider, purpose, options) => {
+    calls.push([root, provider, purpose, options.source]);
+    return { ok: true, provider, purpose, state: 'ready' };
+  };
+
+  await checkStartupProviderHealth('/synthetic/workspace', {
+    loadConfigFn: () => config,
+    preflight,
+  });
+  assert.deepEqual(calls, [
+    ['/synthetic/workspace', 'codex', 'startup', 'startup'],
+    ['/synthetic/workspace', 'claude', 'startup', 'startup'],
+  ]);
+
+  let cleared = false;
+  const monitor = createRuntimeProviderHealthMonitor('/synthetic/workspace', {
+    loadConfigFn: () => config,
+    preflight,
+    setInterval: () => ({ unref() {} }),
+    clearInterval: () => { cleared = true; },
+  });
+  assert.deepEqual(await monitor.runNow(), [{
+    ok: true,
+    provider: 'claude',
+    purpose: 'periodic',
+    state: 'ready',
+  }]);
+  assert.deepEqual(calls.at(-1), [
+    '/synthetic/workspace', 'claude', 'periodic', 'periodic',
+  ]);
+  monitor.stop();
+  assert.equal(cleared, true);
+});
+
+test('shutdown drainage starts a queued checkpoint immediately and settles its promise', async () => {
+  const pending = scheduleCheckpoint('test: acknowledged mutation');
+  await drainScheduledCheckpoints();
+  const result = await pending;
+  assert.ok(['success', 'pending', 'partial', 'needs-attention', 'disabled'].includes(result.state));
+});
+
+test('a failed runtime drain leaves the production listener available for a safe retry', async () => {
+  let rejectDrain;
+  const closing = closeServerSafely(server, {
+    drain: () => new Promise((_, reject) => { rejectDrain = reject; }),
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  const quiesced = await request({ path: '/api/app-info' });
+  assert.equal(quiesced.status, 503);
+  rejectDrain(new Error('provider child did not close'));
+  await assert.rejects(
+    closing,
+    /provider child did not close/,
+  );
+  assert.equal(server.listening, true);
+  assert.equal((await request({ path: '/api/app-info' })).status, 200);
+});
+
+test('a real drain timeout keeps admission closed until abandoned work settles, then reopens atomically', async () => {
+  let release;
+  operations.start('shutdown-timeout-test', async () => (
+    new Promise((resolve) => { release = resolve; })
+  ));
+  await new Promise((resolve) => setImmediate(resolve));
+  let providerShutdowns = 0;
+  const originalProviderShutdown = providerLoginControl.shutdown;
+  providerLoginControl.shutdown = async () => { providerShutdowns += 1; };
+  try {
+    await assert.rejects(
+      closeServerSafely(server, { drain: () => drainRuntimeWork({ timeoutMs: 5 }) }),
+      /did not close before shutdown/,
+    );
+    assert.equal(server.listening, true);
+    assert.equal((await request({ path: '/api/app-info' })).status, 503);
+    assert.throws(
+      () => operations.start('late-timeout-work', async () => null),
+      /shutting down/,
+    );
+    release({ stopped: true });
+    let status = 503;
+    for (let attempt = 0; attempt < 50 && status !== 200; attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      status = (await request({ path: '/api/app-info' })).status;
+    }
+    assert.equal(status, 200);
+    assert.equal(providerShutdowns, 0);
+    operations.start('post-timeout-work', async () => null);
+    await new Promise((resolve) => setImmediate(resolve));
+  } finally {
+    providerLoginControl.shutdown = originalProviderShutdown;
+  }
+});
+
+test('server startup retries a live-fenced profile publication without starting unsafely', () => {
+  const calls = [];
+  let scheduled;
+  let attempts = 0;
+  const recover = (root) => {
+    calls.push(root);
+    attempts += 1;
+    if (attempts === 1) {
+      const error = new Error('publication is still owned');
+      error.reasonCode = 'profile-publication-fenced';
+      throw error;
+    }
+  };
+  const timer = { unrefCalled: false, unref() { this.unrefCalled = true; } };
+  const schedule = (callback, delay) => {
+    scheduled = { callback, delay };
+    return timer;
+  };
+
+  recoverProfilePublicationsAtStartup({
+    root: '/synthetic/workspace',
+    initialised: () => true,
+    recover,
+    schedule,
+  });
+  assert.deepEqual(calls, ['/synthetic/workspace']);
+  assert.equal(scheduled.delay, 1_000);
+  assert.equal(timer.unrefCalled, true);
+  scheduled.callback();
+  assert.deepEqual(calls, ['/synthetic/workspace', '/synthetic/workspace']);
+});
+
+test('server startup retries search-profile staging while workspace mutation authority is busy', () => {
+  let scheduled;
+  let attempts = 0;
+  const timer = { unrefCalled: false, unref() { this.unrefCalled = true; } };
+  const stage = () => {
+    attempts += 1;
+    if (attempts === 1) {
+      const error = new Error('workspace busy');
+      error.reasonCode = 'mutation-busy';
+      throw error;
+    }
+    return { migrated: false };
+  };
+  stageSearchProfileReviewAtStartup({
+    initialised: () => true,
+    stage,
+    schedule(callback, delay) {
+      scheduled = { callback, delay };
+      return timer;
+    },
+  });
+  assert.equal(scheduled.delay, 1_000);
+  assert.equal(timer.unrefCalled, true);
+  assert.deepEqual(scheduled.callback(), { migrated: false });
+});
+
+test('runtime provider preflight performs no provider probe during auth mutation', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'scout-provider-preflight-'));
+  const mutation = acquireProviderAuthMutation(root, 'codex', { phase: 'login' });
+  let detections = 0;
+  try {
+    const result = await runtimeProviderPreflight(root, 'codex', 'periodic', {
+      source: 'periodic',
+      detectProvidersFn: async () => {
+        detections += 1;
+        return {};
+      },
+    });
+    assert.equal(detections, 0);
+    assert.equal(result.state, 'login-in-progress');
+  } finally {
+    releaseProviderAuthMutation(root, mutation);
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('guided login confirms health with a bounded real provider turn', async () => {
+  const status = {
+    installed: true,
+    authenticated: true,
+    capabilities: { structuredOutput: true },
+  };
+  Object.defineProperties(status, {
+    executable: { value: '/trusted/bin/codex' },
+    env: { value: { PATH: '/trusted/bin' } },
+  });
+  let received;
+  const success = await confirmProviderLoginHealth('codex', status, {
+    runStructuredTurnFn: async (options) => {
+      received = options;
+      return { ok: true, value: options.validate({ ready: true }) };
+    },
+  });
+  assert.deepEqual(success, { kind: 'remote-success', source: 'post-auth' });
+  assert.equal(received.provider, 'codex');
+  assert.equal(received.status, status);
+  assert.deepEqual(received.schema.required, ['ready']);
+  assert.equal(received.schema.additionalProperties, false);
+  assert.match(received.prompt, /fixed provider health check/i);
+  assert.doesNotMatch(received.prompt, /workspace|profile|job|account|token/i);
+  assert.equal(received.timeoutMs, 60_000);
+  assert.equal(received.maxInputTokens, 256);
+  assert.equal(received.maxOutputBytes, 32 * 1024);
+  assert.equal(received.maxOutputLines, 128);
+  assert.equal(received.maxLineBytes, 2 * 1024);
+
+  const network = new Error('raw private provider failure');
+  Object.defineProperty(network, 'reasonCode', { value: 'network-unavailable' });
+  assert.deepEqual(await confirmProviderLoginHealth('claude', status, {
+    runStructuredTurnFn: async () => { throw network; },
+  }), { kind: 'network-failure', source: 'post-auth' });
+});
 
 let server;
 let port;
+
+async function removeTestWorkspace() {
+  let lastError;
+  for (let attempt = 0; attempt < 20; attempt += 1) {
+    try {
+      await fs.promises.rm(testWorkspace, { recursive: true, force: true });
+      return;
+    } catch (error) {
+      if (!['EBUSY', 'ENOTEMPTY', 'EPERM'].includes(error?.code)) throw error;
+      lastError = error;
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+  }
+  throw lastError;
+}
 
 before(async () => {
   server = createServer();
@@ -30,11 +287,12 @@ before(async () => {
 
 after(async () => {
   if (server) await new Promise((resolve) => server.close(resolve));
+  await providerLoginControl.shutdown();
   if (previousWorkspace === undefined) delete process.env.SCOUT_WORKSPACE;
   else process.env.SCOUT_WORKSPACE = previousWorkspace;
   if (previousDeviceSettings === undefined) delete process.env.SCOUT_DEVICE_SETTINGS;
   else process.env.SCOUT_DEVICE_SETTINGS = previousDeviceSettings;
-  fs.rmSync(testWorkspace, { recursive: true, force: true });
+  await removeTestWorkspace();
 });
 
 function request({ method = 'GET', path = '/', headers = {}, body = '' }) {
@@ -58,6 +316,419 @@ const JSON_HEADERS = () => {
   return { host, origin: `http://${host}`, 'content-type': 'application/json' };
 };
 
+test('provider setup status projects only bounded readiness fields', () => {
+  const raw = {
+    provider: 'codex',
+    installed: true,
+    authenticated: false,
+    command: '/private/bin/codex',
+    version: 'codex 1.2.3 private@example.test',
+    source: '/private/bin',
+    attempts: [{ raw: `token=${'secret'}` }],
+    authMessage: `token=${'secret'} private@example.test`,
+    capabilities: { structuredOutput: true, futurePrivateField: 'secret' },
+  };
+  assert.deepEqual(publicProviderStatus(raw), {
+    installed: true,
+    authenticated: false,
+    capabilities: { structuredOutput: true },
+  });
+  assert.doesNotMatch(JSON.stringify(publicProviderStatus(raw)), /private|secret|@/);
+  assert.deepEqual(
+    publicProviderStatus({ ...raw, authenticated: true }, {
+      state: 'sign-in-required',
+      reasonCode: 'authentication-required',
+      checkedAt: '2026-07-29T10:00:00.000Z',
+      history: [{ privateDiagnostic: 'do not publish' }],
+    }),
+    {
+      installed: true,
+      authenticated: false,
+      capabilities: { structuredOutput: true },
+      healthState: 'sign-in-required',
+    },
+  );
+  assert.deepEqual(
+    publicProviderStatus({ ...raw, authenticated: true }, {
+      state: 'network-unavailable',
+      reasonCode: 'network-failure',
+      remoteAuthBarrier: true,
+    }),
+    {
+      installed: true,
+      authenticated: false,
+      capabilities: { structuredOutput: true },
+      healthState: 'network-unavailable',
+    },
+  );
+  assert.deepEqual(
+    publicProviderStatus({ ...raw, authenticated: true }, {
+      state: 'untrusted-private-state',
+      remoteAuthBarrier: false,
+    }),
+    {
+      installed: true,
+      authenticated: false,
+      capabilities: { structuredOutput: true },
+      healthState: 'provider-error',
+    },
+  );
+});
+
+test('API exception projection uses fixed public copy and never returns diagnostics', () => {
+  const raw = new Error(`git failed at ${['', 'Users', 'private', '.ssh', 'id_ed25519'].join('/')} token=${['PRIVATE', 'SECRET'].join('-')}`);
+  const projected = publicApiError('Private backup could not be completed.', raw);
+  assert.deepEqual(projected, {
+    error: 'Private backup could not be completed.',
+    reasonCode: 'request-failed',
+  });
+  assert.doesNotMatch(JSON.stringify(projected), /Users|id_ed25519|PRIVATE-SECRET|token/i);
+});
+
+test('setup and CV exception projections expose only fixed actionable classifications', () => {
+  assert.deepEqual(
+    publicSetupConfigError(new Error('workspace triage.checkScore cannot exceed actionScore')),
+    {
+      error: 'Check score cannot exceed action score.',
+      reasonCode: 'invalid-triage-thresholds',
+    },
+  );
+  assert.deepEqual(
+    publicCvImportError(new Error('PDF contains little or no selectable text; scanned PDFs need OCR before import')),
+    {
+      error: 'This PDF contains little or no selectable text. Scanned PDFs need OCR before import.',
+      reasonCode: 'pdf-needs-ocr',
+    },
+  );
+  const privateDiagnostic = `PDF could not be read: failed at ${['', 'Users', 'private', 'cv.pdf'].join('/')} token=${['PRIVATE', 'SECRET'].join('-')}`;
+  const unreadable = publicCvImportError(new Error(privateDiagnostic));
+  assert.deepEqual(unreadable, {
+    error: 'PDF could not be read. Export it again or choose another PDF.',
+    reasonCode: 'pdf-unreadable',
+  });
+  assert.doesNotMatch(JSON.stringify(unreadable), /Users|PRIVATE-SECRET|token/i);
+  assert.deepEqual(publicSetupConfigError(new Error(privateDiagnostic)), {
+    error: 'Setup settings could not be saved.',
+    reasonCode: 'request-failed',
+  });
+  assert.deepEqual(publicCvImportError(new Error(privateDiagnostic.replace('PDF could not be read:', 'unknown:'))), {
+    error: 'CV import could not be completed.',
+    reasonCode: 'request-failed',
+  });
+});
+
+test('device status omits persisted paths and remote update checks cannot auto-download', () => {
+  const privatePath = ['', 'Users', 'private', 'Scout', 'updates', 'Scout.exe'].join('/');
+  const settings = {
+    schemaVersion: 3,
+    startWithWindows: true,
+    startup: { mechanism: 'task-scheduler', verifiedAt: `July 29, 2026 (${privatePath})` },
+    completedSections: { [privatePath]: 1 },
+    deferredSections: { [privatePath]: privatePath },
+    updates: {
+      policy: 'download',
+      lastCheckedAt: privatePath,
+      lastNotifiedVersion: privatePath,
+      downloaded: {
+        path: privatePath,
+        name: 'Scout-0.1.0-beta.22-windows-x64.exe',
+        sha256: 'a'.repeat(64),
+        version: '0.1.0-beta.22',
+        verifiedAt: '2026-07-29T10:00:00.000Z',
+      },
+      downloadError: privatePath,
+    },
+  };
+  const result = { available: true, package: { name: 'Scout.exe' }, latestVersion: '0.1.0-beta.23' };
+  assert.equal(canAutoDownloadUpdate('remote-owner', settings, result), false);
+  assert.equal(canAutoDownloadUpdate('local', settings, result), true);
+  const projected = publicDeviceSettings(settings, {
+    supported: true,
+    enabled: false,
+    mechanism: 'task-scheduler',
+    error: privatePath,
+  });
+  assert.equal(projected.updates.policy, 'download');
+  assert.equal(projected.updates.downloaded.name, 'Scout-0.1.0-beta.22-windows-x64.exe');
+  assert.equal(projected.startup.verifiedAt, null);
+  assert.doesNotMatch(JSON.stringify(projected), /Users|completedSections|deferredSections|lastCheckedAt|lastNotifiedVersion/);
+});
+
+test('provider login access classifies the configured remote owner without requiring backup', () => {
+  const settings = {
+    remoteAccess: {
+      enabled: true,
+      ownerLogin: 'owner@example.test',
+      origin: 'https://scout.example.ts.net',
+    },
+  };
+  const req = {
+    method: 'POST',
+    headers: {
+      host: 'scout.example.ts.net',
+      origin: 'https://scout.example.ts.net',
+      'tailscale-user-login': 'owner@example.test',
+      'content-type': 'application/json',
+    },
+    socket: { remoteAddress: '127.0.0.1' },
+  };
+  assert.deepEqual(
+    requestAccess(req, new URL('https://scout.example.ts.net/api/provider-login/start'), settings),
+    { ok: true, access: 'remote-owner' },
+  );
+  assert.equal(
+    requestAccess(
+      { ...req, headers: { ...req.headers, 'tailscale-user-login': 'other@example.test' } },
+      new URL('https://scout.example.ts.net/api/provider-login/start'),
+      settings,
+    ).ok,
+    false,
+  );
+  assert.equal(
+    requestAccess(
+      { ...req, headers: { ...req.headers, origin: undefined } },
+      new URL('https://scout.example.ts.net/api/provider-login/start'),
+      settings,
+    ).ok,
+    false,
+  );
+});
+
+test('provider login routes require same-origin JSON, ephemeral CSRF and server-derived ownership', async () => {
+  const calls = [];
+  const session = {
+    codeRequired: false,
+    createdAt: '2026-07-29T10:00:00.000Z',
+    expiresAt: '2026-07-29T10:10:00.000Z',
+    provider: 'codex',
+    reasonCode: null,
+    sessionId: '00000000-0000-4000-8000-000000000001',
+    state: 'starting',
+    userCode: null,
+    verificationUrl: null,
+  };
+  const original = providerLoginControl.manager;
+  const originalDeviceSettings = fs.existsSync(process.env.SCOUT_DEVICE_SETTINGS)
+    ? fs.readFileSync(process.env.SCOUT_DEVICE_SETTINGS)
+    : null;
+  providerLoginControl.manager = {
+    async startProviderLogin(provider, owner) {
+      calls.push(['start', provider, owner]);
+      return session;
+    },
+    async retryProviderLogin(provider, previousSessionId, owner) {
+      calls.push(['retry', provider, previousSessionId, owner]);
+      return session;
+    },
+    getActiveProviderLogin(provider, owner) {
+      calls.push(['status', provider, owner]);
+      return null;
+    },
+    async submitProviderLoginCode(id, code, owner) {
+      calls.push(['code', id, code, owner]);
+      return { ...session, provider: 'claude', state: 'authenticating' };
+    },
+    async cancelProviderLogin(id, owner) {
+      calls.push(['cancel', id, owner]);
+      return { ...session, state: 'cancelled', reasonCode: 'cancelled' };
+    },
+    getProviderLoginSession(id, owner) {
+      calls.push(['get', id, owner]);
+      return { ...session, state: 'failed', reasonCode: 'login-failed' };
+    },
+    async clearClaudeCredentials(previousSessionId, owner) {
+      calls.push(['clear', previousSessionId, owner]);
+      return this.clearResult || {
+        provider: 'claude', reasonCode: null, state: 'cleared',
+      };
+    },
+    async shutdown() {},
+  };
+  try {
+    const statusResponse = await request({
+      path: '/api/provider-login/status?provider=codex',
+      headers: { host: `127.0.0.1:${port}` },
+    });
+    assert.equal(statusResponse.status, 200);
+    const status = JSON.parse(statusResponse.text);
+    assert.equal(status.provider, 'codex');
+    assert.equal(status.session, null);
+    assert.match(status.csrfToken, /^[A-Za-z0-9_-]{32,128}$/);
+    assert.deepEqual(Object.keys(status).sort(), ['csrfToken', 'provider', 'session']);
+
+    const missingOrigin = await request({
+      method: 'POST',
+      path: '/api/provider-login/start',
+      headers: {
+        host: `127.0.0.1:${port}`,
+        'content-type': 'application/json',
+        'x-scout-provider-login-csrf': status.csrfToken,
+      },
+      body: '{"provider":"codex"}',
+    });
+    assert.equal(missingOrigin.status, 403);
+
+    const wrongType = await request({
+      method: 'POST',
+      path: '/api/provider-login/start',
+      headers: {
+        host: `127.0.0.1:${port}`,
+        origin: `http://127.0.0.1:${port}`,
+        'content-type': 'text/plain',
+        'x-scout-provider-login-csrf': status.csrfToken,
+      },
+      body: '{"provider":"codex"}',
+    });
+    assert.equal(wrongType.status, 415);
+
+    const missingCsrf = await request({
+      method: 'POST',
+      path: '/api/provider-login/start',
+      headers: JSON_HEADERS(),
+      body: '{"provider":"codex"}',
+    });
+    assert.equal(missingCsrf.status, 403);
+
+    const extraField = await request({
+      method: 'POST',
+      path: '/api/provider-login/start',
+      headers: { ...JSON_HEADERS(), 'x-scout-provider-login-csrf': status.csrfToken },
+      body: '{"provider":"codex","command":"sh"}',
+    });
+    assert.equal(extraField.status, 400);
+
+    const started = await request({
+      method: 'POST',
+      path: '/api/provider-login/start',
+      headers: { ...JSON_HEADERS(), 'x-scout-provider-login-csrf': status.csrfToken },
+      body: '{"provider":"codex"}',
+    });
+    assert.equal(started.status, 202);
+    assert.deepEqual(JSON.parse(started.text), { session });
+    const owner = calls.find(([name]) => name === 'start')[2];
+    assert.equal(owner.access, 'local');
+    assert.equal(owner.originVerified, true);
+    assert.equal(owner.csrfVerified, true);
+    assert.match(owner.ownerId, /^[A-Za-z0-9._:-]{1,128}$/);
+    assert.equal(JSON.stringify(owner).includes(status.csrfToken), false);
+
+    const csrfHeaders = {
+      ...JSON_HEADERS(),
+      'x-scout-provider-login-csrf': status.csrfToken,
+    };
+    const code = await request({
+      method: 'POST',
+      path: '/api/provider-login/code',
+      headers: csrfHeaders,
+      body: JSON.stringify({ sessionId: session.sessionId, code: 'CODE-1234' }),
+    });
+    assert.equal(code.status, 200);
+    assert.equal(JSON.parse(code.text).session.state, 'authenticating');
+
+    const cancelled = await request({
+      method: 'POST',
+      path: '/api/provider-login/cancel',
+      headers: csrfHeaders,
+      body: JSON.stringify({ sessionId: session.sessionId }),
+    });
+    assert.equal(cancelled.status, 200);
+    assert.equal(JSON.parse(cancelled.text).session.state, 'cancelled');
+
+    const operationsBeforeRetry = JSON.stringify(operations.list());
+    const durableFilesBeforeRetry = fs.existsSync(testWorkspace)
+      ? fs.readdirSync(testWorkspace, { recursive: true }).map(String).sort()
+      : [];
+    const retried = await request({
+      method: 'POST',
+      path: '/api/provider-login/retry',
+      headers: csrfHeaders,
+      body: JSON.stringify({ provider: 'codex', sessionId: session.sessionId }),
+    });
+    assert.equal(retried.status, 202);
+    assert.equal(calls.some(([name]) => name === 'retry'), true);
+    assert.equal(JSON.stringify(operations.list()), operationsBeforeRetry);
+    assert.deepEqual(
+      fs.readdirSync(testWorkspace, { recursive: true }).map(String).sort(),
+      durableFilesBeforeRetry,
+    );
+
+    const unconfirmedClear = await request({
+      method: 'POST',
+      path: '/api/provider-login/clear-claude-credentials',
+      headers: csrfHeaders,
+      body: JSON.stringify({ confirmed: false, sessionId: session.sessionId }),
+    });
+    assert.equal(unconfirmedClear.status, 409);
+    assert.equal(calls.some(([name]) => name === 'clear'), false);
+
+    providerLoginControl.manager.clearResult = {
+      provider: 'claude', reasonCode: 'logout-failed', state: 'failed',
+    };
+    const failedClear = await request({
+      method: 'POST',
+      path: '/api/provider-login/clear-claude-credentials',
+      headers: csrfHeaders,
+      body: JSON.stringify({ confirmed: true, sessionId: session.sessionId }),
+    });
+    assert.equal(failedClear.status, 502);
+    assert.equal(JSON.parse(failedClear.text).result.state, 'failed');
+    providerLoginControl.manager.clearResult = null;
+
+    const cleared = await request({
+      method: 'POST',
+      path: '/api/provider-login/clear-claude-credentials',
+      headers: csrfHeaders,
+      body: JSON.stringify({ confirmed: true, sessionId: session.sessionId }),
+    });
+    assert.equal(cleared.status, 200);
+    assert.deepEqual(JSON.parse(cleared.text), {
+      result: { provider: 'claude', reasonCode: null, state: 'cleared' },
+    });
+
+    fs.writeFileSync(process.env.SCOUT_DEVICE_SETTINGS, JSON.stringify({
+      schemaVersion: 2,
+      remoteAccess: {
+        enabled: true,
+        ownerLogin: 'owner@example.test',
+        origin: 'https://scout.example.ts.net',
+      },
+    }));
+    const remoteHeaders = {
+      host: 'scout.example.ts.net',
+      origin: 'https://scout.example.ts.net',
+      'tailscale-user-login': 'owner@example.test',
+      'content-type': 'application/json',
+    };
+    const remoteStatusResponse = await request({
+      path: '/api/provider-login/status?provider=codex',
+      headers: remoteHeaders,
+    });
+    assert.equal(remoteStatusResponse.status, 200);
+    const remoteStatus = JSON.parse(remoteStatusResponse.text);
+    const remoteStarted = await request({
+      method: 'POST',
+      path: '/api/provider-login/start',
+      headers: {
+        ...remoteHeaders,
+        'x-scout-provider-login-csrf': remoteStatus.csrfToken,
+      },
+      body: '{"provider":"codex"}',
+    });
+    assert.equal(remoteStarted.status, 202);
+    const remoteOwner = calls.filter(([name]) => name === 'start').at(-1)[2];
+    assert.equal(remoteOwner.access, 'remote-owner');
+    assert.equal(remoteOwner.ownerId, owner.ownerId);
+    assert.notEqual(remoteStatus.csrfToken, status.csrfToken);
+  } finally {
+    providerLoginControl.manager = original;
+    if (originalDeviceSettings) fs.writeFileSync(
+      process.env.SCOUT_DEVICE_SETTINGS,
+      originalDeviceSettings,
+    );
+    else fs.rmSync(process.env.SCOUT_DEVICE_SETTINGS, { force: true });
+  }
+});
+
 function profileDraft() {
   return {
     version: 1,
@@ -66,6 +737,7 @@ function profileDraft() {
       primaryTitles: [{ value: 'Researcher', strength: 'mandatory', provenance: 'explicit' }],
       locations: [{ value: 'Remote', strength: 'strong-preference', provenance: 'explicit' }],
       sectors: [{ value: 'Public interest', strength: 'nice-to-have', provenance: 'unconfirmed-inference' }],
+      employers: [{ value: 'Example Research', strength: 'strong-preference', provenance: 'explicit' }],
     },
     negative: {
       excludedTitles: [{ value: 'Commission-only', strength: 'hard-exclusion', provenance: 'explicit' }],
@@ -95,13 +767,46 @@ test('search-profile routes review a complete draft and publish only the current
   fs.writeFileSync(path.join(paths.profile, 'calibration.md'), 'Synthetic calibration evidence. '.repeat(5), 'utf8');
   fs.writeFileSync(path.join(paths.cv, 'master-cv.md'), 'Synthetic CV evidence. '.repeat(25), 'utf8');
   fs.mkdirSync(path.join(WORKSPACE_ROOT, '.scout', 'onboarding'), { recursive: true });
-  fs.writeFileSync(path.join(WORKSPACE_ROOT, '.scout', 'onboarding', 'activated.json'), '{"approved":true}\n', 'utf8');
+  const activatedHashes = Object.fromEntries([
+    'workspace.json', 'profile/context.md', 'profile/calibration.md',
+    'cv/master-cv.md', 'data/search-categories.json',
+  ].map((relative) => [
+    relative,
+    crypto.createHash('sha256').update(fs.readFileSync(path.join(WORKSPACE_ROOT, relative))).digest('hex'),
+  ]));
+  fs.writeFileSync(
+    path.join(WORKSPACE_ROOT, '.scout', 'onboarding', 'activated.json'),
+    `${JSON.stringify({ activatedHashes })}\n`,
+    'utf8',
+  );
   const setupStatus = await request({ method: 'GET', path: '/api/setup/status' });
   assert.equal(setupStatus.status, 200);
+  assert.equal(JSON.parse(setupStatus.text).searchProfilePublished, false);
   const migrated = await request({ method: 'GET', path: '/api/search-profile' });
   assert.equal(migrated.status, 200);
-  assert.equal(JSON.parse(migrated.text).draft?.status, 'draft');
+  const migratedState = JSON.parse(migrated.text);
+  assert.equal(migratedState.draft?.status, 'draft');
+  assert.equal(
+    migratedState.draft.target.primaryTitles[0].provenance,
+    'deterministic-derivation',
+  );
   assert.equal(fs.existsSync(paths.searchProfilePublished), false);
+
+  const migratedPublication = await request({
+    method: 'POST', path: '/api/search-profile/publish', headers: JSON_HEADERS(),
+    body: JSON.stringify({ revision: migratedState.draftRevision, confirmed: true }),
+  });
+  assert.equal(migratedPublication.status, 200);
+  const migratedResult = JSON.parse(migratedPublication.text);
+  assert.equal(
+    migratedResult.published.target.primaryTitles[0].provenance,
+    'deterministic-derivation',
+  );
+  assert.equal(migratedResult.lanePlan.profileId, migratedResult.published.id);
+  const migratedLanePlan = JSON.parse(fs.readFileSync(paths.searchLanes, 'utf8'));
+  assert.ok(migratedLanePlan.lanes.some(({ profileFields }) => (
+    profileFields.some(({ provenance }) => provenance === 'deterministic-derivation')
+  )));
 
   const draft = profileDraft();
   fs.mkdirSync(path.dirname(paths.searchProfileDraft), { recursive: true });
@@ -112,8 +817,14 @@ test('search-profile routes review a complete draft and publish only the current
   const reviewed = await request({ method: 'GET', path: '/api/search-profile' });
   assert.equal(reviewed.status, 200);
   assert.deepEqual(JSON.parse(reviewed.text), {
-    rawPresent: true, draft, published: null, draftRevision: revision,
+    rawPresent: true, draft, published: migratedResult.published, draftRevision: revision,
   });
+  const adaptive = await request({ method: 'GET', path: '/api/search-profile/adaptive' });
+  assert.equal(adaptive.status, 200);
+  const adaptiveState = JSON.parse(adaptive.text);
+  assert.equal(adaptiveState.lanePlan.profileId, migratedResult.published.id);
+  assert.equal(adaptiveState.questionnaire.questions[0].phase, 'universal');
+  assert.ok(adaptiveState.questionnaire.questions.some(({ phase }) => phase === 'specialist'));
 
   const partial = await request({
     method: 'PUT', path: '/api/search-profile/draft', headers: JSON_HEADERS(),
@@ -128,9 +839,26 @@ test('search-profile routes review a complete draft and publish only the current
   assert.equal(saved.status, 200);
   assert.equal(JSON.parse(saved.text).draftRevision, revision);
 
+  const adapt = await request({
+    method: 'PUT', path: '/api/search-profile/adaptive', headers: JSON_HEADERS(),
+    body: JSON.stringify({
+      revision,
+      answers: [{
+        questionId: 'specialist-skills',
+        values: [{ value: 'Evidence synthesis', strength: 'strong-preference' }],
+      }],
+    }),
+  });
+  assert.equal(adapt.status, 200);
+  const adapted = JSON.parse(adapt.text);
+  assert.notEqual(adapted.draftRevision, revision);
+  assert.deepEqual(adapted.draft.target.skills, [{
+    value: 'Evidence synthesis', strength: 'strong-preference', provenance: 'explicit',
+  }]);
+
   const unconfirmed = await request({
     method: 'POST', path: '/api/search-profile/publish', headers: JSON_HEADERS(),
-    body: JSON.stringify({ revision, confirmed: false }),
+    body: JSON.stringify({ revision: adapted.draftRevision, confirmed: false }),
   });
   assert.equal(unconfirmed.status, 409);
 
@@ -142,13 +870,170 @@ test('search-profile routes review a complete draft and publish only the current
 
   const published = await request({
     method: 'POST', path: '/api/search-profile/publish', headers: JSON_HEADERS(),
-    body: JSON.stringify({ revision, confirmed: true }),
+    body: JSON.stringify({ revision: adapted.draftRevision, confirmed: true }),
   });
   assert.equal(published.status, 200);
   const result = JSON.parse(published.text);
   assert.match(result.published.id, /^profile-[a-f0-9]{12}$/);
-  assert.deepEqual(JSON.parse(fs.readFileSync(paths.searchProfilePublished, 'utf8')), result.published);
+  assert.equal(result.historicalRerank.created, true);
+  assert.ok(result.historicalRerank.totals.reconstructed >= 0);
+  assert.equal(
+    fs.existsSync(path.join(paths.profile, 'search', 'rankings', `${result.published.id}.json`)),
+    true,
+  );
+  const publishedArtifact = JSON.parse(fs.readFileSync(paths.searchProfilePublished, 'utf8'));
+  assert.equal(publishedArtifact._scoutMutation?.schemaVersion, 1);
+  assert.match(publishedArtifact._scoutMutation?.mutationId || '', /^mutation-[a-f0-9]{40}$/);
+  assert.deepEqual(loadPublishedSearchProfile(WORKSPACE_ROOT), result.published);
+  const publishedStatus = await request({ method: 'GET', path: '/api/setup/status' });
+  assert.equal(publishedStatus.status, 200);
+  assert.equal(JSON.parse(publishedStatus.text).searchProfilePublished, true);
+  const lanePlan = JSON.parse(fs.readFileSync(paths.searchLanes, 'utf8'));
+  assert.equal(lanePlan.profileId, result.published.id);
+  assert.ok(lanePlan.lanes.some(({ profileFields }) => (
+    profileFields.some(({ path: field }) => field === 'target.skills')
+  )));
+  assert.equal(result.lanePlan.profileId, result.published.id);
+  const employerRegistry = JSON.parse(fs.readFileSync(paths.employers, 'utf8'));
+  assert.equal(employerRegistry.schemaVersion, 1);
+  const namedEmployer = employerRegistry.employers.find(
+    ({ canonicalName }) => canonicalName === 'Example Research',
+  );
+  assert.equal(namedEmployer.userPriority, 'priority');
+  assert.equal(namedEmployer.origins[0].kind, 'named-profile');
+  assert.equal(result.employerRegistry.active, 1);
+  assert.match(result.employerRegistry.revision, /^[a-f0-9]{64}$/);
   assert.equal(loadWorkspaceConfig(WORKSPACE_ROOT).searchProfile.publishedId, result.published.id);
+
+  const employerReviewResponse = await request({ method: 'GET', path: '/api/employers' });
+  assert.equal(employerReviewResponse.status, 200);
+  const employerReview = JSON.parse(employerReviewResponse.text);
+  assert.equal(employerReview.employers[0].canonicalName, 'Example Research');
+  assert.match(employerReview.revision, /^[a-f0-9]{64}$/);
+  const retiredEmployerResponse = await request({
+    method: 'PUT', path: '/api/employers', headers: JSON_HEADERS(),
+    body: JSON.stringify({
+      revision: employerReview.revision,
+      confirmed: true,
+      employer: {
+        id: employerReview.employers[0].id,
+        userPriority: 'inactive',
+        reason: 'Reviewed pause',
+        aliases: ['Example Research Ltd'],
+        industries: ['Research'],
+        locations: ['London'],
+      },
+    }),
+  });
+  assert.equal(retiredEmployerResponse.status, 200);
+  const retiredEmployerRegistry = JSON.parse(retiredEmployerResponse.text).registry;
+  assert.equal(retiredEmployerRegistry.employers[0].decision.state, 'inactive');
+  assert.equal(retiredEmployerRegistry.employers[0].decision.reason, 'Reviewed pause');
+  assert.deepEqual(retiredEmployerRegistry.employers[0].aliases, ['Example Research Ltd']);
+  assert.deepEqual(retiredEmployerRegistry.employers[0].industries, ['Research']);
+  assert.deepEqual(retiredEmployerRegistry.employers[0].locations, ['London']);
+  assert.equal(retiredEmployerRegistry.employers[0].reviewHistory.length, 1);
+  const staleEmployerResponse = await request({
+    method: 'PUT', path: '/api/employers', headers: JSON_HEADERS(),
+    body: JSON.stringify({
+      revision: employerReview.revision,
+      confirmed: true,
+      employer: {
+        id: employerReview.employers[0].id,
+        userPriority: 'relevant',
+      },
+    }),
+  });
+  assert.equal(staleEmployerResponse.status, 409);
+  const undoEmployerResponse = await request({
+    method: 'POST', path: '/api/employers/undo', headers: JSON_HEADERS(),
+    body: JSON.stringify({
+      revision: retiredEmployerRegistry.revision,
+      confirmed: true,
+      employerId: retiredEmployerRegistry.employers[0].id,
+      reviewId: retiredEmployerRegistry.employers[0].reviewHistory[0].id,
+    }),
+  });
+  assert.equal(undoEmployerResponse.status, 200);
+  const restoredEmployerRegistry = JSON.parse(undoEmployerResponse.text).registry;
+  assert.deepEqual(restoredEmployerRegistry.employers[0].aliases, []);
+  assert.deepEqual(restoredEmployerRegistry.employers[0].industries, []);
+  assert.deepEqual(restoredEmployerRegistry.employers[0].locations, []);
+  assert.equal(restoredEmployerRegistry.employers[0].reviewHistory[1].undoOf,
+    retiredEmployerRegistry.employers[0].reviewHistory[0].id);
+
+  const retireLane = lanePlan.lanes[0];
+  let recordedPlan = lanePlan;
+  for (let index = 1; index <= 3; index += 1) {
+    recordedPlan = recordSearchLaneRun(recordedPlan, {
+      runId: `server-lane-run-${index}`,
+      recordedAt: `2026-07-${String(20 + index).padStart(2, '0')}T10:00:00.000Z`,
+      results: [{
+        laneId: retireLane.id,
+        returned: 0, parsed: 0, new: 0, eligible: 0, selected: 0, promising: 0,
+      }],
+    });
+  }
+  writeSearchLanePlan(WORKSPACE_ROOT, recordedPlan);
+  const laneRevision = searchLanePlanRevision(recordedPlan);
+
+  const unconfirmedRetirement = await request({
+    method: 'POST', path: '/api/search-lanes/retire-unproductive', headers: JSON_HEADERS(),
+    body: JSON.stringify({ revision: laneRevision, confirmed: false }),
+  });
+  assert.equal(unconfirmedRetirement.status, 400);
+  const staleRetirement = await request({
+    method: 'POST', path: '/api/search-lanes/retire-unproductive', headers: JSON_HEADERS(),
+    body: JSON.stringify({ revision: 'stale', confirmed: true }),
+  });
+  assert.equal(staleRetirement.status, 409);
+  const retiredResponse = await request({
+    method: 'POST', path: '/api/search-lanes/retire-unproductive', headers: JSON_HEADERS(),
+    body: JSON.stringify({ revision: laneRevision, confirmed: true }),
+  });
+  assert.equal(retiredResponse.status, 200);
+  const retiredState = JSON.parse(retiredResponse.text);
+  assert.equal(
+    retiredState.lanePlan.lanes.find(({ id }) => id === retireLane.id).state,
+    'retired',
+  );
+
+  const restoredResponse = await request({
+    method: 'POST', path: '/api/search-lanes/restore', headers: JSON_HEADERS(),
+    body: JSON.stringify({
+      revision: retiredState.laneRevision,
+      laneId: retireLane.id,
+      confirmed: true,
+    }),
+  });
+  assert.equal(restoredResponse.status, 200);
+  const restoredState = JSON.parse(restoredResponse.text);
+  const restoredLane = restoredState.lanePlan.lanes.find(({ id }) => id === retireLane.id);
+  assert.equal(restoredLane.state, 'active');
+  assert.equal(restoredLane.history.length, 3);
+
+  const blockingLease = acquireScanLease(WORKSPACE_ROOT, currentLeaseOwner(), {
+    kind: 'scan',
+    runId: 'server-lane-blocking-scan',
+  });
+  try {
+    const blockedRetirement = await request({
+      method: 'POST', path: '/api/search-lanes/retire-unproductive', headers: JSON_HEADERS(),
+      body: JSON.stringify({
+        revision: restoredState.laneRevision,
+        confirmed: true,
+      }),
+    });
+    assert.equal(blockedRetirement.status, 409);
+    assert.match(JSON.parse(blockedRetirement.text).error, /in progress/i);
+    assert.equal(
+      JSON.parse(fs.readFileSync(paths.searchLanes, 'utf8'))
+        .lanes.find(({ id }) => id === retireLane.id).state,
+      'active',
+    );
+  } finally {
+    releaseScanLease(blockingLease);
+  }
 });
 
 test('local server rejects a non-loopback Host header', async () => {
@@ -198,6 +1083,88 @@ test('remote pages and APIs require the configured Tailscale owner', async () =>
   assert.equal(alteredOrigin.status, 403);
 });
 
+test('Codex deep-link capability is device-local, bounded and private', async () => {
+  const settingsFile = process.env.SCOUT_DEVICE_SETTINGS;
+  const previousSettings = fs.existsSync(settingsFile) ? fs.readFileSync(settingsFile) : null;
+  const previousInspector = codexDeepLinkDetection.inspect;
+  let inspections = 0;
+  try {
+    fs.writeFileSync(settingsFile, JSON.stringify({
+      schemaVersion: 3,
+      remoteAccess: {
+        enabled: true,
+        ownerLogin: 'owner@example.com',
+        origin: 'https://scout-host.example.ts.net',
+        httpsPort: 443,
+        managedMapping: { protocol: 'https', port: 443, target: 'http://127.0.0.1:8459' },
+      },
+    }));
+    codexDeepLinkDetection.inspect = async () => {
+      inspections += 1;
+      return {
+        registered: false,
+        registryPath: 'HKCU\\Software\\Classes\\codex',
+        executable: ['C:', 'Users', 'private', 'Codex.exe'].join('\\'),
+        error: `person@example.test token=${'secret'}`,
+      };
+    };
+    const local = await request({ path: '/api/device/codex-deep-link' });
+    assert.equal(local.status, 200);
+    const localBody = JSON.parse(local.text);
+    assert.equal(localBody.state, 'unavailable');
+    assert.equal(localBody.canAttempt, false);
+    assert.doesNotMatch(local.text, /registry|Users|person@|token|executable|error/i);
+
+    const remote = await request({
+      path: '/api/device/codex-deep-link',
+      headers: { host: 'scout-host.example.ts.net', 'tailscale-user-login': 'owner@example.com' },
+    });
+    assert.equal(remote.status, 200);
+    assert.equal(JSON.parse(remote.text).state, 'remote');
+    assert.equal(inspections, 1);
+  } finally {
+    codexDeepLinkDetection.inspect = previousInspector;
+    if (previousSettings) fs.writeFileSync(settingsFile, previousSettings);
+    else fs.rmSync(settingsFile, { force: true });
+  }
+});
+
+test('Codex handler inspection uses only fixed read-only platform commands', async () => {
+  const macCalls = [];
+  const mac = await inspectCodexDeepLinkHandler({
+    platform: 'darwin',
+    run: async (command, args) => {
+      macCalls.push([command, args]);
+      return {
+        status: 0,
+        failed: false,
+        timedOut: false,
+        exceeded: false,
+        stdout: '({ LSHandlerRoleAll = "com.openai.codex"; LSHandlerURLScheme = codex; })',
+      };
+    },
+  });
+  assert.deepEqual(mac, { registered: true });
+  assert.deepEqual(macCalls, [[
+    '/usr/bin/defaults',
+    ['read', 'com.apple.LaunchServices/com.apple.launchservices.secure', 'LSHandlers'],
+  ]]);
+
+  const windowsCalls = [];
+  const windows = await inspectCodexDeepLinkHandler({
+    platform: 'win32',
+    run: async (command, args) => {
+      windowsCalls.push([command, args]);
+      return { status: windowsCalls.length === 2 ? 0 : 1, failed: false, timedOut: false, exceeded: false };
+    },
+  });
+  assert.deepEqual(windows, { registered: true });
+  assert.deepEqual(windowsCalls, [
+    ['reg.exe', ['query', 'HKCU\\Software\\Classes\\codex\\shell\\open\\command', '/ve']],
+    ['reg.exe', ['query', 'HKCR\\codex\\shell\\open\\command', '/ve']],
+  ]);
+});
+
 test('remote owner mutations require HTTPS Origin and administration remains local-only', async () => {
   const remote = { host: 'scout-host.example.ts.net', 'tailscale-user-login': 'owner@example.com', 'content-type': 'application/json' };
   const noOrigin = await request({ method: 'POST', path: '/api/chat/stop', headers: remote, body: '{}' });
@@ -211,6 +1178,14 @@ test('remote owner mutations require HTTPS Origin and administration remains loc
   fs.writeFileSync(path.join(testWorkspace, '.scout', 'sync.json'), JSON.stringify({ version: 1, enabled: true, remoteUrl: 'git@github.com:example/private.git' }));
   const ownerChat = await request({ method: 'POST', path: '/api/chat/stop', headers: { ...remote, origin: 'https://scout-host.example.ts.net' }, body: JSON.stringify({ id: 'none' }) });
   assert.equal(ownerChat.status, 200);
+  const backupResolution = await request({
+    method: 'POST',
+    path: '/api/sync/resolve',
+    headers: { ...remote, origin: 'https://scout-host.example.ts.net' },
+    body: JSON.stringify({ analysisToken: '0'.repeat(64), confirmed: false }),
+  });
+  assert.equal(backupResolution.status, 409);
+  assert.match(JSON.parse(backupResolution.text).error, /Confirm/);
   const localOnly = await request({ method: 'POST', path: '/api/remote-access/disable', headers: { ...remote, origin: 'https://scout-host.example.ts.net' }, body: '{}' });
   assert.equal(localOnly.status, 403);
   assert.match(JSON.parse(localOnly.text).error, /only be changed on the Scout host/);
@@ -225,6 +1200,25 @@ test('remote owner mutations require HTTPS Origin and administration remains loc
   assert.match(JSON.parse(rotatePassphrase.text).error, /only be changed on the Scout host/);
   const remoteUpdate = await request({ method: 'POST', path: '/api/update/download', headers: { ...remote, origin: 'https://scout-host.example.ts.net' }, body: '{}' });
   assert.equal(remoteUpdate.status, 403);
+});
+
+test('backup divergence confirmation cannot acquire authority while a scan owns the fence', async () => {
+  const active = acquireScanLease(testWorkspace, currentLeaseOwner(), {
+    kind: 'scan', runId: 'active-scan-during-backup-resolution',
+  });
+  assert.ok(active);
+  try {
+    const response = await request({
+      method: 'POST',
+      path: '/api/sync/resolve',
+      headers: JSON_HEADERS(),
+      body: JSON.stringify({ analysisToken: '1'.repeat(64), confirmed: true }),
+    });
+    assert.equal(response.status, 409);
+    assert.match(JSON.parse(response.text).error, /scan or workspace mutation is in progress/i);
+  } finally {
+    releaseScanLease(active);
+  }
 });
 
 test('local device settings keep update downloads explicitly opt-in', async () => {
@@ -343,6 +1337,12 @@ test('served shell and service worker receive the exact UI build id', async () =
   assert.match(page.text, new RegExp(`scout-icon\\.png\\?v=${UI_BUILD_ID}`));
   assert.doesNotMatch(page.text, /__SCOUT_UI_BUILD__/);
 
+  const app = await request({ path: `/app.js?v=${UI_BUILD_ID}` });
+  assert.equal(app.headers['cache-control'], 'no-cache');
+  assert.match(app.text, new RegExp(`chatDrawerState\\.mjs\\?v=${UI_BUILD_ID}`));
+  assert.match(app.text, new RegExp(`codexDeepLink\\.mjs\\?v=${UI_BUILD_ID}`));
+  assert.doesNotMatch(app.text, /__SCOUT_UI_BUILD__/);
+
   const manifest = await request({ path: '/manifest.webmanifest' });
   assert.equal(manifest.headers['cache-control'], 'no-cache');
   assert.match(manifest.text, new RegExp(`scout-icon\\.png\\?v=${UI_BUILD_ID}`));
@@ -352,6 +1352,40 @@ test('served shell and service worker receive the exact UI build id', async () =
   assert.equal(worker.headers['cache-control'], 'no-cache');
   assert.match(worker.text, new RegExp(`const BUILD = '${UI_BUILD_ID}'`));
   assert.doesNotMatch(worker.text, /__SCOUT_UI_BUILD__/);
+});
+
+test('a change to the character module alone moves the UI build fingerprint', () => {
+  const readOriginal = (name) => fs.readFileSync(path.join(APP_ROOT, 'ui', name));
+  assert.equal(computeUiBuildId(readOriginal), UI_BUILD_ID);
+
+  // Only ui/lib/scoutCharacter.mjs differs. If it were missing from the
+  // fingerprint inputs, a module-only release would keep the old build id, the
+  // old `scout-shell-<id>` cache and the old ?v= module URL, so installed PWAs
+  // would go on running the previous character definitions.
+  const mutated = computeUiBuildId((name) => (name === 'lib/scoutCharacter.mjs'
+    ? Buffer.from('export const SCOUT_STATES = {};')
+    : readOriginal(name)));
+  assert.notEqual(mutated, UI_BUILD_ID);
+  assert.ok(UI_BUILD_FILES.includes('lib/scoutCharacter.mjs'));
+});
+
+test('the served shell and offline cache both version the character module', async () => {
+  const versioned = new RegExp(`/lib/scoutCharacter\\.mjs\\?v=${UI_BUILD_ID}`);
+  const page = await request({ path: '/' });
+  assert.match(page.text, versioned);
+
+  // The worker interpolates BUILD itself, so the served copy proves the cached
+  // module URL and the cache name both carry this build id.
+  const worker = await request({ path: '/service-worker.js' });
+  assert.match(worker.text, new RegExp(`const BUILD = '${UI_BUILD_ID}'`));
+  assert.match(worker.text, /const CACHE_PREFIX = 'scout-shell-'/);
+  assert.match(worker.text, /const CACHE = `\$\{CACHE_PREFIX\}\$\{BUILD\}`/);
+  assert.match(worker.text, /`\/lib\/scoutCharacter\.mjs\?v=\$\{BUILD\}`/);
+  assert.doesNotMatch(worker.text, /__SCOUT_UI_BUILD__/);
+
+  const module = await request({ path: '/lib/scoutCharacter.mjs' });
+  assert.equal(module.status, 200);
+  assert.match(module.headers['content-type'], /text\/javascript/);
 });
 
 test('restart responds first, then schedules the respawn', async () => {
@@ -369,9 +1403,38 @@ test('restart responds first, then schedules the respawn', async () => {
     assert.equal(response.status, 200);
     assert.deepEqual(JSON.parse(response.text), { ok: true, restarting: true });
     assert.equal(respawned, false, 'respawn must happen after the response is sent');
-    await new Promise((resolve) => setTimeout(resolve, 350));
+    assert.equal((await request({ path: '/api/app-info' })).status, 503);
+    const deadline = Date.now() + 2_000;
+    while (!respawned && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
     assert.equal(respawned, true);
   } finally {
+    restartControl.respawn = originalRespawn;
+  }
+});
+
+test('restart does not hand off to a successor while provider shutdown is unconfirmed', async () => {
+  const originalRespawn = restartControl.respawn;
+  const originalManager = providerLoginControl.manager;
+  let respawned = false;
+  restartControl.respawn = () => { respawned = true; };
+  providerLoginControl.manager = {
+    shutdown: async () => { throw new Error('provider child did not close during shutdown'); },
+  };
+  try {
+    const host = `127.0.0.1:${port}`;
+    const response = await request({
+      method: 'POST',
+      path: '/api/restart',
+      headers: { host, origin: `http://${host}`, 'content-type': 'application/json' },
+      body: '{}',
+    });
+    assert.equal(response.status, 200);
+    await new Promise((resolve) => setTimeout(resolve, 350));
+    assert.equal(respawned, false);
+  } finally {
+    providerLoginControl.manager = originalManager;
     restartControl.respawn = originalRespawn;
   }
 });
@@ -459,6 +1522,7 @@ test('shutdown responds before scheduling process exit', async () => {
     assert.equal(response.status, 200);
     assert.deepEqual(JSON.parse(response.text), { ok: true, shuttingDown: true });
     assert.equal(exited, false, 'exit must happen after the response is sent');
+    assert.equal((await request({ path: '/api/app-info' })).status, 503);
     await new Promise((resolve) => setTimeout(resolve, 300));
     assert.equal(exited, true);
   } finally {
@@ -559,15 +1623,51 @@ test('latest scan API exposes only bounded review fields and scan health omits r
   assert.doesNotMatch(text, /private query|full advert|private evidence|provider prompt/);
   const health = await request({ path: '/api/scan-health' });
   assert.doesNotMatch(health.text, /private query/);
+  const storage = JSON.parse(health.text).storagePressure;
+  assert.equal(['healthy', 'warning', 'blocked'].includes(storage.state), true);
+  assert.deepEqual(Object.keys(storage.totals).sort(), ['artifacts', 'queue', 'runs', 'totalBytes']);
+  assert.doesNotMatch(JSON.stringify(storage), /private-run|scan-lease|workspace/i);
 });
 
 test('latest scan API exposes reconciled metrics and bounded explanations only', async () => {
   fs.mkdirSync(path.join(testWorkspace, 'data'), { recursive: true });
   fs.writeFileSync(path.join(testWorkspace, 'data', 'scan-runs.jsonl'), `${JSON.stringify({
-    schemaVersion: 4, timestamp: '2026-07-26T10:00:00.000Z', agent: 'codex', mode: 'primary', errors: [],
+    schemaVersion: 5, timestamp: '2026-07-26T10:00:00.000Z', agent: 'codex', mode: 'primary', errors: [],
     profile_id: 'profile-123456789abc', discovery_engine: 'ranked-discovery',
-    funnel: { sourceRecords: 2532, sourceErrors: 2, failedSourceRecords: 3, uniqueVacancies: 120, deterministicallyExcluded: 40, eligible: 80, ranked: 80, selected: 60, assessed: 59, assessmentFailed: 1 },
-    explanations: [{ vacancy_id: 'vacancy-1', pre_rank: { score: 82, positive: [{ code: 'title', score: 4, raw: 'private payload' }], negative: [{ code: 'negative', score: -1, path: 'C:\\private' }] }, selection_reason: 'score-band', assessment_status: 'assessed', source: 'ats', sourceUrl: 'https://example.test/job', raw: 'private payload', path: 'C:\\private' }],
+    funnel: {
+      sourceRecords: 2532, sourceErrors: 2, failedSourceRecords: 3, parsed: 2532,
+      normalised: 2529, duplicateObservations: 2409, uniqueVacancies: 120,
+      deterministicallyExcluded: 40, eligible: 80, ranked: 80, aboveThreshold: 60,
+      selected: 60, assessed: 59, assessmentFailed: 1,
+      bySource: {
+        ats: {
+          count: 2532, failedRecords: 3, sourceErrors: 2, sourceRecords: 2532,
+          parsed: 2532, normalised: 2529, duplicateObservations: 2409,
+          uniqueVacancies: 120, deterministicallyExcluded: 40, eligible: 80,
+          ranked: 80, aboveThreshold: 60, selected: 60, assessed: 59, assessmentFailed: 1,
+        },
+      },
+    },
+    coverage: {
+      schemaVersion: 1,
+      source: [{ value: 'ats', found: 120, ranked: 80, selected: 60, excluded: 40, assessed: 59, assessmentFailed: 1 }],
+      employer: [{ value: 'Acme', found: 1, ranked: 1, selected: 0, excluded: 0, assessed: 0, assessmentFailed: 0 }],
+      lane: [], roleFamily: [], location: [],
+      provider: [{ value: 'codex', found: 120, ranked: 80, selected: 60, excluded: 40, assessed: 59, assessmentFailed: 1 }],
+      run: [{ value: 'run-123', found: 120, ranked: 80, selected: 60, excluded: 40, assessed: 59, assessmentFailed: 1 }],
+      date: [{ value: '2026-07-26', found: 120, ranked: 80, selected: 60, excluded: 40, assessed: 59, assessmentFailed: 1 }],
+      failureReasons: [{ value: 'diversity-limit', count: 20 }],
+    },
+    explanations: [{
+      vacancy_id: 'vacancy-1', company: 'Acme', role: 'Platform Engineer',
+      dimensions: { source: 'ats', employer: 'Acme', lane: 'primary', role_family: 'engineering', location: 'London' },
+      stages: { found: true, ranked: true, selected: false, excluded: false, assessed: false },
+      above_threshold: true,
+      pre_rank: { score: 82, positive: [{ code: 'title', score: 4, raw: 'private payload' }], negative: [{ code: 'negative', score: -1, path: 'C:\\private' }] },
+      reason_code: 'diversity-limit', selection_reason: null, assessment_status: 'not-selected',
+      source: 'ats', sourceUrl: 'https://example.test/job?private=query#fragment',
+      raw: 'private payload', path: 'C:\\private',
+    }],
   })}\n`);
   const response = await request({ path: '/api/scans/latest' });
   assert.equal(response.status, 200);
@@ -575,16 +1675,79 @@ test('latest scan API exposes reconciled metrics and bounded explanations only',
   const latest = JSON.parse(response.text).scan;
   assert.equal(latest.funnel.sourceErrors, 2);
   assert.equal(latest.funnel.failedSourceRecords, 3);
+  assert.equal(latest.funnel.bySource.ats.uniqueVacancies, 120);
+  assert.equal(latest.coverage.source[0].found, 120);
+  assert.equal(latest.explanations[0].reasonCode, 'diversity-limit');
+  assert.equal(latest.explanations[0].sourceUrl, 'https://example.test/job');
   assert.doesNotMatch(response.text, /private payload|C:\\private/);
 });
 
-test('latest scan API bounds source URLs in persisted explanation records', async () => {
+test('latest scan API strips oversized query data from persisted explanation URLs', async () => {
   fs.mkdirSync(path.join(testWorkspace, 'data'), { recursive: true });
   const oversizedUrl = `https://example.test/job?${'x'.repeat(5000)}`;
   fs.writeFileSync(path.join(testWorkspace, 'data', 'scan-runs.jsonl'), `${JSON.stringify({ timestamp: '2026-07-26T10:00:00.000Z', explanations: [{ vacancy_id: 'vacancy-1', pre_rank: {}, assessment_status: 'assessed', source: 'ats', sourceUrl: oversizedUrl }] })}\n`);
   const response = await request({ path: '/api/scans/latest' });
   const { scan } = JSON.parse(response.text);
-  assert.equal(scan.explanations[0].sourceUrl, null);
+  assert.equal(scan.explanations[0].sourceUrl, 'https://example.test/job');
+});
+
+test('run and queue APIs expose journal-backed state through privacy-safe summaries', async () => {
+  const runId = 'run-1234567890-private';
+  const lease = acquireScanLease(testWorkspace, currentLeaseOwner(), { kind: 'scan', runId });
+  try {
+    const journal = openRunJournal(testWorkspace, runId);
+    appendRunEvent(journal, {
+      type: 'run.started', stageId: 'initialise', idempotencyKey: 'run-started',
+      payload: {
+        schemaVersion: 1,
+        compatibility: {
+          schemaVersion: 1, mode: 'primary', purpose: 'job-discovery',
+          profileVersion: 'profile-v3', sourceConfigFingerprint: 'a'.repeat(64),
+          journalSchemaVersion: 1, artifactSchemaVersion: 1,
+          pipelineVersion: 'pipeline-v9', rankingVersion: 'ranking-v1',
+          promptVersion: 'prompt-v1', assessmentSchemaVersion: 1,
+          provider: 'codex', model: 'gpt-5', mutationSchemaVersion: 1,
+          targetRevision: 'tracker-v1',
+        },
+      },
+    }, lease);
+    appendRunEvent(journal, {
+      type: 'stage.completed', stageId: 'collect', idempotencyKey: 'collect-completed',
+      payload: { schemaVersion: 1, reference: { kind: 'stage', id: 'collect' }, count: 12 },
+    }, lease);
+    enqueueScanRequest(testWorkspace, {
+      id: 'request-1234567890-private', key: 'manual-discovery',
+      requester: 'manual', purpose: 'job-discovery',
+      requestedAt: '2026-07-29T00:00:00.000Z', expiresAt: '2026-07-30T00:00:00.000Z',
+      windowAt: null,
+      compatibility: {
+        profileFingerprint: 'b'.repeat(64), configFingerprint: 'c'.repeat(64), schemaVersion: 1,
+      },
+      lease,
+    });
+
+    const runsResponse = await request({ path: '/api/scan/runs' });
+    const queueResponse = await request({ path: '/api/scan/queue' });
+    assert.equal(runsResponse.status, 200);
+    assert.equal(queueResponse.status, 200);
+    const runs = JSON.parse(runsResponse.text);
+    const queue = JSON.parse(queueResponse.text);
+    assert.equal(runs.runs[0].id, 'run-1234…');
+    assert.equal(runs.runs[0].state, 'normalising');
+    assert.equal(runs.runs[0].owner, 'active worker');
+    assert.equal(queue.requests[0].id, 'request-…');
+    assert.equal(queue.requests[0].status, 'queued');
+    for (const text of [runsResponse.text, queueResponse.text]) {
+      assert.doesNotMatch(text, /run-1234567890-private|request-1234567890-private/i);
+      assert.doesNotMatch(text, new RegExp(currentLeaseOwner().host.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i'));
+      assert.doesNotMatch(text, new RegExp(String(process.pid)));
+      assert.doesNotMatch(text, /profileFingerprint|configFingerprint|sourceConfigFingerprint|targetRevision/i);
+    }
+  } finally {
+    releaseScanLease(lease);
+    fs.rmSync(path.join(testWorkspace, '.scout', 'runs'), { recursive: true, force: true });
+    fs.rmSync(path.join(testWorkspace, '.scout', 'scan-queue.jsonl'), { force: true });
+  }
 });
 
 test('legacy CV downloads require a hash-bound explicit override', async () => {
@@ -696,11 +1859,258 @@ test('POST /api/status accepts the shortlist status and persists it', async () =
     headers: { host, origin: `http://${host}`, 'content-type': 'application/json' },
     body: JSON.stringify({ id, status: 'shortlist', trackerRevision: before.trackerRevision }),
   });
-  assert.equal(response.status, 200);
+  assert.equal(response.status, 200, response.text);
   assert.equal(JSON.parse(response.text).ok, true);
 
   const saved = JSON.parse(fs.readFileSync(trackerFile, 'utf8')).opportunities[0];
   assert.equal(saved.status, 'shortlist');
+});
+
+test('feedback, proposal, publication and undo remain separate revisioned mutations', { concurrency: false }, async () => {
+  seedWorkspace(APP_ROOT, testWorkspace);
+  const trackerFile = path.join(testWorkspace, 'data', 'opportunities.json');
+  const id = 'feedback-test-2026-07';
+  fs.writeFileSync(trackerFile, `${JSON.stringify({
+    updated: '2026-07-30',
+    opportunities: [{
+      id,
+      company: 'Feedback Test',
+      role: 'Platform Engineer',
+      location: 'Manchester',
+      status: 'new',
+      score: 70,
+      profileId: 'profile-aaaaaaaaaaaa',
+      learningVersionId: 'learning-baseline',
+      vacancyId: 'vacancy-canonical-feedback',
+      jobIdentity: { providerId: 'vacancy-feedback-test' },
+    }],
+  }, null, 2)}\n`);
+
+  const initial = JSON.parse((await request({ path: '/api/feedback-learning' })).text);
+  const feedbackResponse = await request({
+    method: 'POST',
+    path: '/api/feedback',
+    headers: JSON_HEADERS(),
+    body: JSON.stringify({
+      revision: initial.revision,
+      opportunityId: id,
+      decision: 'promising',
+      reason: 'positive',
+      explanation: 'The responsibilities are a strong fit.',
+    }),
+  });
+  assert.equal(feedbackResponse.status, 200, feedbackResponse.text);
+  const feedback = JSON.parse(feedbackResponse.text).ledger;
+  assert.equal(feedback.feedbackEvents[0].scope, 'job');
+  assert.equal(feedback.feedbackEvents[0].vacancyId, 'vacancy-canonical-feedback');
+  assert.deepEqual(feedback.active.changes, []);
+  assert.equal(
+    JSON.parse(fs.readFileSync(trackerFile, 'utf8')).opportunities[0].status,
+    'new',
+    'feedback must not silently mutate tracker status',
+  );
+
+  const proposalResponse = await request({
+    method: 'POST',
+    path: '/api/learning/proposals',
+    headers: JSON_HEADERS(),
+    body: JSON.stringify({
+      revision: feedback.revision,
+      sourceEventIds: [feedback.feedbackEvents[0].id],
+      explanation: 'Review a modest preference for Manchester.',
+      change: {
+        kind: 'rank-adjustment',
+        field: 'location',
+        value: 'Manchester',
+        weight: 6,
+        scope: 'profile-wide',
+      },
+    }),
+  });
+  assert.equal(proposalResponse.status, 200, proposalResponse.text);
+  const proposed = JSON.parse(proposalResponse.text).ledger;
+  assert.equal(proposed.proposals[0].status, 'pending');
+  assert.deepEqual(proposed.active.changes, []);
+
+  const publishResponse = await request({
+    method: 'POST',
+    path: '/api/learning/publish',
+    headers: JSON_HEADERS(),
+    body: JSON.stringify({
+      revision: proposed.revision,
+      proposalId: proposed.proposals[0].id,
+      confirmed: true,
+    }),
+  });
+  assert.equal(publishResponse.status, 200, publishResponse.text);
+  const published = JSON.parse(publishResponse.text).ledger;
+  assert.equal(published.active.changes[0].weight, 6);
+
+  const undoResponse = await request({
+    method: 'POST',
+    path: '/api/learning/undo',
+    headers: JSON_HEADERS(),
+    body: JSON.stringify({
+      revision: published.revision,
+      versionId: published.active.id,
+      confirmed: true,
+      explanation: 'Restore the previous ranking behavior.',
+    }),
+  });
+  assert.equal(undoResponse.status, 200, undoResponse.text);
+  assert.deepEqual(JSON.parse(undoResponse.text).ledger.active.changes, []);
+
+  const stale = await request({
+    method: 'POST',
+    path: '/api/feedback',
+    headers: JSON_HEADERS(),
+    body: JSON.stringify({
+      revision: initial.revision,
+      opportunityId: id,
+      decision: 'saved',
+      reason: 'positive',
+      explanation: 'Stale write.',
+    }),
+  });
+  assert.equal(stale.status, 409);
+  assert.equal(JSON.parse(stale.text).conflict, true);
+});
+
+test('reconsideration proposals and publication reference a current exact profile rule', { concurrency: false }, async () => {
+  seedWorkspace(APP_ROOT, testWorkspace);
+  const searchDirectory = path.join(testWorkspace, 'profile', 'search');
+  fs.mkdirSync(searchDirectory, { recursive: true });
+  const rule = { value: 'Platform Engineer', strength: 'mandatory', provenance: 'explicit' };
+  const publishedProfile = publishSearchProfile({
+    version: 1,
+    status: 'draft',
+    target: { primaryTitles: [rule] },
+    negative: {},
+    compensation: {
+      currency: null, period: 'year', minimum: null,
+      minimumStrength: 'neutral', unknownPolicy: 'include',
+    },
+  }, { publishedAt: '2026-07-31T10:00:00.000Z' });
+  fs.writeFileSync(
+    path.join(searchDirectory, 'published.json'),
+    `${JSON.stringify(publishedProfile)}\n`,
+  );
+  const trackerFile = path.join(testWorkspace, 'data', 'opportunities.json');
+  fs.writeFileSync(trackerFile, `${JSON.stringify({
+    updated: '2026-07-31',
+    opportunities: [{
+      id: 'exact-rule-feedback',
+      company: 'Rule Test',
+      role: 'Platform Engineer',
+      status: 'new',
+      score: 70,
+      profileId: publishedProfile.id,
+      jobIdentity: { providerId: 'exact-rule-feedback' },
+    }],
+  })}\n`);
+  const initial = JSON.parse((await request({ path: '/api/feedback-learning' })).text);
+  const feedbackResponse = await request({
+    method: 'POST',
+    path: '/api/feedback',
+    headers: JSON_HEADERS(),
+    body: JSON.stringify({
+      revision: initial.revision,
+      opportunityId: 'exact-rule-feedback',
+      decision: 'not-interested',
+      reason: 'role-family',
+      explanation: 'Review this exact title gate.',
+    }),
+  });
+  assert.equal(feedbackResponse.status, 200, feedbackResponse.text);
+  const ledger = JSON.parse(feedbackResponse.text).ledger;
+  const sourceEventId = ledger.feedbackEvents.at(-1)?.id;
+  assert.ok(sourceEventId);
+
+  const unknown = await request({
+    method: 'POST',
+    path: '/api/learning/proposals',
+    headers: JSON_HEADERS(),
+    body: JSON.stringify({
+      revision: ledger.revision,
+      sourceEventIds: [sourceEventId],
+      explanation: 'Invalid reconsideration.',
+      change: {
+        kind: 'reconsider-rule',
+        profileRuleId: 'rule-nonexistent',
+        scope: 'profile-wide',
+      },
+    }),
+  });
+  assert.equal(unknown.status, 400, unknown.text);
+
+  const current = JSON.parse((await request({ path: '/api/feedback-learning' })).text);
+  const exactId = profileRuleId('target', 'primaryTitles', rule);
+  const proposedResponse = await request({
+    method: 'POST',
+    path: '/api/learning/proposals',
+    headers: JSON_HEADERS(),
+    body: JSON.stringify({
+      revision: current.revision,
+      sourceEventIds: [sourceEventId],
+      explanation: 'Review the exact title gate.',
+      change: {
+        kind: 'reconsider-rule',
+        profileRuleId: exactId,
+        scope: 'profile-wide',
+      },
+    }),
+  });
+  assert.equal(proposedResponse.status, 200, proposedResponse.text);
+  const proposed = JSON.parse(proposedResponse.text).ledger;
+
+  const replacement = publishSearchProfile({
+    version: 1,
+    status: 'draft',
+    target: {
+      primaryTitles: [{
+        value: 'Data Engineer', strength: 'mandatory', provenance: 'explicit',
+      }],
+    },
+    negative: {},
+    compensation: {
+      currency: null, period: 'year', minimum: null,
+      minimumStrength: 'neutral', unknownPolicy: 'include',
+    },
+  }, { publishedAt: '2026-07-31T10:05:00.000Z' });
+  fs.writeFileSync(
+    path.join(searchDirectory, 'published.json'),
+    `${JSON.stringify(replacement)}\n`,
+  );
+  const stalePublish = await request({
+    method: 'POST',
+    path: '/api/learning/publish',
+    headers: JSON_HEADERS(),
+    body: JSON.stringify({
+      revision: proposed.revision,
+      proposalId: proposed.proposals.at(-1).id,
+      confirmed: true,
+    }),
+  });
+  assert.equal(stalePublish.status, 400, stalePublish.text);
+});
+
+test('source preview refuses loopback destinations before network access', { concurrency: false }, async () => {
+  seedWorkspace(APP_ROOT, testWorkspace);
+  const trackerFile = path.join(testWorkspace, 'data', 'opportunities.json');
+  fs.writeFileSync(trackerFile, `${JSON.stringify({
+    updated: '2026-07-31',
+    opportunities: [{
+      id: 'unsafe-source-preview',
+      company: 'Unsafe Source',
+      role: 'Engineer',
+      status: 'new',
+      score: 70,
+      sources: ['http://127.0.0.1:9/private'],
+    }],
+  })}\n`);
+  const response = await request({ path: '/api/source?id=unsafe-source-preview' });
+  assert.equal(response.status, 502, response.text);
+  assert.equal(JSON.parse(response.text).reasonCode, 'unsafe-destination');
 });
 
 test('a UI mutation racing scan completion preserves every tracked user field', { concurrency: false }, async () => {
@@ -757,4 +2167,50 @@ test('a UI mutation racing scan completion preserves every tracked user field', 
   assert.deepEqual(saved.application, original.opportunities[0].application);
   assert.match(saved.notes, /Existing note/);
   assert.match(saved.notes, /Arrived during scan completion/);
+});
+
+test('runtime shutdown closes admission and drains checkpoints produced while work settles', async () => {
+  let lateCheckpoint;
+  let admittedCheckpoint;
+  let releaseHandler;
+  let markHandlerStarted;
+  const handlerStarted = new Promise((resolve) => { markHandlerStarted = resolve; });
+  routes['POST /api/test/shutdown-admitted-handler'] = async (_req, res) => {
+    markHandlerStarted();
+    await new Promise((resolve) => { releaseHandler = resolve; });
+    admittedCheckpoint = scheduleCheckpoint('test: checkpoint produced by admitted HTTP handler');
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end('{"ok":true}');
+  };
+  operations.start('shutdown-checkpoint-test', async (_update, { signal }) => new Promise((resolve) => {
+    signal.addEventListener('abort', () => {
+      lateCheckpoint = scheduleCheckpoint('test: checkpoint produced during shutdown');
+      resolve({ stopped: true });
+    }, { once: true });
+  }));
+  await new Promise((resolve) => setImmediate(resolve));
+
+  const admittedRequest = request({
+    method: 'POST',
+    path: '/api/test/shutdown-admitted-handler',
+    headers: JSON_HEADERS(),
+    body: '{}',
+  });
+  await handlerStarted;
+  const drainage = drainRuntimeWork({ timeoutMs: 5_000 });
+  await new Promise((resolve) => setImmediate(resolve));
+  releaseHandler();
+  await drainage;
+  assert.equal((await admittedRequest).status, 200);
+  assert.ok(lateCheckpoint);
+  assert.ok(admittedCheckpoint);
+  const result = await lateCheckpoint;
+  const admittedResult = await admittedCheckpoint;
+  assert.ok(['success', 'pending', 'partial', 'needs-attention', 'disabled'].includes(result.state));
+  assert.ok(['success', 'pending', 'partial', 'needs-attention', 'disabled'].includes(admittedResult.state));
+  assert.throws(
+    () => operations.start('late-shutdown-work', async () => null),
+    /shutting down/,
+  );
+  delete routes['POST /api/test/shutdown-admitted-handler'];
 });

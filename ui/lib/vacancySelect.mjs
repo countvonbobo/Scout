@@ -6,6 +6,11 @@ function text(value) {
   return String(value ?? '').trim();
 }
 
+function groupText(value, fallback) {
+  return text(value).normalize('NFKD').replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase().replace(/\s+/g, ' ') || fallback;
+}
+
 function scoreOf(vacancy) {
   const score = Number(vacancy?.preRankScore ?? vacancy?.score ?? 0);
   return Number.isFinite(score) ? score : 0;
@@ -22,15 +27,26 @@ function compareText(left, right) {
 }
 
 function employerOf(vacancy) {
-  return text(vacancy?.employerId ?? valueOf(vacancy?.employer) ?? vacancy?.company) || 'unknown-employer';
+  return groupText(vacancy?.employerId ?? valueOf(vacancy?.employer) ?? vacancy?.company, 'unknown-employer');
 }
 
 function sourceOf(vacancy) {
-  return text(vacancy?.source ?? vacancy?.sourceName) || 'unknown-source';
+  return groupText(vacancy?.source ?? vacancy?.sourceName, 'unknown-source');
 }
 
 function laneOf(vacancy) {
-  return text(vacancy?.laneId ?? vacancy?.lane ?? vacancy?.sourceLane) || 'unknown-lane';
+  return groupText(vacancy?.laneId ?? vacancy?.lane ?? vacancy?.sourceLane, 'unknown-lane');
+}
+
+function roleFamilyOf(vacancy) {
+  return groupText(
+    vacancy?.roleFamilyId ?? vacancy?.roleFamily ?? vacancy?.targetRoleFamily,
+    'unknown-role-family',
+  );
+}
+
+function locationOf(vacancy) {
+  return groupText(vacancy?.locationId ?? valueOf(vacancy?.location), 'unknown-location');
 }
 
 function assessedAt(vacancy) {
@@ -67,6 +83,26 @@ function countBy(values, keyOf) {
   }, new Map());
 }
 
+const CONSTRAINT_KEYS = Object.freeze({
+  employer: employerOf,
+  source: sourceOf,
+  lane: laneOf,
+  roleFamily: roleFamilyOf,
+  location: locationOf,
+});
+
+function selectionCounts(values) {
+  return Object.fromEntries(Object.entries(CONSTRAINT_KEYS)
+    .map(([name, keyOf]) => [name, countBy(values, keyOf)]));
+}
+
+function addSelectionCount(counts, vacancy) {
+  for (const [name, keyOf] of Object.entries(CONSTRAINT_KEYS)) {
+    const key = keyOf(vacancy);
+    counts[name].set(key, (counts[name].get(key) || 0) + 1);
+  }
+}
+
 function limitFor(limit, proportion) {
   return Math.max(1, Math.floor(limit * proportion));
 }
@@ -75,20 +111,25 @@ function constraintState(eligible, limit) {
   const employerCount = new Set(eligible.map(employerOf)).size;
   const sourceCount = new Set(eligible.map(sourceOf)).size;
   const laneCount = new Set(eligible.map(laneOf)).size;
+  const roleFamilyCount = new Set(eligible.map(roleFamilyOf)).size;
+  const locationCount = new Set(eligible.map(locationOf)).size;
   return {
     lane: laneCount >= 3 ? limitFor(limit, 0.5) : null,
     source: sourceCount >= 2 ? limitFor(limit, 0.6) : null,
+    roleFamily: roleFamilyCount >= 3 ? limitFor(limit, 0.5) : null,
+    location: locationCount >= 3 ? limitFor(limit, 0.5) : null,
     employer: employerCount >= 4 ? limitFor(limit, 0.3) : null,
   };
 }
 
+function permittedWithCounts(vacancy, counts, constraints) {
+  return Object.entries(CONSTRAINT_KEYS).every(([name, keyOf]) => (
+    !constraints[name] || (counts[name].get(keyOf(vacancy)) || 0) < constraints[name]
+  ));
+}
+
 function permitted(vacancy, selected, constraints) {
-  const employers = countBy(selected, employerOf);
-  const sources = countBy(selected, sourceOf);
-  const lanes = countBy(selected, laneOf);
-  return (!constraints.employer || (employers.get(employerOf(vacancy)) || 0) < constraints.employer)
-    && (!constraints.source || (sources.get(sourceOf(vacancy)) || 0) < constraints.source)
-    && (!constraints.lane || (lanes.get(laneOf(vacancy)) || 0) < constraints.lane);
+  return permittedWithCounts(vacancy, selectionCounts(selected), constraints);
 }
 
 function hash(seed, value) {
@@ -110,13 +151,18 @@ function chooseDeterministic(eligible, limit) {
   const constraints = constraintState(eligible, limit);
   const relaxed = [];
   const selected = [];
+  const counts = selectionCounts(selected);
   while (selected.length < limit && selected.length < eligible.length) {
-    const next = eligible.find((vacancy) => !selected.includes(vacancy) && permitted(vacancy, selected, constraints));
+    const next = eligible.find((vacancy) => (
+      !selected.includes(vacancy) && permittedWithCounts(vacancy, counts, constraints)
+    ));
     if (next) {
       selected.push(next);
+      addSelectionCount(counts, next);
       continue;
     }
-    const nextConstraint = ['lane', 'source', 'employer'].find((name) => constraints[name]);
+    const nextConstraint = ['lane', 'source', 'roleFamily', 'location', 'employer']
+      .find((name) => constraints[name]);
     if (!nextConstraint) break;
     constraints[nextConstraint] = null;
     relaxed.push(nextConstraint);
@@ -152,15 +198,31 @@ export function selectVacancies(ranked, {
   const belowCutoff = ordered.filter((vacancy) => scoreOf(vacancy) < Number(threshold));
   const deterministic = chooseDeterministic(eligible, boundedLimit);
   const selected = explore(deterministic.selected, eligible, exploration, seed, deterministic.constraints);
-  const selectedIds = new Set(deterministic.selected.map(vacancyId));
+  const deterministicIds = new Set(deterministic.selected.map(vacancyId));
+  const selectedIds = new Set(selected.map(vacancyId));
+  const topBudgetIds = new Set(eligible.slice(0, boundedLimit).map(vacancyId));
+  const notSelected = ordered.filter((vacancy) => !selectedIds.has(vacancyId(vacancy)))
+    .map((vacancy) => {
+      const id = vacancyId(vacancy);
+      const reason = scoreOf(vacancy) < Number(threshold)
+        ? 'below-relevance-threshold'
+        : deterministicIds.has(id)
+          ? 'exploration-replacement'
+          : topBudgetIds.has(id)
+            ? 'diversity-limit'
+            : 'assessment-capacity';
+      return { vacancyId: id, score: scoreOf(vacancy), reason };
+    });
   return {
     selected,
     belowCutoff,
     reasons: selected.map((vacancy) => ({
       vacancyId: vacancyId(vacancy), score: scoreOf(vacancy),
-      reason: selectedIds.has(vacancyId(vacancy)) ? 'deterministic-rank' : 'exploration',
+      reason: deterministicIds.has(vacancyId(vacancy)) ? 'deterministic-rank' : 'exploration',
     })),
+    notSelected,
     constraintsRelaxed: deterministic.constraintsRelaxed,
     seed,
+    threshold: Number(threshold),
   };
 }

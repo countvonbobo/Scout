@@ -5,6 +5,9 @@ import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { isMainModule } from '../ui/lib/mainModule.mjs';
+import {
+  auditStagedRelease, loadMarkers, verifiedAuditTreeDigest,
+} from './release-audit.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const DEFAULT_ROOT = path.resolve(HERE, '..');
@@ -47,6 +50,7 @@ export const RELEASE_FILES = Object.freeze([
   { source: 'docs/KNOWN_ISSUES.md', target: 'docs/KNOWN_ISSUES.md' },
   { source: 'docs/REPOSITORY_LAYOUT.md', target: 'docs/REPOSITORY_LAYOUT.md' },
   { source: 'docs/RELEASE.md', target: 'docs/RELEASE.md' },
+  { source: 'docs/SUPPLY_CHAIN_SECURITY.md', target: 'docs/SUPPLY_CHAIN_SECURITY.md' },
   { source: 'docs/releases', target: 'docs/releases', tree: true },
   { source: 'docs/diagnostics', target: 'docs/diagnostics', tree: true },
   { source: 'docs/SCOUT_SCAN_PROTOCOL.md', target: 'docs/SCOUT_SCAN_PROTOCOL.md' },
@@ -81,23 +85,50 @@ export const PUBLIC_SOURCE_FILES = Object.freeze([
 ]);
 
 function normalise(relative) {
-  return relative.split(path.sep).join('/');
+  return String(relative).replaceAll('\\', '/').replace(/^\.\/+/, '');
+}
+
+export function includeCopiedTreePath(relative) {
+  const value = normalise(relative);
+  const lower = value.toLocaleLowerCase('en-US');
+  const base = path.posix.basename(lower);
+  const parts = lower.split('/').filter(Boolean);
+  if (parts.includes('.git')) return false;
+  if (
+    base === 'workspace.json'
+    && lower !== 'templates/workspace/workspace.json'
+  ) return false;
+  if (base === '.env' || base.startsWith('.env.')) return false;
+  if (/\.(?:bak|backup|log(?:\.\d+)?|swp|swo|temp|tmp)$/i.test(base)) return false;
+  if (base.endsWith('~') || base.startsWith('.#')) return false;
+  return true;
 }
 
 export function includeReleasePath(relative) {
   const value = normalise(relative);
-  const base = path.posix.basename(value);
-  if (value.split('/').some((part) => ['.bin', 'fixtures', 'test', 'tests', 'test-data', '__tests__'].includes(part))) return false;
-  if (base === '.DS_Store' || base === 'Thumbs.db') return false;
+  if (!includeCopiedTreePath(value)) return false;
+  const lower = value.toLocaleLowerCase('en-US');
+  const base = path.posix.basename(lower);
+  const parts = lower.split('/').filter(Boolean);
+  const root = parts[0] === 'app' ? parts[1] : parts[0];
+  if (['.scout', 'applications', 'chats', 'cv', 'data', 'profile', 'reports'].includes(root)) return false;
+  if (parts.some((part) => ['.bin', 'fixtures', 'test', 'tests', 'test-data', '__tests__', '__snapshots__'].includes(part))) return false;
+  if (base === '.ds_store' || base === 'thumbs.db') return false;
+  if (/\.(?:doc|docx|odt|pdf|rtf)$/i.test(base)) return false;
   if (/\.test\.mjs$/i.test(base)) return false;
-  if (value.split('/').includes('__snapshots__')) return false;
   return true;
 }
 
 export function includePublicSourcePath(relative) {
   const value = normalise(relative);
-  if (!includeReleasePath(value) && !/\.test\.mjs$/i.test(path.posix.basename(value))) return false;
-  if (value === 'output' || value.startsWith('output/')) return false;
+  if (!includeCopiedTreePath(value)) return false;
+  const lower = value.toLocaleLowerCase('en-US');
+  if (
+    lower === 'output'
+    || lower.startsWith('output/')
+    || lower === 'installer/output'
+    || lower.startsWith('installer/output/')
+  ) return false;
   return true;
 }
 
@@ -140,27 +171,195 @@ export function productionLockfile(lock) {
 }
 
 function writeProductionManifests(root, appDir) {
-  const manifest = JSON.parse(fs.readFileSync(required(root, 'package.json'), 'utf8'));
-  const lock = JSON.parse(fs.readFileSync(required(root, 'package-lock.json'), 'utf8'));
+  const manifest = JSON.parse(readRegularFile(required(root, 'package.json'), root).toString('utf8'));
+  const lock = JSON.parse(readRegularFile(required(root, 'package-lock.json'), root).toString('utf8'));
   fs.writeFileSync(path.join(appDir, 'package.json'), `${JSON.stringify(productionPackageManifest(manifest), null, 2)}\n`);
   fs.writeFileSync(path.join(appDir, 'package-lock.json'), `${JSON.stringify(productionLockfile(lock), null, 2)}\n`);
   return lock;
 }
 
-function copyTree(source, target, relative = '', include = includeReleasePath) {
-  const stat = fs.lstatSync(source);
+function samePathRecord(left, right) {
+  return left.dev === right.dev && left.ino === right.ino
+    && left.size === right.size && left.mtimeNs === right.mtimeNs
+    && left.ctimeNs === right.ctimeNs;
+}
+
+function readRegularFileRecord(source, verifiedRoot = path.dirname(source), expected = null) {
+  const ancestorsBefore = releasePathIdentity(verifiedRoot, source);
+  const before = fs.lstatSync(source, { bigint: true });
+  if (expected && !samePathRecord(before, expected)) {
+    throw new Error(`release input changed after directory enumeration: ${source}`);
+  }
+  if (!before.isFile() || before.isSymbolicLink()) {
+    throw new Error(`release input must be a regular file: ${source}`);
+  }
+  const noFollow = fs.constants.O_NOFOLLOW || 0;
+  const descriptor = fs.openSync(source, fs.constants.O_RDONLY | noFollow);
+  try {
+    const opened = fs.fstatSync(descriptor, { bigint: true });
+    const content = fs.readFileSync(descriptor);
+    const openedAfterRead = fs.fstatSync(descriptor, { bigint: true });
+    const ancestorsAfter = releasePathIdentity(verifiedRoot, source);
+    const after = fs.lstatSync(source, { bigint: true });
+    if (!opened.isFile() || after.isSymbolicLink() || !after.isFile()
+      || opened.dev !== before.dev || opened.ino !== before.ino
+      || after.dev !== opened.dev || after.ino !== opened.ino
+      || openedAfterRead.dev !== opened.dev || openedAfterRead.ino !== opened.ino
+      || openedAfterRead.size !== opened.size
+      || openedAfterRead.mtimeNs !== opened.mtimeNs
+      || openedAfterRead.ctimeNs !== opened.ctimeNs
+      || after.size !== openedAfterRead.size
+      || after.mtimeNs !== openedAfterRead.mtimeNs
+      || after.ctimeNs !== openedAfterRead.ctimeNs
+      || ancestorsAfter !== ancestorsBefore) {
+      throw new Error(`release input identity changed while reading: ${source}`);
+    }
+    return {
+      content,
+      mode: Number(openedAfterRead.mode & 0o777n),
+    };
+  } finally {
+    fs.closeSync(descriptor);
+  }
+}
+
+function readRegularFile(source, verifiedRoot = path.dirname(source)) {
+  return readRegularFileRecord(source, verifiedRoot).content;
+}
+
+function copyRegularFile(source, target, verifiedRoot = path.dirname(source), expected = null) {
+  const { content, mode } = readRegularFileRecord(source, verifiedRoot, expected);
+  fs.mkdirSync(path.dirname(target), { recursive: true });
+  fs.writeFileSync(target, content, { flag: 'wx', mode });
+}
+
+export function copyVerifiedReleaseFile(source, target, {
+  verifiedRoot = path.dirname(source),
+} = {}) {
+  copyRegularFile(path.resolve(source), path.resolve(target), path.resolve(verifiedRoot));
+  return target;
+}
+
+function copyTree(
+  source,
+  target,
+  relative = '',
+  include = includeReleasePath,
+  verifiedRoot = source,
+  expected = null,
+) {
+  const ancestorsBefore = releasePathIdentity(verifiedRoot, source);
+  const stat = fs.lstatSync(source, { bigint: true });
+  if (expected && !samePathRecord(stat, expected)) {
+    throw new Error(`release input changed after directory enumeration: ${source}`);
+  }
   if (stat.isSymbolicLink()) throw new Error(`release input may not be a symbolic link: ${source}`);
   if (stat.isDirectory()) {
     fs.mkdirSync(target, { recursive: true });
-    for (const name of fs.readdirSync(source).sort()) {
+    const entries = fs.readdirSync(source).sort().map((name) => ({
+      name,
+      stat: fs.lstatSync(path.join(source, name), { bigint: true }),
+    }));
+    for (const { name, stat: childStat } of entries) {
       const childRelative = relative ? path.join(relative, name) : name;
       if (!include(childRelative)) continue;
-      copyTree(path.join(source, name), path.join(target, name), childRelative, include);
+      copyTree(
+        path.join(source, name),
+        path.join(target, name),
+        childRelative,
+        include,
+        verifiedRoot,
+        childStat,
+      );
+    }
+    const after = fs.lstatSync(source, { bigint: true });
+    const ancestorsAfter = releasePathIdentity(verifiedRoot, source);
+    if (!after.isDirectory() || after.isSymbolicLink()
+      || after.dev !== stat.dev || after.ino !== stat.ino
+      || after.mtimeNs !== stat.mtimeNs || after.ctimeNs !== stat.ctimeNs
+      || ancestorsAfter !== ancestorsBefore) {
+      throw new Error(`release input directory changed while reading: ${source}`);
     }
     return;
   }
-  fs.mkdirSync(path.dirname(target), { recursive: true });
-  fs.copyFileSync(source, target);
+  copyRegularFile(source, target, verifiedRoot, stat);
+}
+
+export function auditStageBeforePackaging(stageDir, {
+  env = process.env,
+  requireMarkers = true,
+} = {}) {
+  const source = path.resolve(stageDir);
+  const markerFile = env.SCOUT_RELEASE_MARKERS_FILE
+    ? path.resolve(DEFAULT_ROOT, env.SCOUT_RELEASE_MARKERS_FILE) : null;
+  const markers = loadMarkers({ markerFile, envMarkers: env.SCOUT_RELEASE_MARKERS });
+  if (requireMarkers && markers.length === 0) {
+    throw new Error('pre-package release audit failed: release audit requires at least one configured personal marker');
+  }
+  const snapshot = `${source}.audited-${crypto.randomUUID()}`;
+  try {
+    const result = auditStagedRelease({ root: source, markers, snapshotRoot: snapshot });
+    if (!result.ok) {
+      const findings = result.findings.map(({ file, line, rule }) => `${file}:${line} ${rule}`).join('\n');
+      throw new Error(`pre-package release audit failed:\n${findings}`);
+    }
+    if (verifiedAuditTreeDigest(snapshot) !== result.treeDigest) {
+      throw new Error('pre-package release audit snapshot differs from inspected bytes');
+    }
+    const seal = (entry) => {
+      const stat = fs.lstatSync(entry);
+      if (stat.isSymbolicLink()) return;
+      if (stat.isDirectory()) {
+        for (const name of fs.readdirSync(entry)) seal(path.join(entry, name));
+        fs.chmodSync(entry, 0o555);
+      } else if (stat.isFile()) {
+        fs.chmodSync(entry, stat.mode & ~0o222);
+      }
+    };
+    seal(snapshot);
+    const output = [
+      `Release audit scanned ${result.filesScanned} files with ${result.markerCount} configured personal markers.`,
+      `Release audit tree digest: ${result.treeDigest}`,
+      'Release audit passed.',
+      '',
+    ].join('\n');
+    return { output, treeDigest: result.treeDigest, stageDir: snapshot };
+  } catch (error) {
+    try {
+      const restoreWrite = (entry) => {
+        if (!fs.existsSync(entry)) return;
+        const stat = fs.lstatSync(entry);
+        if (stat.isDirectory()) {
+          fs.chmodSync(entry, 0o755);
+          for (const name of fs.readdirSync(entry)) restoreWrite(path.join(entry, name));
+        } else if (!stat.isSymbolicLink()) fs.chmodSync(entry, stat.mode | 0o200);
+      };
+      restoreWrite(snapshot);
+      fs.rmSync(snapshot, { recursive: true, force: true });
+    } catch {}
+    throw error;
+  }
+}
+
+export function removeAuditedStage(stageDir) {
+  const root = path.resolve(stageDir);
+  if (!path.basename(root).includes('.audited-') || !fs.existsSync(root)) return;
+  const restore = (entry) => {
+    const stat = fs.lstatSync(entry);
+    if (stat.isDirectory()) {
+      fs.chmodSync(entry, 0o755);
+      for (const name of fs.readdirSync(entry)) restore(path.join(entry, name));
+    } else if (!stat.isSymbolicLink()) fs.chmodSync(entry, stat.mode | 0o200);
+  };
+  restore(root);
+  fs.rmSync(root, { recursive: true, force: true });
+}
+
+export function assertAuditedStage(audit) {
+  if (!audit?.stageDir || !/^[a-f0-9]{64}$/.test(String(audit.treeDigest || ''))
+    || verifiedAuditTreeDigest(audit.stageDir) !== audit.treeDigest) {
+    throw new Error('audited release payload differs from the privacy-authorized snapshot');
+  }
 }
 
 export function stagePublicSource({
@@ -173,18 +372,65 @@ export function stagePublicSource({
   for (const entry of PUBLIC_SOURCE_FILES) {
     const source = required(resolvedRoot, entry.source);
     const target = path.join(resolvedStage, entry.target);
-    if (entry.tree) copyTree(source, target, '', entry.publicFilter ? includePublicSourcePath : () => true);
-    else {
-      fs.mkdirSync(path.dirname(target), { recursive: true });
-      fs.copyFileSync(source, target);
-    }
+    if (entry.tree) copyTree(source, target, normalise(entry.target), includePublicSourcePath, resolvedRoot);
+    else copyRegularFile(source, target, resolvedRoot);
   }
   return { root: resolvedRoot, stageDir: resolvedStage };
 }
 
+export function auditPublicSourceStage({
+  root = DEFAULT_ROOT,
+  stageDir,
+  markers = process.env.SCOUT_RELEASE_MARKERS || '',
+} = {}) {
+  const result = spawnSync(process.execPath, [
+    path.join(path.resolve(root), 'tools', 'release-audit.mjs'),
+    '--root',
+    path.resolve(stageDir),
+    '--stage',
+    '--require-markers',
+  ], {
+    cwd: root,
+    encoding: 'utf8',
+    env: { ...process.env, SCOUT_RELEASE_MARKERS: markers },
+    windowsHide: true,
+  });
+  if (result.status !== 0) {
+    throw new Error(`public source privacy audit failed:\n${String(result.stdout || '')}\n${String(result.stderr || '')}`.trim());
+  }
+  return { status: result.status, output: String(result.stdout || '') };
+}
+
+function releasePathIdentity(root, file) {
+  const resolvedRoot = path.resolve(root);
+  const value = path.resolve(file);
+  const fromRoot = path.relative(resolvedRoot, value);
+  if (!fromRoot || fromRoot === '..' || fromRoot.startsWith(`..${path.sep}`) || path.isAbsolute(fromRoot)) {
+    if (value !== resolvedRoot) throw new Error('required release input escapes its root');
+  }
+  const identities = [];
+  let component = resolvedRoot;
+  for (const segment of fromRoot ? fromRoot.split(path.sep) : []) {
+    const rootStat = fs.lstatSync(component);
+    if (rootStat.isSymbolicLink() || !rootStat.isDirectory()) {
+      throw new Error(`release input ancestor must be a real directory: ${component}`);
+    }
+    identities.push(`${rootStat.dev}:${rootStat.ino}`);
+    component = path.join(component, segment);
+  }
+  const rootStat = fs.lstatSync(resolvedRoot);
+  if (rootStat.isSymbolicLink() || !rootStat.isDirectory()) {
+    throw new Error(`release input root must be a real directory: ${resolvedRoot}`);
+  }
+  if (!identities.length) identities.push(`${rootStat.dev}:${rootStat.ino}`);
+  return identities.join('|');
+}
+
 function required(root, relative) {
-  const value = path.join(root, relative);
+  const resolvedRoot = path.resolve(root);
+  const value = path.resolve(resolvedRoot, relative);
   if (!fs.existsSync(value)) throw new Error(`required release input is missing: ${relative}`);
+  releasePathIdentity(resolvedRoot, value);
   return value;
 }
 
@@ -204,11 +450,8 @@ export function stageRelease({
   for (const entry of RELEASE_FILES) {
     const source = required(resolvedRoot, entry.source);
     const target = path.join(appDir, entry.target);
-    if (entry.tree) copyTree(source, target);
-    else {
-      fs.mkdirSync(path.dirname(target), { recursive: true });
-      fs.copyFileSync(source, target);
-    }
+    if (entry.tree) copyTree(source, target, normalise(entry.target), includeReleasePath, resolvedRoot);
+    else copyRegularFile(source, target, resolvedRoot);
   }
 
   const lock = writeProductionManifests(resolvedRoot, appDir);
@@ -219,16 +462,27 @@ export function stageRelease({
       path.join(appDir, 'node_modules'),
       '',
       (relative) => includeReleasePath(relative) && includeProductionDependency(relative),
+      resolvedRoot,
     );
   }
   const runtimeDir = path.join(resolvedStage, 'runtime');
   fs.mkdirSync(runtimeDir, { recursive: true });
   const runtimeName = platform === 'win32' ? 'ScoutRuntime.exe' : 'node';
-  fs.copyFileSync(required(path.dirname(nodeExecutable), path.basename(nodeExecutable)), path.join(runtimeDir, runtimeName));
+  const nodeRoot = path.dirname(nodeExecutable);
+  copyRegularFile(
+    required(nodeRoot, path.basename(nodeExecutable)),
+    path.join(runtimeDir, runtimeName),
+    nodeRoot,
+  );
   if (platform !== 'win32') fs.chmodSync(path.join(runtimeDir, runtimeName), 0o755);
   const typstName = platform === 'win32' ? 'typst.exe' : 'typst';
   const typstSource = typstExecutable || path.join(resolvedRoot, '.scout-runtime', typstName);
-  fs.copyFileSync(required(path.dirname(typstSource), path.basename(typstSource)), path.join(runtimeDir, typstName));
+  const typstRoot = path.dirname(typstSource);
+  copyRegularFile(
+    required(typstRoot, path.basename(typstSource)),
+    path.join(runtimeDir, typstName),
+    typstRoot,
+  );
   if (platform !== 'win32') fs.chmodSync(path.join(runtimeDir, typstName), 0o755);
 
   return { root: resolvedRoot, stageDir: resolvedStage, appDir };
@@ -236,6 +490,47 @@ export function stageRelease({
 
 export function sha256(file) {
   return crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex');
+}
+
+export function verifiedReleaseFileDigest(file, {
+  verifiedRoot = path.dirname(file),
+} = {}) {
+  return crypto.createHash('sha256')
+    .update(readRegularFile(path.resolve(file), path.resolve(verifiedRoot)))
+    .digest('hex');
+}
+
+export function verifiedReleaseTreeDigest(root) {
+  const verifiedRoot = path.resolve(root);
+  const digest = crypto.createHash('sha256');
+  const visit = (source, relative = '', expected = null) => {
+    const before = fs.lstatSync(source, { bigint: true });
+    if (expected && !samePathRecord(before, expected)) {
+      throw new Error(`release payload changed after directory enumeration: ${source}`);
+    }
+    if (before.isSymbolicLink()) throw new Error(`release payload may not contain a symbolic link: ${source}`);
+    if (before.isFile()) {
+      const { content, mode } = readRegularFileRecord(source, verifiedRoot, before);
+      digest.update('file\0').update(normalise(relative)).update('\0')
+        .update(String(mode)).update('\0').update(content).update('\0');
+      return;
+    }
+    if (!before.isDirectory()) throw new Error(`release payload entry must be a regular file or directory: ${source}`);
+    digest.update('directory\0').update(normalise(relative)).update('\0');
+    const entries = fs.readdirSync(source).sort().map((name) => ({
+      name,
+      stat: fs.lstatSync(path.join(source, name), { bigint: true }),
+    }));
+    for (const { name, stat } of entries) {
+      visit(path.join(source, name), relative ? path.join(relative, name) : name, stat);
+    }
+    const after = fs.lstatSync(source, { bigint: true });
+    if (!samePathRecord(after, before)) {
+      throw new Error(`release payload directory changed while hashing: ${source}`);
+    }
+  };
+  visit(verifiedRoot);
+  return digest.digest('hex');
 }
 
 export function writeChecksums(outputDir) {
@@ -270,24 +565,60 @@ function checkedVersion(value) {
 
 export function buildInstaller({ root = DEFAULT_ROOT, stageDir, version, isccPath } = {}) {
   const staged = stageRelease({ root, stageDir });
+  const packageInputs = path.join(staged.stageDir, 'package-inputs');
+  const hostSource = path.join(packageInputs, 'ScoutHost.cs');
+  const installerSource = path.join(packageInputs, 'Scout.iss');
+  copyVerifiedReleaseFile(
+    required(root, 'installer/windows/ScoutHost.cs'),
+    hostSource,
+    { verifiedRoot: root },
+  );
+  copyVerifiedReleaseFile(
+    required(root, 'installer/Scout.iss'),
+    installerSource,
+    { verifiedRoot: root },
+  );
+  const hostSourceDigest = verifiedReleaseFileDigest(hostSource, { verifiedRoot: staged.stageDir });
+  const installerSourceDigest = verifiedReleaseFileDigest(installerSource, { verifiedRoot: staged.stageDir });
   const csc = path.join(process.env.WINDIR || 'C:\\Windows', 'Microsoft.NET', 'Framework64', 'v4.0.30319', 'csc.exe');
   if (!fs.existsSync(csc)) throw new Error('Windows C# compiler was not found');
-  const host = spawnSync(csc, ['/nologo', '/target:winexe', `/win32icon:${path.join(root, 'ui', 'assets', 'scout-icon.ico')}`, `/out:${path.join(staged.stageDir, 'Scout.exe')}`, '/reference:System.Windows.Forms.dll', '/reference:System.Drawing.dll', '/reference:System.Web.Extensions.dll', path.join(root, 'installer', 'windows', 'ScoutHost.cs')], { cwd: root, encoding: 'utf8', windowsHide: true });
+  const stagedIcon = path.join(staged.appDir, 'ui', 'assets', 'scout-icon.ico');
+  const host = spawnSync(csc, ['/nologo', '/target:winexe', `/win32icon:${stagedIcon}`, `/out:${path.join(staged.stageDir, 'Scout.exe')}`, '/reference:System.Windows.Forms.dll', '/reference:System.Drawing.dll', '/reference:System.Web.Extensions.dll', hostSource], { cwd: staged.stageDir, encoding: 'utf8', windowsHide: true });
   if (host.status !== 0) throw new Error(`Scout host build failed:\n${host.stdout}\n${host.stderr}`);
-  const outputDir = path.join(root, 'installer', 'output');
-  fs.rmSync(outputDir, { recursive: true, force: true });
-  fs.mkdirSync(outputDir, { recursive: true });
-  const iscc = isccPath || findIscc();
-  if (!iscc) throw new Error('Inno Setup 6 was not found; install it or set ISCC_PATH');
-  const selectedVersion = checkedVersion(version || process.env.SCOUT_VERSION || packageVersion(root));
-  const result = spawnSync(iscc, [
-    `/DMyAppVersion=${selectedVersion}`,
-    `/DStageDir=${staged.stageDir}`,
-    path.join(root, 'installer', 'Scout.iss'),
-  ], { cwd: root, encoding: 'utf8', windowsHide: true });
-  if (result.status !== 0) throw new Error(`Inno Setup failed:\n${String(result.stdout || '')}\n${String(result.stderr || '')}`.trim());
-  const checksums = writeChecksums(outputDir);
-  return { ...staged, outputDir, checksums, version: selectedVersion };
+  if (
+    verifiedReleaseFileDigest(hostSource, { verifiedRoot: staged.stageDir }) !== hostSourceDigest
+    || verifiedReleaseFileDigest(installerSource, { verifiedRoot: staged.stageDir }) !== installerSourceDigest
+  ) {
+    throw new Error('verified Windows package input changed during compilation');
+  }
+  const audit = auditStageBeforePackaging(staged.stageDir);
+  const auditedStage = audit.stageDir;
+  try {
+    assertAuditedStage(audit);
+    const auditedPayloadDigest = verifiedReleaseTreeDigest(auditedStage);
+    const outputDir = path.join(root, 'installer', 'output');
+    fs.rmSync(outputDir, { recursive: true, force: true });
+    fs.mkdirSync(outputDir, { recursive: true });
+    const iscc = isccPath || findIscc();
+    if (!iscc) throw new Error('Inno Setup 6 was not found; install it or set ISCC_PATH');
+    const selectedVersion = checkedVersion(version || process.env.SCOUT_VERSION || packageVersion(root));
+    const result = spawnSync(iscc, [
+      `/DMyAppVersion=${selectedVersion}`,
+      `/DStageDir=${auditedStage}`,
+      `/DIconFile=${path.join(auditedStage, path.relative(staged.stageDir, stagedIcon))}`,
+      `/DOutputDir=${outputDir}`,
+      path.join(auditedStage, path.relative(staged.stageDir, installerSource)),
+    ], { cwd: auditedStage, encoding: 'utf8', windowsHide: true });
+    if (result.status !== 0) throw new Error(`Inno Setup failed:\n${String(result.stdout || '')}\n${String(result.stderr || '')}`.trim());
+    if (verifiedReleaseTreeDigest(auditedStage) !== auditedPayloadDigest) {
+      throw new Error('audited Windows release payload changed during packaging');
+    }
+    assertAuditedStage(audit);
+    const checksums = writeChecksums(outputDir);
+    return { ...staged, outputDir, checksums, version: selectedVersion };
+  } finally {
+    removeAuditedStage(auditedStage);
+  }
 }
 
 function valueAfter(flag, argv) {
@@ -308,6 +639,7 @@ async function main(argv = process.argv.slice(2)) {
     : installer
     ? buildInstaller({ root, stageDir, version: valueAfter('--version', argv) || undefined })
     : stageRelease({ root, stageDir });
+  if (publicSource) auditPublicSourceStage({ root, stageDir: result.stageDir });
   process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
 }
 

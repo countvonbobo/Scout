@@ -1,5 +1,7 @@
 import { expect, test } from '@playwright/test';
 import fs from 'node:fs';
+import path from 'node:path';
+import { migrateSearchProfile } from '../../ui/lib/searchProfile.mjs';
 
 const currentVersion = JSON.parse(fs.readFileSync(new URL('../../package.json', import.meta.url), 'utf8')).version;
 
@@ -156,7 +158,7 @@ test('settings sections open the step that edits them', async ({ page }) => {
   // Back from a retune entry step returns to the hub rather than walking
   // further backwards into first-run onboarding.
   await dialog.getByRole('button', { name: 'Back to settings' }).click();
-  await expect(dialog.locator('.settings-card')).toHaveCount(7);
+  await expect(dialog.locator('.settings-card')).toHaveCount(9);
 });
 
 test('the first-run restore form can be dismissed again', async ({ page }) => {
@@ -173,4 +175,80 @@ test('the first-run restore form can be dismissed again', async ({ page }) => {
   await dialog.getByRole('button', { name: 'Cancel' }).click();
   await expect(dialog.getByRole('button', { name: 'Restore securely' })).toBeHidden();
   await expect(dialog.getByRole('button', { name: 'Restore existing workspace' })).toBeEnabled();
+});
+
+test('fresh onboarding publishes the reviewed search profile before offering the first scan', async ({ page }) => {
+  await stubSupportingRoutes(page);
+  let scanStarts = 0;
+  const workspace = process.env.SCOUT_WORKSPACE;
+  const configPath = path.join(workspace, 'workspace.json');
+  const config = JSON.parse(fs.readFileSync(configPath, 'utf8'));
+  config.searchProfile = { schemaVersion: 1, publishedId: null };
+  config.search = {
+    ...config.search,
+    roleFamilies: ['Product engineer'],
+    locations: ['Example City'],
+    exclusions: ['Extensive travel'],
+  };
+  fs.rmSync(path.join(workspace, 'profile', 'search'), { recursive: true, force: true });
+  fs.rmSync(path.join(workspace, 'data', 'search-lanes.json'), { force: true });
+  fs.writeFileSync(configPath, `${JSON.stringify(config, null, 2)}\n`);
+  migrateSearchProfile(workspace);
+  await page.route('**/api/setup/status', async (route) => {
+    await route.fulfill({
+      contentType: 'application/json',
+      body: JSON.stringify({
+        ...createdStatus,
+        ready: true,
+        config: { ...createdStatus.config, ai: { ...createdStatus.config.ai, provider: 'codex' } },
+      }),
+    });
+  });
+  await page.route('**/api/scan', async (route) => {
+    scanStarts += 1;
+    await route.fulfill({
+      status: 202,
+      contentType: 'application/json',
+      body: JSON.stringify({ operation: { id: 'scan-1', type: 'scan', status: 'queued' } }),
+    });
+  });
+
+  const migratedState = await page.request.get('/api/search-profile');
+  expect(migratedState.ok()).toBe(true);
+  const migratedBody = await migratedState.json();
+  expect(migratedBody.draft.target.primaryTitles[0]).toMatchObject({
+    value: 'Product engineer',
+    provenance: 'deterministic-derivation',
+  });
+
+  await page.goto('/');
+  const dialog = page.getByRole('dialog');
+  await expect(dialog.getByRole('heading', { name: 'Review your search profile' })).toBeVisible();
+  const run = dialog.getByRole('button', { name: 'Run first scan now' });
+  await expect(run).toBeDisabled();
+  expect(scanStarts).toBe(0);
+
+  await dialog.getByLabel('I reviewed this complete profile and want to publish it').check();
+  await dialog.getByRole('button', { name: 'Publish this reviewed profile' }).click();
+  await expect(run).toBeEnabled();
+  await expect(page.locator('#setup-status')).toContainText('Search profile published');
+  expect(scanStarts).toBe(0);
+
+  const publishedState = await page.request.get('/api/search-profile');
+  expect(publishedState.ok()).toBe(true);
+  const publishedBody = await publishedState.json();
+  expect(publishedBody.published.target.primaryTitles[0]).toMatchObject({
+    value: 'Product engineer',
+    provenance: 'deterministic-derivation',
+  });
+  const laneState = await page.request.get('/api/search-profile/adaptive');
+  expect(laneState.ok()).toBe(true);
+  const laneBody = await laneState.json();
+  expect(laneBody.lanePlan.profileId).toBe(publishedBody.published.id);
+  expect(laneBody.lanePlan.lanes.some(({ profileFields }) => (
+    profileFields.some(({ provenance }) => provenance === 'deterministic-derivation')
+  ))).toBe(true);
+
+  await run.click();
+  await expect.poll(() => scanStarts).toBe(1);
 });

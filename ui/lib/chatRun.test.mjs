@@ -1,5 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { EventEmitter } from 'node:events';
+import { PassThrough } from 'node:stream';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { runTurn } from './chatRun.mjs';
@@ -22,7 +24,9 @@ function fakeTurn(prompt, extra = {}) {
 
 test('happy path: streams events, captures session, text, files, usage', async () => {
   const events = [];
-  const { finished } = fakeTurn('hello world', { onEvent: (e) => events.push(e) });
+  const turn = fakeTurn('hello world', { onEvent: (e) => events.push(e) });
+  assert.equal(Number.isSafeInteger(turn.pid) && turn.pid > 0, true);
+  const { finished } = turn;
   const r = await finished;
   assert.equal(r.ok, true);
   assert.equal(r.text, 'echo: hello world');
@@ -33,16 +37,32 @@ test('happy path: streams events, captures session, text, files, usage', async (
   assert.ok(events.some((e) => e.kind === 'tool'));
 });
 
-test('non-zero exit without a done event fails with stderr detail', async () => {
+test('non-zero exit without a done event returns only a bounded failure code', async () => {
   const r = await fakeTurn('FAIL').finished;
   assert.equal(r.ok, false);
-  assert.match(r.error, /fake failure detail|exit code 3/);
+  assert.equal(r.error, 'Provider turn failed.');
+  assert.equal(r.reasonCode, 'provider-error');
+  assert.doesNotMatch(JSON.stringify(r), /fake failure detail/);
+});
+
+test('raw provider authentication failures become a bounded reason before diagnostics are discarded', async () => {
+  const r = await fakeTurn('AUTH_FAIL').finished;
+  assert.deepEqual(r, {
+    ok: false,
+    error: 'Provider authentication is required.',
+    reasonCode: 'authentication-required',
+    sessionId: null,
+    filesTouched: [],
+  });
+  assert.doesNotMatch(JSON.stringify(r), /401|person@example|secret|unauthorized/i);
 });
 
 test('non-zero exit remains a failure even after a successful done event', async () => {
   const r = await fakeTurn('DONE_THEN_FAIL').finished;
   assert.equal(r.ok, false);
-  assert.match(r.error, /not actually successful|exit code 3/);
+  assert.equal(r.error, 'Provider turn failed.');
+  assert.equal(r.reasonCode, 'provider-error');
+  assert.doesNotMatch(JSON.stringify(r), /not actually successful/);
 });
 
 test('stop() kills the child and reports stopped', async () => {
@@ -59,6 +79,39 @@ test('timeout resolves with a timeout error', async () => {
   assert.match(r.error, /timed out/);
 });
 
+test('output byte and individual-line limits stop the provider turn', async () => {
+  const result = await fakeTurn('OVER_OUTPUT', {
+    timeoutMs: 5_000,
+    maxOutputBytes: 256,
+    maxOutputLines: 8,
+    maxLineBytes: 64,
+  }).finished;
+  assert.equal(result.ok, false);
+  assert.equal(result.outputExceeded, true);
+  assert.equal(result.error, 'Provider output exceeded the safe limit.');
+  assert.equal(result.reasonCode, 'output-limit');
+});
+
+test('stop escalates a stubborn provider process group to forced closure', async () => {
+  const turn = fakeTurn('STUBBORN');
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  turn.stop();
+  const result = await Promise.race([
+    turn.finished,
+    new Promise((resolve) => setTimeout(() => resolve('still-running'), 2_000)),
+  ]);
+  assert.notEqual(result, 'still-running');
+  assert.equal(result.stopped, true);
+});
+
+test('tool events expose only bounded activity while touched files stay relative', async () => {
+  const events = [];
+  const result = await fakeTurn('hello', { onEvent: (event) => events.push(event) }).finished;
+  const tool = events.find((event) => event.kind === 'tool');
+  assert.deepEqual(tool, { kind: 'tool', label: 'Editing a file', activity: 'writing' });
+  assert.deepEqual(result.filesTouched, ['applications/acme-role-2026-07/cv.typ']);
+});
+
 test('missing binary resolves with a not-found error', async () => {
   const r = await runTurn({
     command: 'definitely-not-a-real-cli-xyz',
@@ -68,7 +121,32 @@ test('missing binary resolves with a not-found error', async () => {
     parseLine: parseClaudeLine,
   }).finished;
   assert.equal(r.ok, false);
-  assert.match(r.error, /not found on PATH/);
+  assert.equal(r.error, 'Provider CLI is unavailable.');
+  assert.equal(r.reasonCode, 'provider-unavailable');
+});
+
+test('process errors remain close-gated before a chat turn settles', async () => {
+  const child = new EventEmitter();
+  child.pid = 4242;
+  child.stdin = new PassThrough();
+  child.stdout = new PassThrough();
+  child.stderr = new PassThrough();
+  child.kill = () => true;
+  let settled = false;
+  const turn = runTurn({
+    command: 'synthetic-provider',
+    args: [],
+    prompt: 'hello',
+    cwd: REPO,
+    parseLine: () => [],
+    spawnFn: () => child,
+  });
+  turn.finished.then(() => { settled = true; });
+  child.emit('error', Object.assign(new Error('synthetic spawn failure'), { code: 'ENOENT' }));
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(settled, false);
+  child.emit('close', null);
+  assert.equal((await turn.finished).reasonCode, 'provider-unavailable');
 });
 
 test('tool paths on another Windows drive are excluded', { skip: process.platform !== 'win32' }, async () => {

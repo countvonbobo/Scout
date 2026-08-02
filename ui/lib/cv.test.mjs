@@ -118,14 +118,55 @@ test('background rendering times out without replacing the previous PDF', async 
     fs.mkdirSync(path.join(root, 'applications', 'example'), { recursive: true });
     fs.writeFileSync(path.join(root, 'applications', 'example', 'cv.typ'), '= Example');
     fs.writeFileSync(path.join(root, 'applications', 'example', 'cv.pdf'), '%PDF-1.7\nprevious valid pdf body');
+    let child;
+    let killed = false;
     const stalled = () => {
-      const child = new EventEmitter(); child.stdout = new PassThrough(); child.stderr = new PassThrough(); child.kill = () => {};
+      child = new EventEmitter(); child.stdout = new PassThrough(); child.stderr = new PassThrough();
+      child.kill = () => { killed = true; };
       return child;
     };
-    await assert.rejects(renderCvTarget(root, { target: 'application', slug: 'example' }, {
+    let settled = false;
+    const pending = renderCvTarget(root, { target: 'application', slug: 'example' }, {
       runtimeResolver: () => ({ available: true, command: 'typst' }), spawnImpl: stalled, timeoutMs: 5,
-    }), /timed out/);
+    });
+    void pending.then(() => { settled = true; }, () => { settled = true; });
+    await new Promise((resolve) => setTimeout(resolve, 15));
+    assert.equal(killed, true);
+    assert.equal(settled, false);
+    child.emit('close', null);
+    await assert.rejects(pending, /timed out/);
     assert.equal(fs.readFileSync(path.join(root, 'applications', 'example', 'cv.pdf'), 'utf8'), '%PDF-1.7\nprevious valid pdf body');
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test('background rendering kills Typst when managed shutdown aborts the operation', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'scout-render-abort-'));
+  try {
+    fs.mkdirSync(path.join(root, 'applications', 'example'), { recursive: true });
+    fs.writeFileSync(path.join(root, 'applications', 'example', 'cv.typ'), '= Example');
+    let killed = false;
+    let closeChild;
+    const stalled = () => {
+      const child = new EventEmitter();
+      child.stdout = new PassThrough();
+      child.stderr = new PassThrough();
+      child.kill = () => { killed = true; closeChild = () => child.emit('close', null); };
+      return child;
+    };
+    const controller = new AbortController();
+    const pending = renderCvTarget(root, { target: 'application', slug: 'example' }, {
+      runtimeResolver: () => ({ available: true, command: 'typst' }),
+      spawnImpl: stalled,
+      signal: controller.signal,
+    });
+    let settled = false;
+    void pending.then(() => { settled = true; }, () => { settled = true; });
+    controller.abort(new Error('operation cancelled for shutdown'));
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(settled, false);
+    closeChild();
+    await assert.rejects(pending, /cancelled for shutdown/);
+    assert.equal(killed, true);
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 

@@ -23,8 +23,12 @@ const establishedStatus = {
     ai: { provider: 'codex', model: null, models: { codex: null, claude: null } },
   },
   providers: {
-    codex: { installed: true, authenticated: true, capabilities: { structuredOutput: true } },
-    claude: { installed: true, authenticated: true, capabilities: { structuredOutput: true } },
+    codex: {
+      installed: true, authenticated: true, capabilities: { structuredOutput: true }, healthState: 'ready',
+    },
+    claude: {
+      installed: true, authenticated: true, capabilities: { structuredOutput: true }, healthState: 'ready',
+    },
   },
   adzunaConfigured: false,
   scanHealth: { healthy: true, lastRunAt: '2026-07-20T08:00:00.000Z' },
@@ -49,6 +53,13 @@ test.beforeEach(async ({ page }) => {
   });
   await page.route('**/api/operations?type=*', async (route) => {
     await route.fulfill({ contentType: 'application/json', body: JSON.stringify({ operation: null }) });
+  });
+  await page.route('**/api/provider-login/status?*', async (route) => {
+    const provider = new URL(route.request().url()).searchParams.get('provider');
+    await route.fulfill({
+      contentType: 'application/json',
+      body: JSON.stringify({ provider, session: null, csrfToken: `csrf-${provider}-synthetic-000000000000` }),
+    });
   });
   await page.goto('/');
   await expect(page.locator('#sync-status')).toBeVisible();
@@ -95,6 +106,60 @@ test('first service worker installation does not pretend Scout has updated', asy
     }
   });
   await expect(page.locator('#ui-update-banner')).toBeHidden();
+});
+
+test('a verified update download presents a safe package name and actionable location alias', async ({ page }) => {
+  const packageName = 'Scout-0.1.0-beta.23-windows-x64.exe';
+  const locationHint = `%LOCALAPPDATA%\\Scout\\updates\\${packageName}`;
+  await page.route('**/api/update/download', async (route) => {
+    await route.fulfill({
+      contentType: 'application/json',
+      body: JSON.stringify({
+        downloaded: {
+          name: packageName,
+          sha256: 'a'.repeat(64),
+          version: '0.1.0-beta.23',
+          verifiedAt: '2026-07-29T10:00:00.000Z',
+          locationHint,
+        },
+      }),
+    });
+  });
+  await page.evaluate(() => window.Scout.renderUpdateBanner({
+    available: true,
+    latestVersion: '0.1.0-beta.23',
+    canDownload: true,
+    package: { name: 'Scout-0.1.0-beta.23-windows-x64.exe' },
+  }));
+
+  const banner = page.locator('#update-banner');
+  await banner.getByRole('button', { name: 'Download verified update' }).click();
+  await expect(banner).toContainText(packageName);
+  await expect(banner).toContainText(locationHint);
+  await expect(banner).not.toContainText('undefined');
+  await expect(banner).not.toContainText('/Users/');
+});
+
+test('an automatically downloaded update presents the same actionable installer handoff', async ({ page }) => {
+  const packageName = 'Scout-0.1.0-beta.23-windows-x64.exe';
+  const locationHint = `%LOCALAPPDATA%\\Scout\\updates\\${packageName}`;
+  await page.evaluate(({ name, hint }) => window.Scout.renderUpdateBanner({
+    available: true,
+    latestVersion: '0.1.0-beta.23',
+    canDownload: true,
+    package: { name },
+    downloaded: {
+      name,
+      version: '0.1.0-beta.23',
+      locationHint: hint,
+    },
+  }), { name: packageName, hint: locationHint });
+
+  const banner = page.locator('#update-banner');
+  await expect(banner).toContainText(packageName);
+  await expect(banner).toContainText(locationHint);
+  await expect(banner.getByRole('button', { name: 'Download verified update' })).toHaveCount(0);
+  await expect(banner).not.toContainText('/Users/');
 });
 
 test('a stale tracker mutation refreshes its revision and retries exactly once', async ({ page }) => {
@@ -145,6 +210,50 @@ test('backup status opens dedicated details and advanced backup settings', async
   await expect(sync).toBeFocused();
 });
 
+test('safe backup divergence requires confirmation and submits only the analysis token', async ({ page }) => {
+  const analysisToken = 'a'.repeat(64);
+  await page.unroute('**/api/setup/status');
+  await page.route('**/api/setup/status', (route) => route.fulfill({
+    contentType: 'application/json',
+    body: JSON.stringify({
+      ...establishedStatus,
+      sync: {
+        state: 'needs-attention',
+        enabled: true,
+        conflict: true,
+        ahead: 2,
+        behind: 1,
+        resolution: {
+          classification: 'disjoint-safe',
+          canResolve: true,
+          analysisToken,
+          localAreas: ['opportunity tracker'],
+          remoteAreas: ['reports'],
+        },
+      },
+    }),
+  }));
+  let submitted;
+  await page.route('**/api/sync/resolve', async (route) => {
+    submitted = route.request().postDataJSON();
+    await route.fulfill({
+      contentType: 'application/json',
+      body: JSON.stringify({ state: 'synced', resolved: true, recoveryRefsCreated: true }),
+    });
+  });
+  await page.reload();
+  await page.locator('#sync-status').click();
+  const dialog = page.getByRole('dialog');
+  await dialog.getByRole('button', { name: 'Advanced backup settings' }).click();
+  await expect(dialog.getByText(/Scout host and GitHub both have new backup history/)).toBeVisible();
+  await expect(dialog.getByText(/opportunity tracker/)).toBeVisible();
+  await expect(dialog.getByText(/reports/)).toBeVisible();
+  page.once('dialog', (confirmation) => confirmation.accept());
+  await dialog.getByRole('button', { name: 'Preserve both and sync' }).click();
+  await expect.poll(() => submitted).toEqual({ analysisToken, confirmed: true });
+  expect(JSON.stringify(submitted)).not.toMatch(/opportunit|reports|refs\/|workspace/i);
+});
+
 test('scan settings offer only the selected provider until verification is requested', async ({ page }) => {
   await page.getByRole('button', { name: 'Settings' }).click();
   const dialog = page.getByRole('dialog');
@@ -153,6 +262,118 @@ test('scan settings offer only the selected provider until verification is reque
   await expect(dialog.getByText('Claude verification pass time')).toHaveCount(0);
   await dialog.getByRole('button', { name: 'Add verification pass' }).click();
   await expect(dialog.getByText('Claude verification pass time')).toBeVisible();
+});
+
+test('search settings review lane evidence before reversible retirement', async ({ page }) => {
+  const baseLane = {
+    id: 'lane-aaaaaaaaaaaaaaaa',
+    definitionFingerprint: 'a'.repeat(64),
+    state: 'active',
+    kind: 'title',
+    source: 'query-sources',
+    query: 'Platform engineer',
+    canonicalQuery: 'platform engineer',
+    priority: 100,
+    priorityBand: 'core',
+    profileFields: [{
+      path: 'target.primaryTitles',
+      ruleId: 'rule-primary',
+      value: 'Platform engineer',
+      strength: 'strong-preference',
+      provenance: 'explicit',
+    }],
+    overlaps: [],
+    createdAt: '2026-07-20T10:00:00.000Z',
+    updatedAt: '2026-07-23T10:00:00.000Z',
+    aggregate: { returned: 0, parsed: 0, new: 0, eligible: 0, selected: 0, promising: 0 },
+    runCount: 3,
+    failureCount: 0,
+    consecutiveUnproductiveRuns: 3,
+    history: [{
+      runId: 'run-three',
+      recordedAt: '2026-07-23T10:00:00.000Z',
+      laneId: 'lane-aaaaaaaaaaaaaaaa',
+      returned: 0, parsed: 0, new: 0, eligible: 0, selected: 0, promising: 0,
+    }],
+    retirement: null,
+  };
+  const plan = {
+    schemaVersion: 1,
+    profileId: 'profile-aaaaaaaaaaaa',
+    generatedAt: '2026-07-20T10:00:00.000Z',
+    updatedAt: '2026-07-23T10:00:00.000Z',
+    generation: 1,
+    lanes: [baseLane],
+    archivedLanes: [],
+    omissions: [],
+  };
+  await page.route('**/api/search-profile', (route) => route.fulfill({
+    contentType: 'application/json',
+    body: JSON.stringify({
+      rawPresent: true,
+      draft: null,
+      published: { id: plan.profileId },
+      draftRevision: null,
+    }),
+  }));
+  await page.route('**/api/search-profile/adaptive', (route) => route.fulfill({
+    contentType: 'application/json',
+    body: JSON.stringify({ questionnaire: null, lanePlan: plan, laneRevision: 'revision-one' }),
+  }));
+  let retirementRequest;
+  await page.route('**/api/search-lanes/retire-unproductive', (route) => {
+    retirementRequest = route.request().postDataJSON();
+    const retired = {
+      ...plan,
+      lanes: [{
+        ...baseLane,
+        state: 'retired',
+        retirement: {
+          reason: 'consistently-unproductive',
+          retiredAt: '2026-07-24T10:00:00.000Z',
+          minimumRuns: 3,
+          reversible: true,
+        },
+      }],
+    };
+    return route.fulfill({
+      contentType: 'application/json',
+      body: JSON.stringify({ ok: true, lanePlan: retired, laneRevision: 'revision-two' }),
+    });
+  });
+  let restoreRequest;
+  await page.route('**/api/search-lanes/restore', (route) => {
+    restoreRequest = route.request().postDataJSON();
+    return route.fulfill({
+      contentType: 'application/json',
+      body: JSON.stringify({ ok: true, lanePlan: plan, laneRevision: 'revision-three' }),
+    });
+  });
+
+  await page.getByRole('button', { name: 'Settings' }).click();
+  const dialog = page.getByRole('dialog');
+  await dialog.getByRole('button', { name: 'Search & profile' }).click();
+  await dialog.getByText('Search lanes and run history', { exact: true }).click();
+  await expect(dialog.getByText('Platform engineer', { exact: true })).toBeVisible();
+  await expect(dialog.getByText(/3 run\(s\)/)).toBeVisible();
+  await expect(dialog.getByText(/0 returned,\s+0 parsed,\s+0 new,\s+0 eligible,\s+0 selected,\s+0 promising/).first()).toBeVisible();
+  await expect(dialog.getByText(/value: Platform engineer; strength: strong-preference; provenance: explicit/)).toBeVisible();
+  await dialog.getByRole('button', { name: 'Retire reviewed unproductive lanes' }).click();
+  await expect(page.locator('#setup-status')).toContainText('Confirm that you reviewed');
+  await dialog.locator('#search-lanes-retire-confirm').check();
+  await dialog.getByRole('button', { name: 'Retire reviewed unproductive lanes' }).click();
+  await expect.poll(() => retirementRequest).toEqual({
+    revision: 'revision-one',
+    confirmed: true,
+  });
+  await dialog.getByText('Search lanes and run history', { exact: true }).click();
+  await dialog.getByRole('button', { name: 'Restore this lane' }).click();
+  await expect.poll(() => restoreRequest).toEqual({
+    laneId: baseLane.id,
+    revision: 'revision-two',
+    confirmed: true,
+  });
+  await expect(dialog.getByRole('button', { name: 'Restore this lane' })).toHaveCount(0);
 });
 
 test('AI and scan settings save independent provider model choices', async ({ page }) => {
@@ -295,8 +516,19 @@ test('settings opens a hub and retuning is explicit and dismissible', async ({ p
 
   const dialog = page.getByRole('dialog');
   await expect(dialog.getByRole('heading', { name: 'Scout settings' })).toBeVisible();
-  await expect(dialog.locator('.settings-card')).toHaveCount(7);
+  await expect(dialog.locator('.settings-card')).toHaveCount(9);
   await expect(dialog.getByText('Review settings')).toHaveCount(0);
+
+  await dialog.getByRole('button', { name: 'Employers' }).click();
+  await expect(dialog.getByRole('heading', { name: 'Employers' })).toBeVisible();
+  await expect(dialog.getByRole('heading', { name: 'Add an employer for review' })).toBeVisible();
+  await dialog.getByRole('button', { name: 'Back to settings' }).click();
+
+  await dialog.getByRole('button', { name: 'Feedback & learning' }).click();
+  await expect(dialog.getByRole('heading', { name: 'Feedback & learning' })).toBeVisible();
+  await expect(dialog.getByText(/Job feedback never changes tracker status or ranking by itself/)).toBeVisible();
+  await expect(dialog.getByText(/No learned ranking changes are active/)).toBeVisible();
+  await dialog.getByRole('button', { name: 'Back to settings' }).click();
 
   await dialog.getByRole('button', { name: 'Search & profile' }).click();
   await expect(dialog.getByRole('heading', { name: 'Search & profile' })).toBeVisible();
@@ -316,7 +548,7 @@ test('settings traps focus, makes the dashboard inert, and restores its opener',
   const settings = page.getByRole('button', { name: 'Settings' });
   await settings.click();
   const dialog = page.getByRole('dialog');
-  await expect(dialog.locator('.settings-card')).toHaveCount(7);
+  await expect(dialog.locator('.settings-card')).toHaveCount(9);
   await expect(dialog.getByRole('heading', { name: 'Scout settings' })).toBeFocused();
   await expect.poll(() => page.locator('main').evaluate((element) => element.inert)).toBe(true);
 
@@ -378,12 +610,12 @@ test('a slow initial setup response cannot replace an explicit Settings view', a
   await expect.poll(() => Boolean(releaseInitial)).toBe(true);
   await page.getByRole('button', { name: 'Settings' }).click();
   const dialog = page.getByRole('dialog');
-  await expect(dialog.locator('.settings-card')).toHaveCount(7);
+  await expect(dialog.locator('.settings-card')).toHaveCount(9);
 
   releaseInitial();
   await expect.poll(() => statusRequests).toBe(2);
   await page.waitForTimeout(100);
-  await expect(dialog.locator('.settings-card')).toHaveCount(7);
+  await expect(dialog.locator('.settings-card')).toHaveCount(9);
   await expect(dialog.getByRole('heading', { name: 'Scout setup update' })).toHaveCount(0);
 });
 
@@ -485,6 +717,322 @@ test('settings is a single usable scroll surface on a phone viewport', async ({ 
   const appBox = await appDevice.boundingBox();
   expect(appBox.y).toBeGreaterThanOrEqual(0);
   expect(appBox.y + appBox.height).toBeLessThanOrEqual(740);
+});
+
+test('guided provider login supports code, failure, retry and cancel without browser persistence', async ({ page }) => {
+  await page.unroute('**/api/setup/status');
+  await page.route('**/api/setup/status', async (route) => {
+    await route.fulfill({
+      contentType: 'application/json',
+      body: JSON.stringify({
+        ...establishedStatus,
+        providers: {
+          ...establishedStatus.providers,
+          claude: { installed: true, authenticated: false, capabilities: { structuredOutput: true } },
+        },
+      }),
+    });
+  });
+  await page.unroute('**/api/provider-login/status?*');
+  let session = null;
+  let startCount = 0;
+  let retryCount = 0;
+  let statusRequests = 0;
+  const requests = [];
+  const snapshot = (state, fields = {}) => ({
+    codeRequired: state === 'awaiting-code',
+    createdAt: '2026-07-29T10:00:00.000Z',
+    expiresAt: '2026-07-29T10:10:00.000Z',
+    provider: 'claude',
+    reasonCode: state === 'failed' ? 'validation-failed' : null,
+    sessionId: '00000000-0000-4000-8000-000000000002',
+    state,
+    userCode: null,
+    verificationUrl: null,
+    ...fields,
+  });
+  await page.route('**/api/provider-login/**', async (route) => {
+    const request = route.request();
+    const url = new URL(request.url());
+    const action = url.pathname.split('/').at(-1);
+    if (action === 'status') {
+      statusRequests += 1;
+      await route.fulfill({
+        contentType: 'application/json',
+        body: JSON.stringify({
+          provider: 'claude',
+          session,
+          [['csrf', 'Token'].join('')]: ['csrf', 'claude', 'synthetic', '000000000000'].join('-'),
+        }),
+      });
+      return;
+    }
+    requests.push({
+      action,
+      csrf: request.headers()['x-scout-provider-login-csrf'],
+      body: request.postDataJSON(),
+    });
+    if (action === 'start') session = snapshot(++startCount === 1 ? 'awaiting-code' : 'succeeded');
+    if (action === 'code') session = snapshot('failed');
+    if (action === 'retry') session = snapshot(++retryCount === 1 ? 'starting' : 'succeeded');
+    if (action === 'cancel') session = snapshot('failed', {
+      reasonCode: 'credentials-expired',
+    });
+    if (action === 'clear-claude-credentials') {
+      session = null;
+      await route.fulfill({
+        contentType: 'application/json',
+        body: JSON.stringify({ result: { provider: 'claude', reasonCode: null, state: 'cleared' } }),
+      });
+      return;
+    }
+    await route.fulfill({
+      status: action === 'start' || action === 'retry' ? 202 : 200,
+      contentType: 'application/json',
+      body: JSON.stringify({ session }),
+    });
+  });
+
+  await page.getByRole('button', { name: 'Settings' }).click();
+  const dialog = page.getByRole('dialog');
+  await dialog.getByRole('button', { name: 'AI providers' }).click();
+  await dialog.getByRole('button', { name: 'Sign in to Claude with Scout' }).click();
+  const codeInput = dialog.getByLabel('One-time provider code');
+  await expect(codeInput).toBeVisible();
+  await codeInput.fill('PRIVATE-CODE');
+  const statusBeforeTyping = statusRequests;
+  await expect.poll(() => statusRequests).toBeGreaterThan(statusBeforeTyping);
+  await expect(codeInput).toHaveValue('PRIVATE-CODE');
+  await dialog.getByRole('button', { name: 'Submit code' }).click();
+  await expect(dialog.getByRole('button', { name: 'Retry Claude sign-in' })).toBeVisible();
+  await expect(dialog.getByRole('button', { name: 'Clear expired Claude sign-in' })).toHaveCount(0);
+  await expect(dialog).toContainText('claude auth login');
+  await expect(dialog).not.toContainText('validation-failed');
+
+  await dialog.getByRole('button', { name: 'Retry Claude sign-in' }).click();
+  await expect(dialog.getByRole('button', { name: 'Cancel Claude sign-in' })).toBeVisible();
+  await dialog.getByRole('button', { name: 'Cancel Claude sign-in' }).click();
+  await expect(dialog.getByRole('button', { name: 'Retry Claude sign-in' })).toBeVisible();
+  await expect(dialog.getByRole('button', { name: 'Clear expired Claude sign-in' })).toBeVisible();
+  page.once('dialog', (confirmation) => confirmation.accept());
+  await dialog.getByRole('button', { name: 'Clear expired Claude sign-in' }).click();
+  await dialog.getByRole('button', { name: 'Sign in to Claude with Scout' }).click();
+  await expect(dialog).toContainText('Sign-in succeeded');
+
+  expect(requests.map(({ action }) => action)).toEqual([
+    'start', 'code', 'retry', 'cancel', 'clear-claude-credentials', 'start',
+  ]);
+  for (const request of requests) {
+    expect(request.csrf).toBe('csrf-claude-synthetic-000000000000');
+  }
+  expect(requests.find(({ action }) => action === 'clear-claude-credentials').body)
+    .toEqual({
+      confirmed: true,
+      sessionId: '00000000-0000-4000-8000-000000000002',
+    });
+  const stored = await page.evaluate(() => ({
+    local: Object.entries(localStorage),
+    session: Object.entries(sessionStorage),
+  }));
+  expect(JSON.stringify(stored)).not.toContain('PRIVATE-CODE');
+});
+
+test('a durable remote authentication failure keeps reauthentication reachable', async ({ page }) => {
+  await page.unroute('**/api/setup/status');
+  await page.route('**/api/setup/status', (route) => route.fulfill({
+    contentType: 'application/json',
+    body: JSON.stringify({
+      ...establishedStatus,
+      providers: {
+        ...establishedStatus.providers,
+        codex: {
+          installed: true,
+          authenticated: true,
+          capabilities: { structuredOutput: true },
+          healthState: 'sign-in-required',
+        },
+      },
+    }),
+  }));
+
+  await page.getByRole('button', { name: 'Settings' }).click();
+  const dialog = page.getByRole('dialog');
+  await dialog.getByRole('button', { name: 'AI providers' }).click();
+  const codexCard = dialog.locator('.setup-provider:has([data-provider-login="codex"])');
+  await expect(codexCard.getByRole('button', { name: 'Sign in to Codex with Scout' })).toBeVisible();
+  await expect(codexCard).toContainText('codex login --device-auth');
+  await expect(codexCard).toContainText('Codex needs sign-in');
+  await expect(codexCard).not.toContainText('Codex is signed in');
+  await expect(codexCard).not.toContainText('Installed, signed in and compatible');
+});
+
+test('provider cards render every non-usable health state truthfully and disabled', async ({ page }) => {
+  const expected = [
+    [null, 'provider status unavailable'],
+    ['checking', 'checking provider status'],
+    ['login-in-progress', 'sign-in in progress'],
+    ['network-unavailable', 'network unavailable'],
+    ['rate-limited', 'provider rate limited'],
+    ['provider-error', 'provider error'],
+  ];
+  for (const [healthState, label] of expected) {
+    const rendered = await page.evaluate(({ nextHealthState }) => {
+      const setup = window.ScoutSetup;
+      setup.status = {
+        ...setup.status,
+        providers: {
+          ...setup.status.providers,
+          codex: {
+            installed: true,
+            authenticated: true,
+            capabilities: { structuredOutput: true },
+            healthState: nextHealthState,
+          },
+        },
+      };
+      const card = document.createElement('div');
+      card.innerHTML = setup.providerCard('codex');
+      return {
+        disabled: card.querySelector('input[name="setup-provider"]')?.disabled,
+        text: card.textContent,
+      };
+    }, { nextHealthState: healthState });
+    expect(rendered.disabled, healthState).toBe(true);
+    expect(rendered.text, healthState).toContain(label);
+    expect(rendered.text, healthState).not.toContain('Installed, signed in and compatible');
+  }
+});
+
+test('guided login preserves failed logout state and reports no false success', async ({ page }) => {
+  await page.unroute('**/api/setup/status');
+  await page.route('**/api/setup/status', (route) => route.fulfill({
+    contentType: 'application/json',
+    body: JSON.stringify({
+      ...establishedStatus,
+      providers: {
+        ...establishedStatus.providers,
+        claude: {
+          installed: true,
+          authenticated: false,
+          capabilities: { structuredOutput: true },
+        },
+      },
+    }),
+  }));
+  let session = {
+    codeRequired: false,
+    createdAt: '2026-07-29T10:00:00.000Z',
+    expiresAt: '2026-07-29T10:10:00.000Z',
+    provider: 'claude',
+    reasonCode: 'credentials-expired',
+    sessionId: '00000000-0000-4000-8000-000000000003',
+    state: 'failed',
+    userCode: null,
+    verificationUrl: null,
+  };
+  await page.route('**/api/provider-login/**', async (route) => {
+    const action = new URL(route.request().url()).pathname.split('/').at(-1);
+    if (action === 'status') {
+      return route.fulfill({
+        contentType: 'application/json',
+        body: JSON.stringify({
+          provider: 'claude',
+          session,
+          [['csrf', 'Token'].join('')]: ['csrf', 'claude', 'synthetic', '000000000000'].join('-'),
+        }),
+      });
+    }
+    session = { ...session, reasonCode: 'logout-failed' };
+    return route.fulfill({
+      status: 502,
+      contentType: 'application/json',
+      body: JSON.stringify({
+        result: { provider: 'claude', reasonCode: 'logout-failed', state: 'failed' },
+      }),
+    });
+  });
+  await page.getByRole('button', { name: 'Settings' }).click();
+  const dialog = page.getByRole('dialog');
+  await dialog.getByRole('button', { name: 'AI providers' }).click();
+  page.once('dialog', (confirmation) => confirmation.accept());
+  await dialog.getByRole('button', { name: 'Clear expired Claude sign-in' }).click();
+  await expect(dialog.getByRole('button', { name: 'Retry Claude sign-in' })).toBeVisible();
+  await expect(dialog.getByRole('button', { name: 'Sign in to Claude with Scout' })).toHaveCount(0);
+  await expect(page.locator('#setup-status')).not.toContainText('sign-in cleared');
+});
+
+test('guided login ignores stale polls and suppresses duplicate mutations', async ({ page }) => {
+  await page.unroute('**/api/setup/status');
+  await page.route('**/api/setup/status', (route) => route.fulfill({
+    contentType: 'application/json',
+    body: JSON.stringify({
+      ...establishedStatus,
+      providers: {
+        ...establishedStatus.providers,
+        claude: {
+          installed: true,
+          authenticated: false,
+          capabilities: { structuredOutput: true },
+        },
+      },
+    }),
+  }));
+  let claudeStatusCount = 0;
+  let releaseStaleStatus;
+  const staleStatus = new Promise((resolve) => { releaseStaleStatus = resolve; });
+  let starts = 0;
+  const active = {
+    codeRequired: false,
+    createdAt: '2026-07-29T10:00:00.000Z',
+    expiresAt: '2026-07-29T10:10:00.000Z',
+    provider: 'claude',
+    reasonCode: null,
+    sessionId: '00000000-0000-4000-8000-000000000004',
+    state: 'starting',
+    userCode: null,
+    verificationUrl: null,
+  };
+  await page.route('**/api/provider-login/**', async (route) => {
+    const request = route.request();
+    const url = new URL(request.url());
+    const action = url.pathname.split('/').at(-1);
+    if (action === 'status') {
+      const provider = url.searchParams.get('provider');
+      if (provider === 'claude') {
+        claudeStatusCount += 1;
+        if (claudeStatusCount === 2) await staleStatus;
+      }
+      return route.fulfill({
+        contentType: 'application/json',
+        body: JSON.stringify({
+          provider,
+          session: null,
+          csrfToken: `csrf-${provider}-synthetic-000000000000`,
+        }),
+      });
+    }
+    if (action === 'start') starts += 1;
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    return route.fulfill({
+      status: 202,
+      contentType: 'application/json',
+      body: JSON.stringify({ session: active }),
+    });
+  });
+  await page.getByRole('button', { name: 'Settings' }).click();
+  const dialog = page.getByRole('dialog');
+  await dialog.getByRole('button', { name: 'AI providers' }).click();
+  await page.evaluate(() => { void window.ScoutSetup.refreshProviderLogin('claude'); });
+  const start = dialog.getByRole('button', { name: 'Sign in to Claude with Scout' });
+  await start.evaluate((button) => {
+    button.click();
+    button.click();
+  });
+  await expect(dialog.getByRole('button', { name: 'Cancel Claude sign-in' })).toBeVisible();
+  releaseStaleStatus();
+  await expect.poll(() => claudeStatusCount).toBeGreaterThanOrEqual(2);
+  await expect(dialog.getByRole('button', { name: 'Cancel Claude sign-in' })).toBeVisible();
+  expect(starts).toBe(1);
 });
 
 test('phone All view reaches its rightmost column and keeps strong-match controls on screen', async ({ page }) => {

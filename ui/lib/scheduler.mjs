@@ -8,8 +8,182 @@ export const MAC_LABEL = 'app.scout.daily-scan';
 export const LINUX_UNIT = 'scout-daily-scan';
 
 function validateJobId(value = 'primary') {
-  if (!/^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(String(value))) throw new Error('schedule job id must use lower-case letters, numbers and hyphens');
+  if (!/^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(String(value)) || String(value).length > 64) {
+    throw new Error('schedule job id must use at most 64 lower-case letters, numbers and hyphens');
+  }
   return String(value);
+}
+
+const HEALTH_STATES = new Set([
+  'checking',
+  'ready',
+  'credentials-present-unverified',
+  'sign-in-required',
+  'login-in-progress',
+  'network-unavailable',
+  'rate-limited',
+  'cli-update-required',
+  'provider-error',
+]);
+const HEALTH_REASON_CODES = new Set([
+  'checking',
+  'credentials-found',
+  'signed-out',
+  'login-started',
+  'remote-ok',
+  'authentication-required',
+  'network-unavailable',
+  'rate-limited',
+  'cli-update-required',
+  'provider-error',
+  'preflight-failed',
+  'schedule-disabled',
+]);
+
+function validateScheduledProvider(value) {
+  if (!['codex', 'claude'].includes(value)) throw new Error('schedule provider is unsupported');
+  return value;
+}
+
+function safeReasonCode(value, fallback = null) {
+  const reason = String(value || '');
+  return HEALTH_REASON_CODES.has(reason) ? reason : fallback;
+}
+
+function safeCheckedAt(value) {
+  const parsed = new Date(value);
+  return typeof value === 'string' && !Number.isNaN(parsed.getTime()) ? parsed.toISOString() : null;
+}
+
+function safeProviderPreflight(value, provider, purpose, jobId = null) {
+  const ok = value?.ok === true;
+  const state = HEALTH_STATES.has(value?.state) ? value.state : (ok ? 'ready' : 'provider-error');
+  const checkedAt = safeCheckedAt(value?.checkedAt);
+  return {
+    ok,
+    provider,
+    purpose,
+    state,
+    ...(jobId ? { jobId } : {}),
+    ...(!ok ? { reasonCode: safeReasonCode(value?.reasonCode, 'preflight-failed') } : {}),
+    ...(checkedAt ? { checkedAt } : {}),
+    ...(value?.verified === true ? { verified: true } : {}),
+    ...(value?.alertId === `provider-health:${provider}:${state}`
+      ? { alertId: value.alertId }
+      : {}),
+    ...(value?.shouldNotify === true ? { shouldNotify: true } : {}),
+  };
+}
+
+async function defaultProviderPreflight(...args) {
+  const { providerPreflight } = await import('./providerHealth.mjs');
+  return providerPreflight(...args);
+}
+
+export async function scheduledProviderPreflight(root, job, {
+  preflight = defaultProviderPreflight,
+} = {}) {
+  const jobId = validateJobId(job?.id);
+  const provider = validateScheduledProvider(job?.provider);
+  if (job?.enabled !== true) {
+    return {
+      ok: false,
+      provider,
+      purpose: 'scheduled-job',
+      state: 'checking',
+      jobId,
+      reasonCode: 'schedule-disabled',
+    };
+  }
+  try {
+    const result = await preflight(root, provider, 'scheduled-job', { source: 'scheduled-preflight' });
+    return safeProviderPreflight(result, provider, 'scheduled-job', jobId);
+  } catch {
+    return {
+      ok: false,
+      provider,
+      purpose: 'scheduled-job',
+      state: 'provider-error',
+      jobId,
+      reasonCode: 'preflight-failed',
+    };
+  }
+}
+
+export function createProviderHealthMonitor({
+  root,
+  getScheduleJobs,
+  preflight = defaultProviderPreflight,
+  intervalMs = 5 * 60 * 1000,
+  setInterval: scheduleInterval = globalThis.setInterval,
+  clearInterval: cancelInterval = globalThis.clearInterval,
+} = {}) {
+  if (typeof getScheduleJobs !== 'function') throw new TypeError('provider health monitor requires schedule jobs');
+  if (!Number.isFinite(intervalMs) || intervalMs < 1_000 || intervalMs > 24 * 60 * 60 * 1000) {
+    throw new RangeError('provider health interval must be between one second and one day');
+  }
+  let stopped = false;
+  let inFlight = null;
+
+  const runNow = () => {
+    if (stopped) return Promise.resolve([]);
+    if (inFlight) return inFlight;
+    inFlight = Promise.resolve()
+      .then(() => getScheduleJobs())
+      .then(async (jobs) => {
+        const enabled = Array.isArray(jobs) ? jobs.filter((job) => job?.enabled === true) : [];
+        const providers = [];
+        const seen = new Set();
+        for (const job of enabled) {
+          validateJobId(job?.id);
+          const provider = validateScheduledProvider(job?.provider);
+          if (!seen.has(provider)) {
+            seen.add(provider);
+            providers.push(provider);
+          }
+        }
+        return Promise.all(providers.map(async (provider) => {
+          try {
+            const result = await preflight(root, provider, 'periodic', { source: 'periodic' });
+            return safeProviderPreflight(result, provider, 'periodic');
+          } catch {
+            return {
+              ok: false,
+              provider,
+              purpose: 'periodic',
+              state: 'provider-error',
+              reasonCode: 'preflight-failed',
+            };
+          }
+        }));
+      })
+      .finally(() => { inFlight = null; });
+    return inFlight;
+  };
+
+  let timer;
+  const start = () => {
+    timer = scheduleInterval(() => { void runNow().catch(() => {}); }, intervalMs);
+    timer?.unref?.();
+  };
+  start();
+  return {
+    runNow,
+    stop() {
+      if (stopped) return;
+      stopped = true;
+      cancelInterval(timer);
+    },
+    resume() {
+      if (!stopped) return;
+      stopped = false;
+      start();
+    },
+    async drain() {
+      this.stop();
+      if (inFlight) await inFlight;
+    },
+  };
 }
 
 export function nativeScheduleNames(id = 'primary') {
@@ -167,6 +341,44 @@ export function nextScheduledRun(time, now = new Date(), timezone = null, days =
     if (wanted.has(candidate.getDay()) && candidate > now) return candidate.toISOString();
   }
   return null;
+}
+
+export function scheduledLogicalWindow(time, now = new Date(), timezone = null, days = null) {
+  validateTime(time);
+  const [hours, minutes] = time.split(':').map(Number);
+  const wanted = new Set(normaliseScheduleDays(days));
+  if (timezone) {
+    const zone = validateTimezone(timezone);
+    const today = zonedParts(now, zone);
+    for (let offset = 0; offset <= 7; offset += 1) {
+      const day = new Date(Date.UTC(today.year, today.month - 1, today.day - offset));
+      if (!wanted.has(day.getUTCDay())) continue;
+      const candidate = zonedInstant({
+        year: day.getUTCFullYear(), month: day.getUTCMonth() + 1, day: day.getUTCDate(),
+        hour: hours, minute: minutes,
+      }, zone);
+      if (candidate <= now) return candidate.toISOString();
+    }
+    return null;
+  }
+  for (let offset = 0; offset <= 7; offset += 1) {
+    const candidate = new Date(now);
+    candidate.setDate(candidate.getDate() - offset);
+    candidate.setHours(hours, minutes, 0, 0);
+    if (wanted.has(candidate.getDay()) && candidate <= now) return candidate.toISOString();
+  }
+  return null;
+}
+
+// A delayed native scheduler invocation must not revive a scheduled request
+// indefinitely: it is valid until its next configured window, capped at 12h.
+export function scheduledRequestExpiry(requestedAt, nextWindowAt) {
+  const requested = new Date(requestedAt);
+  const window = new Date(nextWindowAt);
+  if (Number.isNaN(requested.getTime()) || Number.isNaN(window.getTime()) || window <= requested) {
+    throw new TypeError('scheduled request times must be ordered ISO timestamps');
+  }
+  return new Date(Math.min(requested.getTime() + 12 * 60 * 60 * 1000, window.getTime())).toISOString();
 }
 
 export function scheduleSummary(config = {}, scanHealth = null, tasks = [], now = new Date()) {

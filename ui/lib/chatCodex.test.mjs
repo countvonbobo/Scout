@@ -42,13 +42,13 @@ test('parseCodexLine: current shape', () => {
       item: { type: 'file_change', changes: [{ path: 'applications/acme/cv.typ' }, { path: 'applications/acme/outreach.md' }] },
     })),
     [
-      { kind: 'tool', label: 'edit: applications/acme/cv.typ', file: 'applications/acme/cv.typ', mutatesFile: true, activity: 'writing' },
-      { kind: 'tool', label: 'edit: applications/acme/outreach.md', file: 'applications/acme/outreach.md', mutatesFile: true, activity: 'writing' },
+      { kind: 'tool', label: 'Editing a file', file: 'applications/acme/cv.typ', mutatesFile: true, activity: 'writing' },
+      { kind: 'tool', label: 'Editing a file', file: 'applications/acme/outreach.md', mutatesFile: true, activity: 'writing' },
     ],
   );
   assert.deepEqual(
     parseCodexLine(JSON.stringify({ type: 'item.completed', item: { type: 'command_execution', command: 'typst compile' } })),
-    [{ kind: 'tool', label: 'run: typst compile', file: null, activity: 'thinking' }],
+    [{ kind: 'tool', label: 'Running a provider command', file: null, activity: 'thinking' }],
   );
   assert.deepEqual(
     parseCodexLine(JSON.stringify({ type: 'turn.completed', usage: { input_tokens: 9 } })),
@@ -56,7 +56,7 @@ test('parseCodexLine: current shape', () => {
   );
   assert.deepEqual(
     parseCodexLine(JSON.stringify({ type: 'turn.failed', error: { message: 'nope' } })),
-    [{ kind: 'done', text: 'nope', ok: false, usage: {} }],
+    [{ kind: 'done', text: '', ok: false, usage: {} }],
   );
 });
 
@@ -75,7 +75,7 @@ test('parseCodexLine: legacy shape', () => {
   );
   assert.deepEqual(
     parseCodexLine(JSON.stringify({ msg: { type: 'error', message: 'bad' } })),
-    [{ kind: 'done', text: 'bad', ok: false, usage: {} }],
+    [{ kind: 'done', text: '', ok: false, usage: {} }],
   );
 });
 

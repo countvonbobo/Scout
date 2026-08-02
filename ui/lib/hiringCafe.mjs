@@ -178,10 +178,16 @@ export async function fetchHiringCafe(queries = DEFAULT_HIRING_CAFE_QUERIES, fet
       let count = 0;
       for (const hit of hits) {
         if (hit.is_expired) continue;
-        const job = normalise(hit, options);
+        const job = { ...normalise(hit, options), searchQueries: [query] };
         count += 1;
         const key = job.providerId || job.url || `${job.company.toLowerCase().trim()}|${job.title.toLowerCase().trim()}|${job.location.toLowerCase().trim()}`;
-        if (seen.has(key)) continue;
+        if (seen.has(key)) {
+          const existing = jobs.find((item) => (
+            (item.providerId || item.url || `${item.company.toLowerCase().trim()}|${item.title.toLowerCase().trim()}|${item.location.toLowerCase().trim()}`) === key
+          ));
+          if (existing && !existing.searchQueries.includes(query)) existing.searchQueries.push(query);
+          continue;
+        }
         seen.add(key);
         jobs.push(job);
       }

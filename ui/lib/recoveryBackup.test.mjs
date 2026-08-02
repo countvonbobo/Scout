@@ -4,13 +4,47 @@ import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import {
-  initializeRecoveryBackup, loadRecoveryHeader, recoveryFileList, restoreRecoveryBackup,
+  createRecoveryKeys, initializeRecoveryBackup, loadRecoveryHeader, recoveryFileList, restoreRecoveryBackup,
   restoreRecoveryBackupWithKey, rotateRecoveryPassphrase, unlockRecoveryKey, writeRecoveryBackup,
+  verifyReviewedRunArchive, writeReviewedRunArchive,
 } from './recoveryBackup.mjs';
+import * as recoveryBackup from './recoveryBackup.mjs';
 import crypto from 'node:crypto';
 
 const EXAMPLE_ENV = ['SECRET', 'example'].join('=') + '\n';
 const CHANGED_ENV = ['SECRET', 'dummy'].join('=') + '\n';
+
+test('reviewed run archives use the authenticated recovery-key boundary and detect tampering', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'scout-reviewed-archive-'));
+  const created = initializeRecoveryBackup(root, 'correct horse battery staple');
+  try {
+    const written = writeReviewedRunArchive(root, created.dataKey, {
+      schemaVersion: 1,
+      archiveId: 'a'.repeat(64),
+      reviewedSelectionDigest: 'b'.repeat(64),
+      runs: [{ runId: 'synthetic-run', files: [{ path: 'journal.jsonl', data: 'PRIVATE-JOURNAL' }] }],
+    }, { commitFence: (commit) => commit() });
+    assert.doesNotMatch(fs.readFileSync(written.file, 'utf8'), /synthetic-run|PRIVATE-JOURNAL/);
+    assert.equal(verifyReviewedRunArchive(written.file, created.dataKey).runs[0].runId, 'synthetic-run');
+    const record = JSON.parse(fs.readFileSync(written.file, 'utf8'));
+    const changed = Buffer.from(record.data, 'base64url');
+    changed[0] ^= 1;
+    record.data = changed.toString('base64url');
+    fs.writeFileSync(written.file, JSON.stringify(record));
+    assert.throws(() => verifyReviewedRunArchive(written.file, created.dataKey), /modified|invalid/i);
+    assert.throws(
+      () => writeReviewedRunArchive(root, crypto.randomBytes(32), {
+        schemaVersion: 1,
+        archiveId: 'c'.repeat(64),
+        reviewedSelectionDigest: 'd'.repeat(64),
+        runs: [],
+      }, { commitFence: (commit) => commit() }),
+      /persisted recovery|data key/i,
+    );
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
 
 function fixture() {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'scout-recovery-'));
@@ -55,6 +89,39 @@ test('recovery backup encrypts only resumable ignored state and restores with ei
     fs.rmSync(target, { recursive: true, force: true });
   }
   fs.rmSync(root, { recursive: true, force: true });
+});
+
+test('scan-owned recovery restore yields to an independent heartbeat and fences component mutations', async () => {
+  const root = fixture();
+  fs.writeFileSync(path.join(root, 'applications', 'example', 'cv.pdf'), Buffer.alloc(8 * 1024 * 1024, 0x62));
+  const created = initializeRecoveryBackup(root, 'correct horse battery staple');
+  const target = fs.mkdtempSync(path.join(os.tmpdir(), 'scout-async-restored-'));
+  let heartbeatTicks = 0;
+  let fenceChecks = 0;
+  const heartbeat = setInterval(() => { heartbeatTicks += 1; }, 1);
+  try {
+    assert.equal(
+      typeof recoveryBackup.restoreRecoveryBackupWithKeyAsync,
+      'function',
+      'the scan-owned restore must expose an asynchronous implementation',
+    );
+    const restored = await recoveryBackup.restoreRecoveryBackupWithKeyAsync(
+      root,
+      target,
+      created.dataKey,
+      created.header,
+      { assertFence() { fenceChecks += 1; } },
+    );
+
+    assert.equal(restored.files, 4);
+    assert.equal(fs.statSync(path.join(target, 'applications', 'example', 'cv.pdf')).size, 8 * 1024 * 1024);
+    assert.ok(heartbeatTicks > 0, 'large recovery restore must yield to the independent heartbeat');
+    assert.ok(fenceChecks >= 8, 'restore component mutations must be fenced individually');
+  } finally {
+    clearInterval(heartbeat);
+    fs.rmSync(target, { recursive: true, force: true });
+    fs.rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test('unchanged encrypted files retain their blob and changed files rotate only their blob', () => {

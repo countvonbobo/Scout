@@ -1,4 +1,5 @@
 (function installScoutReportView(global) {
+  const MUTATION_MARKER = /\n?<!-- scout-mutation:([A-Za-z0-9%._~-]+) -->\s*$/;
   const KNOWN = new Set([
     'Scan runs', 'Headline', 'Action today', 'One check from unlocking',
     'Follow-ups due', 'Changes since last scan', 'Discarded', 'Verdicts',
@@ -6,6 +7,21 @@
   const escape = (value) => String(value ?? '').replace(/[&<>"']/g, (char) => ({
     '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
   })[char]);
+
+  function embedMutationMarker(markdown, marker) {
+    const source = String(markdown || '').replace(MUTATION_MARKER, '').trimEnd();
+    return `${source}\n\n<!-- scout-mutation:${encodeURIComponent(JSON.stringify(marker))} -->\n`;
+  }
+
+  function readMutationMarker(markdown) {
+    const encoded = String(markdown || '').match(MUTATION_MARKER)?.[1];
+    if (!encoded) return null;
+    try {
+      return JSON.parse(decodeURIComponent(encoded));
+    } catch {
+      return null;
+    }
+  }
 
   function inline(value) {
     let text = escape(value);
@@ -54,7 +70,7 @@
   }
 
   function parse(markdown) {
-    const source = String(markdown || '').replace(/\r\n/g, '\n');
+    const source = String(markdown || '').replace(/\r\n/g, '\n').replace(MUTATION_MARKER, '');
     const headings = [...source.matchAll(/^##\s+(.+?)\s*$/gm)];
     if (!headings.length) return { fallback: true, source };
     const title = source.match(/^#\s+(.+?)\s*$/m)?.[1] || 'Daily report';
@@ -79,5 +95,7 @@
     </article>`;
   }
 
-  global.ScoutReportView = Object.freeze({ parse, render });
+  global.ScoutReportView = Object.freeze({
+    embedMutationMarker, parse, readMutationMarker, render,
+  });
 })(globalThis);

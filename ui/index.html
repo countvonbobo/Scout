@@ -588,6 +588,17 @@
     #usage-meters { flex: 1 1 100%; order: 1; }
     #usage-meters:empty { display: none; }
     .chat-head .act { order: 2; }
+    .codex-link-status {
+      order: 2; flex: 1 1 100%; display: flex; align-items: center; flex-wrap: wrap; gap: 6px;
+      padding-top: 6px; border-top: 1px solid var(--line); color: var(--muted);
+    }
+    .chat-model-status {
+      order: 2; flex: 1 1 100%; color: var(--danger); padding-top: 4px;
+    }
+    .codex-link-status code {
+      max-width: 100%; overflow-wrap: anywhere; padding: 2px 5px; border-radius: 4px; background: var(--soft);
+    }
+    .codex-link-status > span { flex: 1 1 220px; }
     .setup-schedule-row { padding-top: 10px; border-top: 1px solid var(--line); }
     .setup-schedule-row + .setup-schedule-row { margin-top: 12px; }
     .setup-schedule-days {
@@ -816,19 +827,21 @@
     .scout-bubble::after { content:''; position:absolute; width:14px; height:14px; background:var(--panel); transform:rotate(45deg); }
     .scout-bubble.tail-left::after { left:-8px; top:38px; border-left:1px solid var(--line); border-bottom:1px solid var(--line); }
     .scout-bubble.tail-right::after { right:-8px; bottom:34px; border-right:1px solid var(--line); border-top:1px solid var(--line); }
-    .scout-sprite { position:absolute; inset:0; display:block; width:100%; height:100%; transform:translate(var(--scout-align-x,0),var(--scout-align-y,0)); transform-origin:center; background-image:var(--scout-src),var(--scout-fallback); background-repeat:no-repeat; background-size:calc(var(--scout-columns) * 100%) calc(var(--scout-rows) * 100%),contain; background-position:0 0,center; animation:scout-frames var(--scout-duration) step-end var(--scout-iterations); }
-    .scout-sprite.reduced-motion { animation:none; background-position:var(--scout-still-x) var(--scout-still-y), center; }
+    /* The walk itself is a keyframes rule generated per grid signature by
+       ui/lib/scoutCharacter.mjs and named through --scout-walk, so the frame
+       count, the grid and the frame rate are all decided there and a sheet whose
+       last row is only partly used stops at its real last frame. Nothing here
+       assumes how many cells there are. */
+    .scout-sprite { position:absolute; inset:0; display:block; width:100%; height:100%; transform:translate(var(--scout-align-x,0),var(--scout-align-y,0)); transform-origin:center; background-image:var(--scout-src),var(--scout-fallback); background-repeat:no-repeat; background-size:calc(var(--scout-columns) * 100%) calc(var(--scout-rows) * 100%),contain; background-position:var(--scout-still-x,0%) var(--scout-still-y,0%),center; animation:var(--scout-walk) var(--scout-duration) step-end var(--scout-iterations) both; }
+    /* A still is centred on its own terms, so it uses the representative frame's
+       anchor rather than the anchor that centres the whole walk. */
+    .scout-sprite.reduced-motion { animation:none; transform:translate(var(--scout-still-align-x,0),var(--scout-still-align-y,0)); }
     .scout-offscreen .scout-sprite, .scout-page-hidden .scout-sprite { animation-play-state:paused; }
-    @keyframes scout-frames {
-      0% { background-position:0 0,center; } 6.25% { background-position:33.333% 0,center; }
-      12.5% { background-position:66.667% 0,center; } 18.75% { background-position:100% 0,center; }
-      25% { background-position:0 33.333%,center; } 31.25% { background-position:33.333% 33.333%,center; }
-      37.5% { background-position:66.667% 33.333%,center; } 43.75% { background-position:100% 33.333%,center; }
-      50% { background-position:0 66.667%,center; } 56.25% { background-position:33.333% 66.667%,center; }
-      62.5% { background-position:66.667% 66.667%,center; } 68.75% { background-position:100% 66.667%,center; }
-      75% { background-position:0 100%,center; } 81.25% { background-position:33.333% 100%,center; }
-      87.5% { background-position:66.667% 100%,center; } 93.75%,100% { background-position:100% 100%,center; }
-    }
+    /* Until the canonical module marks a character ready — or for good, if it
+       never loads — the box keeps its role and name and shows Scout's resting
+       cell instead of an empty slot. One static cell of the shipped 4x4 sheet,
+       never an animation, and never a second copy of the state definitions. */
+    .scout-character:not([data-scout-ready]) .scout-sprite { background-image:url('/assets/scout-idle.png?v=__SCOUT_UI_BUILD__'); background-size:400% 400%; background-position:0 0; animation:none; }
     .chat-companion { display:flex; gap:12px; align-items:center; padding:10px 16px 4px; color:var(--muted); font-size:12px; }
     .chat-companion .scout-character { width:112px; height:112px; }
     .chat-companion .scout-bubble { padding:10px 14px; max-width:360px; }
@@ -849,7 +862,7 @@
     .source-unavailable { border-color:var(--danger); color:var(--danger); }
     @keyframes scout-arrive { from { opacity:0; transform:translateX(30px); } }
     @keyframes scout-arrive-mobile { from { opacity:0; } }
-    @media (prefers-reduced-motion:reduce) { .scout-sprite { animation:none; background-position:var(--scout-still-x) var(--scout-still-y), center; } .scout-arrival { animation:none; } }
+    @media (prefers-reduced-motion:reduce) { .scout-sprite { animation:none; transform:translate(var(--scout-still-align-x,0),var(--scout-still-align-y,0)); } .scout-arrival { animation:none; } }
     @media (max-width:620px) { .scout-arrival { right:6px; } .scout-arrival-character { width:120px; height:120px; } .scout-arrival-copy { margin-bottom:48px; } }
     @media (max-width:700px) {
       body { overflow-x:hidden; }
@@ -984,7 +997,8 @@
   <div id="scout-arrival" class="scout-arrival hidden"></div>
   <div id="undo-toast" class="hidden" role="status" aria-live="polite"></div>
   <script src="/reportView.js?v=__SCOUT_UI_BUILD__"></script>
-  <script src="/app.js?v=__SCOUT_UI_BUILD__"></script>
+  <script type="module" src="/app.js?v=__SCOUT_UI_BUILD__"></script>
+  <script type="module" src="/lib/scoutCharacter.mjs?v=__SCOUT_UI_BUILD__"></script>
   <script type="module" src="/setup.js?v=__SCOUT_UI_BUILD__"></script>
 </body>
 </html>

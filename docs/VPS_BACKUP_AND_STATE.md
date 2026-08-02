@@ -14,7 +14,7 @@ Every permitted client connects through Tailscale Serve to Scout on the VPS. Whe
 
 The response may say `savedLocally: true` and `syncQueued: true`: the durable VPS write has completed and the remote push is queued. **Settings -> Backup** shows `synced`, `offline`, or `needs attention` and the last successful time. Offline changes remain on the VPS and retry; Scout never force-pushes or silently resolves divergent histories.
 
-Remote pages remain readable when backup is disabled, but Beta 16 rejects remote state-changing requests until encrypted private backup is enabled. Backup connection, disablement, deploy-key generation, and recovery-key display are host-local administration operations. This prevents a phone session from silently creating unbacked canonical state or changing recovery ownership.
+Remote pages remain readable when backup is disabled, but Scout rejects remote state-changing requests until encrypted private backup is enabled. Backup connection, disablement, deploy-key generation, and recovery-key display are host-local administration operations. This prevents a phone session from silently creating unbacked canonical state or changing recovery ownership.
 
 ## Scope and exclusions
 
@@ -37,6 +37,29 @@ Provider authentication stores and resumable provider session identifiers are ne
 If adopting an older non-empty private repository, checkpoint the surviving local workspace into Scout's encrypted recovery format first. Then use the protected adoption procedure described in the release/incident documentation; Scout clones and validates into a temporary sibling, restores the existing encrypted data, completes a backup push, and atomically retains the old VPS workspace as `.before-adopt-<timestamp>`.
 
 If the canonical VPS is already synced but the original passphrase is unavailable, do not initialize another recovery header or force-push a stale checkout. From the host-local maintenance path, rotate the recovery passphrase while the VPS still has its unlocked data key. Rotation changes only the passphrase-wrapped copy of that key; it preserves the encrypted file blobs and emergency-key wrapper, then must reach `synced` before the new passphrase is accepted.
+
+## Divergence and push-pending recovery
+
+Scout resolves divergence automatically only after fetching both tips,
+verifying a clean worktree and proving that the changes are disjoint ordinary
+additions or modifications. The confirmation is bound to the branch and both
+analysed tips. Resolution holds the fenced lease and workspace mutation
+coordinator, creates local and remote recovery references, revalidates the tips,
+and uses a normal no-fast-forward merge. It never resets, rebases or
+force-pushes.
+
+If the merge succeeds but GitHub is unavailable, the local merge is canonical
+and backup reports push-pending. Preserve the merge commit and both recovery
+references. After connectivity returns, use **Retry**; Scout refetches and
+revalidates before pushing the existing merge. Do not launch another writable
+host or reconstruct the merge by hand. If a tracker/report mutation or scan
+finalisation is active, wait for it to finish before resolving divergence.
+
+Overlapping edits, renames, deletions, dirty files, changed tips, unusual Git
+state or a failed merge remain manual-review cases. Retain both recovery
+references and a VPS snapshot while investigating. Never remove `.git`,
+`.scout/sync.json`, `.scout-backup/`, run journals or the fenced lease as a
+recovery shortcut.
 
 ## Acceptance test
 

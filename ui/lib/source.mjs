@@ -127,7 +127,25 @@ export function extractJobFacts(html) {
 
 export function buildSourcePayload(html, url, fetchedAt) {
   const text = htmlToText(html);
-  return { ok: true, url, fetchedAt, facts: extractJobFacts(html), text, thin: text.length < THIN_TEXT_CHARS };
+  let publicUrl = null;
+  try {
+    const parsed = new URL(String(url || ''));
+    if (['http:', 'https:'].includes(parsed.protocol)) {
+      parsed.username = '';
+      parsed.password = '';
+      parsed.search = '';
+      parsed.hash = '';
+      publicUrl = parsed.toString();
+    }
+  } catch {}
+  return {
+    ok: true,
+    url: publicUrl,
+    fetchedAt,
+    facts: extractJobFacts(html),
+    text,
+    thin: text.length < THIN_TEXT_CHARS,
+  };
 }
 
 export function sourceUrlOf(entry) {

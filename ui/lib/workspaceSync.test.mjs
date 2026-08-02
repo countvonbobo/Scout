@@ -1,15 +1,24 @@
 import assert from 'node:assert/strict';
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
+import { EventEmitter } from 'node:events';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 import {
-  adoptExistingWorkspaceFromGithub, confirmRecoveryKey, connectWorkspaceSync, disableWorkspaceSync, loadSyncSettings, pendingRecoveryKey,
-  queueWorkspaceSync, restoreWorkspaceFromGithub, runWorkspaceSync, syncStatus, validateGithubUrl,
+  adoptExistingWorkspaceFromGithub, analyseBackupDivergence, confirmRecoveryKey, connectWorkspaceSync,
+  disableWorkspaceSync, loadSyncSettings, pendingRecoveryKey, queueWorkspaceSync, resolveBackupDivergence,
+  restoreWorkspaceFromGithub, runWorkspaceSync, saveSyncSettings, syncStatus, validateGithubUrl,
   verifyPrivateGithubRemote,
 } from './workspaceSync.mjs';
 import { initializeRecoveryBackup } from './recoveryBackup.mjs';
+import { mutateTrackerSnapshot } from './trackerPersistence.mjs';
+import { serializeTracker } from './tracker.mjs';
+import { withMutationCoordinator } from './mutationCoordinator.mjs';
+import {
+  acquireScanLease, currentLeaseOwner, releaseScanLease,
+} from './scanLease.mjs';
 
 const EXAMPLE_ENV = ['SECRET', 'example'].join('=') + '\n';
 const CHANGED_ENV = ['SECRET', 'dummy'].join('=') + '\n';
@@ -34,6 +43,76 @@ function fixture() {
 }
 
 const fakeCapabilities = (spawn) => ({ spawn });
+
+async function pairedFixture() {
+  const f = fixture();
+  const spawnAdapter = (command, args, options) => {
+    if (args[0] === 'credential-manager') return { status: 0, stdout: 'test-gcm', stderr: '' };
+    return spawnSync(command, args, options);
+  };
+  const connected = await connectWorkspaceSync(f.root, {
+    remoteUrl: 'https://github.com/example/repo', passphrase: 'correct horse battery staple',
+  }, { verifyRemote: async () => ({ url: f.remote, empty: true }), spawn: spawnAdapter });
+  const deviceTwo = path.join(f.base, 'device-two');
+  await restoreWorkspaceFromGithub({
+    remoteUrl: 'https://github.com/example/repo', targetRoot: deviceTwo, secret: connected.recoveryKey,
+  }, { verifyRemote: async () => ({ url: f.remote, empty: false }), spawn: spawnAdapter });
+  return { ...f, spawn: spawnAdapter, deviceTwo };
+}
+
+async function disjointDivergence(pair) {
+  fs.writeFileSync(path.join(pair.root, 'data', 'remote-change.json'), '{}\n');
+  await runWorkspaceSync(pair.root, 'remote change', { spawn: pair.spawn });
+  fs.writeFileSync(path.join(pair.deviceTwo, 'data', 'local-change.json'), '{}\n');
+  return runWorkspaceSync(pair.deviceTwo, 'local change', { spawn: pair.spawn });
+}
+
+function backupLease(root, runId = 'backup-resolution-test') {
+  const lease = acquireScanLease(root, currentLeaseOwner(), {
+    kind: 'backup-divergence', runId, phase: 'resolve',
+  });
+  assert.ok(lease);
+  return lease;
+}
+
+async function waitUntil(predicate, timeoutMs = 5_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (predicate()) return;
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  throw new Error('timed out waiting for backup coordination fixture');
+}
+
+function processExists(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return error?.code === 'EPERM';
+  }
+}
+
+function commitRawIndexEntry(root, relative, mode, contentOrOid, message) {
+  let oid = contentOrOid;
+  if (mode !== '160000') {
+    const source = path.join(root, '.scout-raw-entry');
+    fs.writeFileSync(source, contentOrOid);
+    oid = git(root, 'hash-object', '-w', source);
+    fs.rmSync(source);
+  }
+  git(root, 'update-index', '--add', '--cacheinfo', `${mode},${oid},${relative}`);
+  git(root, 'commit', '-m', message);
+}
+
+function commitLocalSideOfRawDivergence(pair, name) {
+  git(pair.deviceTwo, 'config', 'user.name', 'Test');
+  git(pair.deviceTwo, 'config', 'user.email', 'test@example.invalid');
+  fs.writeFileSync(path.join(pair.deviceTwo, 'data', `${name}-local.json`), '{}\n');
+  git(pair.deviceTwo, 'add', 'data');
+  git(pair.deviceTwo, 'commit', '-m', `${name} local change`);
+  git(pair.deviceTwo, 'fetch', 'origin');
+}
 
 test('GitHub repository URLs reject credentials and non-GitHub remotes', () => {
   assert.equal(validateGithubUrl('https://github.com/example/scout-workspace').url, 'https://github.com/example/scout-workspace.git');
@@ -103,6 +182,616 @@ test('local-only checkpoints never contact a Git remote', async () => {
   assert.match(git(f.root, 'log', '-1', '--pretty=%s'), /local only change/);
   assert.equal(calls.some((args) => ['fetch', 'push', 'pull', 'ls-remote'].includes(args[0])), false);
   fs.rmSync(f.base, { recursive: true, force: true });
+});
+
+test('multi-record scan-run backup and fresh clone are marker-free while live recovery state remains', async () => {
+  const f = fixture();
+  const marker = {
+    schemaVersion: 1,
+    mutationId: 'mutation-backup-test',
+    mutationKey: 'a'.repeat(64),
+    runKey: 'b'.repeat(64),
+    intendedDigest: 'c'.repeat(64),
+    targetKey: 'd'.repeat(64),
+  };
+  fs.mkdirSync(path.join(f.root, 'reports'), { recursive: true });
+  fs.writeFileSync(path.join(f.root, 'data', 'opportunities.json'), `${JSON.stringify({
+    updated: '2026-07-28',
+    opportunities: [{ id: 'kept' }],
+    _scoutMutation: marker,
+  }, null, 2)}\n`);
+  fs.writeFileSync(
+    path.join(f.root, 'reports', '2026-07-28.md'),
+    `# Scout report\n\n## Headline\n\nSafe summary.\n\n<!-- scout-mutation:${encodeURIComponent(JSON.stringify(marker))} -->\n`,
+  );
+  fs.writeFileSync(
+    path.join(f.root, 'data', 'scan-runs.jsonl'),
+    `${JSON.stringify({ schemaVersion: 4, timestamp: '2026-07-28T09:00:00.000Z' })}\n`
+      + `${JSON.stringify({ schemaVersion: 4, timestamp: '2026-07-28T10:00:00.000Z', _scoutMutation: marker })}\n`,
+  );
+  fs.writeFileSync(
+    path.join(f.root, 'data', 'search-lanes.json'),
+    `${JSON.stringify({
+      schemaVersion: 1,
+      profileId: 'profile-aaaaaaaaaaaa',
+      lanes: [],
+      _scoutMutation: marker,
+    }, null, 2)}\n`,
+  );
+  fs.writeFileSync(
+    path.join(f.root, 'data', 'employers.json'),
+    `${JSON.stringify({
+      schemaVersion: 1,
+      generation: 2,
+      employers: [{ id: 'employer-0123456789abcdef' }],
+      _scoutMutation: marker,
+    }, null, 2)}\n`,
+  );
+  git(f.root, 'init');
+
+  const status = await runWorkspaceSync(f.root, 'marker-free recovery projection');
+
+  assert.equal(status.state, 'disabled');
+  for (const relative of [
+    'data/opportunities.json',
+    'data/search-lanes.json',
+    'data/employers.json',
+    'data/scan-runs.jsonl',
+    'reports/2026-07-28.md',
+  ]) {
+    assert.doesNotMatch(git(f.root, 'show', `HEAD:${relative}`), /scout-mutation|_scoutMutation/);
+    assert.match(fs.readFileSync(path.join(f.root, ...relative.split('/')), 'utf8'), /scout-mutation|_scoutMutation/);
+  }
+  const restoredTracker = JSON.parse(git(f.root, 'show', 'HEAD:data/opportunities.json'));
+  const restoredLanes = JSON.parse(git(f.root, 'show', 'HEAD:data/search-lanes.json'));
+  const restoredEmployers = JSON.parse(git(f.root, 'show', 'HEAD:data/employers.json'));
+  const committedRuns = git(f.root, 'show', 'HEAD:data/scan-runs.jsonl')
+    .split(/\r?\n/).filter(Boolean).map((line) => JSON.parse(line));
+  assert.equal(restoredTracker.opportunities[0].id, 'kept');
+  assert.equal(restoredLanes.profileId, 'profile-aaaaaaaaaaaa');
+  assert.equal(Object.hasOwn(restoredLanes, '_scoutMutation'), false);
+  assert.equal(restoredEmployers.employers[0].id, 'employer-0123456789abcdef');
+  assert.equal(Object.hasOwn(restoredEmployers, '_scoutMutation'), false);
+  assert.deepEqual(
+    committedRuns.map((record) => record.timestamp),
+    ['2026-07-28T09:00:00.000Z', '2026-07-28T10:00:00.000Z'],
+  );
+  assert.equal(committedRuns.some((record) => Object.hasOwn(record, '_scoutMutation')), false);
+  const restored = path.join(f.base, 'fresh-clone');
+  git(f.base, 'clone', f.root, restored);
+  const restoredRuns = fs.readFileSync(path.join(restored, 'data', 'scan-runs.jsonl'), 'utf8')
+    .trim().split(/\r?\n/).map((line) => JSON.parse(line));
+  assert.equal(restoredRuns.length, 2);
+  assert.equal(restoredRuns.some((record) => Object.hasOwn(record, '_scoutMutation')), false);
+  const liveRuns = fs.readFileSync(path.join(f.root, 'data', 'scan-runs.jsonl'), 'utf8')
+    .trim().split(/\r?\n/).map((line) => JSON.parse(line));
+  assert.equal(Object.hasOwn(liveRuns[0], '_scoutMutation'), false);
+  assert.deepEqual(liveRuns[1]._scoutMutation, marker);
+  assert.equal(git(f.root, 'status', '--porcelain'), '');
+
+  const liveTracker = JSON.parse(fs.readFileSync(path.join(f.root, 'data', 'opportunities.json'), 'utf8'));
+  liveTracker.opportunities.push({ id: 'later-semantic-change' });
+  fs.writeFileSync(path.join(f.root, 'data', 'opportunities.json'), `${JSON.stringify(liveTracker, null, 2)}\n`);
+  await runWorkspaceSync(f.root, 'later marker-bearing semantic change');
+  const laterBackup = JSON.parse(git(f.root, 'show', 'HEAD:data/opportunities.json'));
+  assert.deepEqual(laterBackup.opportunities.map((item) => item.id), ['kept', 'later-semantic-change']);
+  assert.equal(Object.hasOwn(laterBackup, '_scoutMutation'), false);
+  assert.equal(git(f.root, 'status', '--porcelain'), '');
+  fs.rmSync(f.base, { recursive: true, force: true });
+});
+
+test('marker-free backup survives a real tracker mutation and restores the semantic edit', async () => {
+  const f = fixture();
+  const marker = {
+    schemaVersion: 1,
+    mutationId: 'mutation-real-edit',
+    mutationKey: '1'.repeat(64),
+    runKey: '2'.repeat(64),
+    intendedDigest: '3'.repeat(64),
+    targetKey: '4'.repeat(64),
+  };
+  const trackerFile = path.join(f.root, 'data', 'opportunities.json');
+  fs.writeFileSync(trackerFile, `${JSON.stringify({
+    updated: '2026-07-28',
+    opportunities: [{ id: 'before-edit', status: 'new' }],
+    _scoutMutation: marker,
+  }, null, 2)}\n`);
+  git(f.root, 'init');
+  await runWorkspaceSync(f.root, 'first marker-free backup');
+
+  mutateTrackerSnapshot(
+    trackerFile,
+    (tracker) => ({
+      ...tracker,
+      opportunities: [
+        ...tracker.opportunities,
+        { id: 'edited-through-real-api', status: 'shortlist' },
+      ],
+    }),
+    serializeTracker,
+  );
+  await queueWorkspaceSync(f.root, 'real tracker edit backup');
+
+  const committed = git(f.root, 'show', 'HEAD:data/opportunities.json');
+  assert.match(committed, /edited-through-real-api/);
+  assert.doesNotMatch(committed, /_scoutMutation/);
+  const restored = path.join(f.base, 'restored');
+  git(f.base, 'clone', f.root, restored);
+  const restoredTracker = JSON.parse(fs.readFileSync(path.join(restored, 'data', 'opportunities.json'), 'utf8'));
+  assert.deepEqual(
+    restoredTracker.opportunities.map((item) => item.id),
+    ['before-edit', 'edited-through-real-api'],
+  );
+  assert.equal(git(f.root, 'status', '--porcelain'), '');
+  assert.doesNotMatch(git(f.root, 'ls-files', '-v'), /^[a-z] /m);
+  fs.rmSync(f.base, { recursive: true, force: true });
+});
+
+test('marker projection cleanup leaves no hidden or temporary Git state after commit failure', async () => {
+  const f = fixture();
+  const marker = {
+    schemaVersion: 1,
+    mutationId: 'mutation-cleanup',
+    mutationKey: '5'.repeat(64),
+    runKey: '6'.repeat(64),
+    intendedDigest: '7'.repeat(64),
+    targetKey: '8'.repeat(64),
+  };
+  const trackerFile = path.join(f.root, 'data', 'opportunities.json');
+  fs.writeFileSync(trackerFile, `${JSON.stringify({
+    updated: '2026-07-28',
+    opportunities: [{ id: 'before-failure' }],
+    _scoutMutation: marker,
+  }, null, 2)}\n`);
+  git(f.root, 'init');
+  await runWorkspaceSync(f.root, 'seed marker-free backup');
+  mutateTrackerSnapshot(
+    trackerFile,
+    (tracker) => ({
+      ...tracker,
+      opportunities: [...tracker.opportunities, { id: 'visible-after-failure' }],
+    }),
+    serializeTracker,
+  );
+  const failingSpawn = (command, args, options) => (
+    args[0] === 'commit'
+      ? { status: 1, stdout: '', stderr: 'synthetic commit interruption' }
+      : spawnSync(command, args, options)
+  );
+
+  await assert.rejects(
+    runWorkspaceSync(f.root, 'interrupted marker projection', { spawn: failingSpawn }),
+    /synthetic commit interruption/,
+  );
+  assert.doesNotMatch(git(f.root, 'ls-files', '-v'), /^[a-z] /m);
+  const scoutState = path.join(f.root, '.scout');
+  assert.equal(fs.existsSync(scoutState) && fs.readdirSync(scoutState).some((name) => (
+    name.startsWith('backup-projection-') || name.includes('index')
+  )), false);
+  assert.match(git(f.root, 'status', '--porcelain'), /opportunities\.json/);
+  fs.rmSync(f.base, { recursive: true, force: true });
+});
+
+test('runtime sync remains asynchronous while a Git mutation is pending', async () => {
+  const f = fixture();
+  git(f.root, 'init');
+  let commitStarted = false;
+  let releaseCommit;
+  const commitGate = new Promise((resolve) => { releaseCommit = resolve; });
+  let timerFired = false;
+  setTimeout(() => { timerFired = true; }, 5);
+  const spawnAsync = async (command, args, options) => {
+    if (args[0] === 'commit') {
+      commitStarted = true;
+      await commitGate;
+    }
+    return spawnSync(command, args, options);
+  };
+
+  const sync = runWorkspaceSync(f.root, 'asynchronous runtime checkpoint', { spawnAsync });
+  await new Promise((resolve) => setTimeout(resolve, 25));
+  const observed = { commitStarted, timerFired };
+  releaseCommit();
+  const result = await sync;
+
+  assert.deepEqual(observed, { commitStarted: true, timerFired: true });
+  assert.equal(result.state, 'disabled');
+  fs.rmSync(f.base, { recursive: true, force: true });
+});
+
+test('enabled runtime recovery checkpoint yields to an independent heartbeat and fences component mutations', async () => {
+  const f = fixture();
+  git(f.root, 'init');
+  git(f.root, 'config', 'user.name', 'Test');
+  git(f.root, 'config', 'user.email', 'test@example.invalid');
+  const created = initializeRecoveryBackup(f.root, 'correct horse battery staple');
+  saveSyncSettings(f.root, {
+    enabled: true,
+    remoteUrl: 'https://github.com/example/private-workspace.git',
+    dataKey: created.dataKey.toString('base64url'),
+  });
+  fs.mkdirSync(path.join(f.root, 'applications'), { recursive: true });
+  fs.writeFileSync(path.join(f.root, 'applications', 'large-cv.pdf'), Buffer.alloc(8 * 1024 * 1024, 0x61));
+
+  let afterFetch = false;
+  let heartbeatTicks = 0;
+  let heartbeat;
+  let ticksBeforeNextGit = null;
+  let fenceChecks = 0;
+  let checksBeforeNextGit = null;
+  const spawnAsync = async (command, args, options) => {
+    if (args[0] === 'fetch') {
+      afterFetch = true;
+      heartbeat = setInterval(() => { heartbeatTicks += 1; }, 1);
+      return { status: 1, stdout: '', stderr: 'synthetic offline' };
+    }
+    if (afterFetch && ticksBeforeNextGit === null) {
+      ticksBeforeNextGit = heartbeatTicks;
+      checksBeforeNextGit = fenceChecks;
+    }
+    return spawnSync(command, args, options);
+  };
+
+  try {
+    const result = await runWorkspaceSync(f.root, 'large fenced checkpoint', {
+      spawnAsync,
+      assertFence() {
+        fenceChecks += 1;
+      },
+    });
+
+    assert.equal(result.state, 'offline');
+    assert.ok(ticksBeforeNextGit > 0, 'the recovery checkpoint must yield before the next Git command');
+    assert.ok(checksBeforeNextGit > 4, 'recovery component mutations must be fenced individually');
+  } finally {
+    clearInterval(heartbeat);
+    fs.rmSync(f.base, { recursive: true, force: true });
+  }
+});
+
+test('runtime sync command timeout returns bounded needs-attention state', async () => {
+  const f = fixture();
+  git(f.root, 'init');
+  const spawnAsync = async (command, args, options) => {
+    if (args[0] === 'commit') return new Promise(() => {});
+    return spawnSync(command, args, options);
+  };
+
+  const result = await runWorkspaceSync(f.root, 'timed runtime checkpoint', {
+    commandTimeoutMs: 20,
+    spawnAsync,
+  });
+
+  assert.equal(result.state, 'needs-attention');
+  assert.equal(result.pending, true);
+  assert.doesNotMatch(JSON.stringify(result), /workspace\.json|opportunities\.json/);
+  fs.rmSync(f.base, { recursive: true, force: true });
+});
+
+function terminateTestProcessTree(child) {
+  if (!child?.pid || child.exitCode !== null || child.signalCode !== null) return;
+  if (process.platform === 'win32') {
+    spawnSync('taskkill.exe', ['/pid', String(child.pid), '/T', '/F'], {
+      windowsHide: true,
+      stdio: 'ignore',
+    });
+    return;
+  }
+  try { process.kill(-child.pid, 'SIGKILL'); } catch {}
+}
+
+test('runtime command timeout terminates the process tree and awaits parent close', async () => {
+  const f = fixture();
+  const sentinel = path.join(f.base, 'surviving-grandchild.txt');
+  const grandchildPidFile = path.join(f.base, 'grandchild.pid');
+  git(f.root, 'init');
+  let commandProcess;
+  let commandClosed = false;
+  const grandchildScript = [
+    "const fs = require('node:fs');",
+    "const destination = process.argv[1];",
+    "setTimeout(() => fs.writeFileSync(destination, 'survived'), 5000);",
+  ].join(' ');
+  const parentScript = [
+    "const { spawn } = require('node:child_process');",
+    "const fs = require('node:fs');",
+    `const child = spawn(process.execPath, ['-e', ${JSON.stringify(grandchildScript)}, process.argv[1]], { stdio: 'ignore', windowsHide: true });`,
+    "fs.writeFileSync(process.argv[2], String(child.pid));",
+    'setInterval(() => {}, 1000);',
+  ].join(' ');
+  const spawnAsync = async (command, args, options) => {
+    if (args[0] !== 'commit') return spawnSync(command, args, options);
+    return commandProcess;
+  };
+
+  try {
+    commandProcess = spawn(process.execPath, ['-e', parentScript, sentinel, grandchildPidFile], {
+      detached: process.platform !== 'win32',
+      windowsHide: true,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    commandProcess.once('close', () => { commandClosed = true; });
+    await waitUntil(() => fs.existsSync(grandchildPidFile));
+    const result = await runWorkspaceSync(f.root, 'timed process-tree checkpoint', {
+      commandTimeoutMs: 50,
+      spawnAsync,
+    });
+
+    assert.equal(result.state, 'needs-attention');
+    assert.equal(result.pending, true);
+    assert.equal(commandClosed, true, 'sync must await the timed-out parent close event');
+    assert.equal(fs.existsSync(grandchildPidFile), true, 'fixture must start a transport grandchild');
+    const grandchildPid = Number(fs.readFileSync(grandchildPidFile, 'utf8'));
+    assert.equal(processExists(grandchildPid), false, 'a timed-out transport grandchild must be terminated');
+    assert.equal(fs.existsSync(sentinel), false, 'a timed-out transport grandchild must not outlive sync');
+  } finally {
+    terminateTestProcessTree(commandProcess);
+    fs.rmSync(f.base, { recursive: true, force: true });
+  }
+});
+
+test('Windows runtime timeout remains bounded when taskkill never closes', async (t) => {
+  if (process.platform !== 'win32') {
+    t.diagnostic('taskkill is Windows-specific');
+    return;
+  }
+  const f = fixture();
+  git(f.root, 'init');
+  const commandChild = new EventEmitter();
+  commandChild.pid = 2_147_483_000;
+  commandChild.exitCode = null;
+  commandChild.signalCode = null;
+  commandChild.stdout = new EventEmitter();
+  commandChild.stderr = new EventEmitter();
+  let commandKilled = false;
+  commandChild.kill = () => {
+    commandKilled = true;
+    commandChild.exitCode = 1;
+    setImmediate(() => commandChild.emit('close', 1));
+    return true;
+  };
+  const killer = new EventEmitter();
+  let killerKilled = false;
+  killer.kill = () => { killerKilled = true; return true; };
+  const spawnAsync = async (command, args, options) => (
+    args[0] === 'commit' ? commandChild : spawnSync(command, args, options)
+  );
+
+  const result = await runWorkspaceSync(f.root, 'hung taskkill checkpoint', {
+    commandTimeoutMs: 5,
+    spawnAsync,
+    _testHooks: {
+      spawnAuxiliary: () => killer,
+      auxiliaryTimeoutMs: 1,
+      closeTimeoutMs: 5,
+    },
+  });
+
+  assert.equal(result.state, 'needs-attention');
+  assert.equal(result.pending, true);
+  assert.equal(killerKilled, true);
+  assert.equal(commandKilled, true);
+  fs.rmSync(f.base, { recursive: true, force: true });
+});
+
+test('backup setup publishes a concrete child identity for crash recovery', { timeout: 30_000 }, async () => {
+  const f = fixture();
+  let setupChild = null;
+  let pending = null;
+  const syncSpawn = (command, args, options) => {
+    if (args[0] === 'credential-manager') return { status: 0, stdout: 'test-gcm', stderr: '' };
+    return spawnSync(command, args, options);
+  };
+  const spawnAsync = (command, args, options) => {
+    if (args[0] === 'init') {
+      setupChild = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 30000)'], options);
+      return setupChild;
+    }
+    return spawn(command, args, options);
+  };
+  try {
+    pending = connectWorkspaceSync(f.root, {
+      remoteUrl: 'https://github.com/example/setup-crash', passphrase: 'correct horse battery staple',
+    }, {
+      verifyRemote: async () => ({ url: f.remote, empty: true }),
+      spawn: syncSpawn,
+      spawnAsync,
+    });
+    await waitUntil(
+      () => setupChild?.pid && fs.existsSync(path.join(f.root, '.scout', 'mutation.guard', 'owner.json')),
+      20_000,
+    );
+    const guard = JSON.parse(fs.readFileSync(path.join(f.root, '.scout', 'mutation.guard', 'owner.json'), 'utf8'));
+    assert.equal(guard.childOperation.state, 'running');
+    assert.equal(guard.childOperation.owner.pid, setupChild.pid);
+    setupChild.kill();
+    await assert.rejects(pending, /git init failed|failed|SIGTERM|exit/i);
+  } finally {
+    try { setupChild?.kill(); } catch {}
+    await pending?.catch(() => {});
+    fs.rmSync(f.base, { recursive: true, force: true });
+  }
+});
+
+test('backup setup attachment failure closes the spawned Git child before releasing authority', async () => {
+  const f = fixture();
+  let childPid = null;
+  const syncSpawn = (command, args, options) => {
+    if (args[0] === 'credential-manager') return { status: 0, stdout: 'test-gcm', stderr: '' };
+    return spawnSync(command, args, options);
+  };
+  await assert.rejects(() => connectWorkspaceSync(f.root, {
+    remoteUrl: 'https://github.com/example/setup-attach-failure', passphrase: 'correct horse battery staple',
+  }, {
+    verifyRemote: async () => ({ url: f.remote, empty: true }),
+    spawn: syncSpawn,
+    spawnAsync: (command, args, options) => spawn(command, args, options),
+    _testHooks: {
+      beforeAttachChild(child) {
+        childPid = child.pid;
+        throw new Error('synthetic child attachment publication failure');
+      },
+    },
+  }), /synthetic child attachment publication failure/);
+  assert.equal(Number.isSafeInteger(childPid) && childPid > 0, true);
+  await waitUntil(() => !processExists(childPid));
+  await waitUntil(() => !fs.existsSync(path.join(f.root, '.scout', 'mutation.guard')));
+  fs.rmSync(f.base, { recursive: true, force: true });
+});
+
+test('Windows unresolved Git child keeps durable mutation authority until close', async (t) => {
+  if (process.platform !== 'win32') {
+    t.diagnostic('taskkill is Windows-specific');
+    return;
+  }
+  const f = fixture();
+  git(f.root, 'init');
+  const commandChild = new EventEmitter();
+  commandChild.pid = 2_147_482_999;
+  commandChild.exitCode = null;
+  commandChild.signalCode = null;
+  commandChild.stdout = new EventEmitter();
+  commandChild.stderr = new EventEmitter();
+  commandChild.kill = () => false;
+  const killer = new EventEmitter();
+  killer.kill = () => true;
+  const scheduledCleanup = [];
+  const spawnAsync = async (command, args, options) => (
+    args[0] === 'commit' ? commandChild : spawnSync(command, args, options)
+  );
+
+  const result = await runWorkspaceSync(f.root, 'unresolved child checkpoint', {
+    commandTimeoutMs: 5,
+    spawnAsync,
+    _testHooks: {
+      spawnAuxiliary: () => killer,
+      auxiliaryTimeoutMs: 1,
+      closeTimeoutMs: 5,
+      guardCleanupScheduler: (callback) => {
+        scheduledCleanup.push(callback);
+        return { unref() {} };
+      },
+    },
+  });
+  assert.equal(result.state, 'needs-attention');
+  const guard = path.join(f.root, '.scout', 'mutation.guard');
+  assert.equal(fs.existsSync(guard), true);
+  assert.equal(JSON.parse(fs.readFileSync(path.join(guard, 'owner.json'), 'utf8'))
+    .childOperation.state, 'running');
+
+  const contender = await runWorkspaceSync(f.root, 'blocked successor checkpoint');
+  assert.equal(contender.pending, true);
+  assert.equal(fs.existsSync(guard), true);
+
+  const originalRename = fs.renameSync;
+  let cleanupContended = false;
+  fs.renameSync = (source, destination) => {
+    if (!cleanupContended && String(destination).endsWith(path.join('mutation.guard', 'owner.json'))) {
+      cleanupContended = true;
+      throw Object.assign(new Error('injected late guard metadata contention'), { code: 'EPERM' });
+    }
+    return originalRename(source, destination);
+  };
+  try {
+    commandChild.exitCode = 1;
+    commandChild.emit('close', 1);
+  } finally {
+    fs.renameSync = originalRename;
+  }
+  assert.equal(scheduledCleanup.length, 1);
+  assert.equal(fs.existsSync(guard), true);
+  scheduledCleanup.shift()();
+  assert.equal(fs.existsSync(guard), false);
+  fs.rmSync(f.base, { recursive: true, force: true });
+});
+
+test('a stale runtime sync fence prevents the first local mutation', async () => {
+  const f = fixture();
+  git(f.root, 'init');
+
+  await assert.rejects(() => runWorkspaceSync(f.root, 'stale fenced checkpoint', {
+    assertFence() {
+      throw new Error('synthetic stale sync fence');
+    },
+  }), /synthetic stale sync fence/);
+
+  assert.equal(git(f.root, 'log', '--all', '--oneline'), '');
+  assert.match(git(f.root, 'status', '--porcelain'), /workspace\.json/);
+  fs.rmSync(f.base, { recursive: true, force: true });
+});
+
+test('startup and periodic checkpoints report pending while another process owns every mutation phase', async () => {
+  const holderFixture = fileURLToPath(new URL('./fixtures/scan-lease-holder.mjs', import.meta.url));
+  for (const [phase, reason] of [
+    ['collect', 'startup sync'],
+    ['profile-publication', 'periodic sync'],
+    ['tracker-report', 'periodic sync'],
+    ['finalise', 'periodic sync'],
+  ]) {
+    const f = fixture();
+    git(f.root, 'init');
+    const marker = path.join(f.root, `.holder-${phase}.json`);
+    const holder = spawn(process.execPath, [holderFixture, f.root, phase, marker], {
+      stdio: 'ignore',
+      windowsHide: true,
+    });
+    let spawnCalls = 0;
+    try {
+      await waitUntil(() => fs.existsSync(marker));
+      const result = await queueWorkspaceSync(f.root, reason, {
+        spawn(command, args, options) {
+          spawnCalls += 1;
+          return spawnSync(command, args, options);
+        },
+      });
+      assert.equal(result.state, 'pending');
+      assert.equal(result.pending, true);
+      assert.equal(result.reasonCode, 'mutation-busy');
+      assert.equal(spawnCalls, 0, `${reason} must not start Git during ${phase}`);
+    } finally {
+      holder.kill('SIGKILL');
+      await waitUntil(() => holder.exitCode !== null || holder.signalCode !== null);
+      fs.rmSync(f.base, { recursive: true, force: true });
+    }
+  }
+});
+
+test('a backup that loses its lease starts no mutation and is never retried unfenced', async () => {
+  const f = fixture();
+  git(f.root, 'init');
+  const lease = backupLease(f.root, 'backup-fence-loss');
+  let successor;
+  const commands = [];
+  let revoked = false;
+  try {
+    const result = await runWorkspaceSync(f.root, 'lease-loss checkpoint', {
+      lease,
+      spawn(command, args, options) {
+        commands.push(args.join(' '));
+        const response = spawnSync(command, args, options);
+        if (!revoked) {
+          revoked = true;
+          releaseScanLease(lease);
+          successor = backupLease(f.root, 'backup-fence-successor');
+        }
+        return response;
+      },
+    });
+    assert.equal(result.state, 'pending');
+    assert.equal(result.reasonCode, 'mutation-busy');
+    assert.equal(commands.every((command) => (
+      command === 'rev-parse --show-toplevel'
+      || command === 'config --get user.name'
+      || command === 'config --get user.email'
+    )), true);
+    assert.equal(commands.some((command) => /^(?:init|add|commit|merge|push|rm|update-index)\b/.test(command)), false);
+    assert.equal(git(f.root, 'log', '--all', '--oneline'), '');
+    assert.match(git(f.root, 'status', '--porcelain'), /workspace\.json/);
+  } finally {
+    if (successor) releaseScanLease(successor);
+    else if (!revoked) releaseScanLease(lease);
+    fs.rmSync(f.base, { recursive: true, force: true });
+  }
 });
 
 test('a workspace nested under another checkout never checkpoints the parent repository', async () => {
@@ -219,6 +908,361 @@ test('two devices fast-forward safely and divergence never resets, rebases, or f
   fs.rmSync(f.base, { recursive: true, force: true });
 });
 
+test('disjoint additions and modifications produce a tip-bound sanitised confirmation', async () => {
+  const f = await pairedFixture();
+  try {
+    fs.mkdirSync(path.join(f.root, 'profile'), { recursive: true });
+    fs.writeFileSync(path.join(f.root, 'profile', 'context.md'), 'baseline profile\n');
+    await runWorkspaceSync(f.root, 'shared profile baseline', { spawn: f.spawn });
+    await runWorkspaceSync(f.deviceTwo, 'receive profile baseline', { spawn: f.spawn });
+
+    fs.writeFileSync(path.join(f.root, 'profile', 'context.md'), 'remote profile modification\n');
+    await runWorkspaceSync(f.root, 'remote profile change', { spawn: f.spawn });
+    fs.writeFileSync(
+      path.join(f.deviceTwo, 'data', 'opportunities.json'),
+      '{"opportunities":[],"localModification":true}\n',
+    );
+    const diverged = await runWorkspaceSync(f.deviceTwo, 'local tracker modification', { spawn: f.spawn });
+
+    assert.equal(diverged.resolution.classification, 'disjoint-safe');
+    assert.equal(diverged.resolution.canResolve, true);
+    assert.deepEqual(diverged.resolution.localAreas, ['opportunity tracker']);
+    assert.deepEqual(diverged.resolution.remoteAreas, ['profile and preferences']);
+    assert.match(diverged.resolution.analysisToken, /^[a-f0-9]{64}$/);
+    assert.deepEqual(
+      Object.keys(diverged.resolution).sort(),
+      ['ahead', 'analysisToken', 'behind', 'canResolve', 'classification', 'localAreas', 'reason', 'remoteAreas'].sort(),
+    );
+    assert.doesNotMatch(JSON.stringify(diverged.resolution), /context\.md|opportunities\.json|refs\//i);
+  } finally {
+    fs.rmSync(f.base, { recursive: true, force: true });
+  }
+});
+
+test('overlap, rename, deletion, dirty tracked and unsafe untracked state fail closed', async () => {
+  const overlap = await pairedFixture();
+  try {
+    fs.writeFileSync(path.join(overlap.root, 'workspace.json'), '{"schemaVersion":1,"from":"remote"}\n');
+    await runWorkspaceSync(overlap.root, 'remote overlap', { spawn: overlap.spawn });
+    fs.writeFileSync(path.join(overlap.deviceTwo, 'workspace.json'), '{"schemaVersion":1,"from":"local"}\n');
+    await runWorkspaceSync(overlap.deviceTwo, 'local overlap', { spawn: overlap.spawn });
+    const analysis = analyseBackupDivergence(overlap.deviceTwo, { spawn: overlap.spawn });
+    assert.equal(analysis.classification, 'overlapping');
+    assert.equal(analysis.canResolve, false);
+    assert.deepEqual(analysis.localAreas, ['workspace settings']);
+    assert.deepEqual(analysis.remoteAreas, ['workspace settings']);
+    assert.doesNotMatch(JSON.stringify(analysis), /workspace\.json/);
+  } finally {
+    fs.rmSync(overlap.base, { recursive: true, force: true });
+  }
+
+  for (const change of ['rename', 'delete']) {
+    const f = await pairedFixture();
+    try {
+      fs.writeFileSync(path.join(f.root, 'data', 'remote-change.json'), '{}\n');
+      await runWorkspaceSync(f.root, 'remote change', { spawn: f.spawn });
+      if (change === 'rename') {
+        fs.renameSync(path.join(f.deviceTwo, 'workspace.json'), path.join(f.deviceTwo, 'workspace-renamed.json'));
+      } else {
+        fs.rmSync(path.join(f.deviceTwo, 'workspace.json'));
+      }
+      await runWorkspaceSync(f.deviceTwo, `local ${change}`, { spawn: f.spawn });
+      const analysis = analyseBackupDivergence(f.deviceTwo, { spawn: f.spawn });
+      assert.equal(analysis.classification, 'manual-required');
+      assert.match(analysis.reason, /renamed, deleted|non-standard/i);
+    } finally {
+      fs.rmSync(f.base, { recursive: true, force: true });
+    }
+  }
+
+  const dirty = await pairedFixture();
+  try {
+    await disjointDivergence(dirty);
+    fs.appendFileSync(path.join(dirty.deviceTwo, 'workspace.json'), ' ');
+    assert.match(analyseBackupDivergence(dirty.deviceTwo, { spawn: dirty.spawn }).reason, /uncommitted/);
+    git(dirty.deviceTwo, 'restore', 'workspace.json');
+    fs.writeFileSync(path.join(dirty.deviceTwo, 'review-me.txt'), 'untracked\n');
+    assert.match(analyseBackupDivergence(dirty.deviceTwo, { spawn: dirty.spawn }).reason, /untracked/);
+  } finally {
+    fs.rmSync(dirty.base, { recursive: true, force: true });
+  }
+});
+
+test('resolution refetches, rejects stale tips and creates both recovery refs before a no-ff merge', async () => {
+  const f = await pairedFixture();
+  const calls = [];
+  const spawnAdapter = (command, args, options) => {
+    calls.push([...args]);
+    return f.spawn(command, args, options);
+  };
+  let lease;
+  try {
+    const diverged = await disjointDivergence(f);
+    lease = backupLease(f.deviceTwo);
+    await assert.rejects(
+      resolveBackupDivergence(f.deviceTwo, '0'.repeat(64), lease, { spawn: spawnAdapter }),
+      /history changed/i,
+    );
+    assert.equal(git(f.deviceTwo, 'for-each-ref', '--format=%(refname)', 'refs/scout-recovery'), '');
+
+    const resolved = await resolveBackupDivergence(
+      f.deviceTwo,
+      diverged.resolution.analysisToken,
+      lease,
+      { spawn: spawnAdapter },
+    );
+    assert.equal(resolved.state, 'synced');
+    assert.equal(resolved.resolved, true);
+    assert.equal(resolved.recoveryRefsCreated, true);
+    assert.equal(fs.existsSync(path.join(f.deviceTwo, 'data', 'local-change.json')), true);
+    assert.equal(fs.existsSync(path.join(f.deviceTwo, 'data', 'remote-change.json')), true);
+    assert.equal(git(f.deviceTwo, 'rev-list', '--left-right', '--count', 'HEAD...@{u}'), '0\t0');
+    assert.equal(
+      git(f.deviceTwo, 'for-each-ref', '--format=%(refname)', 'refs/scout-recovery').split('\n').length,
+      2,
+    );
+    assert.equal(calls.some((args) => args[0] === 'fetch'), true);
+    assert.equal(calls.some((args) => args[0] === 'merge' && args.includes('--no-ff')), true);
+    assert.equal(
+      calls.some((args) => args.includes('reset') || args.includes('rebase')
+        || args.some((arg) => /^--force/.test(arg))),
+      false,
+    );
+  } finally {
+    if (lease) releaseScanLease(lease);
+    fs.rmSync(f.base, { recursive: true, force: true });
+  }
+});
+
+test('resolution merges the exact verified remote object when its tracking ref advances', async () => {
+  const f = await pairedFixture();
+  let lease;
+  try {
+    const divergence = await disjointDivergence(f);
+    const verifiedRemote = git(f.deviceTwo, 'rev-parse', '@{u}');
+    let advanced = false;
+    const racingSpawn = (command, args, options) => {
+      if (!advanced && args[0] === 'merge' && args.includes('--no-ff')) {
+        advanced = true;
+        fs.writeFileSync(path.join(f.root, 'data', 'unconfirmed-remote.json'), '{}\n');
+        git(f.root, 'add', 'data/unconfirmed-remote.json');
+        git(f.root, 'commit', '-m', 'unconfirmed remote advance');
+        git(f.root, 'push', 'origin', 'HEAD');
+        git(f.deviceTwo, 'fetch', 'origin');
+      }
+      return f.spawn(command, args, options);
+    };
+    lease = backupLease(f.deviceTwo, 'backup-moving-ref-race');
+    const result = await resolveBackupDivergence(
+      f.deviceTwo,
+      divergence.resolution.analysisToken,
+      lease,
+      { spawn: racingSpawn },
+    );
+
+    assert.equal(advanced, true);
+    assert.equal(result.state, 'needs-attention');
+    assert.equal(result.resolved, false);
+    assert.equal(fs.existsSync(path.join(f.deviceTwo, 'data', 'unconfirmed-remote.json')), false);
+    const githubRef = git(
+      f.deviceTwo,
+      'for-each-ref',
+      '--format=%(refname)',
+      'refs/scout-recovery',
+    ).split('\n').find((ref) => ref.endsWith('/github'));
+    assert.equal(git(f.deviceTwo, 'rev-parse', githubRef), verifiedRemote);
+  } finally {
+    if (lease) releaseScanLease(lease);
+    fs.rmSync(f.base, { recursive: true, force: true });
+  }
+});
+
+test('disjoint symlink, gitlink and file-mode transitions require manual review', async () => {
+  for (const kind of ['symlink', 'gitlink', 'type-change', 'executable-change']) {
+    const f = await pairedFixture();
+    try {
+      git(f.root, 'config', 'user.name', 'Test');
+      git(f.root, 'config', 'user.email', 'test@example.invalid');
+      if (kind === 'type-change' || kind === 'executable-change') {
+        fs.mkdirSync(path.join(f.root, 'profile'), { recursive: true });
+        fs.writeFileSync(path.join(f.root, 'profile', `${kind}.md`), 'ordinary file\n');
+        git(f.root, 'add', `profile/${kind}.md`);
+        git(f.root, 'commit', '-m', `${kind} baseline`);
+        git(f.root, 'push', 'origin', 'HEAD');
+        git(f.deviceTwo, 'fetch', 'origin');
+        git(f.deviceTwo, 'merge', '--ff-only', '@{u}');
+      }
+
+      if (kind === 'symlink') {
+        commitRawIndexEntry(
+          f.root,
+          'profile/disjoint-link',
+          '120000',
+          '../workspace.json',
+          'add disjoint symlink',
+        );
+      } else if (kind === 'gitlink') {
+        commitRawIndexEntry(
+          f.root,
+          'applications/disjoint-module',
+          '160000',
+          git(f.root, 'rev-parse', 'HEAD'),
+          'add disjoint gitlink',
+        );
+      } else if (kind === 'type-change') {
+        commitRawIndexEntry(
+          f.root,
+          'profile/type-change.md',
+          '120000',
+          '../workspace.json',
+          'replace regular file with symlink',
+        );
+      } else {
+        git(f.root, 'update-index', '--chmod=+x', 'profile/executable-change.md');
+        git(f.root, 'commit', '-m', 'change regular file mode');
+      }
+      git(f.root, 'push', 'origin', 'HEAD');
+      commitLocalSideOfRawDivergence(f, kind);
+
+      const analysis = analyseBackupDivergence(f.deviceTwo, { spawn: f.spawn });
+      assert.equal(analysis.classification, 'manual-required', kind);
+      assert.equal(analysis.canResolve, false, kind);
+      assert.match(analysis.reason, /mode|non-standard|file type/i, kind);
+      assert.doesNotMatch(JSON.stringify(analysis), /disjoint-link|disjoint-module|type-change\.md/i);
+    } finally {
+      fs.rmSync(f.base, { recursive: true, force: true });
+    }
+  }
+});
+
+test('malformed or unmerged raw diff metadata fails closed', async () => {
+  const f = await pairedFixture();
+  try {
+    await disjointDivergence(f);
+    const malformed = analyseBackupDivergence(f.deviceTwo, {
+      spawn: (command, args, options) => (
+        args[0] === 'diff' && args.includes('--raw')
+          ? { status: 0, stdout: ':malformed\0data/example.json\0', stderr: '' }
+          : f.spawn(command, args, options)
+      ),
+    });
+    assert.equal(malformed.classification, 'manual-required');
+    assert.match(malformed.reason, /could not be compared/i);
+
+    const unmergedHeader = `:100644 100644 ${'a'.repeat(40)} ${'b'.repeat(40)} U`;
+    const unmerged = analyseBackupDivergence(f.deviceTwo, {
+      spawn: (command, args, options) => (
+        args[0] === 'diff' && args.includes('--raw')
+          ? { status: 0, stdout: `${unmergedHeader}\0data/conflict.json\0`, stderr: '' }
+          : f.spawn(command, args, options)
+      ),
+    });
+    assert.equal(unmerged.classification, 'manual-required');
+    assert.match(unmerged.reason, /non-standard/i);
+    assert.doesNotMatch(JSON.stringify(unmerged), /conflict\.json/i);
+
+    for (const length of [40, 64, 41, 63]) {
+      const objectId = 'a'.repeat(length);
+      const zeroId = '0'.repeat(length);
+      const header = `:000000 100644 ${zeroId} ${objectId} A`;
+      const analysis = analyseBackupDivergence(f.deviceTwo, {
+        spawn: (command, args, options) => (
+          args[0] === 'diff' && args.includes('--raw')
+            ? { status: 0, stdout: `${header}\0data/object-id.json\0`, stderr: '' }
+            : f.spawn(command, args, options)
+        ),
+      });
+      if (length === 40 || length === 64) {
+        assert.equal(analysis.classification, 'overlapping', `valid ${length}-digit object ID`);
+      } else {
+        assert.equal(analysis.classification, 'manual-required', `invalid ${length}-digit object ID`);
+        assert.match(analysis.reason, /could not be compared/i);
+      }
+      assert.doesNotMatch(JSON.stringify(analysis), /object-id\.json/i);
+    }
+  } finally {
+    fs.rmSync(f.base, { recursive: true, force: true });
+  }
+});
+
+test('merge failure keeps both tips and refs while push failure keeps a pending local merge', async () => {
+  const mergeFailure = await pairedFixture();
+  let lease;
+  try {
+    const divergence = await disjointDivergence(mergeFailure);
+    const localBefore = git(mergeFailure.deviceTwo, 'rev-parse', 'HEAD');
+    const remoteBefore = git(mergeFailure.deviceTwo, 'rev-parse', '@{u}');
+    lease = backupLease(mergeFailure.deviceTwo, 'backup-merge-failure');
+    const result = await resolveBackupDivergence(
+      mergeFailure.deviceTwo,
+      divergence.resolution.analysisToken,
+      lease,
+      {
+        spawn: (command, args, options) => (
+          args[0] === 'merge' && args.includes('--no-ff')
+            ? { status: 1, stdout: '', stderr: 'synthetic merge failure' }
+            : mergeFailure.spawn(command, args, options)
+        ),
+      },
+    );
+    assert.equal(result.state, 'needs-attention');
+    assert.equal(git(mergeFailure.deviceTwo, 'rev-parse', 'HEAD'), localBefore);
+    assert.equal(git(mergeFailure.deviceTwo, 'rev-parse', '@{u}'), remoteBefore);
+    assert.equal(
+      git(mergeFailure.deviceTwo, 'for-each-ref', '--format=%(refname)', 'refs/scout-recovery').split('\n').length,
+      2,
+    );
+  } finally {
+    if (lease) releaseScanLease(lease);
+    fs.rmSync(mergeFailure.base, { recursive: true, force: true });
+  }
+
+  const pushFailure = await pairedFixture();
+  lease = null;
+  try {
+    const divergence = await disjointDivergence(pushFailure);
+    lease = backupLease(pushFailure.deviceTwo, 'backup-push-failure');
+    const result = await resolveBackupDivergence(
+      pushFailure.deviceTwo,
+      divergence.resolution.analysisToken,
+      lease,
+      {
+        spawn: (command, args, options) => (
+          args[0] === 'push'
+            ? { status: 1, stdout: '', stderr: 'synthetic offline push' }
+            : pushFailure.spawn(command, args, options)
+        ),
+      },
+    );
+    assert.equal(result.state, 'offline');
+    assert.equal(result.pending, true);
+    assert.equal(fs.existsSync(path.join(pushFailure.deviceTwo, 'data', 'local-change.json')), true);
+    assert.equal(fs.existsSync(path.join(pushFailure.deviceTwo, 'data', 'remote-change.json')), true);
+    assert.equal(Number(git(pushFailure.deviceTwo, 'rev-list', '--left-right', '--count', 'HEAD...@{u}').split('\t')[0]) > 0, true);
+  } finally {
+    if (lease) releaseScanLease(lease);
+    fs.rmSync(pushFailure.base, { recursive: true, force: true });
+  }
+});
+
+test('backup divergence resolution cannot overlap a tracker or report mutation', async () => {
+  const f = await pairedFixture();
+  let lease;
+  try {
+    const divergence = await disjointDivergence(f);
+    lease = backupLease(f.deviceTwo, 'backup-coordinator-race');
+    await withMutationCoordinator(f.deviceTwo, lease, async () => {
+      await assert.rejects(
+        resolveBackupDivergence(f.deviceTwo, divergence.resolution.analysisToken, lease, { spawn: f.spawn }),
+        /another workspace mutation is in progress/i,
+      );
+    });
+  } finally {
+    if (lease) releaseScanLease(lease);
+    fs.rmSync(f.base, { recursive: true, force: true });
+  }
+});
+
 test('offline sync keeps a local commit pending', async () => {
   const f = fixture();
   const realSpawn = (command, args, options) => {
@@ -235,6 +1279,9 @@ test('offline sync keeps a local commit pending', async () => {
   const result = await runWorkspaceSync(f.root, 'offline change', { spawn: offlineSpawn });
   assert.equal(result.state, 'offline');
   assert.equal(result.pending, true);
+  assert.equal(result.reasonCode, 'backup-offline');
+  assert.equal(result.error, 'GitHub backup is temporarily unavailable');
+  assert.doesNotMatch(JSON.stringify(result), /synthetic offline|github\.com\/example|Users|home\//i);
   assert.match(git(f.root, 'log', '-1', '--pretty=%s'), /offline change/);
   fs.rmSync(f.base, { recursive: true, force: true });
 });
@@ -252,7 +1299,9 @@ test('backup setup still returns the recovery key when the first checkpoint need
   assert.match(connected.recoveryKey, /^SCOUT-1-/);
   assert.equal(connected.status.state, 'needs-attention');
   assert.equal(connected.status.pending, true);
-  assert.match(connected.status.error, /synthetic commit failure/);
+  assert.equal(connected.status.error, 'Private backup needs attention');
+  assert.equal(connected.status.reasonCode, 'backup-error');
+  assert.doesNotMatch(JSON.stringify(connected.status), /synthetic commit failure/);
   assert.equal(loadSyncSettings(f.root).enabled, true);
   fs.rmSync(f.base, { recursive: true, force: true });
 });

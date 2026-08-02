@@ -3,6 +3,8 @@ import fs from 'node:fs';
 import vm from 'node:vm';
 import { test } from 'node:test';
 import { CATEGORY_PALETTE } from './lib/categoryColor.mjs';
+import { createChatDrawerState, reduceChatDrawer } from './lib/chatDrawerState.mjs';
+import { codexDeepLinkCapability, openCodexTask } from './lib/codexDeepLink.mjs';
 
 function loadScout() {
   const context = {
@@ -12,6 +14,10 @@ function loadScout() {
     fetch: () => new Promise(() => {}),
     console,
     matchMedia: () => ({ matches: false }),
+    createChatDrawerState,
+    codexDeepLinkCapability,
+    codexTaskLaunchView: openCodexTask,
+    reduceChatDrawer,
   };
   context.activityState = () => 'thinking';
   context.applyScoutState = () => {};
@@ -32,13 +38,38 @@ test('custom CV recommendations are preselected but remain optional', () => {
   assert.match(html, /app\.js\?v=__SCOUT_UI_BUILD__/);
 });
 
-test('strict CSP-compatible UI markup uses delegated actions instead of inline handlers', () => {
+test('strict CSP-compatible UI markup uses delegated actions instead of inline handlers', async () => {
   const source = fs.readFileSync(new URL('./app.js', import.meta.url), 'utf8');
   const html = fs.readFileSync(new URL('./index.html', import.meta.url), 'utf8');
+  const workerListeners = new Map();
+  const openedCaches = [];
+  const workerSource = fs.readFileSync(new URL('./service-worker.js', import.meta.url), 'utf8')
+    .replace('__SCOUT_UI_BUILD__', 'csp-contract-build');
+  vm.runInNewContext(workerSource, {
+    URL,
+    caches: {
+      open(name) {
+        openedCaches.push(name);
+        return Promise.resolve({ addAll: async () => {} });
+      },
+    },
+    self: {
+      addEventListener(type, listener) { workerListeners.set(type, listener); },
+      clients: { claim() {} },
+      location: { origin: 'https://scout.test' },
+      skipWaiting() {},
+    },
+  }, { filename: 'ui/service-worker.js' });
+  let install;
+  workerListeners.get('install')({
+    waitUntil(promise) { install = promise; },
+  });
+  await install;
+
   assert.doesNotMatch(source, /\son(?:click|change|input|keydown|submit)\s*=/i);
   assert.doesNotMatch(html, /\son(?:click|change|input|keydown|submit)\s*=/i);
   assert.match(html, /app\.js\?v=__SCOUT_UI_BUILD__/);
-  assert.match(fs.readFileSync(new URL('./service-worker.js', import.meta.url), 'utf8'), /scout-shell-\$\{BUILD\}/);
+  assert.deepEqual(openedCaches, ['scout-shell-csp-contract-build']);
   assert.match(source, /data-action="open-entry"/);
   assert.match(source, /\.card\[data-id\]/);
   assert.match(source, /bindDelegatedActions/);
@@ -124,13 +155,122 @@ test('configured triage thresholds drive score presentation', () => {
   assert.equal(scout.fitClass(63), 'fit-weak');
 });
 
-test('Codex chats use the canonical desktop task deep link and raw tool commands stay hidden', () => {
-  const { context } = loadScout();
-  assert.equal(context.codexTaskUrl('019f1234-abcd-7890'), 'codex://threads/019f1234-abcd-7890');
-  assert.equal(context.codexTaskUrl('../unsafe'), null);
+test('Codex task controls escape fallback identity and never call a click success', () => {
+  const { scout } = loadScout();
+  scout.chat = {
+    id: 'chat-a',
+    engine: 'codex',
+    data: { cliSessionId: '<img src=x onerror=alert(1)>' },
+  };
+  scout.chatDrawerState = createChatDrawerState('chat-a', 1);
+  scout.chatDrawerState = reduceChatDrawer(scout.chatDrawerState, {
+    type: 'codexLink/resolved', chatId: 'chat-a', generation: 1, requestGeneration: 1,
+    value: { state: 'unavailable', canAttempt: false, reasonCode: 'handler-missing' },
+  });
+  const fallback = scout.codexTaskControlsHtml(scout.chat);
+  assert.match(fallback, /&lt;img src=x onerror=alert\(1\)&gt;/);
+  assert.doesNotMatch(fallback, /<img/);
+  assert.match(fallback, /copy task ID/i);
+  assert.doesNotMatch(fallback, /success/i);
   const source = fs.readFileSync(new URL('./app.js', import.meta.url), 'utf8');
   assert.doesNotMatch(source, /chat-msg tool/);
   assert.match(source, /Technical details/);
+});
+
+test('chat usage copy keeps unavailable, account estimate, allowance window, model spend and reset timing distinct', () => {
+  const { scout } = loadScout();
+  const unavailable = scout.usageSummaryView({ claude: { unknown: true }, codex: { unknown: true } });
+  assert.match(unavailable.text, /claude usage unavailable/i);
+  assert.match(unavailable.text, /codex usage unavailable/i);
+
+  const estimated = scout.usageSummaryView({
+    checkedAt: '2026-07-28T10:00:00.000Z',
+    claude: { fiveHourTokens: 2_000, weekTokens: 5_000, approximate: true },
+    codex: {
+      windows: [{
+        usedPercent: 42, label: 'weekly', resetsAt: '2026-07-29T10:00:00.000Z',
+      }],
+    },
+  });
+  assert.match(estimated.text, /estimated account usage/i);
+  assert.match(estimated.text, /42% weekly allowance used/i);
+  assert.match(estimated.title, /weekly resets/i);
+
+  const spend = scout.modelSpendHtml('claude', {
+    byModel: [{ model: 'safe-model', weekTokens: 9_000 }],
+  }, 'safe-model');
+  assert.match(spend, /spent on this model/i);
+  assert.doesNotMatch(spend, /allowance remaining/i);
+});
+
+test('engine picker explains catalogue provenance, effective defaults and unavailable saved choices', () => {
+  const { scout } = loadScout();
+  scout.chat = { id: 'synthetic-chat', purpose: 'job' };
+  scout.chatDrawerState = createChatDrawerState('synthetic-chat', 1);
+
+  const refreshed = scout.engineCardHtml('codex', {
+    usage: { unknown: true },
+    models: [{
+      id: 'gpt-5.6-sol',
+      label: 'GPT-5.6 Sol',
+      tradeoff: 'Most capable for complex work.',
+      source: 'refreshed',
+      available: true,
+      selected: true,
+    }],
+    defaultModel: null,
+    effectiveModel: {
+      id: 'gpt-5.6-sol', label: 'GPT-5.6 Sol', available: true, known: true,
+      state: 'provider-default',
+    },
+    catalogue: { state: 'refreshed' },
+  });
+  assert.match(refreshed, /Provider default — GPT-5\.6 Sol/);
+  assert.match(refreshed, /Most capable for complex work/);
+  assert.match(refreshed, /refreshed catalogue/);
+
+  const stale = scout.engineCardHtml('codex', {
+    usage: { unknown: true },
+    models: [{
+      id: 'gpt-old-stale',
+      label: 'gpt-old-stale',
+      tradeoff: 'Configured model is absent from the refreshed catalogue.',
+      source: 'configured',
+      available: false,
+      selected: false,
+    }],
+    defaultModel: null,
+    effectiveModel: {
+      id: 'gpt-old-stale', label: 'gpt-old-stale', available: false, known: true,
+      state: 'stale',
+    },
+    catalogue: { state: 'refreshed' },
+  });
+  assert.match(stale, /saved default unavailable/i);
+  assert.match(stale, /choose another model/i);
+  assert.match(stale, /value="gpt-old-stale"[^>]*disabled/);
+});
+
+test('engine picker escapes catalogue labels, tradeoffs and IDs and ignores unexpected raw fields', () => {
+  const { scout } = loadScout();
+  const html = scout.engineCardHtml('codex', {
+    usage: { unknown: true },
+    models: [{
+      id: 'safe-model',
+      label: '<img src=x onerror=alert(1)>',
+      tradeoff: '<script>bad()</script>',
+      source: 'refreshed',
+      available: true,
+      selected: false,
+      raw: `${['', 'Users', 'example'].join('/')} token=${'secret'}`,
+    }],
+    effectiveModel: { id: null, label: 'Provider default (model unknown)', available: 'unknown', known: false },
+    catalogue: { state: 'fallback' },
+  });
+  assert.doesNotMatch(html, /<img|<script|Users\/example|token=secret/);
+  assert.match(html, /&lt;img/);
+  assert.match(html, /&lt;script&gt;/);
+  assert.match(html, /bundled fallback/);
 });
 
 test('interview prep is a manual, separate conversation with escaped saved-pack content', () => {
@@ -266,6 +406,50 @@ test('scan health labels distinguish selection from successful assessment', () =
   assert.doesNotMatch(html, /vacancies checked/i);
 });
 
+test('run audit renders persisted recovery and queue state without private diagnostic fields', () => {
+  const { scout } = loadScout();
+  scout.scanRuns = [{
+    id: 'run-1234…', state: 'repairing', label: 'Repairing affected jobs',
+    owner: 'active worker', startedAt: '2026-07-29T00:00:00.000Z',
+    updatedAt: '2026-07-29T00:05:00.000Z', profileVersion: 'profile-v3',
+    pipelineVersion: 'pipeline-v9', completedStages: ['collect', 'normalise', 'deduplicate', 'filter', 'rank', 'select'],
+    assessment: {
+      currentBatch: 2, totalBatches: 3, totalBatchesExact: false,
+      completedBatches: 1, completedJobs: 10, failedJobs: 1,
+    },
+    recoveryCount: 2, terminalReason: null,
+    host: 'PRIVATE-HOST', pid: 4242, prompt: 'private prompt', advert: 'full advert body',
+  }];
+  scout.scanQueue = {
+    requests: [{
+      id: 'request-…', status: 'queued', requester: 'manual', purpose: 'job-discovery',
+      requestedAt: '2026-07-29T00:04:00.000Z', expiresAt: '2026-07-30T00:04:00.000Z',
+      prompt: 'private queued prompt',
+    }],
+  };
+  const html = scout.scanRunAuditCard();
+  assert.match(html, /Repairing affected jobs/);
+  assert.match(html, /batch 2 of at least 3/i);
+  assert.match(html, /2 recoveries/i);
+  assert.match(html, /1 queued request/i);
+  assert.match(html, /run-1234…/);
+  assert.doesNotMatch(html, /PRIVATE-HOST|4242|private prompt|full advert body|private queued prompt/i);
+});
+
+test('the Jobs audit remains visible for queue-only and waiting workspaces', () => {
+  const { scout } = loadScout();
+  scout.latestScan = null;
+  scout.scanRuns = [];
+  scout.scanRunState = 'waiting';
+  scout.scanQueue = {
+    state: 'queued',
+    requests: [{ id: 'request-…', status: 'queued', requester: 'manual', purpose: 'job-discovery' }],
+  };
+  assert.match(scout.latestScanCard(), /1 queued request/i);
+  scout.scanQueue = { state: 'waiting', requests: [] };
+  assert.match(scout.latestScanCard(), /Waiting to scan/i);
+});
+
 test('renderJobs lists only new jobs, highest score first, with tags and actions', () => {
   const { scout, context } = loadScout();
   const { doc } = withJobsDom();
@@ -353,6 +537,36 @@ test('triage actions post the right status transitions', async () => {
   assert.deepEqual(normalized[0], ['/api/status', { id: 'a', status: 'shortlist' }]);
   assert.deepEqual(normalized[1], ['/api/status', { id: 'b', status: 'ignore' }]);
   assert.deepEqual(normalized[2], ['/api/status', { id: 'b', status: 'new' }]);
+});
+
+test('explicit job feedback is separate from tracker status and carries the current ledger revision', async () => {
+  const { scout, context } = loadScout();
+  const answers = ['not-interested', 'location', 'The commute is too long.'];
+  context.window.prompt = () => answers.shift();
+  let alertText = '';
+  context.window.alert = (value) => { alertText = value; };
+  scout.feedbackLearning = { revision: 'a'.repeat(64) };
+  const calls = [];
+  scout.api = async (pathname, options) => {
+    calls.push([pathname, JSON.parse(options.body)]);
+    return { ok: true, ledger: { revision: 'b'.repeat(64) } };
+  };
+
+  const result = await scout.recordJobFeedback('job-1');
+
+  assert.equal(result.ok, true);
+  assert.deepEqual(calls, [[
+    '/api/feedback',
+    {
+      revision: 'a'.repeat(64),
+      opportunityId: 'job-1',
+      decision: 'not-interested',
+      reason: 'location',
+      explanation: 'The commute is too long.',
+    },
+  ]]);
+  assert.match(alertText, /Ranking did not change/);
+  assert.equal(scout.feedbackLearning.revision, 'b'.repeat(64));
 });
 
 test('No removes a job immediately and restores it when persistence fails', async () => {
@@ -456,6 +670,77 @@ test('app.js inlined CATEGORY_PALETTE stays in sync with the canonical ui/lib/ca
   for (const { bg, fg } of CATEGORY_PALETTE) {
     assert.match(source, new RegExp(`bg: '${bg}', fg: '${fg}'`), `app.js is missing inlined entry ${bg}/${fg}`);
   }
+});
+
+test('app.js keeps no Scout animation timing, geometry or alignment data of its own', () => {
+  const source = fs.readFileSync(new URL('./app.js', import.meta.url), 'utf8');
+  // Every duplicate below produced a different animation from the canonical
+  // ui/lib/scoutCharacter.mjs definition: one 2s/16-frame cycle for every state,
+  // an alignment table missing welcome/asking/sleeping, and a still frame pinned
+  // to frame zero regardless of the state's configured reducedMotionFrame.
+  assert.doesNotMatch(source, /SCOUT_RUNTIME_ALIGNMENT/);
+  assert.doesNotMatch(source, /SCOUT_RUNTIME_STATES/);
+  assert.doesNotMatch(source, /--scout-(?:duration|frames|columns|rows|iterations|align-[xy]|still-[xy]|src)/);
+  assert.doesNotMatch(source, /\/assets\/scout-\w+\.png/);
+  assert.match(source, /window\.ScoutCharacter/);
+});
+
+test('index.html loads the canonical character module and defines no fixed 16-frame animation', () => {
+  const html = fs.readFileSync(new URL('./index.html', import.meta.url), 'utf8');
+  assert.match(html, /<script type="module" src="\/lib\/scoutCharacter\.mjs\?v=__SCOUT_UI_BUILD__"><\/script>/);
+  assert.ok(
+    html.indexOf('src="/app.js?v=__SCOUT_UI_BUILD__"')
+      < html.indexOf('src="/lib/scoutCharacter.mjs?v=__SCOUT_UI_BUILD__"'),
+    'the independent app module must execute before a delayed character module',
+  );
+  // The old hand-written keyframe table hard-coded 16 cells and rounded thirds,
+  // so any state with a different grid or frame rate drifted off its cell. The
+  // walk is now a per-grid keyframes rule generated from the definition.
+  assert.doesNotMatch(html, /@keyframes scout-frames/);
+  assert.doesNotMatch(html, /@keyframes scout-frame-column/);
+  const sprite = html.match(/\.scout-sprite \{[^}]*\}/)?.[0] || '';
+  assert.ok(sprite, '.scout-sprite rule must exist');
+  assert.doesNotMatch(sprite, /\d+\.\d+%/);
+  assert.match(sprite, /animation:var\(--scout-walk\) var\(--scout-duration\) step-end var\(--scout-iterations\)/);
+  // Offscreen and hidden-page pausing must survive the rewrite.
+  assert.match(html, /\.scout-offscreen \.scout-sprite, \.scout-page-hidden \.scout-sprite \{ animation-play-state:paused; \}/);
+  // Reduced motion holds the representative frame on its own anchor.
+  assert.match(html, /\.scout-sprite\.reduced-motion \{[^}]*animation:none;[^}]*--scout-still-align-x/);
+  assert.match(html, /@media \(prefers-reduced-motion:reduce\) \{[^}]*--scout-still-align-x/);
+});
+
+test('a character rendered before the module arrives is a hydratable, labelled placeholder', () => {
+  const { context } = loadScout();
+  // loadScout runs app.js with no window.ScoutCharacter, which is exactly the
+  // production window between the classic script executing and the deferred
+  // module evaluating — and the permanent state if the module never loads.
+  assert.equal(context.window.ScoutCharacter, undefined);
+  const markup = context.scoutMarkup('found', 'scout-arrival-character');
+  assert.match(markup, /class="scout-character[^"]*scout-arrival-character/);
+  assert.match(markup, /role="img"/);
+  assert.match(markup, /aria-label="Scout"/);
+  assert.match(markup, /data-scout-state="found"/);
+  assert.match(markup, /<span class="scout-sprite" aria-hidden="true"><\/span>/);
+  assert.doesNotMatch(markup, /data-scout-ready/);
+  // A state name can only ever reach the placeholder as a bare identifier.
+  assert.match(context.scoutMarkup('"><script>alert(1)</script>'), /data-scout-state="scriptalertscript"/);
+  assert.doesNotMatch(context.scoutMarkup('"><script>alert(1)</script>'), /<script>/);
+
+  const html = fs.readFileSync(new URL('./index.html', import.meta.url), 'utf8');
+  // Until the module marks a character ready, the box shows Scout's resting
+  // cell rather than an empty slot.
+  assert.match(html, /\.scout-character:not\(\[data-scout-ready\]\) \.scout-sprite \{[^}]*scout-idle\.png/);
+  assert.match(html, /\.scout-character:not\(\[data-scout-ready\]\) \.scout-sprite \{[^}]*animation:none/);
+});
+
+test('the character module is cached offline and carries the UI build fingerprint', () => {
+  const worker = fs.readFileSync(new URL('./service-worker.js', import.meta.url), 'utf8');
+  assert.match(worker, /\/lib\/scoutCharacter\.mjs\?v=\$\{BUILD\}/);
+  assert.match(worker, /url\.pathname === '\/lib\/scoutCharacter\.mjs'/);
+  // A module-only change must move the build id, or the shell cache and the
+  // versioned module URL would both keep serving the previous character.
+  const server = fs.readFileSync(new URL('./server.mjs', import.meta.url), 'utf8');
+  assert.match(server, /UI_BUILD_FILES = \[[\s\S]*'lib\/scoutCharacter\.mjs'/);
 });
 
 test('dynamic category lane machinery is gone', () => {

@@ -5,11 +5,17 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { ENGINES, registerChatRoutes } from './chatService.mjs';
+import { ENGINES, registerChatRoutes, shutdownActiveChatTurns } from './chatService.mjs';
 import { parseClaudeLine } from './chatClaude.mjs';
 import { emptyChat, loadChat, saveChat } from './chatStore.mjs';
 import { HANDOFF_SUMMARY_PROMPT } from './chatPrompts.mjs';
 import { interviewPrepPath } from './interviewPrep.mjs';
+import { readProviderHealth } from './providerHealth.mjs';
+import { ProviderLifecycleUnclosedError } from './structuredTurn.mjs';
+import { mergeWorkspaceDefaults, writeWorkspaceConfig } from './workspace.mjs';
+import {
+  acquireProviderAuthMutation, releaseProviderAuthMutation,
+} from './providerAuthMutation.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const FAKE = path.join(HERE, 'fixtures', 'fake-cli.mjs');
@@ -59,6 +65,10 @@ function routeFixture(root, overrides = {}) {
     repoRoot: root,
     readTracker: () => ({ opportunities: [ENTRY] }),
     providerStatusFn: () => ({ installed: true, authenticated: true, executable: 'provider', env: process.env }),
+    providerCataloguesFn: async () => ({
+      claude: { state: 'unsupported', models: [] },
+      codex: { state: 'unsupported', models: [] },
+    }),
     ...overrides,
   });
   return routes;
@@ -271,6 +281,57 @@ test('job and prep conversations share one running slot per opportunity', async 
   assert.equal(sseEvents((await prepPromise).text()).at(-1).event, 'done');
 });
 
+test('an editable provider turn holds the workspace mutation fence until its process closes', async () => {
+  const root = tmpRoot();
+  let finish;
+  const routes = routeFixture(root, {
+    runTurnFn: () => ({
+      stop() {},
+      finished: new Promise((resolve) => { finish = resolve; }),
+    }),
+  });
+  const pending = callRoute(
+    routes['POST /api/chat/send'],
+    JSON.stringify({ id: ID, engine: 'codex', text: 'Edit my CV' }),
+  );
+  while (!finish) await new Promise((resolve) => setImmediate(resolve));
+  assert.throws(
+    () => writeWorkspaceConfig(root, mergeWorkspaceDefaults()),
+    /another workspace mutation is in progress/,
+  );
+  finish({ ok: true, text: 'Done', sessionId: 'session', filesTouched: [], usage: {} });
+  assert.equal(sseEvents((await pending).text()).at(-1).event, 'done');
+  writeWorkspaceConfig(root, mergeWorkspaceDefaults());
+});
+
+test('provider attachment failure stops and observes the spawned writer before authority closes', async () => {
+  const root = tmpRoot();
+  let stopped = false;
+  let closeChild;
+  let finishCalls = 0;
+  const routes = routeFixture(root, {
+    runTurnFn: () => ({
+      pid: 4242,
+      stop() { stopped = true; closeChild({ ok: false, reasonCode: 'stopped' }); },
+      finished: new Promise((resolve) => { closeChild = resolve; }),
+    }),
+    withWorkspaceMutationAuthorityAsyncFn: async (_root, _metadata, commit) => commit({
+      coordinator: {
+        beginChild: () => 'child-operation',
+        attachChild: () => { throw new Error('synthetic attachment publication failure'); },
+        finishChild: () => { finishCalls += 1; },
+      },
+    }),
+  });
+  const response = await callRoute(
+    routes['POST /api/chat/send'],
+    JSON.stringify({ id: ID, engine: 'codex', text: 'Edit my CV' }),
+  );
+  assert.equal(stopped, true);
+  assert.equal(finishCalls, 1);
+  assert.equal(sseEvents(response.text()).at(-1).event, 'error');
+});
+
 test('chat routes reject unknown purposes and fit mode in prep chats', async () => {
   const root = tmpRoot();
   const routes = routeFixture(root);
@@ -337,6 +398,73 @@ test('handoff route summarises the old session, starts the other engine, and per
   }
 });
 
+test('runtime shutdown waits for an admitted handoff and prevents its second provider turn', { concurrency: false }, async () => {
+  const root = tmpRoot();
+  const chat = emptyChat('claude');
+  chat.cliSessionId = 'old-session';
+  saveChat(root, ID, chat);
+  const oldClaude = ENGINES.claude;
+  const oldCodex = ENGINES.codex;
+  ENGINES.claude = { build: fakeBuild([], 'claude'), parse: parseClaudeLine };
+  ENGINES.codex = { build: fakeBuild([], 'codex'), parse: parseClaudeLine };
+  let turnCount = 0;
+  let releaseHealth;
+  let healthStartedResolve;
+  const healthStarted = new Promise((resolve) => { healthStartedResolve = resolve; });
+  const holdHealth = new Promise((resolve) => { releaseHealth = resolve; });
+  const routes = {};
+  const runtime = registerChatRoutes({
+    routes,
+    repoRoot: root,
+    readTracker: () => ({ opportunities: [ENTRY] }),
+    providerStatusFn: () => ({
+      installed: true, authenticated: true, executable: 'provider', env: process.env,
+    }),
+    runTurnFn: () => {
+      turnCount += 1;
+      return {
+        stop() {},
+        finished: Promise.resolve({
+          ok: true,
+          text: 'bounded handoff summary',
+          sessionId: 'summary-session',
+          filesTouched: [],
+          usage: {},
+        }),
+      };
+    },
+    recordProviderResultHealthFn: async () => {
+      healthStartedResolve();
+      await holdHealth;
+    },
+  });
+  const req = new EventEmitter();
+  const res = new MockResponse();
+
+  try {
+    routes['POST /api/chat/handoff'](req, res, JSON.stringify({ id: ID }));
+    await healthStarted;
+    let shutdownSettled = false;
+    const shutdown = runtime.shutdown({ timeoutMs: 1_000 }).then(() => { shutdownSettled = true; });
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(shutdownSettled, false);
+    releaseHealth();
+    await shutdown;
+    await res.finished;
+    assert.equal(turnCount, 1);
+    assert.equal(sseEvents(res.text()).at(-1).event, 'error');
+
+    const rejected = await callRoute(
+      routes['POST /api/chat/send'],
+      JSON.stringify({ id: ID, engine: 'codex', text: 'late work' }),
+    );
+    assert.equal(rejected.statusCode, 503);
+  } finally {
+    ENGINES.claude = oldClaude;
+    ENGINES.codex = oldCodex;
+  }
+});
+
 test('handoff route persists the switch and summary when the replacement turn fails', { concurrency: false }, async () => {
   const root = tmpRoot();
   const chat = emptyChat('claude');
@@ -363,7 +491,7 @@ test('handoff route persists the switch and summary when the replacement turn fa
     const res = await callRoute(routeFixture(root)['POST /api/chat/handoff'], JSON.stringify({ id: ID }));
     const events = sseEvents(res.text());
     assert.equal(events.at(-1).event, 'error');
-    assert.equal(events.at(-1).data.message, 'replacement failed');
+    assert.equal(events.at(-1).data.message, 'Provider turn failed.');
     assert.equal(events.at(-1).data.engine, 'codex');
     assert.equal(events.at(-1).data.sessionId, 'replacement-session');
     const saved = loadChat(root, ID);
@@ -372,7 +500,7 @@ test('handoff route persists the switch and summary when the replacement turn fa
     assert.ok(saved.filesTouched.includes('applications/acme/failed.typ'));
     assert.equal(saved.handoffs.length, 1);
     assert.ok(saved.messages.some((m) => m.role === 'system' && m.text.startsWith('handoff summary:')));
-    assert.equal(saved.messages.at(-1).text, 'replacement failed');
+    assert.equal(saved.messages.at(-1).text, 'Provider turn failed.');
   } finally {
     ENGINES.claude = oldClaude;
     ENGINES.codex = oldCodex;
@@ -462,6 +590,62 @@ test('a failed send preserves emitted session and file metadata for retry', { co
   }
 });
 
+test('raw provider failures and tool diagnostics never reach SSE or durable chat', async () => {
+  const root = tmpRoot();
+  const privateText = `token=${['PRIVATE', 'SECRET'].join('-')} ${['', 'Users', 'private', 'account@example.test'].join('/')}`;
+  const routes = routeFixture(root, {
+    runTurnFn: (options) => {
+      options.onEvent({
+        kind: 'tool',
+        label: `run: ${privateText}`,
+        file: `${['', 'Users', 'private'].join('/')}/${ID}/cv.typ`,
+        activity: 'writing',
+      });
+      return {
+        stop() {},
+        finished: Promise.resolve({
+          ok: false,
+          error: privateText,
+          reasonCode: 'unexpected-private-reason',
+          filesTouched: [`applications/${ID}/cv.typ`],
+        }),
+      };
+    },
+  });
+  const response = await callRoute(
+    routes['POST /api/chat/send'],
+    JSON.stringify({ id: ID, engine: 'claude', text: 'Hello' }),
+  );
+  assert.doesNotMatch(response.text(), /PRIVATE-SECRET|Users|account@|run:/);
+  const events = sseEvents(response.text());
+  assert.deepEqual(events.find((event) => event.event === 'tool'), {
+    event: 'tool',
+    data: { label: 'Editing a file', activity: 'writing' },
+  });
+  assert.equal(events.at(-1).data.message, 'Provider turn failed.');
+  const saved = loadChat(root, ID);
+  assert.doesNotMatch(JSON.stringify(saved), /PRIVATE-SECRET|Users|account@|run:/);
+  assert.equal(saved.messages.at(-1).text, 'Provider turn failed.');
+  assert.deepEqual(saved.filesTouched, [`applications/${ID}/cv.typ`]);
+});
+
+test('tracker read failures do not expose private diagnostic details at the API boundary', async () => {
+  const root = tmpRoot();
+  const privateText = `token=${['PRIVATE', 'SECRET'].join('-')} ${['', 'Users', 'private', 'data', 'opportunities.json'].join('/')}`;
+  const routes = routeFixture(root, {
+    readTracker: () => { throw new Error(privateText); },
+  });
+  const response = new MockResponse();
+  routes['GET /api/chat'](
+    new EventEmitter(), response, '',
+    new URL(`http://127.0.0.1/api/chat?id=${ID}`),
+  );
+  await response.finished;
+  assert.equal(response.statusCode, 500);
+  assert.deepEqual(JSON.parse(response.text()), { error: 'Tracker could not be read.' });
+  assert.doesNotMatch(response.text(), /PRIVATE-SECRET|Users\/private|opportunities\.json/);
+});
+
 test('a CV writing turn triggers installed-app quality validation when evidence exists', { concurrency: false }, async () => {
   const root = tmpRoot();
   const app = path.join(root, 'applications', 'acme-role-2026-07');
@@ -521,6 +705,281 @@ test('bounded fit assessment receives the selected job, identifies its provider 
   assert.equal(JSON.parse(get.text()).chat.engine, 'claude');
 });
 
+test('ordinary chat records remote-auth failure without resending and preserves the failed message for explicit retry', async () => {
+  const root = tmpRoot();
+  let invocations = 0;
+  let nextResult = {
+    ok: false,
+    status: 401,
+    error: `Unauthorized for person@example.test ${['token', 'private-secret'].join('=')}`,
+    filesTouched: [],
+  };
+  const routes = routeFixture(root, {
+    runTurnFn: () => {
+      invocations += 1;
+      return {
+        stop() {},
+        finished: Promise.resolve(nextResult),
+      };
+    },
+  });
+
+  const failed = await callRoute(
+    routes['POST /api/chat/send'],
+    JSON.stringify({ id: ID, engine: 'codex', text: 'Keep this draft for retry.' }),
+  );
+
+  assert.equal(invocations, 1);
+  assert.equal(sseEvents(failed.text()).at(-1).event, 'error');
+  const saved = loadChat(root, ID);
+  assert.equal(saved.messages.find((message) => message.role === 'user').text, 'Keep this draft for retry.');
+  assert.doesNotMatch(JSON.stringify(saved), /person@|token|private-secret/i);
+  assert.equal(readProviderHealth(root, 'codex').state, 'sign-in-required');
+  assert.equal(readProviderHealth(root, 'codex').remoteAuthBarrier, true);
+
+  nextResult = {
+    ok: true,
+    text: 'Retried only after confirmation.',
+    updates: ['Retried only after confirmation.'],
+    sessionId: 'explicit-retry',
+    filesTouched: [],
+    usage: {},
+  };
+  const retried = await callRoute(
+    routes['POST /api/chat/send'],
+    JSON.stringify({ id: ID, engine: 'codex', text: 'I confirm this retry.' }),
+  );
+  assert.equal(invocations, 2);
+  assert.equal(sseEvents(retried.text()).at(-1).event, 'done');
+  assert.equal(readProviderHealth(root, 'codex').state, 'ready');
+  assert.equal(readProviderHealth(root, 'codex').remoteAuthBarrier, false);
+});
+
+test('durable authentication mutation blocks same-provider chat across tabs but not another provider', async () => {
+  const root = tmpRoot();
+  const mutation = acquireProviderAuthMutation(root, 'codex', {
+    owner: { host: 'synthetic-host', pid: 42, processStart: 'synthetic-start' },
+    mutationId: 'chat-auth-mutation-0001',
+  });
+  let invocations = 0;
+  const runTurnFn = () => {
+    invocations += 1;
+    return {
+      stop() {},
+      finished: Promise.resolve({
+        ok: true, text: 'Claude remains usable.', updates: ['Claude remains usable.'],
+        sessionId: 'claude-session', filesTouched: [], usage: {},
+      }),
+    };
+  };
+  const firstTab = routeFixture(root, { runTurnFn });
+  const secondTab = routeFixture(root, { runTurnFn });
+
+  for (const routes of [firstTab, secondTab]) {
+    const blocked = await callRoute(
+      routes['POST /api/chat/send'],
+      JSON.stringify({ id: ID, engine: 'codex', text: 'Do not spawn this.' }),
+    );
+    const error = sseEvents(blocked.text()).at(-1);
+    assert.equal(error.event, 'error');
+    assert.equal(error.data.reasonCode, 'provider-auth-in-progress');
+    assert.match(error.data.message, /sign-in is being updated/i);
+  }
+  assert.equal(invocations, 0);
+
+  const usable = await callRoute(
+    firstTab['POST /api/chat/send'],
+    JSON.stringify({ id: ID, engine: 'claude', text: 'Use the other provider.' }),
+  );
+  assert.equal(sseEvents(usable.text()).at(-1).event, 'done');
+  assert.equal(invocations, 1);
+  releaseProviderAuthMutation(root, mutation);
+});
+
+test('runtime shutdown stops and awaits active SSE provider turns', async () => {
+  const root = tmpRoot();
+  let resolveTurn;
+  let stopped = false;
+  const routes = routeFixture(root, {
+    runTurnFn: () => ({
+      stop() {
+        stopped = true;
+        resolveTurn({
+          ok: false, reasonCode: 'stopped', stopped: true,
+          sessionId: null, filesTouched: [],
+        });
+      },
+      finished: new Promise((resolve) => { resolveTurn = resolve; }),
+    }),
+  });
+  const req = new EventEmitter();
+  const res = new MockResponse();
+  routes['POST /api/chat/send'](
+    req,
+    res,
+    JSON.stringify({ id: ID, engine: 'codex', text: 'Stop safely.' }),
+  );
+  await new Promise((resolve) => setImmediate(resolve));
+  await shutdownActiveChatTurns({ timeoutMs: 500 });
+  await res.finished;
+  assert.equal(stopped, true);
+  assert.equal(sseEvents(res.text()).at(-1).data.reasonCode, undefined);
+});
+
+test('a settled late chat result is not resent or allowed to overwrite login-in-progress health', async () => {
+  const root = tmpRoot();
+  let resolveTurn;
+  let invocations = 0;
+  const routes = routeFixture(root, {
+    runTurnFn: () => {
+      invocations += 1;
+      return {
+        stop() {},
+        finished: new Promise((resolve) => { resolveTurn = resolve; }),
+      };
+    },
+  });
+  const req = new EventEmitter();
+  const res = new MockResponse();
+  routes['POST /api/chat/send'](
+    req,
+    res,
+    JSON.stringify({ id: ID, engine: 'codex', text: 'Finish exactly once.' }),
+  );
+  const mutationWhileRunning = acquireProviderAuthMutation(root, 'codex', {
+    owner: { host: 'synthetic-host', pid: 43, processStart: 'synthetic-start-2' },
+    mutationId: 'chat-auth-mutation-0002',
+  });
+  assert.equal(mutationWhileRunning, null);
+  resolveTurn({
+    ok: true, text: 'Settled result.', updates: ['Settled result.'],
+    sessionId: 'settled-session', filesTouched: [], usage: {},
+  });
+  await res.finished;
+
+  assert.equal(invocations, 1);
+  assert.equal(sseEvents(res.text()).at(-1).event, 'done');
+  assert.equal(loadChat(root, ID).messages.filter(({ role }) => role === 'assistant').length, 1);
+  const mutation = acquireProviderAuthMutation(root, 'codex', {
+    owner: { host: 'synthetic-host', pid: 43, processStart: 'synthetic-start-2' },
+    mutationId: 'chat-auth-mutation-0002',
+  });
+  assert.ok(mutation);
+  releaseProviderAuthMutation(root, mutation);
+});
+
+test('bounded fit assessment records remote-auth failure without automatically retrying provider work', async () => {
+  const root = tmpRoot();
+  let invocations = 0;
+  const routes = routeFixture(root, {
+    runStructuredTurnFn: async () => {
+      invocations += 1;
+      const error = new Error('codex structured turn failed: authentication is required');
+      Object.defineProperty(error, 'reasonCode', { value: 'authentication-required' });
+      throw error;
+    },
+  });
+
+  const failed = await callRoute(
+    routes['POST /api/chat/send'],
+    JSON.stringify({ id: ID, engine: 'codex', mode: 'fit-assessment', text: 'Assess once.' }),
+  );
+
+  assert.equal(invocations, 1);
+  assert.equal(sseEvents(failed.text()).at(-1).event, 'error');
+  assert.equal(readProviderHealth(root, 'codex').state, 'sign-in-required');
+  assert.equal(readProviderHealth(root, 'codex').remoteAuthBarrier, true);
+  assert.equal(loadChat(root, ID).messages.find((message) => message.role === 'user').text, 'Assess once.');
+});
+
+test('fit assessment retains provider-work fencing until an unclosed child settles', async () => {
+  const root = tmpRoot();
+  let close;
+  const closure = new Promise((resolve) => { close = resolve; });
+  let releases = 0;
+  const routes = routeFixture(root, {
+    runStructuredTurnFn: async () => {
+      throw new ProviderLifecycleUnclosedError('fit child remains open', closure);
+    },
+    recordProviderResultHealthFn: async () => {},
+    acquireProviderWorkFn: () => ({ provider: 'codex', workId: 'fit-work-00000001' }),
+    renewProviderWorkFn: (_root, capability) => capability,
+    releaseProviderWorkFn: () => { releases += 1; },
+  });
+  await callRoute(
+    routes['POST /api/chat/send'],
+    JSON.stringify({
+      id: ID,
+      engine: 'codex',
+      mode: 'fit-assessment',
+      text: 'Assess once.',
+    }),
+  );
+  assert.equal(releases, 0);
+  close();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(releases, 1);
+});
+
+test('fit assessment disconnect stops the real structured provider operation', async () => {
+  const root = tmpRoot();
+  let stopped = 0;
+  let rejectTurn;
+  const operation = new Promise((_resolve, reject) => { rejectTurn = reject; });
+  operation.stop = () => {
+    stopped += 1;
+    const error = new Error('stopped');
+    error.reasonCode = 'stopped';
+    rejectTurn(error);
+  };
+  const routes = routeFixture(root, {
+    runStructuredTurnFn: () => operation,
+    recordProviderResultHealthFn: async () => {},
+  });
+  const req = new EventEmitter();
+  const response = new MockResponse();
+  routes['POST /api/chat/send'](
+    req,
+    response,
+    JSON.stringify({
+      id: ID, engine: 'codex', mode: 'fit-assessment', text: 'Assess once.',
+    }),
+  );
+  await new Promise((resolve) => setImmediate(resolve));
+  await callRoute(
+    routes['POST /api/chat/stop'],
+    JSON.stringify({ id: ID }),
+  );
+  await response.finished;
+  assert.equal(stopped, 1);
+});
+
+test('engine catalogue performs no provider probe while authentication is being updated', async () => {
+  const root = tmpRoot();
+  const mutation = acquireProviderAuthMutation(root, 'codex', { phase: 'login' });
+  let probes = 0;
+  try {
+    const routes = routeFixture(root, {
+      providerCataloguesFn: async () => {
+        probes += 1;
+        return {};
+      },
+    });
+    const response = new MockResponse();
+    routes['GET /api/engines'](
+      new EventEmitter(),
+      response,
+      '',
+      new URL('http://127.0.0.1/api/engines'),
+    );
+    await response.finished;
+    assert.equal(response.statusCode, 200);
+    assert.equal(probes, 0);
+  } finally {
+    releaseProviderAuthMutation(root, mutation);
+  }
+});
+
 test('completed assistant updates persist as separate chat messages', async () => {
   const root = tmpRoot();
   const checkpoints = [];
@@ -552,7 +1011,7 @@ test('handoff build errors end SSE and release the running slot', { concurrency:
     const routes = routeFixture(root);
     const response = await callRoute(routes['POST /api/chat/handoff'], JSON.stringify({ id: ID }));
     assert.deepEqual(sseEvents(response.text()).at(-1), {
-      event: 'error', data: { message: 'summary failed: bad saved session' },
+      event: 'error', data: { message: 'Handoff summary could not start.' },
     });
     const get = new MockResponse();
     routes['GET /api/chat'](new EventEmitter(), get, '', new URL(`http://127.0.0.1/api/chat?id=${ID}`));
@@ -577,7 +1036,7 @@ test('handoff save errors end SSE and release the running slot', { concurrency: 
     });
     const response = await callRoute(routes['POST /api/chat/handoff'], JSON.stringify({ id: ID }));
     assert.deepEqual(sseEvents(response.text()).at(-1), {
-      event: 'error', data: { message: 'handoff transcript save failed: disk full' },
+      event: 'error', data: { message: 'Handoff chat history could not be saved.' },
     });
     const get = new MockResponse();
     routes['GET /api/chat'](new EventEmitter(), get, '', new URL(`http://127.0.0.1/api/chat?id=${ID}`));
@@ -632,14 +1091,32 @@ test('an unsafe model identifier is rejected before any turn runs', async () => 
   assert.equal(ran, false);
 });
 
-test('the engine picker is answered without spawning a provider CLI', async () => {
+test('the engine picker uses bounded injected catalogues and returns effective defaults', async () => {
   const root = tmpRoot();
-  let providerChecks = 0;
+  const config = {
+    locale: 'en-GB', currency: 'GBP', timezone: 'Europe/London',
+    ai: { provider: 'codex', model: null, models: { codex: 'gpt-5.6-terra', claude: null } },
+  };
+  fs.writeFileSync(path.join(root, 'workspace.json'), `${JSON.stringify(config)}\n`);
+  let catalogueChecks = 0;
   const routes = routeFixture(root, {
-    providerStatusFn: (engine) => { providerChecks += 1; return { installed: true, authenticated: true, executable: engine, env: {} }; },
+    providerCataloguesFn: async () => {
+      catalogueChecks += 1;
+      return {
+        codex: {
+          state: 'refreshed',
+          reasonCode: `${['', 'Users', 'private'].join('/')} person@example.test token=secret`,
+          checkedAt: `${['', 'Users', 'private', '.codex'].join('/')}`,
+          models: [{ id: 'gpt-5.6-sol', isDefault: true }, { id: 'gpt-5.6-terra' }],
+        },
+        claude: { state: 'unsupported', models: [] },
+      };
+    },
   });
   const response = new MockResponse();
-  routes['GET /api/engines'](new EventEmitter(), response, '', new URL('http://127.0.0.1/api/engines'));
+  await routes['GET /api/engines'](
+    new EventEmitter(), response, '', new URL('http://127.0.0.1/api/engines'),
+  );
   await response.finished;
   const body = JSON.parse(response.text());
   assert.deepEqual(Object.keys(body.engines).sort(), ['claude', 'codex']);
@@ -647,6 +1124,74 @@ test('the engine picker is answered without spawning a provider CLI', async () =
     assert.ok(Array.isArray(body.engines[engine].models));
     assert.ok('usage' in body.engines[engine]);
     assert.ok('defaultModel' in body.engines[engine]);
+    assert.ok('effectiveModel' in body.engines[engine]);
+    assert.ok('catalogue' in body.engines[engine]);
   }
-  assert.equal(providerChecks, 0, 'opening the picker must not probe provider CLIs');
+  assert.equal(body.engines.codex.defaultModel, 'gpt-5.6-terra');
+  assert.equal(body.engines.codex.effectiveModel.label, 'GPT-5.6 Terra');
+  assert.equal(body.engines.codex.catalogue.state, 'refreshed');
+  assert.equal(catalogueChecks, 1);
+  assert.doesNotMatch(response.text(), /executable|env|stdout|stderr|Users|person@|token/);
+});
+
+test('a stale configured engine model is explained and cannot masquerade as the default', async () => {
+  const root = tmpRoot();
+  const config = {
+    locale: 'en-GB', currency: 'GBP', timezone: 'Europe/London',
+    ai: { provider: 'codex', model: null, models: { codex: 'gpt-old-stale', claude: null } },
+  };
+  fs.writeFileSync(path.join(root, 'workspace.json'), `${JSON.stringify(config)}\n`);
+  const routes = routeFixture(root, {
+    providerCataloguesFn: async () => ({
+      codex: { state: 'refreshed', models: [{ id: 'gpt-5.6-sol', isDefault: true }] },
+      claude: { state: 'unsupported', models: [] },
+    }),
+  });
+  const response = new MockResponse();
+  await routes['GET /api/engines'](
+    new EventEmitter(), response, '', new URL('http://127.0.0.1/api/engines'),
+  );
+  await response.finished;
+  const codex = JSON.parse(response.text()).engines.codex;
+  assert.equal(codex.defaultModel, null);
+  assert.equal(codex.effectiveModel.id, 'gpt-old-stale');
+  assert.equal(codex.effectiveModel.available, false);
+  assert.equal(codex.models.find((model) => model.id === 'gpt-old-stale').available, false);
+});
+
+test('a provider-rejected model is marked unavailable on the next picker refresh', async () => {
+  const root = tmpRoot();
+  const routes = routeFixture(root, {
+    runTurnFn: () => ({
+      stop() {},
+      finished: Promise.resolve({
+        ok: false,
+        error: 'The provider rejected that model.',
+        reasonCode: 'model-rejected',
+        filesTouched: [],
+      }),
+    }),
+    providerCataloguesFn: async () => ({
+      codex: {
+        state: 'refreshed',
+        models: [{ id: 'gpt-5.6-sol', isDefault: true }, { id: 'gpt-former' }],
+      },
+      claude: { state: 'unsupported', models: [] },
+    }),
+  });
+  await callRoute(
+    routes['POST /api/chat/send'],
+    JSON.stringify({ id: ID, engine: 'codex', model: 'gpt-former', text: 'Hello' }),
+  );
+
+  const response = new MockResponse();
+  await routes['GET /api/engines'](
+    new EventEmitter(), response, '', new URL('http://127.0.0.1/api/engines'),
+  );
+  await response.finished;
+  const rejected = JSON.parse(response.text()).engines.codex.models
+    .find((model) => model.id === 'gpt-former');
+  assert.equal(rejected.available, false);
+  assert.equal(rejected.selected, false);
+  assert.match(rejected.tradeoff, /provider rejected/i);
 });

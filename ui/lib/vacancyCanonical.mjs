@@ -1,9 +1,18 @@
 import crypto from 'node:crypto';
-import { mergeSourceReferences, sameUnderlyingJob } from './jobIdentity.mjs';
+import {
+  jobIdentity, mergeSourceReferences, sameUnderlyingJob, sourceReferencesOf,
+} from './jobIdentity.mjs';
 
-const DISPLAY_FIELDS = ['employer', 'title', 'location', 'workingPattern', 'employmentType', 'seniority', 'compensation'];
+const DISPLAY_FIELDS = [
+  'employer', 'employerReference', 'title', 'location', 'workingPattern',
+  'employmentType', 'seniority', 'compensation', 'industry',
+];
+const LIST_FIELDS = ['responsibilities', 'skills', 'qualifications', 'eligibility'];
 const PROVENANCE_RANK = { 'explicit-source': 2, 'deterministic-extraction': 1, unknown: 0 };
 const APPLICATION_BOILERPLATE = /(?:\bapply now\.?|\bclick here to apply\.?|\bsubmit your application\.?)/gi;
+const MAX_SEMANTIC_RULE_MATCHES = 64;
+const MAX_SEMANTIC_MATCH_SOURCES = 8;
+const MAX_RESPONSIBILITY_FACTS = 64;
 
 function valueOf(value) {
   return value && typeof value === 'object' && 'value' in value ? value.value : value;
@@ -48,8 +57,15 @@ function fingerprintShape(vacancy, { includeBoilerplate = false } = {}) {
     location: normaliseText(valueOf(vacancy?.location)),
     workingPattern: normaliseText(valueOf(vacancy?.workingPattern)),
     employmentType: normaliseText(valueOf(vacancy?.employmentType)),
+    employerReference: normaliseText(valueOf(vacancy?.employerReference)),
+    responsibilities: valueOf(vacancy?.responsibilities) || null,
+    skills: valueOf(vacancy?.skills) || null,
+    qualifications: valueOf(vacancy?.qualifications) || null,
+    eligibility: valueOf(vacancy?.eligibility) || null,
+    industry: normaliseText(valueOf(vacancy?.industry)),
     compensation: valueOf(vacancy?.compensation) || null,
-    description: includeBoilerplate ? normaliseText(vacancy?.description) : responsibilityDescription(vacancy),
+    description: vacancy?.semanticEvidence?.descriptionDigest
+      || (includeBoilerplate ? normaliseText(vacancy?.description) : responsibilityDescription(vacancy)),
   };
 }
 
@@ -71,20 +87,295 @@ function displayField(observations, name) {
     || { value: null, provenance: 'unknown' };
 }
 
-function canonicalVacancy(observations) {
-  const orderedObservations = sortObservations(observations);
-  const description = orderedObservations.map((observation) => String(observation?.description || '').trim())
-    .sort((left, right) => right.length - left.length || compareStable(left, right))[0] || '';
+function listDisplayField(observations, name) {
+  const candidates = observations.map((observation) => observation?.[name]).filter(Boolean);
+  const values = [...new Set(candidates.flatMap((candidate) => (
+    Array.isArray(valueOf(candidate)) ? valueOf(candidate) : []
+  )))].sort(compareStable);
+  const provenance = candidates.some((candidate) => candidate.provenance === 'explicit-source')
+    ? 'explicit-source'
+    : values.length ? 'deterministic-extraction' : 'unknown';
+  return { value: values.length ? values : null, provenance };
+}
+
+function dateBound(observations, name, direction) {
+  const values = observations.map((observation) => observation?.[name]).filter(Boolean);
+  if (!values.length) return null;
+  return [...values].sort((left, right) => direction * compareStable(left, right))[0];
+}
+
+function metadataValues(observations, name) {
+  return [...new Set(observations.flatMap((observation) => {
+    const value = observation?.[name];
+    return Array.isArray(value) ? value : [value];
+  }).map((value) => String(value || '').trim().slice(0, 120))
+    .filter(Boolean))].sort(compareStable);
+}
+
+function hashedVacancyId(identity) {
+  return `vacancy-ref-${crypto.createHash('sha256')
+    .update(stableJson(identity))
+    .digest('hex').slice(0, 24)}`;
+}
+
+function canonicalVacancyId(canonicalUrl, identity, sourceReferences) {
+  if (canonicalUrl) return canonicalUrl;
+  const references = [...sourceReferences].sort((left, right) => (
+    compareStable(stableJson(left), stableJson(right))
+  ));
+  // A provider reference distinguishes two otherwise identical openings on
+  // their first scan. Durable history, reconciled below, keeps this identifier
+  // when cross-provider coverage later grows or shrinks.
+  if (references.length) {
+    return hashedVacancyId({
+      company: identity.company,
+      title: identity.title,
+      sourceReference: references[0],
+    });
+  }
+  // Reference-free records have no external anchor. Include the remaining
+  // stable semantic fields so distinct locations do not collide, then let
+  // durable-history reconciliation absorb later enrichment.
+  return hashedVacancyId({
+    company: identity.company,
+    title: identity.title,
+    location: identity.location,
+    seniority: identity.seniority,
+  });
+}
+
+function sharedReferenceCount(left, right) {
+  const rightReferences = new Set((right?.sourceReferences || []).map(stableJson));
+  return (left?.sourceReferences || []).filter((reference) => rightReferences.has(stableJson(reference))).length;
+}
+
+function referenceDisambiguatedId(vacancy) {
+  const references = [...(vacancy?.sourceReferences || [])].sort((left, right) => (
+    compareStable(stableJson(left), stableJson(right))
+  ));
+  return hashedVacancyId({
+    baseId: vacancy.vacancyId,
+    sourceReference: references[0] || null,
+    company: jobIdentity(vacancy).company,
+    title: jobIdentity(vacancy).title,
+    location: jobIdentity(vacancy).location,
+  });
+}
+
+function disambiguateCurrentVacancyIds(vacancies) {
+  const counts = new Map();
+  for (const { vacancyId } of vacancies) counts.set(vacancyId, (counts.get(vacancyId) || 0) + 1);
+  // Every member receives a reference-derived ID. Keeping the first member's
+  // base URL would make that opening change identity whenever a peer enters or
+  // leaves the same scan.
+  return vacancies.map((vacancy) => (
+    counts.get(vacancy.vacancyId) > 1
+      ? { ...vacancy, vacancyId: referenceDisambiguatedId(vacancy) }
+      : vacancy
+  ));
+}
+
+function reconcileDurableVacancyIds(vacancies, priorVacancies) {
+  const priorById = new Map();
+  for (const prior of priorVacancies || []) {
+    if (!prior || typeof prior !== 'object' || typeof prior.vacancyId !== 'string' || !prior.vacancyId) continue;
+    const existing = priorById.get(prior.vacancyId);
+    const evidenceScore = (value) => (
+      sourceReferencesOf(value).length * 4
+      + Number(Boolean(jobIdentity(value).company))
+      + Number(Boolean(jobIdentity(value).title))
+    );
+    const score = evidenceScore(prior);
+    const existingScore = existing ? evidenceScore(existing) : -1;
+    if (!existing || score > existingScore
+      || (score === existingScore && compareStable(stableJson(prior), stableJson(existing)) < 0)) {
+      priorById.set(prior.vacancyId, prior);
+    }
+  }
+  const priors = [...priorById.values()];
+  const claimed = new Set();
+  const reservedPriorIds = new Set(priors.map(({ vacancyId }) => vacancyId));
+  const usedIds = new Set();
+  return vacancies.map((vacancy) => {
+    const match = priors
+      .map((prior, index) => ({ prior, index, shared: sharedReferenceCount(prior, vacancy) }))
+      .filter(({ prior }) => {
+        if (sameUnderlyingJob(prior, vacancy)) return true;
+        const identity = jobIdentity(prior);
+        const sparseLegacyIdentity = !identity.company && !identity.title && !identity.references.length;
+        return sparseLegacyIdentity && prior.vacancyId === vacancy.vacancyId;
+      })
+      .sort((left, right) => (
+        right.shared - left.shared
+        || compareStable(left.prior.vacancyId, right.prior.vacancyId)
+        || left.index - right.index
+      ))
+      .find(({ index }) => !claimed.has(index));
+    let vacancyId = vacancy.vacancyId;
+    if (match) {
+      claimed.add(match.index);
+      vacancyId = match.prior.vacancyId;
+    }
+    if ((!match && reservedPriorIds.has(vacancyId)) || usedIds.has(vacancyId)) {
+      vacancyId = referenceDisambiguatedId(vacancy);
+    }
+    usedIds.add(vacancyId);
+    return vacancyId === vacancy.vacancyId ? vacancy : { ...vacancy, vacancyId };
+  });
+}
+
+function boundedSemanticText(value, maximum) {
+  return String(value || '').normalize('NFKC').replace(/[\r\n\t]+/g, ' ')
+    .replace(/\s{2,}/g, ' ').trim().slice(0, maximum);
+}
+
+function semanticMatchEvidence(observation, match) {
+  const semantic = observation.semanticEvidence;
+  const fallback = {
+    source: boundedSemanticText(observation.source, 80),
+    providerId: boundedSemanticText(observation.sourceRecordId, 160),
+    descriptionDigest: /^[a-f0-9]{64}$/.test(semantic.descriptionDigest || '')
+      ? semantic.descriptionDigest
+      : '',
+    provenance: 'deterministic-extraction',
+  };
+  const supplied = Array.isArray(match?.evidence) && match.evidence.length
+    ? match.evidence
+    : [fallback];
+  return supplied.map((item) => ({
+    source: boundedSemanticText(item?.source || fallback.source, 80),
+    providerId: boundedSemanticText(item?.providerId || fallback.providerId, 160),
+    descriptionDigest: /^[a-f0-9]{64}$/.test(item?.descriptionDigest || '')
+      ? item.descriptionDigest
+      : fallback.descriptionDigest,
+    provenance: ['explicit-source', 'deterministic-extraction'].includes(item?.provenance)
+      ? item.provenance
+      : fallback.provenance,
+    status: match?.status === 'unknown' ? 'unknown' : 'matched',
+  })).filter(({ source, providerId, descriptionDigest }) => (
+    source || providerId || descriptionDigest
+  ));
+}
+
+function mergedSemanticEvidence(observations) {
+  const semanticObservations = observations.filter((observation) => observation?.semanticEvidence);
+  if (!semanticObservations.length) return null;
+  const selected = [...semanticObservations].sort((left, right) => (
+    Number(right.semanticEvidence.descriptionLength || 0) - Number(left.semanticEvidence.descriptionLength || 0)
+    || compareStable(left.semanticEvidence.descriptionDigest, right.semanticEvidence.descriptionDigest)
+  ))[0];
+  const ruleEvidence = new Map();
+  for (const observation of semanticObservations) {
+    const entries = observation.semanticEvidence.profileRuleEvidence
+      || (observation.semanticEvidence.profileRuleMatches || []).map((match) => (
+        typeof match === 'string' ? { id: match, status: 'matched' } : { ...match, status: 'matched' }
+      ));
+    for (const rawEntry of entries) {
+      const entry = typeof rawEntry === 'string'
+        ? { id: rawEntry, fact: '', status: 'matched' }
+        : rawEntry;
+      const id = boundedSemanticText(entry?.id, 160);
+      if (!id) continue;
+      const current = ruleEvidence.get(id) || {
+        id, fact: '', status: 'unknown', evidence: [],
+      };
+      const fact = boundedSemanticText(entry?.fact, 160);
+      if (fact && (!current.fact || compareStable(fact, current.fact) < 0)) current.fact = fact;
+      if (entry?.status === 'matched') current.status = 'matched';
+      const evidence = [...current.evidence, ...semanticMatchEvidence(observation, entry)];
+      current.evidence = [...new Map(evidence.map((item) => [stableJson(item), item])).values()]
+        .sort((left, right) => compareStable(stableJson(left), stableJson(right)))
+        .slice(0, MAX_SEMANTIC_MATCH_SOURCES);
+      ruleEvidence.set(id, current);
+    }
+  }
+  const responsibilityFacts = [...new Set(semanticObservations.flatMap(({ semanticEvidence }) => (
+    (semanticEvidence.responsibilityFacts || [])
+      .map((fact) => boundedSemanticText(fact, 160))
+      .filter(Boolean)
+  )))].sort(compareStable);
+  if (responsibilityFacts.length > MAX_RESPONSIBILITY_FACTS) {
+    throw new Error('canonical advert responsibility evidence exceeds the supported limit');
+  }
   return {
-    observations: orderedObservations,
-    canonicalUrl: orderedObservations.map((observation) => observation?.canonicalUrl).find(Boolean) || null,
-    sourceReferences: mergeSourceReferences(...orderedObservations),
-    description,
-    ...Object.fromEntries(DISPLAY_FIELDS.map((name) => [name, displayField(orderedObservations, name)])),
+    ...selected.semanticEvidence,
+    descriptionPresent: semanticObservations.some(({ semanticEvidence }) => (
+      semanticEvidence.descriptionPresent === true
+    )),
+    profileRuleEvidence: [...ruleEvidence.values()]
+      .sort((left, right) => compareStable(left.id, right.id))
+      .slice(0, MAX_SEMANTIC_RULE_MATCHES),
+    profileRuleMatches: [...ruleEvidence.values()]
+      .filter(({ status }) => status === 'matched')
+      .map(({ status, ...match }) => ({
+        ...match,
+        evidence: match.evidence
+          .filter((item) => item.status === 'matched')
+          .map(({ status: evidenceStatus, ...item }) => item),
+      }))
+      .sort((left, right) => compareStable(left.id, right.id))
+      .slice(0, MAX_SEMANTIC_RULE_MATCHES),
+    responsibilityFacts,
   };
 }
 
-export function canonicaliseObservations(observations) {
+function canonicalVacancy(observations) {
+  const orderedObservations = sortObservations(observations);
+  const semanticEvidence = mergedSemanticEvidence(orderedObservations);
+  const description = semanticEvidence
+    ? ''
+    : orderedObservations.map((observation) => String(observation?.description || '').trim())
+      .sort((left, right) => right.length - left.length || compareStable(left, right))[0] || '';
+  const fields = Object.fromEntries(DISPLAY_FIELDS.map((name) => [name, displayField(orderedObservations, name)]));
+  const canonicalUrl = orderedObservations.map((observation) => observation?.canonicalUrl).find(Boolean) || null;
+  const urlIdentityDigest = orderedObservations
+    .map((observation) => observation?.urlIdentityDigest)
+    .find((value) => /^[a-f0-9]{64}$/.test(String(value || ''))) || null;
+  const sourceReferences = mergeSourceReferences(...orderedObservations);
+  const identity = jobIdentity({
+    company: fields.employer,
+    title: fields.title,
+    location: fields.location,
+    seniority: fields.seniority,
+  });
+  const vacancyId = urlIdentityDigest
+    ? `vacancy-url-${urlIdentityDigest.slice(0, 24)}`
+    : canonicalVacancyId(canonicalUrl, {
+    company: identity.company,
+    title: identity.title,
+    location: identity.location,
+    seniority: identity.seniority,
+    }, sourceReferences);
+  const collectionSources = metadataValues(orderedObservations, 'collectionSource');
+  const laneIds = [...new Set([
+    ...metadataValues(orderedObservations, 'laneId'),
+    ...metadataValues(orderedObservations, 'laneIds'),
+  ])].sort(compareStable);
+  const roleFamilies = metadataValues(orderedObservations, 'roleFamily');
+  return {
+    observations: orderedObservations,
+    vacancyId,
+    canonicalUrl,
+    ...(urlIdentityDigest ? { urlIdentityDigest } : {}),
+    sourceReferences,
+    collectionSources,
+    collectionSource: collectionSources[0] || null,
+    description,
+    postedAt: dateBound(orderedObservations, 'postedAt', 1),
+    closingAt: dateBound(orderedObservations, 'closingAt', 1),
+    firstSeenAt: dateBound(orderedObservations, 'firstSeenAt', 1),
+    lastSeenAt: dateBound(orderedObservations, 'lastSeenAt', -1),
+    laneIds,
+    laneId: laneIds[0] || null,
+    roleFamilies,
+    roleFamily: roleFamilies[0] || null,
+    ...(semanticEvidence ? { semanticEvidence } : {}),
+    ...fields,
+    ...Object.fromEntries(LIST_FIELDS.map((name) => [name, listDisplayField(orderedObservations, name)])),
+  };
+}
+
+export function canonicaliseObservations(observations, { priorVacancies = [] } = {}) {
   const groups = [];
   const orderedObservations = sortObservations(observations || []);
   for (const observation of orderedObservations) {
@@ -92,8 +383,14 @@ export function canonicaliseObservations(observations) {
     if (group) group.push(observation);
     else groups.push([observation]);
   }
+  const vacancies = reconcileDurableVacancyIds(
+    disambiguateCurrentVacancyIds(
+      groups.sort((left, right) => compareStable(groupKey(left), groupKey(right))).map(canonicalVacancy),
+    ),
+    priorVacancies,
+  );
   return {
-    vacancies: groups.sort((left, right) => compareStable(groupKey(left), groupKey(right))).map(canonicalVacancy),
+    vacancies,
     duplicateObservations: orderedObservations.length - groups.length,
   };
 }
@@ -104,7 +401,11 @@ export function vacancyContentFingerprint(vacancy) {
 
 export function classifyVacancyChange(previous, current) {
   if (isClosed(previous) && !isClosed(current)) return 'reopened';
-  if (vacancyContentFingerprint(previous) !== vacancyContentFingerprint(current)) return 'material';
+  const currentFingerprint = vacancyContentFingerprint(current);
+  if (previous?.contentFingerprint) {
+    return previous.contentFingerprint === currentFingerprint ? 'unchanged' : 'material';
+  }
+  if (vacancyContentFingerprint(previous) !== currentFingerprint) return 'material';
   return stableJson(fingerprintShape(previous, { includeBoilerplate: true })) === stableJson(fingerprintShape(current, { includeBoilerplate: true }))
     ? 'unchanged'
     : 'minor';

@@ -1,46 +1,46 @@
-// Kept self-contained so a browser connected to a pre-update Scout server can
-// still boot. The matching modules contain the unit-tested canonical helpers.
+import { createChatDrawerState, reduceChatDrawer } from './lib/chatDrawerState.mjs?v=__SCOUT_UI_BUILD__';
+import { openCodexTask as codexTaskLaunchView } from './lib/codexDeepLink.mjs?v=__SCOUT_UI_BUILD__';
+
+// Keep browser orchestration here while pure state machines live in /lib, where
+// deterministic unit tests exercise them without a DOM. Scout character data
+// is likewise read from its canonical module rather than copied here.
 const SCOUT_UI_BUILD = typeof document !== 'undefined'
   ? document.querySelector?.('meta[name="scout-ui-build"]')?.content || null
   : null;
-const uiAsset = (pathname) => SCOUT_UI_BUILD ? `${pathname}?v=${encodeURIComponent(SCOUT_UI_BUILD)}` : pathname;
-const SCOUT_RUNTIME_STATES = {
-  idle: [uiAsset('/assets/scout-idle.png'), 'Scout is ready'], listening: [uiAsset('/assets/scout-idle.png'), 'Scout is listening'],
-  thinking: [uiAsset('/assets/scout-thinking.png'), 'Scout is thinking'], searching: [uiAsset('/assets/scout-searching.png'), 'Scout is searching'],
-  writing: [uiAsset('/assets/scout-explaining.png'), 'Scout is updating your files'], explaining: [uiAsset('/assets/scout-explaining.png'), 'Scout is explaining'],
-  found: [uiAsset('/assets/scout-found.png'), 'Scout found a strong match'], success: [uiAsset('/assets/scout-found.png'), 'Scout finished successfully'],
-  warning: [uiAsset('/assets/scout-warning.png'), 'Scout needs your attention'],
-};
-const SCOUT_RUNTIME_ALIGNMENT = {
-  idle: [1.7, 4.8], listening: [1.7, 4.8], thinking: [2.8, 3.2], searching: [0.6, -1.4],
-  writing: [1.4, -1.8], explaining: [1.4, -1.8], found: [4.5, -1.6], success: [4.5, -1.6], warning: [0.7, -0.1],
-};
+const DURABLE_RUN_STATES = new Set([
+  'collecting', 'normalising', 'deduplicating', 'filtering', 'ranking', 'selecting',
+  'assessing', 'repairing', 'recovering', 'updating-tracker', 'writing-report',
+  'finalising', 'partial', 'abandoned', 'failed', 'complete',
+]);
+const TERMINAL_RUN_STATES = new Set(['partial', 'abandoned', 'failed', 'complete']);
+const ACTIVE_QUEUE_STATES = new Set(['queued', 'claimed', 'legacy-claimed']);
+const TERMINAL_QUEUE_STATES = new Set([
+  'expired', 'stale', 'skipped', 'superseded', 'succeeded', 'succeeded-pending',
+  'succeeded-partial', 'failed',
+]);
+// Character frame count, frame rate, looping, reduced-motion frame and anchor
+// belong to ui/lib/scoutCharacter.mjs alone. index.html loads that module and it
+// publishes window.ScoutCharacter; app.js only forwards to it, so there is no
+// second place a state's timing or alignment can disagree from.
+const scoutCharacter = () => (typeof window !== 'undefined' ? window.ScoutCharacter : null);
 function activityState(activity) {
-  const value = String(activity || '').toLowerCase();
-  if (/search|read|fetch|browse|source|advert/.test(value)) return 'searching';
-  if (/write|edit|patch|file|cv|resume/.test(value)) return 'writing';
-  if (/explain|answer|respond|delta/.test(value)) return 'explaining';
-  return 'thinking';
+  return scoutCharacter()?.activityState(activity) || 'thinking';
 }
+// The module is deferred, so a render can land before it evaluates, and it may
+// never evaluate at all if the request fails. Emitting nothing would leave
+// arrival, the chat companion and every assistant message permanently without
+// Scout or its accessible name, because later hydration can only adopt markup
+// that already exists. So emit a bounded, named placeholder carrying the state
+// for the module to hydrate — no timing, alignment or label table, just the
+// character's own name until the canonical one arrives.
 function scoutMarkup(state = 'idle', className = '') {
-  const def = SCOUT_RUNTIME_STATES[state] || SCOUT_RUNTIME_STATES.idle;
-  return `<span class="scout-character ${className}" data-scout-state="${state}" role="img" aria-label="${def[1]}"><span class="scout-sprite" aria-hidden="true"></span></span>`;
+  const character = scoutCharacter();
+  if (character) return character.scoutMarkup(state, className);
+  const name = String(state).replace(/[^a-z]/gi, '') || 'idle';
+  return `<span class="scout-character ${className}" data-scout-state="${name}" role="img" aria-label="Scout"><span class="scout-sprite" aria-hidden="true"></span></span>`;
 }
-function applyScoutState(element, state, { reducedMotion = false } = {}) {
-  if (!element) return;
-  const def = SCOUT_RUNTIME_STATES[state] || SCOUT_RUNTIME_STATES.idle;
-  const sprite = element.querySelector('.scout-sprite');
-  element.dataset.scoutState = state in SCOUT_RUNTIME_STATES ? state : 'idle';
-  element.setAttribute('aria-label', def[1]);
-  if (!sprite) return;
-  sprite.style.setProperty('--scout-src', `url("${def[0]}")`);
-  sprite.style.setProperty('--scout-columns', 4); sprite.style.setProperty('--scout-rows', 4);
-  sprite.style.setProperty('--scout-frames', 16); sprite.style.setProperty('--scout-duration', '2s');
-  sprite.style.setProperty('--scout-iterations', ['found','success','warning'].includes(state) ? '1' : 'infinite');
-  const align = SCOUT_RUNTIME_ALIGNMENT[state] || [0, 0];
-  sprite.style.setProperty('--scout-align-x', `${align[0]}%`); sprite.style.setProperty('--scout-align-y', `${align[1]}%`);
-  sprite.style.setProperty('--scout-still-x', '0%'); sprite.style.setProperty('--scout-still-y', '0%');
-  sprite.classList.toggle('reduced-motion', reducedMotion);
+function applyScoutState(element, state, options = {}) {
+  return scoutCharacter()?.applyScoutState(element, state, options) || null;
 }
 function strongUnseenMatches(entries, threshold, acknowledged = []) {
   const seen = new Set(acknowledged || []);
@@ -98,12 +98,6 @@ function chooseArtifactSlug(existingSlugs, opportunity, slugOfCompany, opportuni
   if (wanted && (wanted === resolved.slug || wanted === fresh)) return wanted;
   return resolved.slug;
 }
-function codexTaskUrl(sessionId) {
-  const value = String(sessionId || '').trim();
-  if (!/^[A-Za-z0-9-]+$/.test(value)) return null;
-  return `codex://threads/${encodeURIComponent(value)}`;
-}
-
 const ScoutModal = (() => {
   const stack = [];
   const registrations = new WeakMap();
@@ -233,6 +227,7 @@ const Scout = {
   cvPreviewZoom: 'page-width',
   cvRenderTimer: null,
   chat: null,
+  chatDrawerState: null,
   chatOpenSeq: 0,
   engineOptions: null,
   enginePicks: {},
@@ -242,6 +237,7 @@ const Scout = {
   scanRunning: false,
   scanOperationTimer: null,
   latestScan: null,
+  feedbackLearning: null,
   lastSyncPullAt: null,
   companyHistory: null,
   uiBuildId: SCOUT_UI_BUILD,
@@ -357,22 +353,41 @@ const Scout = {
     return (e.sources && e.sources[0]) ? this.safeHref(e.sources[0]) : '';
   },
 
-  async loadOpportunities() {
-    const [data, cvFiles, latest] = await Promise.all([
+  async loadOpportunities({ durableRuns: suppliedRuns, durableQueue: suppliedQueue } = {}) {
+    const [data, cvFiles, latest, durableRuns, durableQueue, feedbackLearning] = await Promise.all([
       this.api('/api/opportunities'),
       this.api('/api/cv'),
       this.api('/api/scans/latest').catch(() => ({ scan: null })),
+      suppliedRuns === undefined
+        ? this.api('/api/scan/runs').catch(() => ({ state: 'waiting', runs: [] }))
+        : Promise.resolve(suppliedRuns),
+      suppliedQueue === undefined
+        ? this.api('/api/scan/queue').catch(() => ({ state: 'waiting', requests: [] }))
+        : Promise.resolve(suppliedQueue),
+      this.api('/api/feedback-learning').catch(() => null),
     ]);
     this.state.data = data;
     this.state.cvFiles = cvFiles;
     this.latestScan = latest?.scan || null;
+    this.scanRuns = Array.isArray(durableRuns?.runs) ? durableRuns.runs : [];
+    this.scanRunState = durableRuns?.state || 'waiting';
+    this.scanQueue = durableQueue && Array.isArray(durableQueue.requests)
+      ? durableQueue
+      : { state: 'waiting', requests: [] };
+    this.feedbackLearning = feedbackLearning;
     this.applyWorkspaceConfig(this.state.data.workspaceConfig, { render: false });
     const h = this.state.data.scanHealth;
+    const activeRun = this.scanRuns.find((run) => !['complete', 'partial', 'abandoned', 'failed'].includes(run.state));
+    const queuedCount = this.scanQueue.requests.filter((request) => request.status === 'queued').length;
     const status = document.getElementById('scan-status');
-    if (status) {
-      status.textContent = h?.lastRunAt
+    if (status && !this.scanRunning) {
+      status.textContent = activeRun
+        ? `${activeRun.label || 'Scan in progress'}${activeRun.assessment?.totalBatches ? ` · batch ${activeRun.assessment.currentBatch} of ${activeRun.assessment.totalBatchesExact ? '' : 'at least '}${activeRun.assessment.totalBatches}` : ''}`
+        : queuedCount
+        ? `${queuedCount} queued ${queuedCount === 1 ? 'request' : 'requests'}`
+        : h?.lastRunAt
         ? `Last scan: ${Number(h.funnel?.assessed ?? h.candidatesFound ?? 0)} assessed · ${Number(h.keepersAdded || 0)} kept`
-        : 'No scan completed yet';
+        : 'Waiting to scan';
       status.dataset.action = h?.lastRunAt ? 'open-scan-result' : '';
       status.tabIndex = h?.lastRunAt ? 0 : -1;
       status.setAttribute('role', h?.lastRunAt ? 'button' : 'status');
@@ -442,14 +457,40 @@ const Scout = {
   },
 
   latestScanCard() {
+    const audit = this.scanRunAuditCard();
     const scan = this.latestScan;
-    if (!scan?.runAt) return '';
+    if (!scan?.runAt) return audit;
     const broadened = scan.automaticBroadened ? ' after an automatic broader discovery pass' : '';
-    return `<div class="card scan-result-card">
+    return `${audit}<div class="card scan-result-card">
       <div class="top"><b>Latest scan result</b><span class="chip">${this.esc(scan.degraded ? 'degraded' : 'complete')}</span></div>
       <p><strong>${this.esc(scan.funnel?.assessed ?? scan.candidatesFound)} assessed, ${this.esc(scan.keepersAdded)} kept</strong>${this.discardBreakdown(scan) ? ` — ${this.esc(this.discardBreakdown(scan))}` : ''}${this.esc(broadened)}.</p>
       <p class="meta">Zero keepers can be a valid result: Scout keeps approved gates in force even when it broadens discovery.</p>
       <div class="controls"><button class="act" data-action="open-scan-result">Review this scan</button>${scan.reportDate ? `<button class="act" data-action="open-scan-report" data-date="${this.esc(scan.reportDate)}">Open dated report</button>` : ''}</div>
+    </div>`;
+  },
+
+  scanRunAuditCard() {
+    const run = Array.isArray(this.scanRuns) ? this.scanRuns[0] : null;
+    const queued = (this.scanQueue?.requests || []).filter((request) => request.status === 'queued');
+    if (!run && !queued.length) {
+      if (this.scanRunState !== 'waiting' && this.scanQueue?.state !== 'waiting') return '';
+      return `<div class="card scan-run-audit">
+        <div class="top"><b>Durable scan state</b><span class="chip">waiting</span></div>
+        <p><strong>Waiting to scan</strong></p>
+      </div>`;
+    }
+    const batch = run?.assessment?.totalBatches
+      ? ` · batch ${this.esc(run.assessment.currentBatch)} of ${run.assessment.totalBatchesExact ? '' : 'at least '}${this.esc(run.assessment.totalBatches)}`
+      : '';
+    const recoveries = Number(run?.recoveryCount || 0);
+    const recoveryText = `${recoveries} ${recoveries === 1 ? 'recovery' : 'recoveries'}`;
+    const queueText = `${queued.length} queued ${queued.length === 1 ? 'request' : 'requests'}`;
+    const terminal = run?.terminalReason ? ` · ${this.esc(run.terminalReason)}` : '';
+    return `<div class="card scan-run-audit">
+      <div class="top"><b>Durable scan state</b><span class="chip">${this.esc(run?.state || 'queued')}</span></div>
+      ${run ? `<p><strong>${this.esc(run.label || run.state)}</strong>${batch}${terminal}</p>
+        <div class="meta">run ${this.esc(run.id)} · ${this.esc(run.owner || 'inactive worker')} · ${this.esc(recoveryText)}</div>` : ''}
+      <div class="meta">${this.esc(queueText)}</div>
     </div>`;
   },
 
@@ -469,7 +510,7 @@ const Scout = {
       ['Excluded by confirmed rules', funnel.deterministicallyExcluded], ['Eligible and ranked', funnel.ranked],
       ['Selected for detailed assessment', funnel.selected], ['Successfully assessed', funnel.assessed], ['Assessment failed', funnel.assessmentFailed],
     ].filter(([, value]) => Number.isFinite(Number(value))).map(([label, value]) => `<li>${this.esc(label)}: <b>${this.esc(value)}</b></li>`).join('') : '';
-    return `<div class="card">
+    return `${this.scanRunAuditCard()}<div class="card">
       <div class="top"><b>Scan health</b><span class="chip">${this.esc(healthText)}</span></div>
       <p><strong>${this.esc(Number(health?.funnel?.assessed ?? health?.candidatesFound ?? 0))} assessed, ${this.esc(Number(health?.keepersAdded || 0))} kept</strong>${this.discardBreakdown(health) ? ` — ${this.esc(this.discardBreakdown(health))}` : ''}. Zero keepers can be a valid result when strict gates exclude every candidate.</p>
       <div class="meta">last run: ${this.esc(health?.lastRunAt || 'never')}</div>
@@ -488,6 +529,11 @@ const Scout = {
     const poll = async () => {
       try {
         const response = await fetch(`/api/operations/${encodeURIComponent(id)}`);
+        if (response.status === 404) {
+          this.scanOperationTimer = null;
+          await this.reattachScanOperation({ reconcileMissing: true });
+          return;
+        }
         const body = await response.json();
         if (!response.ok) throw new Error(body.error || 'Scan status unavailable');
         this.showOperation(body.operation);
@@ -499,25 +545,76 @@ const Scout = {
         this.scanRunning = false;
         if (button) { button.disabled = false; button.textContent = 'Scan now'; }
         if (body.operation.status === 'succeeded') await this.loadOpportunities();
-      } catch (error) {
-        this.scanOperationTimer = null;
-        this.scanRunning = false;
-        if (button) { button.disabled = false; button.textContent = 'Scan now'; }
-        document.getElementById('scan-status').textContent = error.message;
+      } catch {
+        // A transient transport or decoding failure is not evidence that the
+        // durable operation stopped. Keep the UI fenced and retry discovery;
+        // only a terminal operation response may re-enable submission.
+        this.scanOperationTimer = setTimeout(poll, 1000);
       }
     };
     this.scanOperationTimer = setTimeout(poll, 250);
   },
 
-  async reattachScanOperation() {
+  async reattachScanOperation({ reconcileMissing = false } = {}) {
+    const button = document.getElementById?.('scan-now') || null;
     try {
       const response = await fetch('/api/operations?type=scan');
       const body = await response.json();
       if (response.ok && body.operation && ['queued', 'running'].includes(body.operation.status)) {
         this.showOperation(body.operation);
         this.watchScanOperation(body.operation.id);
+        return;
       }
-    } catch { /* the normal last-scan label remains available */ }
+      if (!reconcileMissing) return;
+      // Operation IDs are process-local. After a restart, reconcile against
+      // durable run/queue state before deciding whether submission is safe.
+      const [durableRuns, durableQueue] = await Promise.all([
+        this.api('/api/scan/runs'),
+        this.api('/api/scan/queue'),
+      ]);
+      if (!durableRuns || !Array.isArray(durableRuns.runs)
+        || !durableQueue || !Array.isArray(durableQueue.requests)) {
+        throw new Error('durable scan state is invalid');
+      }
+      if (!durableRuns.runs.every((run) => DURABLE_RUN_STATES.has(run?.state))
+        || durableRuns.state !== (durableRuns.runs[0]?.state || 'waiting')
+        || !durableQueue.requests.every(
+          (request) => ACTIVE_QUEUE_STATES.has(request?.status)
+            || TERMINAL_QUEUE_STATES.has(request?.status),
+        )
+        || durableQueue.state !== (
+          durableQueue.requests.some((request) => request.status === 'queued') ? 'queued' : 'waiting'
+        )) {
+        throw new Error('durable scan state is invalid');
+      }
+      const activeRun = durableRuns.runs.some(
+        (run) => !TERMINAL_RUN_STATES.has(run.state),
+      );
+      const queued = durableQueue.requests.some(
+        (request) => ACTIVE_QUEUE_STATES.has(request.status),
+      );
+      if (activeRun || queued) {
+        this.scanRunning = true;
+        if (button) { button.disabled = true; button.textContent = 'Scanning…'; }
+        await this.loadOpportunities({ durableRuns, durableQueue });
+        this.scanOperationTimer = setTimeout(
+          () => this.reattachScanOperation({ reconcileMissing: true }),
+          1000,
+        );
+        return;
+      }
+      this.scanRunning = false;
+      await this.loadOpportunities({ durableRuns, durableQueue });
+      if (button) { button.disabled = false; button.textContent = 'Scan now'; }
+    } catch {
+      if (!reconcileMissing) return;
+      this.scanRunning = true;
+      if (button) { button.disabled = true; button.textContent = 'Scanning…'; }
+      this.scanOperationTimer = setTimeout(
+        () => this.reattachScanOperation({ reconcileMissing: true }),
+        1000,
+      );
+    }
   },
 
   discoveryKey() {
@@ -763,6 +860,7 @@ const Scout = {
       <div class="detail"></div>
       <div class="triage-actions">
         <button class="act triage-no" data-action="triage-no" data-id="${this.esc(e.id)}">No</button>
+        <button class="act" data-action="record-feedback" data-id="${this.esc(e.id)}">Feedback</button>
         <button class="act triage-yes" data-action="triage-yes" data-id="${this.esc(e.id)}">Yes, shortlist</button>
       </div>
     </div>`;
@@ -934,16 +1032,56 @@ const Scout = {
     const scan = this.latestScan;
     if (!scan) return;
     const labels = { kept: 'Kept', hard_exclusion: 'Hard exclusions', mandatory_unmet: 'Mandatory gates', below_threshold: 'Below threshold', provider_discarded: 'Assessment discards' };
+    const reasonLabels = {
+      'advert-closed': 'The advert was no longer live when Scout checked it.',
+      'assessment-capacity': 'It cleared the relevance threshold, but the detailed-assessment capacity was already full.',
+      'assessment-failed': 'Scout selected it, but its bounded assessment did not complete successfully.',
+      'below-relevance-threshold': 'Its deterministic relevance score was below the configured assessment threshold.',
+      'diversity-limit': 'A stronger mix of employers, sources, role families, lanes or locations filled the assessment set.',
+      'exploration-replacement': 'A seeded exploration place replaced this deterministic selection.',
+      'unchanged-rejection': 'The advert and profile were unchanged since the previous rejection, so Scout did not repeat the assessment.',
+      'unchanged-prior-assessment': 'The advert and profile were unchanged since the previous assessment.',
+      'verification-scope': 'This verification pass was limited to vacancies requiring a second assessment.',
+    };
+    const reasonText = (code) => reasonLabels[code]
+      || String(code || 'not-selected').replaceAll('-', ' ').replace(/^./, (letter) => letter.toUpperCase());
     const groups = Object.entries(labels).map(([outcome, label]) => {
       const items = (scan.reviewed || []).filter((item) => item.outcome === outcome).sort((a, b) => Number(b.score || 0) - Number(a.score || 0));
       if (!items.length) return '';
       return `<details ${outcome !== 'kept' ? 'open' : ''}><summary>${this.esc(label)} (${items.length})</summary><div class="scan-review-list">${items.map((item) => `<article class="scan-review-item"><div><b>${this.esc(item.company)} — ${this.esc(item.role)}</b><span class="chip">${this.esc(item.score ?? '—')}</span></div><p>${this.esc((item.reasons || []).join('; ') || label)}</p>${item.sourceUrl ? `<a href="${this.safeHref(item.sourceUrl)}" target="_blank" rel="noopener">View source ↗</a>` : ''}</article>`).join('')}</div></details>`;
     }).join('');
+    const coverageSources = (scan.coverage?.source || []).map((item) => (
+      `<article class="scan-review-item"><div><b>${this.esc(item.value)}</b><span class="chip">${this.esc(item.assessed)} assessed</span></div><p>${this.esc(`${item.found} found · ${item.ranked} ranked · ${item.selected} selected · ${item.excluded} excluded`)}</p></article>`
+    )).join('');
+    const coverage = coverageSources ? `<details><summary>Coverage by source (${scan.coverage.source.length})</summary><div class="scan-review-list">${coverageSources}</div></details>` : '';
+    const coverageDimensionLabels = {
+      employer: 'employer', lane: 'lane', roleFamily: 'role family', location: 'location',
+      provider: 'provider', run: 'run', date: 'date',
+    };
+    const coverageDimensions = Object.entries(coverageDimensionLabels).map(([dimension, label]) => {
+      const items = scan.coverage?.[dimension] || [];
+      if (!items.length) return '';
+      return `<details><summary>Coverage by ${this.esc(label)} (${items.length})</summary><div class="scan-review-list">${items.map((item) => `<article class="scan-review-item"><div><b>${this.esc(item.value)}</b><span class="chip">${this.esc(item.assessed)} assessed</span></div><p>${this.esc(`${item.found} found · ${item.ranked} ranked · ${item.selected} selected · ${item.excluded} excluded`)}</p></article>`).join('')}</div></details>`;
+    }).join('');
+    const failureReasons = (scan.coverage?.failureReasons || []).length
+      ? `<details><summary>Coverage failures (${scan.coverage.failureReasons.length})</summary><div class="scan-review-list">${scan.coverage.failureReasons.map((item) => `<article class="scan-review-item"><div><b>${this.esc(reasonText(item.value))}</b><span class="chip">${this.esc(item.count)}</span></div></article>`).join('')}</div></details>`
+      : '';
+    const missed = (scan.explanations || []).filter((item) => (
+      item.stages?.excluded || (item.stages?.ranked && !item.stages?.selected)
+    )).sort((left, right) => (
+      Number(right.aboveThreshold) - Number(left.aboveThreshold)
+      || Number(right.preRank?.score || 0) - Number(left.preRank?.score || 0)
+    ));
+    const missedGroup = missed.length ? `<details open><summary>Why roles missed detailed assessment (${missed.length})</summary><div class="scan-review-list">${missed.map((item) => `<article class="scan-review-item scan-explanation-item"><div><b>${this.esc(item.company || item.dimensions?.employer || 'Unknown employer')} — ${this.esc(item.role || 'Unknown role')}</b><span class="chip">${this.esc(item.preRank?.score ?? '—')}</span></div><p>${this.esc(reasonText(item.reasonCode))}</p><p class="meta">${this.esc([item.dimensions?.source, item.dimensions?.lane, item.dimensions?.roleFamily, item.dimensions?.location].filter(Boolean).join(' · '))}</p>${item.sourceUrl ? `<a href="${this.safeHref(item.sourceUrl)}" target="_blank" rel="noopener">View source ↗</a>` : ''}</article>`).join('')}</div></details>` : '';
     const overlay = document.getElementById('scan-result-overlay');
     document.getElementById('scan-result-body').innerHTML = `
       <p><strong>${this.esc(scan.funnel?.assessed ?? scan.candidatesFound)} assessed, ${this.esc(scan.keepersAdded)} kept</strong>${this.discardBreakdown(scan) ? ` — ${this.esc(this.discardBreakdown(scan))}` : ''}.</p>
       ${scan.automaticBroadened ? '<div class="setup-callout"><strong>Discovery widened automatically</strong><p>Scout ran one broader query pass but kept every approved salary, location, commute, exclusion and evidence gate.</p></div>' : ''}
-      ${groups || '<p class="meta">This older scan contains aggregate totals only. Run a new scan for candidate-level explanations.</p>'}
+      ${coverage}
+      ${coverageDimensions}
+      ${failureReasons}
+      ${missedGroup}
+      ${groups || (!missedGroup ? '<p class="meta">This older scan contains aggregate totals only. Run a new scan for candidate-level explanations.</p>' : '')}
       <div class="controls">${scan.reportDate ? `<button class="act" data-action="open-scan-report" data-date="${this.esc(scan.reportDate)}">Open dated report</button>` : ''}<button class="act" data-action="close-scan-result">Close</button></div>`;
     overlay.classList.remove('hidden');
     ScoutModal.focus(overlay, '#scan-result-title');
@@ -1172,10 +1310,50 @@ const Scout = {
           ? `<button class="act" data-action="see-cover-letter" data-slug="${this.esc(slug)}">see cover letter</button>`
           : `<button class="act bridge" data-action="open-chat" data-id="${this.esc(e.id)}" data-prefill="coverLetter">create custom cover letter</button>`}
         <button class="act" data-action="open-company-history" data-id="${this.esc(e.id)}">company history</button>
+        <button class="act" data-action="record-feedback" data-id="${this.esc(e.id)}">record feedback</button>
         <button class="act bridge" data-action="open-chat" data-id="${this.esc(e.id)}" data-prefill="fit">fit and evidence gaps</button>
         <button class="act bridge" data-action="open-chat" data-id="${this.esc(e.id)}" data-prefill="ask">ask about this job</button>
         <button class="act${prepRecommended ? ' bridge' : ''}" data-action="open-interview-prep" data-id="${this.esc(e.id)}">interview prep</button>
       </div>`;
+  },
+
+  async recordJobFeedback(id, presetDecision = null) {
+    const decisions = [
+      'applied', 'interview', 'promising', 'saved', 'rejected',
+      'not-interested', 'duplicate', 'already-seen',
+    ];
+    const reasons = [
+      'location', 'salary', 'seniority', 'responsibilities', 'employer',
+      'role-family', 'other', 'positive', 'duplicate', 'already-seen',
+    ];
+    const decision = presetDecision || window.prompt?.(
+      `Decision (${decisions.join(', ')}):`,
+      'not-interested',
+    );
+    if (!decisions.includes(decision)) return null;
+    const reason = window.prompt?.(`Reason (${reasons.join(', ')}):`, decision === 'promising' ? 'positive' : 'other');
+    if (!reasons.includes(reason)) return null;
+    const explanation = window.prompt?.('Explain this job-specific feedback:', '');
+    if (!String(explanation || '').trim()) return null;
+    if (!this.feedbackLearning?.revision) {
+      this.feedbackLearning = await this.api('/api/feedback-learning');
+    }
+    const result = await this.api('/api/feedback', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        revision: this.feedbackLearning.revision,
+        opportunityId: id,
+        decision,
+        reason,
+        explanation: String(explanation).trim(),
+      }),
+    });
+    if (result?.ok) {
+      this.feedbackLearning = result.ledger;
+      window.alert?.('Job feedback recorded. Ranking did not change; any learned preference must be proposed and reviewed in Settings.');
+    }
+    return result;
   },
 
   async post(pathname, payload, { retryTrackerConflict = true } = {}) {
@@ -1217,7 +1395,7 @@ const Scout = {
 
   company(id) {
     if (id === 'setup-onboarding') return 'Scout setup';
-    const e = this.state.data.opportunities.find((o) => o.id === id);
+    const e = (this.state.data?.opportunities || []).find((o) => o.id === id);
     return e ? e.company : id;
   },
 
@@ -1827,6 +2005,13 @@ const Scout = {
     }
     if (previous?.pollTimer) clearTimeout(previous.pollTimer);
     const openSeq = ++this.chatOpenSeq;
+    if (this.chatDrawerState && this.chatDrawerState.chatId !== null) {
+      this.chatDrawerState = reduceChatDrawer(this.chatDrawerState, {
+        type: 'chat/closed',
+        chatId: this.chatDrawerState.chatId,
+        generation: this.chatDrawerState.generation,
+      });
+    }
     let r;
     const optionQuery = cvOptions
       ? `&xyz=${cvOptions.xyz ? '1' : '0'}&humanize=${cvOptions.humanize ? '1' : '0'}`
@@ -1857,6 +2042,9 @@ const Scout = {
       mode: prefillKey === 'fit' ? 'fit-assessment' : null,
     };
     this.chat = c;
+    this.enginePicks = {};
+    this.engineOptions = null;
+    this.chatDrawerState = createChatDrawerState(id, openSeq);
     this.renderChatDrawer();
     let prefill = c.prefills[prefillKey] || '';
     if (prefillKey === 'tweak') {
@@ -1864,8 +2052,9 @@ const Scout = {
       if (instr) prefill = prefill.replace('<your change>', instr);
     }
     document.getElementById('chat-input').value = prefill;
-    if (!c.engine) void this.loadEngineOptions();
-    this.refreshUsage(c);
+    void this.loadEngineOptions(c);
+    void this.refreshUsage(c);
+    void this.refreshCodexDeepLink(c);
     if (c.recovering) this.scheduleChatRecovery(c);
   },
 
@@ -1913,6 +2102,7 @@ const Scout = {
     if (input) input.value = draft;
     if (!following) document.getElementById('chat-body').scrollTop = previousScrollTop;
     this.refreshUsage(c);
+    void this.refreshCodexDeepLink(c);
   },
 
   renderChatDrawer() {
@@ -1921,7 +2111,15 @@ const Scout = {
     if (!c) return d.classList.add('hidden');
     d.classList.remove('hidden');
     const picker = this.chatPickerHtml();
+    const usageSlot = this.chatDrawerState?.usage;
+    const usageView = usageSlot?.status === 'ready'
+      ? this.usageSummaryView(usageSlot.value)
+      : usageSlot?.status === 'error'
+        ? this.usageSummaryView(null)
+        : { text: 'Checking AI usage…', title: 'Provider usage is loading' };
     const prep = c.purpose === 'interview-prep';
+    const chatModelStatus = this.chatModelStatusHtml(c);
+    const codexTaskControls = this.codexTaskControlsHtml(c);
     const prepControls = prep ? `<div class="controls" style="padding:8px 12px;flex-wrap:wrap">
       <button class="act bridge" data-action="use-prep-prompt" data-prompt="interviewPrep">generate pack</button>
       <button class="act" data-action="use-prep-prompt" data-prompt="prepRefresh">refresh research</button>
@@ -1933,13 +2131,12 @@ const Scout = {
         <b>${prep ? 'Interview prep - ' : ''}${this.esc(this.company(c.id))}</b>
         ${c.engine ? `<span class="chip" style="margin-left:0">${this.esc(c.engine)}</span>` : ''}
         ${c.engine ? `<span class="chip model-chip" title="Model used for this conversation">${this.esc(c.model || 'provider default')}</span>` : ''}
-        <span id="usage-meters" class="meta"></span>
+        ${chatModelStatus}
+        <span id="usage-meters" class="meta" role="status" aria-live="polite" title="${this.esc(usageView.title)}">${this.esc(usageView.text)}</span>
         ${c.engine && c.data.cliSessionId
           ? '<button class="act" data-action="handoff-chat">summarise &amp; switch</button>'
           : ''}
-        ${c.engine === 'codex' && codexTaskUrl(c.data.cliSessionId)
-          ? '<button class="act" data-action="open-codex-task">open in Codex</button>'
-          : ''}
+        ${codexTaskControls}
         <button class="act" style="margin-left:auto" data-action="close-chat">close</button>
       </div>
       <div class="chat-companion">${scoutMarkup(c.streaming ? 'thinking' : 'listening')}<div class="scout-bubble tail-left"><span id="scout-chat-status">${c.streaming ? 'I’m thinking…' : prep ? 'Build your prep pack, refresh research, or practise here.' : 'Ask me anything about this opportunity.'}</span></div></div>
@@ -1990,23 +2187,73 @@ const Scout = {
     return `<span class="engine-usage note">~${this.esc(thousands(entry.weekTokens))} tokens spent on this model this week</span>`;
   },
 
+  usageSummaryView(usage) {
+    const bits = [];
+    const titles = [];
+    if (usage?.claude && !usage.claude.unknown) {
+      bits.push(`claude estimated account usage ~${Math.round(Number(usage.claude.fiveHourTokens || 0) / 1000)}k/5h ~${Math.round(Number(usage.claude.weekTokens || 0) / 1000)}k/week`);
+    } else {
+      bits.push('claude usage unavailable');
+    }
+    const windows = usage?.codex?.windows?.length
+      ? usage.codex.windows
+      : [usage?.codex?.primary, usage?.codex?.secondary].filter(Boolean);
+    if (windows.length) {
+      bits.push(`codex ${windows.map((window) => `${Math.round(Number(window.usedPercent || 0))}% ${window.label} allowance used`).join(', ')}`);
+      for (const window of windows) {
+        if (window.resetsAt) titles.push(`codex ${window.label} resets ${new Date(window.resetsAt).toLocaleString()}`);
+      }
+    } else {
+      bits.push('codex usage unavailable');
+    }
+    if (usage?.checkedAt) titles.push(`checked ${new Date(usage.checkedAt).toLocaleTimeString()}`);
+    return {
+      text: bits.join(' · '),
+      title: ['Usage sources remain semantically distinct', ...titles].join(' · '),
+    };
+  },
+
   engineCardHtml(engine, info) {
     const name = engine[0].toUpperCase() + engine.slice(1);
     const models = info?.models || [];
-    const selected = this.enginePicks?.[engine] ?? (info?.defaultModel || '');
-    const option = (value, label) => `<option value="${this.esc(value)}" ${String(selected) === String(value) ? 'selected' : ''}>${this.esc(label)}</option>`;
+    const selected = this.enginePicks?.[engine] ?? '';
+    const effective = info?.effectiveModel || {
+      id: info?.defaultModel || null,
+      label: info?.defaultModel || 'Provider default (model unknown)',
+      known: Boolean(info?.defaultModel),
+      available: 'unknown',
+    };
+    const defaultUnavailable = effective.available === false;
+    const defaultLabel = defaultUnavailable
+      ? `Provider default unavailable — ${effective.label}`
+      : effective.known ? `Provider default — ${effective.label}` : 'Provider default — model unknown';
+    const option = (value, label, { disabled = false } = {}) =>
+      `<option value="${this.esc(value)}" ${disabled ? 'disabled' : ''} ${String(selected) === String(value) ? 'selected' : ''}>${this.esc(label)}</option>`;
+    const catalogueLabel = info?.catalogue?.state === 'refreshed'
+      ? 'refreshed catalogue'
+      : 'bundled fallback · availability may be unknown';
+    const modelLabel = (model) => [
+      model.label,
+      model.tradeoff,
+      model.available === false ? 'unavailable' : model.available === 'unknown' ? 'availability unknown' : '',
+    ].filter(Boolean).join(' — ');
+    const unavailableExplanation = defaultUnavailable
+      ? `<div class="engine-model-warning" role="status">Saved default unavailable. Choose another model before starting this chat.</div>`
+      : '';
     return `<div class="engine-card" data-engine-card="${this.esc(engine)}">
-      <div class="engine-head"><b>${this.esc(name)}</b>${info?.defaultModel ? `<span class="chip">default ${this.esc(info.defaultModel)}</span>` : ''}</div>
+      <div class="engine-head"><b>${this.esc(name)}</b><span class="chip">${this.esc(catalogueLabel)}</span></div>
       <div class="engine-usage-block">${this.engineUsageHtml(engine, info?.usage)}</div>
       <label class="engine-model">Model
         <select data-engine-model="${this.esc(engine)}">
-          ${option('', 'Provider default')}
-          ${models.map((model) => option(model.id, model.label + (model.detected ? ' · used here' : ''))).join('')}
+          ${option('', defaultLabel, { disabled: defaultUnavailable })}
+          ${models.map((model) => option(model.id, modelLabel(model), { disabled: model.available === false })).join('')}
           ${option('__other__', 'Other…')}
         </select>
       </label>
-      <input class="engine-model-custom ${selected === '__other__' ? '' : 'hidden'}" data-engine-model-custom="${this.esc(engine)}" type="text" placeholder="Exact model id" pattern="[A-Za-z0-9._:\-]+">
+      <input class="engine-model-custom ${selected === '__other__' ? '' : 'hidden'}" data-engine-model-custom="${this.esc(engine)}" type="text" placeholder="Exact model id" maxlength="128" pattern="[A-Za-z0-9._:\-]{1,128}">
       <div class="engine-model-spend">${this.modelSpendHtml(engine, info?.usage, selected)}</div>
+      ${unavailableExplanation}
+      <div class="engine-model-status meta" role="status" aria-live="polite"></div>
       <button class="act primary" data-action="pick-engine" data-engine="${this.esc(engine)}">Use ${this.esc(name)}</button>
     </div>`;
   },
@@ -2014,21 +2261,80 @@ const Scout = {
   chatPickerHtml() {
     const onboarding = this.chat?.id === 'setup-onboarding';
     const prep = this.chat?.purpose === 'interview-prep';
-    const engines = this.engineOptions?.engines;
+    const engineSlot = this.chatDrawerState?.engines;
+    const engines = engineSlot?.value?.engines;
     return `<div class="chat-picker">
       <div class="label">choose an engine and model for ${onboarding ? 'setup' : prep ? 'interview prep' : 'this job'}</div>
       <div class="engine-cards">
         ${['claude', 'codex'].map((engine) => this.engineCardHtml(engine, engines?.[engine])).join('')}
       </div>
-      ${engines ? '' : '<p class="meta">Checking how much of each provider allowance is left…</p>'}
+      ${engines ? '' : engineSlot?.status === 'error'
+        ? '<p class="meta" role="status">Model choices unavailable. Provider defaults and safe custom IDs remain available.</p>'
+        : '<p class="meta" role="status">Checking model choices…</p>'}
     </div>`;
   },
 
-  // Read once when the picker is shown; the drawer re-renders when it arrives.
-  async loadEngineOptions() {
-    try { this.engineOptions = await this.api('/api/engines'); }
-    catch { this.engineOptions = null; return; }
-    if (this.chat && !this.chat.engine) this.renderChatDrawer();
+  renderChatDrawerSnapshot() {
+    const draft = document.getElementById('chat-input')?.value;
+    const body = document.getElementById('chat-body');
+    const following = this.chatNearBottom(body);
+    const scrollTop = body?.scrollTop;
+    const customInputs = typeof document.querySelectorAll === 'function'
+      ? [...document.querySelectorAll('[data-engine-model-custom]')]
+      : [];
+    const customs = Object.fromEntries(customInputs
+      .map((input) => [input.dataset.engineModelCustom, input.value]));
+    this.renderChatDrawer();
+    const input = document.getElementById('chat-input');
+    if (input && draft !== undefined) input.value = draft;
+    for (const [engine, value] of Object.entries(customs)) {
+      const custom = document.querySelector(`[data-engine-model-custom="${engine}"]`);
+      if (custom) custom.value = value;
+    }
+    if (!following && scrollTop !== undefined) {
+      const nextBody = document.getElementById('chat-body');
+      if (nextBody) nextBody.scrollTop = scrollTop;
+    }
+  },
+
+  async loadEngineOptions(target = this.chat) {
+    const drawer = this.chatDrawerState;
+    if (!target || !drawer || drawer.chatId !== target.id) return;
+    const requestGeneration = drawer.engines.requestGeneration + 1;
+    this.chatDrawerState = reduceChatDrawer(drawer, {
+      type: 'engines/requested',
+      chatId: drawer.chatId,
+      generation: drawer.generation,
+      requestGeneration,
+    });
+    let value;
+    try {
+      value = await this.api('/api/engines');
+      if (!value?.engines) throw new Error('model choices unavailable');
+    } catch {
+      const before = this.chatDrawerState;
+      this.chatDrawerState = reduceChatDrawer(before, {
+        type: 'engines/rejected',
+        chatId: drawer.chatId,
+        generation: drawer.generation,
+        requestGeneration,
+        error: 'model choices unavailable',
+      });
+      if (this.chatDrawerState !== before) this.renderChatDrawerSnapshot();
+      return;
+    }
+    const before = this.chatDrawerState;
+    this.chatDrawerState = reduceChatDrawer(before, {
+      type: 'engines/resolved',
+      chatId: drawer.chatId,
+      generation: drawer.generation,
+      requestGeneration,
+      value,
+    });
+    if (this.chatDrawerState !== before) {
+      this.engineOptions = value;
+      this.renderChatDrawerSnapshot();
+    }
   },
 
   // Keep the remembered pick, the free-text field and the per-model spend line in
@@ -2039,8 +2345,11 @@ const Scout = {
     if (!card) return;
     this.enginePicks = { ...this.enginePicks, [engine]: select.value };
     card.querySelector('[data-engine-model-custom]')?.classList.toggle('hidden', select.value !== '__other__');
+    const status = card.querySelector('.engine-model-status');
+    if (status) status.textContent = '';
     const spend = card.querySelector('.engine-model-spend');
-    if (spend) spend.innerHTML = this.modelSpendHtml(engine, this.engineOptions?.engines?.[engine]?.usage, select.value);
+    const info = this.chatDrawerState?.engines?.value?.engines?.[engine];
+    if (spend) spend.innerHTML = this.modelSpendHtml(engine, info?.usage, select.value);
   },
 
   selectedEngineModel(engine) {
@@ -2049,6 +2358,71 @@ const Scout = {
     const value = card.querySelector('[data-engine-model]')?.value || '';
     if (value !== '__other__') return value || null;
     return card.querySelector('[data-engine-model-custom]')?.value.trim() || null;
+  },
+
+  chatModelStatusHtml(chat = this.chat) {
+    if (!chat?.engine) return '';
+    const info = this.chatDrawerState?.engines?.value?.engines?.[chat.engine];
+    if (!info) return '';
+    const record = chat.model
+      ? (info.models || []).find((model) => model.id === chat.model)
+      : info.effectiveModel;
+    if (record?.available !== false) return '';
+    const label = record.label || record.id || chat.model || 'saved provider default';
+    const subject = chat.model ? 'Conversation model' : 'Saved default';
+    return `<span class="chat-model-status meta" role="status" aria-live="polite">
+      ${this.esc(subject)} ${this.esc(label)} is unavailable. Choose a currently available model if a new turn fails.
+    </span>`;
+  },
+
+  codexTaskControlsHtml(chat = this.chat) {
+    const taskId = chat?.engine === 'codex' ? chat?.data?.cliSessionId : null;
+    if (!taskId) return '';
+    const slot = this.chatDrawerState?.codexLink;
+    const capability = slot?.status === 'ready'
+      ? slot.value
+      : {
+          state: slot?.status === 'error' ? 'failed' : 'unknown',
+          canAttempt: false,
+          reasonCode: slot?.status === 'error' ? 'handler-check-failed' : 'handler-status-unknown',
+        };
+    const baseView = codexTaskLaunchView(taskId, capability);
+    const attempt = chat.codexLinkAttempt?.taskId === baseView.taskId ? chat.codexLinkAttempt : null;
+    const view = attempt
+      ? { ...baseView, state: attempt.state, reasonCode: attempt.reasonCode }
+      : baseView;
+    const messages = {
+      remote: 'Opening Codex depends on the device opening this page, not the Scout server. Copy the task ID and resume it in Codex on this device.',
+      unavailable: 'No supported Codex handler was found on this device. Copy the task ID and resume it in Codex.',
+      failed: 'Scout could not verify the Codex handler on this device. Copy the task ID and resume it in Codex.',
+      unknown: 'Checking whether this device can open Codex. The task ID remains copyable.',
+    };
+    let message;
+    if (view.reasonCode === 'invalid-task-id') {
+      message = 'This task identity cannot be opened as a link. Copy it manually only if you recognise it.';
+    } else if (view.reasonCode === 'launch-failed') {
+      message = 'Scout could not open Codex on this device. Copy the task ID and resume it in Codex.';
+    } else if (view.reasonCode === 'copied') {
+      message = 'Task ID copied. Open Codex on this device and resume that task.';
+    } else if (view.reasonCode === 'copy-failed') {
+      message = 'Scout could not copy automatically. Select the visible task ID and resume it in Codex.';
+    } else if (view.state === 'attempting') {
+      message = 'Scout asked this device to open Codex, but the browser cannot confirm success. If Codex did not open, copy the task ID and resume it.';
+    } else {
+      message = messages[capability.state] || messages.unknown;
+    }
+    const open = view.canNavigate
+      ? '<button class="act" data-action="open-codex-task">open in Codex</button>'
+      : '';
+    const copy = view.taskId != null
+      ? '<button class="act" data-action="copy-codex-task">copy task ID</button>'
+      : '';
+    const identity = view.taskId != null
+      ? `<code data-codex-task-id>${this.esc(view.taskId)}</code>`
+      : '<span>Task identity unavailable.</span>';
+    return `<span class="codex-link-status meta" role="status" aria-live="polite">
+      ${open}${copy}${identity}<span>${this.esc(message)}</span>
+    </span>`;
   },
 
   chatBubble(role, text) {
@@ -2084,12 +2458,51 @@ const Scout = {
     } catch { /* backup status never blocks the local dashboard */ }
   },
 
+  codexNavigate(href) {
+    window.location.assign(href);
+  },
+
   openCodexTask() {
-    const href = codexTaskUrl(this.chat?.engine === 'codex' ? this.chat?.data?.cliSessionId : null);
-    if (!href) return alert('This Scout chat does not have a resumable Codex task yet.');
-    const link = document.createElement('a');
-    link.href = href;
-    link.click();
+    const c = this.chat;
+    const taskId = c?.engine === 'codex' ? c?.data?.cliSessionId : null;
+    const capability = this.chatDrawerState?.codexLink?.value;
+    const view = codexTaskLaunchView(taskId, capability);
+    if (!view.canNavigate) {
+      if (c) c.codexLinkAttempt = view;
+      this.renderChatDrawerSnapshot();
+      return;
+    }
+    try {
+      this.codexNavigate(view.href);
+      c.codexLinkAttempt = view;
+    } catch {
+      c.codexLinkAttempt = codexTaskLaunchView(taskId, {
+        state: 'failed',
+        canAttempt: false,
+        reasonCode: 'launch-failed',
+      });
+    }
+    this.renderChatDrawerSnapshot();
+  },
+
+  async copyCodexTask() {
+    const c = this.chat;
+    const taskId = c?.engine === 'codex' ? c?.data?.cliSessionId : null;
+    const capability = this.chatDrawerState?.codexLink?.value || { state: 'unknown', canAttempt: false };
+    const view = codexTaskLaunchView(taskId, capability);
+    if (view.taskId == null) return;
+    try {
+      await navigator.clipboard.writeText(view.taskId);
+      if (this.chat === c) {
+        c.codexLinkAttempt = { ...view, reasonCode: 'copied' };
+        this.renderChatDrawerSnapshot();
+      }
+    } catch {
+      if (this.chat === c) {
+        c.codexLinkAttempt = { ...view, reasonCode: 'copy-failed' };
+        this.renderChatDrawerSnapshot();
+      }
+    }
   },
 
   setChatScoutState(state, message) {
@@ -2148,8 +2561,21 @@ const Scout = {
 
   pickEngine(engine) {
     const val = document.getElementById('chat-input').value;
+    const card = document.querySelector(`[data-engine-card="${engine}"]`);
+    const selection = card?.querySelector('[data-engine-model]')?.value || '';
+    const info = this.chatDrawerState?.engines?.value?.engines?.[engine];
+    const status = card?.querySelector('.engine-model-status');
+    if (!selection && info?.effectiveModel?.available === false) {
+      if (status) status.textContent = 'Choose an available model before starting this chat.';
+      return;
+    }
+    const model = this.selectedEngineModel(engine);
+    if (selection === '__other__' && !/^[A-Za-z0-9._:-]{1,128}$/.test(String(model || ''))) {
+      if (status) status.textContent = 'Enter a safe exact model ID.';
+      return;
+    }
     this.chat.engine = engine;
-    this.chat.model = this.selectedEngineModel(engine);
+    this.chat.model = model;
     this.renderChatDrawer();
     document.getElementById('chat-input').value = val;
   },
@@ -2285,6 +2711,7 @@ const Scout = {
     document.getElementById('chat-input').value = draft;
     if (!following) document.getElementById('chat-body').scrollTop = previousScrollTop;
     this.refreshUsage(c);
+    void this.refreshCodexDeepLink(c);
   },
 
   async refreshInterviewPrepArtifact(target = this.chat) {
@@ -2321,33 +2748,92 @@ const Scout = {
     }
     if (this.chat?.pollTimer) clearTimeout(this.chat.pollTimer);
     this.chatOpenSeq += 1;
+    if (this.chatDrawerState && this.chatDrawerState.chatId !== null) {
+      this.chatDrawerState = reduceChatDrawer(this.chatDrawerState, {
+        type: 'chat/closed',
+        chatId: this.chatDrawerState.chatId,
+        generation: this.chatDrawerState.generation,
+      });
+    }
     this.chat = null;
     document.getElementById('chat-drawer').classList.add('hidden');
   },
 
   async refreshUsage(target = this.chat) {
-    if (!target) return;
+    const drawer = this.chatDrawerState;
+    if (!target || !drawer || drawer.chatId !== target.id) return;
+    const requestGeneration = drawer.usage.requestGeneration + 1;
+    this.chatDrawerState = reduceChatDrawer(drawer, {
+      type: 'usage/requested',
+      chatId: drawer.chatId,
+      generation: drawer.generation,
+      requestGeneration,
+    });
     let u;
-    try { u = await this.api('/api/usage'); } catch { return; }
-    if (this.chat !== target) return;
-    const el = document.getElementById('usage-meters');
-    if (!el) return;
-    const bits = [];
-    if (u.claude && !u.claude.unknown) {
-      bits.push(`claude ~${Math.round(u.claude.fiveHourTokens / 1000)}k/5h ~${Math.round(u.claude.weekTokens / 1000)}k/wk`);
-    } else bits.push('claude ?');
-    // Label each Codex window from its own length. Assuming the first window is
-    // the five-hour one reported a weekly allowance as "/5h".
-    const windows = u.codex?.windows?.length ? u.codex.windows : [u.codex?.primary, u.codex?.secondary].filter(Boolean);
-    if (windows.length) {
-      bits.push(`codex ${windows.map((window) => `${Math.round(window.usedPercent)}% ${window.label} used`).join(', ')}`);
-    } else bits.push('codex ?');
-    el.textContent = bits.join(' · ');
-    const resetBits = windows
-      .filter((window) => window.resetsAt)
-      .map((window) => `codex ${window.label} resets ${new Date(window.resetsAt).toLocaleString()}`);
-    const checked = u.checkedAt ? new Date(u.checkedAt).toLocaleTimeString() : 'unknown';
-    el.title = ['approximate', ...resetBits, `checked ${checked}`].join(' - ');
+    try {
+      u = await this.api('/api/usage');
+      if (!u || u.error) throw new Error('usage unavailable');
+    } catch {
+      const before = this.chatDrawerState;
+      this.chatDrawerState = reduceChatDrawer(before, {
+        type: 'usage/rejected',
+        chatId: drawer.chatId,
+        generation: drawer.generation,
+        requestGeneration,
+        error: 'usage unavailable',
+      });
+      if (this.chatDrawerState !== before) this.renderChatDrawerSnapshot();
+      return;
+    }
+    const before = this.chatDrawerState;
+    this.chatDrawerState = reduceChatDrawer(before, {
+      type: 'usage/resolved',
+      chatId: drawer.chatId,
+      generation: drawer.generation,
+      requestGeneration,
+      value: u,
+    });
+    if (this.chatDrawerState !== before) this.renderChatDrawerSnapshot();
+  },
+
+  async refreshCodexDeepLink(target = this.chat) {
+    const drawer = this.chatDrawerState;
+    if (!target || target.engine !== 'codex' || !target.data?.cliSessionId
+        || !drawer || drawer.chatId !== target.id) return;
+    const requestGeneration = drawer.codexLink.requestGeneration + 1;
+    this.chatDrawerState = reduceChatDrawer(drawer, {
+      type: 'codexLink/requested',
+      chatId: drawer.chatId,
+      generation: drawer.generation,
+      requestGeneration,
+    });
+    let value;
+    try {
+      value = await this.api('/api/device/codex-deep-link');
+      if (!value || !['supported', 'unavailable', 'failed', 'remote', 'unknown'].includes(value.state)) {
+        throw new Error('invalid capability');
+      }
+    } catch {
+      const before = this.chatDrawerState;
+      this.chatDrawerState = reduceChatDrawer(before, {
+        type: 'codexLink/rejected',
+        chatId: drawer.chatId,
+        generation: drawer.generation,
+        requestGeneration,
+        error: 'Codex link capability unavailable',
+      });
+      if (this.chatDrawerState !== before) this.renderChatDrawerSnapshot();
+      return;
+    }
+    const before = this.chatDrawerState;
+    this.chatDrawerState = reduceChatDrawer(before, {
+      type: 'codexLink/resolved',
+      chatId: drawer.chatId,
+      generation: drawer.generation,
+      requestGeneration,
+      value,
+    });
+    if (this.chatDrawerState !== before) this.renderChatDrawerSnapshot();
   },
 
   openChatForCv() {
@@ -2485,6 +2971,7 @@ const Scout = {
       case 'use-prep-prompt': return this.usePrepPrompt(prompt);
       case 'handoff-chat': return this.handoffChat();
       case 'open-codex-task': return this.openCodexTask();
+      case 'copy-codex-task': return this.copyCodexTask();
       case 'close-chat': return this.closeChat();
       case 'send-chat': return this.sendChat();
       case 'stop-chat': return this.stopChat();
@@ -2493,6 +2980,7 @@ const Scout = {
       case 'triage-no': return this.triageNo(id);
       case 'undo-dismiss': return this.undoDismiss(id);
       case 'remove-shortlist': return this.removeFromShortlist(id);
+      case 'record-feedback': return this.recordJobFeedback(id);
       case 'restore': return this.restoreEntry(id);
       default: return undefined;
     }
@@ -2604,7 +3092,14 @@ const Scout = {
     if (!update?.available && !update?.error) { banner.classList.add('hidden'); return; }
     banner.classList.remove('hidden');
     const copy = document.createElement('p');
-    copy.textContent = update.error ? `Scout could not check for updates: ${update.error}` : `Scout ${update.latestVersion} is available.${update.downloaded?.version === update.latestVersion ? ' The verified package is ready.' : ''}`;
+    const downloadedReady = update.downloaded?.version === update.latestVersion;
+    const installerHandoff = (downloaded) => downloaded?.name && downloaded?.locationHint
+      ? `Close Scout, then run ${downloaded.name}. Find it at ${downloaded.locationHint}.`
+      : null;
+    const readyHandoff = downloadedReady ? installerHandoff(update.downloaded) : null;
+    copy.textContent = update.error
+      ? `Scout could not check for updates: ${update.error}`
+      : `Scout ${update.latestVersion} is available.${readyHandoff ? ` The package is verified. ${readyHandoff}` : downloadedReady ? ' The verified package is ready.' : ''}`;
     banner.append(copy);
     const actions = document.createElement('div'); actions.className = 'update-banner-actions';
     if (update.url) {
@@ -2617,7 +3112,8 @@ const Scout = {
         try {
           const response = await fetch('/api/update/download', { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' });
           const result = await response.json(); if (!response.ok) throw new Error(result.error || 'Download failed');
-          copy.textContent = `Scout ${result.downloaded.version} is verified and ready at ${result.downloaded.path}. Close Scout, then run that package to update.`;
+          if (!result.downloaded?.name || !result.downloaded?.version || !result.downloaded?.locationHint) throw new Error('Downloaded package response was incomplete');
+          copy.textContent = `Scout ${result.downloaded.version} is verified. ${installerHandoff(result.downloaded)}`;
           download.remove();
         } catch (error) { copy.textContent = `Update download failed: ${error.message}`; download.disabled = false; download.textContent = 'Try again'; }
       });

@@ -44,9 +44,9 @@ test('parseClaudeLine: assistant message yields deltas and tools', () => {
   });
   assert.deepEqual(parseClaudeLine(line), [
     { kind: 'delta', text: 'Working on it.' },
-    { kind: 'tool', label: 'Edit: C:/repo/applications/acme/cv.typ', file: 'C:/repo/applications/acme/cv.typ', mutatesFile: true, activity: 'writing' },
-    { kind: 'tool', label: 'Read: C:/repo/profile/context.md', file: 'C:/repo/profile/context.md', mutatesFile: false, activity: 'searching' },
-    { kind: 'tool', label: 'Bash', file: null, mutatesFile: false, activity: 'thinking' },
+    { kind: 'tool', label: 'Editing a file', file: 'C:/repo/applications/acme/cv.typ', mutatesFile: true, activity: 'writing' },
+    { kind: 'tool', label: 'Using provider tools', file: 'C:/repo/profile/context.md', mutatesFile: false, activity: 'searching' },
+    { kind: 'tool', label: 'Using provider tools', file: null, mutatesFile: false, activity: 'thinking' },
   ]);
 });
 
@@ -65,6 +65,7 @@ test('parseClaudeLine: error result has ok false', () => {
   const line = JSON.stringify({ type: 'result', subtype: 'error_during_execution', is_error: true, result: 'boom' });
   const events = parseClaudeLine(line);
   assert.equal(events.at(-1).ok, false);
+  assert.equal(events.at(-1).text, '');
 });
 
 test('parseClaudeLine: structured output is the authoritative result text', () => {

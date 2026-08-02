@@ -45,6 +45,8 @@ export const RETUNE_ENTRY_STEPS = Object.freeze({
 });
 const SETTINGS_SECTIONS = [
   ['search', 'Search & profile', 'Roles, locations, compensation, commute and exclusions'],
+  ['learning', 'Feedback & learning', 'Job feedback, reviewed proposals, versions and undo'],
+  ['employers', 'Employers', 'Named-employer priority, careers monitoring and health'],
   ['providers', 'AI providers', 'Choose the signed-in provider Scout uses'],
   ['sources', 'Sources', 'Public sources and optional Adzuna credentials'],
   ['scans', 'Scans & schedule', 'Run a supervised scan and manage daily jobs'],
@@ -58,6 +60,138 @@ export function splitList(value) {
     .split(/[,\n]/)
     .map((item) => item.trim())
     .filter(Boolean);
+}
+
+export function providerLoginPanelHtml(
+  provider,
+  providerStatus = {},
+  session = null,
+  pending = false,
+) {
+  const name = provider === 'claude' ? 'Claude' : 'Codex';
+  const command = provider === 'claude' ? 'claude auth login' : 'codex login --device-auth';
+  const guide = provider === 'claude'
+    ? 'https://code.claude.com/docs/en/authentication'
+    : 'https://developers.openai.com/codex/auth/';
+  const stateLabels = {
+    starting: 'Starting the provider sign-in flow…',
+    'awaiting-code': 'The provider is waiting for the one-time code.',
+    authenticating: 'The provider is checking the submitted code…',
+    validating: 'Checking the provider sign-in…',
+    succeeded: 'Sign-in succeeded. Refresh provider status before scanning.',
+    failed: 'Sign-in did not complete. Retry or use the manual fallback.',
+    cancelled: 'Sign-in was cancelled.',
+    expired: 'The sign-in window expired. Retry to start a new flow.',
+  };
+  const state = session?.provider === provider ? session.state : null;
+  const active = ['starting', 'awaiting-code', 'authenticating', 'validating'].includes(state);
+  const retryable = ['failed', 'cancelled', 'expired'].includes(state);
+  const reauthenticationRequired = providerStatus.healthState === 'sign-in-required';
+  const authenticated = providerStatus.authenticated === true && !reauthenticationRequired;
+  const canStart = providerStatus.installed === true
+    && !authenticated
+    && !state
+    && !active
+    && !retryable;
+  const statusText = stateLabels[state]
+    || (authenticated
+      ? `${name} is signed in.`
+      : providerStatus.installed
+        ? `${name} needs sign-in.`
+        : `${name} is not installed.`);
+  const sessionId = escapeProfileText(session?.sessionId || '');
+  const disabled = pending ? ' disabled aria-disabled="true"' : '';
+  const device = provider === 'codex' && session?.userCode
+    ? `<p class="provider-login-device-code">Device code: <strong>${escapeProfileText(session.userCode)}</strong></p>`
+    : '';
+  const verification = session?.verificationUrl
+    ? `<p><a href="${escapeProfileText(session.verificationUrl)}" target="_blank" rel="noreferrer">Open the provider sign-in page</a></p>`
+    : '';
+  const code = provider === 'claude' && state === 'awaiting-code' && session?.codeRequired
+    ? `<label class="setup-field" for="provider-login-code-claude">One-time provider code
+      <input id="provider-login-code-claude" type="text" maxlength="256" autocomplete="off" autocapitalize="off" spellcheck="false">
+      </label>
+      <button class="act primary" type="button" data-provider-login-action="code" data-provider="claude" data-session-id="${sessionId}"${disabled}>Submit code</button>`
+    : '';
+  const start = canStart
+    ? `<button class="act primary" type="button" data-provider-login-action="start" data-provider="${provider}"${disabled}>Sign in to ${name} with Scout</button>`
+    : '';
+  const cancel = active
+    ? `<button class="act" type="button" data-provider-login-action="cancel" data-provider="${provider}" data-session-id="${sessionId}"${disabled}>Cancel ${name} sign-in</button>`
+    : '';
+  const retry = retryable
+    ? `<button class="act primary" type="button" data-provider-login-action="retry" data-provider="${provider}" data-session-id="${sessionId}"${disabled}>Retry ${name} sign-in</button>`
+    : '';
+  const clear = provider === 'claude'
+    && state === 'failed'
+    && session?.reasonCode === 'credentials-expired'
+    ? `<button class="act" type="button" data-provider-login-action="clear" data-provider="claude" data-session-id="${sessionId}"${disabled}>Clear expired Claude sign-in</button>`
+    : '';
+  return `<section class="provider-login-panel" data-provider-login="${provider}" aria-label="${name} sign-in">
+    <p class="meta" role="status" aria-live="polite">${statusText}</p>
+    ${device}${verification}
+    <div class="provider-login-actions">${code}${start}${cancel}${retry}${clear}</div>
+    ${authenticated ? '' : `<p class="meta">Manual fallback: open your terminal and run <code>${command}</code>. <a href="${guide}" target="_blank" rel="noreferrer">Official ${name} login guide</a>. Retry only checks sign-in; it does not rerun a missed scan.</p>`}
+  </section>`;
+}
+
+export function providerCardPresentation(provider = {}) {
+  if (provider.installed !== true) {
+    return {
+      available: false,
+      label: 'Not installed',
+      help: 'Install this provider CLI from its official guide, then refresh provider status.',
+    };
+  }
+  const blocked = {
+    checking: {
+      label: 'Installed; checking provider status',
+      help: 'Wait for the bounded provider check to finish, then refresh if needed.',
+    },
+    'sign-in-required': {
+      label: 'Installed; sign-in required',
+      help: 'Sign in with Scout or use the manual provider command, then refresh.',
+    },
+    'login-in-progress': {
+      label: 'Installed; sign-in in progress',
+      help: 'Wait for the current sign-in flow to finish before selecting this provider.',
+    },
+    'network-unavailable': {
+      label: 'Installed; network unavailable',
+      help: 'Restore provider network access, then refresh. Scout will not replay blocked work automatically.',
+    },
+    'rate-limited': {
+      label: 'Installed; provider rate limited',
+      help: 'Wait for the provider rate limit to clear, then retry explicitly.',
+    },
+    'cli-update-required': {
+      label: 'Installed and signed in; CLI update required',
+      help: 'Update this CLI from its official installation guide, then refresh.',
+    },
+    'provider-error': {
+      label: 'Installed; provider error',
+      help: 'Resolve the provider error and refresh status before selecting it.',
+    },
+  };
+  if (Object.hasOwn(blocked, provider.healthState)) {
+    return { available: false, ...blocked[provider.healthState] };
+  }
+  if (!['ready', 'credentials-present-unverified'].includes(provider.healthState)) {
+    return {
+      available: false,
+      label: 'Installed; provider status unavailable',
+      help: 'Refresh provider status. Scout will keep this provider disabled until its state is known.',
+    };
+  }
+  if (provider.authenticated !== true) return { available: false, ...blocked['sign-in-required'] };
+  if (provider.capabilities?.structuredOutput === false) {
+    return { available: false, ...blocked['cli-update-required'] };
+  }
+  return {
+    available: true,
+    label: 'Installed, signed in and compatible',
+    help: '',
+  };
 }
 
 export function buildConfig(form, current = {}) {
@@ -116,8 +250,8 @@ export function handoffAction(ready) {
   return { label: ready ? 'Continue to first scan' : 'Activate a proposal to continue', defer: false, ready: Boolean(ready) };
 }
 
-export function shouldAutoRunFirstScan(scanHealth = {}, ready = true) {
-  return Boolean(ready && !scanHealth.lastRunAt);
+export function firstScanProfileReady(searchProfile, hasHistory = false) {
+  return Boolean(hasHistory || searchProfile?.published);
 }
 
 export function shouldRequestRecoveryKey(status = {}, pendingRecoveryKey = null) {
@@ -179,30 +313,277 @@ function profileRuleText(profile, section, field, strengths) {
   return values.length ? escapeProfileText(values.join(', ')) : 'None recorded';
 }
 
+function adaptiveQuestionEditor(question) {
+  const id = escapeProfileText(question?.id || '');
+  const prompt = escapeProfileText(question?.prompt || '');
+  const field = escapeProfileText(question?.field || '');
+  const suppliedCurrent = question?.current ?? (
+    question?.answer?.kind === 'rules' ? [] : null
+  );
+  const current = question?.answer?.kind === 'rules'
+    ? (Array.isArray(suppliedCurrent) ? suppliedCurrent : []).map(({ value, strength }) => ({
+      value, strength,
+    }))
+    : suppliedCurrent;
+  let editor;
+  if (question?.answer?.kind === 'enum') {
+    editor = `<select data-adaptive-value="${id}">${(question.answer.values || []).map((value) => (
+      `<option value="${escapeProfileText(value)}"${value === current ? ' selected' : ''}>${escapeProfileText(value)}</option>`
+    )).join('')}</select>`;
+  } else {
+    const rows = question?.answer?.kind === 'rules' ? 5 : 4;
+    editor = `<textarea data-adaptive-value="${id}" rows="${rows}">${escapeProfileText(JSON.stringify(current, null, 2))}</textarea>`;
+  }
+  return `<fieldset class="setup-field wide" data-adaptive-phase="${escapeProfileText(question?.phase || '')}">
+    <legend>${escapeProfileText(question?.label || question?.id || 'Question')}</legend>
+    <p>${prompt}</p><p class="meta">Draft field: ${field}</p>
+    <label><span><input type="checkbox" data-adaptive-include="${id}"> Update this structured answer</span></label>
+    ${editor}
+    ${question?.answer?.allowBlocking ? `<label><span><input type="checkbox" data-adaptive-confirm="${id}"> I explicitly confirm any hard exclusion in this answer</span></label>` : ''}
+  </fieldset>`;
+}
+
+export function adaptiveQuestionnaireHtml(adaptive = {}) {
+  const questionnaire = adaptive?.questionnaire;
+  if (!questionnaire?.questions?.length) {
+    return '<p class="meta">Adaptive structured questions are unavailable until a complete draft exists.</p>';
+  }
+  const universal = questionnaire.questions.filter(({ phase }) => phase === 'universal');
+  const specialist = questionnaire.questions.filter(({ phase }) => phase === 'specialist');
+  return `<details id="adaptive-search-questions"><summary>Answer structured search questions</summary>
+    <p>Universal questions come first. Scout then offers at most ${escapeProfileText(questionnaire.specialistLimit)} occupation-relevant follow-ups. Only checked answers are changed.</p>
+    <h4>Universal questions</h4>${universal.map(adaptiveQuestionEditor).join('')}
+    <h4>Specialist follow-ups</h4>${specialist.map(adaptiveQuestionEditor).join('')}
+    <p><button id="search-profile-adaptive-save" class="act" type="button">Save selected structured answers</button></p>
+  </details>`;
+}
+
+export function searchLanePlanHtml(adaptive = {}) {
+  const plan = adaptive?.lanePlan;
+  if (!plan?.lanes?.length) {
+    return '<p class="meta">Search lanes are created when a reviewed profile is published.</p>';
+  }
+  const active = plan.lanes.filter(({ state }) => state === 'active');
+  const retired = plan.lanes.filter(({ state }) => state === 'retired');
+  const eligible = active.filter(({ consecutiveUnproductiveRuns }) => (
+    Number(consecutiveUnproductiveRuns) >= 3
+  ));
+  const lane = (item) => {
+    const counts = item.aggregate || {};
+    const recent = (item.history || []).slice(-3).reverse().map((event) => (
+      `<li>${escapeProfileText(String(event.recordedAt || '').slice(0, 10) || 'unknown date')}: `
+      + `${escapeProfileText(event.returned || 0)} returned, ${escapeProfileText(event.parsed || 0)} parsed, `
+      + `${escapeProfileText(event.new || 0)} new, ${escapeProfileText(event.eligible || 0)} eligible, `
+      + `${escapeProfileText(event.selected || 0)} selected, ${escapeProfileText(event.promising || 0)} promising`
+      + `${event.failures?.length ? ' (source failure recorded)' : ''}</li>`
+    )).join('') || '<li>No completed run yet.</li>';
+    const fields = (item.profileFields || []).map((field) => {
+      const value = typeof field.value === 'string' ? field.value : JSON.stringify(field.value ?? '');
+      return `<li>${escapeProfileText(field.path || 'unknown rule')} — value: ${escapeProfileText(value)}; `
+        + `strength: ${escapeProfileText(field.strength || 'unknown')}; `
+        + `provenance: ${escapeProfileText(field.provenance || 'unknown')}</li>`;
+    }).join('') || '<li>No profile rule evidence recorded.</li>';
+    return `<li data-search-lane="${escapeProfileText(item.id)}">
+      <strong>${escapeProfileText(item.query)}</strong>
+      <span class="meta"> — ${escapeProfileText(item.kind)}; ${escapeProfileText(item.state)};
+      ${escapeProfileText(item.runCount || 0)} run(s); totals: ${escapeProfileText(counts.returned || 0)} returned,
+      ${escapeProfileText(counts.parsed || 0)} parsed, ${escapeProfileText(counts.new || 0)} new,
+      ${escapeProfileText(counts.eligible || 0)} eligible, ${escapeProfileText(counts.selected || 0)} selected,
+      ${escapeProfileText(counts.promising || 0)} promising.</span>
+      <details open><summary>Recent lane history and provenance</summary><ul>${recent}</ul>
+      <p class="meta">Profile rules used by this lane:</p><ul>${fields}</ul></details>
+      ${item.state === 'retired' && item.retirement?.reversible
+        ? `<button class="act" type="button" data-search-lane-restore="${escapeProfileText(item.id)}">Restore this lane</button>`
+        : ''}
+    </li>`;
+  };
+  return `<details id="search-lane-plan"><summary>Search lanes and run history</summary>
+    <p>${active.length} active, ${retired.length} retired, ${(plan.archivedLanes || []).length} archived after profile changes.</p>
+    <ul>${plan.lanes.map(lane).join('')}</ul>
+    ${eligible.length ? `<label><span><input id="search-lanes-retire-confirm" type="checkbox"> I reviewed the evidence and want to retire ${eligible.length} lane(s) with three unproductive runs</span></label>
+      <p><button id="search-lanes-retire" class="act" type="button">Retire reviewed unproductive lanes</button></p>`
+      : '<p class="meta">No active lane currently has three completed unproductive runs.</p>'}
+  </details>`;
+}
+
 export function searchProfileReviewHtml(state = {}) {
   state ||= {};
   const draft = state.draft || null;
   const published = state.published || null;
   const compensation = draft?.compensation || {};
+  const locationUnknownPolicy = draft?.unknownPolicies?.location || 'include';
   const confirmedExclusions = profileRules(draft, 'negative', null, ['hard-exclusion']);
   const draftJson = draft ? escapeProfileText(JSON.stringify(draft, null, 2)) : '';
   const noDraft = draft ? '' : '<p>No complete draft is available yet. Migrate or save a complete draft before publishing.</p>';
   const compensationText = draft
     ? `${escapeProfileText(compensation.minimum == null ? 'No minimum' : `${compensation.currency || 'currency not set'} ${compensation.minimum} per ${compensation.period}`)}; unknown compensation facts: ${escapeProfileText(compensation.unknownPolicy || 'not configured')}.`
     : 'No compensation policy recorded.';
-  return `<section class="setup-callout" id="search-profile-review"><h3>Review your published search profile</h3>
+  return `<section class="setup-callout" id="search-profile-review"><h3>Review your search profile</h3>
     ${noDraft}
     <section><h4>Primary work</h4><p>${profileRuleText(draft, 'target', 'primaryTitles', null)}</p></section>
-    <section><h4>Adjacent work</h4><p>${profileRuleText(draft, 'target', 'sectors', null)}</p></section>
+    <section><h4>Adjacent work</h4><p>${profileRuleText(draft, 'target', 'adjacentTitles', null)}</p></section>
     <section><h4>Mandatory requirements</h4><p>${profileRuleText(draft, 'target', null, ['mandatory'])}</p></section>
     <section><h4>Preferences</h4><p>${profileRuleText(draft, 'target', null, ['strong-preference', 'nice-to-have', 'neutral'])}</p></section>
     <section><h4>Confirmed exclusions</h4><p>${confirmedExclusions.length ? escapeProfileText(confirmedExclusions.join(', ')) : 'None recorded'}</p></section>
-    <section><h4>Accepted locations and working patterns</h4><p>${profileRuleText(draft, 'target', 'locations', null)}</p></section>
+    <section><h4>Accepted locations</h4><p>${profileRuleText(draft, 'target', 'locations', null)}. Unknown location facts: ${escapeProfileText(locationUnknownPolicy)}.</p></section>
+    <section><h4>Mobility</h4><p>${profileRuleText(draft, 'target', 'mobility', null)}</p></section>
+    <section><h4>Working patterns</h4><p>${profileRuleText(draft, 'target', 'workingPatterns', null)}</p></section>
     <section><h4>Compensation and unknown handling</h4><p>${compensationText}</p></section>
     <section><h4>Focused, balanced or exploratory breadth</h4><p>This draft does not make breadth a hard rule; review it as focused, balanced or exploratory before publishing.</p></section>
     <p class="meta">Unconfirmed inferences remain non-blocking until you explicitly confirm them.</p>
     ${published ? `<p>Published version: ${escapeProfileText(published.id)}</p>` : '<p>Not yet published.</p>'}
-    ${draft ? `<details><summary>Edit the complete validated draft</summary><label class="setup-field wide">Complete draft JSON<textarea id="search-profile-draft" rows="16">${draftJson}</textarea></label><p><button id="search-profile-save" class="act" type="button">Save complete draft</button></p></details><label class="setup-field"><span><input id="search-profile-confirm" type="checkbox"> I reviewed this complete profile and want to publish it</span></label><p><button id="search-profile-publish" class="act primary" type="button">Publish this reviewed profile</button></p>` : ''}
+    ${searchLanePlanHtml(state.adaptive)}
+    ${draft ? `${adaptiveQuestionnaireHtml(state.adaptive)}<details><summary>Edit the complete validated draft</summary><label class="setup-field wide">Complete draft JSON<textarea id="search-profile-draft" rows="16">${draftJson}</textarea></label><p><button id="search-profile-save" class="act" type="button">Save complete draft</button></p></details><label class="setup-field"><span><input id="search-profile-confirm" type="checkbox"> I reviewed this complete profile and want to publish it</span></label><p><button id="search-profile-publish" class="act primary" type="button">Publish this reviewed profile</button></p>` : ''}
+  </section>`;
+}
+
+export function employerRegistryHtml(registry = null) {
+  if (!registry) return '<p class="meta">Loading the private employer registry…</p>';
+  const priorities = ['priority', 'relevant', 'normal', 'inactive', 'irrelevant'];
+  const policyOptions = (values, selected) => values.map((value) => (
+    `<option value="${escapeProfileText(value)}"${value === selected ? ' selected' : ''}>${escapeProfileText(value)}</option>`
+  )).join('');
+  const employerCard = (employer) => {
+    const id = escapeProfileText(employer.id);
+    const reviews = employer.reviewHistory || [];
+    const lastReview = reviews.at(-1);
+    const undoableReview = lastReview && !lastReview.undoOf ? lastReview : null;
+    const recent = (employer.history || []).slice(-5).reverse().map((event) => (
+      `<li>${escapeProfileText(String(event.recordedAt || '').slice(0, 10))}: `
+      + `${escapeProfileText(event.status)} via ${escapeProfileText(event.adapter)}; `
+      + `${escapeProfileText(event.parsed)} parsed${event.failureCode ? `; ${escapeProfileText(event.failureCode)}` : ''}</li>`
+    )).join('') || '<li>No completed monitoring check yet.</li>';
+    return `<section class="setup-callout" data-employer="${id}">
+      <h3>${escapeProfileText(employer.canonicalName)}</h3>
+      <p class="meta">Health: ${escapeProfileText(employer.health?.status || 'unknown')}
+      ${employer.health?.reasonCode ? `(${escapeProfileText(employer.health.reasonCode)})` : ''}.
+      Last checked: ${escapeProfileText(employer.monitoring?.lastCheckedAt || 'not yet')}.
+      Next eligible: ${escapeProfileText(employer.monitoring?.nextEligibleAt || 'now')}.</p>
+      <div class="setup-grid">
+        <label class="setup-field">Priority
+          <select data-employer-priority="${id}">${policyOptions(priorities, employer.userPriority)}</select>
+        </label>
+        <label class="setup-field">Decision reason
+          <input data-employer-reason="${id}" maxlength="160" value="${escapeProfileText(employer.decision?.reason || '')}">
+        </label>
+        <label class="setup-field wide">Careers URL
+          <input data-employer-url="${id}" type="url" value="${escapeProfileText(employer.careersUrl || '')}">
+        </label>
+        <label class="setup-field wide">Reviewed aliases (comma-separated)
+          <input data-employer-aliases="${id}" maxlength="1000" value="${escapeProfileText((employer.aliases || []).join(', '))}">
+        </label>
+        <label class="setup-field">Industries (comma-separated)
+          <input data-employer-industries="${id}" maxlength="1000" value="${escapeProfileText((employer.industries || []).join(', '))}">
+        </label>
+        <label class="setup-field">Locations (comma-separated)
+          <input data-employer-locations="${id}" maxlength="1000" value="${escapeProfileText((employer.locations || []).join(', '))}">
+        </label>
+        <label class="setup-field">ATS adapter
+          <select data-employer-adapter="${id}">${policyOptions(['', 'greenhouse', 'lever', 'ashby'], employer.board?.adapter || '')}</select>
+        </label>
+        <label class="setup-field">ATS board ID
+          <input data-employer-board="${id}" maxlength="160" value="${escapeProfileText(employer.board?.boardId || '')}">
+        </label>
+        <label class="setup-field">Terms review
+          <select data-employer-terms="${id}">${policyOptions(['unreviewed', 'allowed', 'disallowed'], employer.access.terms)}</select>
+        </label>
+        <label class="setup-field">Robots review
+          <select data-employer-robots="${id}">${policyOptions(['unknown', 'allowed', 'disallowed'], employer.access.robots)}</select>
+        </label>
+        <label class="setup-field">Minimum interval (minutes)
+          <input data-employer-interval="${id}" type="number" min="15" max="43200" value="${escapeProfileText(employer.access.minIntervalMinutes)}">
+        </label>
+        <label class="setup-field"><span><input data-employer-generic="${id}" type="checkbox"${employer.access.genericEnabled ? ' checked' : ''}> Allow conservative generic-page parsing</span></label>
+      </div>
+      <details><summary>Discovery evidence and recent checks</summary>
+        <p class="meta">Origins: ${escapeProfileText((employer.origins || []).map(({ kind }) => kind).join(', '))}</p>
+        <ul>${recent}</ul>
+      </details>
+      <label><span><input data-employer-confirm="${id}" type="checkbox"> I reviewed this employer and monitoring policy</span></label>
+      <p><button class="act" type="button" data-employer-save="${id}">Save employer</button>
+      ${undoableReview ? `<button class="act" type="button" data-employer-undo="${id}" data-review-id="${escapeProfileText(undoableReview.id)}">Undo latest alias/metadata review</button>` : ''}</p>
+    </section>`;
+  };
+  return `<section id="employer-registry-review">
+    <p>${registry.employers.length} registered employer(s). Priority employers are considered every eligible scan; inactive employers are checked at most every 30 days; irrelevant employers are excluded.</p>
+    ${registry.employers.map(employerCard).join('') || '<p class="meta">No employers registered yet.</p>'}
+    <section class="setup-callout">
+      <h3>Add an employer for review</h3>
+      <div class="setup-grid">
+        <label class="setup-field">Canonical employer name<input id="employer-add-name" maxlength="160"></label>
+        <label class="setup-field">Careers URL<input id="employer-add-url" type="url"></label>
+        <label class="setup-field wide">Reviewed aliases (comma-separated)<input id="employer-add-aliases" maxlength="1000"></label>
+        <label class="setup-field">Industries (comma-separated)<input id="employer-add-industries" maxlength="1000"></label>
+        <label class="setup-field">Locations (comma-separated)<input id="employer-add-locations" maxlength="1000"></label>
+      </div>
+      <label><span><input id="employer-add-confirm" type="checkbox"> I want to add this employer to my private registry</span></label>
+      <p><button id="employer-add" class="act" type="button">Add employer</button></p>
+    </section>
+  </section>`;
+}
+
+export function feedbackLearningHtml(ledger = null) {
+  if (!ledger) return '<p class="meta">Loading private feedback and learned preferences…</p>';
+  const escape = escapeProfileText;
+  const pending = (ledger.proposals || []).filter(({ status }) => status === 'pending');
+  const events = (ledger.feedbackEvents || []).slice(-20).reverse();
+  const versions = (ledger.versions || []).slice().reverse();
+  const activeChanges = ledger.active?.changes || [];
+  const eventOptions = events.map((event) => (
+    `<option value="${escape(event.id)}">${escape(event.decision)} — ${escape(event.reason)} — ${escape(event.opportunityId)}</option>`
+  )).join('');
+  const proposals = pending.map((proposal) => (
+    `<section class="setup-callout" data-learning-proposal="${escape(proposal.id)}">
+      <strong>${escape(proposal.change.kind)}: ${escape(proposal.change.field || proposal.change.profileRuleId)}
+      ${escape(proposal.change.value || '')}</strong>
+      <p>${escape(proposal.explanation)}</p>
+      <p class="meta">Scope: ${escape(proposal.change.scope)}${proposal.change.scopeValue
+    ? ` (${escape(proposal.change.scopeValue)})` : ''}; source feedback: ${escape(proposal.sourceEventIds.join(', '))}</p>
+      <label><span><input type="checkbox" data-learning-publish-confirm="${escape(proposal.id)}"> I reviewed this exact change and want to publish it</span></label>
+      <p><button class="act" type="button" data-learning-publish="${escape(proposal.id)}">Publish reviewed change</button></p>
+    </section>`
+  )).join('') || '<p class="meta">No pending learned-preference proposals.</p>';
+  const changeList = activeChanges.map((change) => (
+    `<li>${escape(change.kind)} — ${escape(change.field || change.profileRuleId)} `
+    + `${escape(change.value || '')}${change.weight ? ` (${change.weight > 0 ? '+' : ''}${escape(change.weight)})` : ''}; `
+    + `${escape(change.scope)}${change.scopeValue ? ` (${escape(change.scopeValue)})` : ''}</li>`
+  )).join('') || '<li>No learned ranking changes are active.</li>';
+  const eventList = events.map((event) => (
+    `<li><strong>${escape(event.decision)}</strong> — ${escape(event.reason)} — ${escape(event.explanation)}
+    <span class="meta">Job only; ${escape(event.recordedAt)}; profile ${escape(event.profileId)};
+    learning ${escape(event.learningVersionId)}.</span></li>`
+  )).join('') || '<li>No explicit feedback recorded yet.</li>';
+  const versionList = versions.map((version) => (
+    `<li>${escape(version.id)} — ${escape(version.explanation)} — ${escape(version.publishedAt)}
+    ${version.undoOf ? `; undo of ${escape(version.undoOf)}` : ''}</li>`
+  )).join('');
+  return `<section id="feedback-learning-review">
+    <p>Job feedback never changes tracker status or ranking by itself. A learned change is a separate proposal and affects future ranking only after exact review and confirmation.</p>
+    <h3>Active published behavior</h3>
+    <p class="meta">Version ${escape(ledger.active?.id || 'learning-baseline')}</p>
+    <ul>${changeList}</ul>
+    <h3>Pending proposals</h3>${proposals}
+    <details><summary>Propose a transparent change from feedback</summary>
+      ${events.length ? `<div class="setup-grid">
+        <label class="setup-field">Source job feedback<select id="learning-source-event">${eventOptions}</select></label>
+        <label class="setup-field">Change kind<select id="learning-kind"><option value="rank-adjustment">Rank adjustment</option><option value="reconsider-rule">Reconsider a published profile rule</option></select></label>
+        <label class="setup-field">Scope<select id="learning-scope"><option value="profile-wide">Profile-wide</option><option value="role-family">Role family</option><option value="employer">Employer</option></select></label>
+        <label class="setup-field">Field<select id="learning-field"><option>title</option><option>employer</option><option>location</option><option>seniority</option><option>responsibilities</option></select></label>
+        <label class="setup-field">Field match value<input id="learning-value" maxlength="160"></label>
+        <label class="setup-field">Scope value (employer or role family)<input id="learning-scope-value" maxlength="160"></label>
+        <label class="setup-field">Weight (-10 to 10)<input id="learning-weight" type="number" min="-10" max="10" value="2"></label>
+        <label class="setup-field">Profile rule ID for reconsideration<input id="learning-rule-id" maxlength="160"></label>
+        <label class="setup-field wide">Why this change is justified<textarea id="learning-explanation" maxlength="1000"></textarea></label>
+      </div><p><button id="learning-propose" class="act" type="button">Create reviewable proposal</button></p>`
+    : '<p class="meta">Record job feedback before proposing a change.</p>'}
+    </details>
+    <details><summary>Recent job-only feedback</summary><ul>${eventList}</ul></details>
+    <details><summary>Published version history</summary><ul>${versionList}</ul></details>
+    ${ledger.active?.id !== 'learning-baseline' ? `<section class="setup-callout">
+      <label class="setup-field wide">Undo explanation<textarea id="learning-undo-explanation" maxlength="1000"></textarea></label>
+      <label><span><input id="learning-undo-confirm" type="checkbox"> I reviewed this rollback and want to restore the previous published behavior</span></label>
+      <p><button id="learning-undo" class="act" type="button">Undo active learned version</button></p>
+    </section>` : ''}
   </section>`;
 }
 
@@ -234,8 +615,13 @@ const Setup = {
   refreshSequence: 0,
   statusRetry: null,
   searchProfile: null,
+  employerRegistry: null,
+  feedbackLearning: null,
   operations: { proposal: null, scan: null },
   operationTimers: {},
+  providerLoginState: { codex: null, claude: null },
+  providerLoginGeneration: { codex: 0, claude: 0 },
+  providerLoginPollTimer: null,
   backgroundOperations: new Set(),
   showVerificationPass: false,
   // The wizard step a retune or resume began from. Back returns to the settings
@@ -350,6 +736,11 @@ const Setup = {
         this.resumeAt(6);
         return;
       }
+      if (!keepOpen && this.status.ready && !this.status.established
+        && !this.status.searchProfilePublished) {
+        this.resumeAt(6);
+        return;
+      }
       if (keepOpen && DISMISSIBLE_VIEWS.has(this.view)) {
         this.el('setup-overlay').classList.remove('hidden');
         this.render();
@@ -459,6 +850,8 @@ const Setup = {
     this.settingsOpen = false;
     this.view = 'closed';
     this.settingsSection = null;
+    if (this.providerLoginPollTimer) clearTimeout(this.providerLoginPollTimer);
+    this.providerLoginPollTimer = null;
     this.el('setup-close').classList.add('hidden');
     this.el('setup-overlay').classList.add('hidden');
   },
@@ -678,6 +1071,8 @@ const Setup = {
     const definition = SETTINGS_SECTIONS.find(([id]) => id === section) || SETTINGS_SECTIONS[0];
     this.prepareDismissibleView({ title: definition[1], subtitle: definition[2], back: true });
     if (section === 'search') return this.renderSearchSettings();
+    if (section === 'learning') return this.renderFeedbackLearningSettings();
+    if (section === 'employers') return this.renderEmployerSettings();
     if (section === 'providers') return this.renderProviderSettings();
     if (section === 'sources') return this.renderSourceSettings();
     if (section === 'scans') return this.renderScanSettings();
@@ -702,15 +1097,78 @@ const Setup = {
       this.enterRetune('search');
       this.focusDialogTitle();
     });
+    this.el('search-profile-adaptive-save')?.addEventListener('click', () => this.saveAdaptiveSearchAnswers());
     this.el('search-profile-save')?.addEventListener('click', () => this.saveSearchProfileDraft());
     this.el('search-profile-publish')?.addEventListener('click', () => this.publishSearchProfile());
+    this.el('search-lanes-retire')?.addEventListener('click', () => this.retireSearchLanes());
+    this.el('setup-body').querySelectorAll('[data-search-lane-restore]').forEach((button) => {
+      button.addEventListener('click', () => this.restoreSearchLane(button.dataset.searchLaneRestore));
+    });
     if (!this.searchProfile) void this.loadSearchProfileReview();
+  },
+
+  renderSearchProfileContext() {
+    if (this.view === 'onboarding' && this.step === STEPS.length - 1) {
+      this.renderFirstScan();
+      return;
+    }
+    this.renderSearchSettings();
   },
 
   async loadSearchProfileReview() {
     try {
-      this.searchProfile = await requestJson('/api/search-profile');
+      const [profile, adaptive] = await Promise.all([
+        requestJson('/api/search-profile'),
+        requestJson('/api/search-profile/adaptive'),
+      ]);
+      this.searchProfile = { ...profile, adaptive };
       if (this.view === 'section' && this.settingsSection === 'search') this.renderSearchSettings();
+      else if (this.view === 'onboarding' && this.step === STEPS.length - 1) this.renderFirstScan();
+    } catch (error) {
+      this.setMessage(error.message, 'error');
+    }
+  },
+
+  async saveAdaptiveSearchAnswers() {
+    try {
+      const questions = this.searchProfile?.adaptive?.questionnaire?.questions || [];
+      const answers = questions.filter(({ id }) => (
+        this.el('setup-body').querySelector(`[data-adaptive-include="${id}"]`)?.checked
+      )).map((question) => {
+        const control = this.el('setup-body').querySelector(`[data-adaptive-value="${question.id}"]`);
+        const answer = {
+          questionId: question.id,
+          value: question.answer.kind === 'enum' ? control.value : JSON.parse(control.value),
+        };
+        if (question.answer.kind === 'rules') {
+          answer.values = answer.value;
+          delete answer.value;
+          if (question.answer.allowBlocking) {
+            answer.confirmed = Boolean(this.el('setup-body')
+              .querySelector(`[data-adaptive-confirm="${question.id}"]`)?.checked);
+          }
+        }
+        return answer;
+      });
+      if (!answers.length) throw new Error('Select at least one structured answer to update.');
+      const result = await requestJson('/api/search-profile/adaptive', {
+        method: 'PUT', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          answers,
+          revision: this.searchProfile?.draftRevision ?? null,
+        }),
+      });
+      this.searchProfile = {
+        ...this.searchProfile,
+        draft: result.draft,
+        draftRevision: result.draftRevision,
+        adaptive: {
+          ...this.searchProfile.adaptive,
+          questionnaire: result.questionnaire,
+        },
+      };
+      this.renderSearchProfileContext();
+      this.setMessage('Selected structured search answers saved for complete review.', 'good');
     } catch (error) {
       this.setMessage(error.message, 'error');
     }
@@ -724,7 +1182,7 @@ const Setup = {
         body: JSON.stringify({ draft, revision: this.searchProfile?.draftRevision ?? null }),
       });
       this.searchProfile = { ...this.searchProfile, draft: result.draft, draftRevision: result.draftRevision };
-      this.renderSearchSettings();
+      await this.loadSearchProfileReview();
       this.setMessage('Complete search-profile draft saved for review.', 'good');
     } catch (error) {
       this.setMessage(error.message, 'error');
@@ -742,10 +1200,266 @@ const Setup = {
         body: JSON.stringify({ revision: this.searchProfile?.draftRevision ?? null, confirmed: true }),
       });
       this.searchProfile = { ...this.searchProfile, published: result.published };
-      this.renderSearchSettings();
+      await this.loadSearchProfileReview();
       this.setMessage('Search profile published. New ranked discovery uses this version.', 'good');
     } catch (error) {
       this.setMessage(error.message, 'error');
+    }
+  },
+
+  async retireSearchLanes() {
+    if (!this.el('search-lanes-retire-confirm')?.checked) {
+      this.setMessage('Confirm that you reviewed the lane history before retiring lanes.', 'error');
+      return;
+    }
+    try {
+      const result = await requestJson('/api/search-lanes/retire-unproductive', {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          revision: this.searchProfile?.adaptive?.laneRevision ?? null,
+          confirmed: true,
+        }),
+      });
+      this.searchProfile.adaptive = {
+        ...this.searchProfile.adaptive,
+        lanePlan: result.lanePlan,
+        laneRevision: result.laneRevision,
+      };
+      this.renderSearchProfileContext();
+      this.setMessage('Reviewed unproductive search lanes retired. They remain restorable.', 'good');
+    } catch (error) {
+      this.setMessage(error.message, 'error');
+    }
+  },
+
+  async restoreSearchLane(laneId) {
+    try {
+      const result = await requestJson('/api/search-lanes/restore', {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          laneId,
+          revision: this.searchProfile?.adaptive?.laneRevision ?? null,
+          confirmed: true,
+        }),
+      });
+      this.searchProfile.adaptive = {
+        ...this.searchProfile.adaptive,
+        lanePlan: result.lanePlan,
+        laneRevision: result.laneRevision,
+      };
+      this.renderSearchProfileContext();
+      this.setMessage('Search lane restored with its full history.', 'good');
+    } catch (error) {
+      this.setMessage(error.message, 'error');
+    }
+  },
+
+  renderEmployerSettings() {
+    this.el('setup-body').innerHTML = employerRegistryHtml(this.employerRegistry);
+    this.el('setup-body').querySelectorAll('[data-employer-save]').forEach((button) => {
+      button.addEventListener('click', () => this.saveEmployer(button.dataset.employerSave));
+    });
+    this.el('setup-body').querySelectorAll('[data-employer-undo]').forEach((button) => {
+      button.addEventListener('click', () => this.undoEmployerReview(
+        button.dataset.employerUndo,
+        button.dataset.reviewId,
+      ));
+    });
+    this.el('employer-add')?.addEventListener('click', () => this.saveEmployer(null));
+    if (!this.employerRegistry) void this.loadEmployerRegistry();
+  },
+
+  renderFeedbackLearningSettings() {
+    this.el('setup-body').innerHTML = feedbackLearningHtml(this.feedbackLearning);
+    this.el('learning-propose')?.addEventListener('click', () => this.proposeLearning());
+    this.el('setup-body').querySelectorAll('[data-learning-publish]').forEach((button) => {
+      button.addEventListener('click', () => this.publishLearning(button.dataset.learningPublish));
+    });
+    this.el('learning-undo')?.addEventListener('click', () => this.undoLearning());
+    if (!this.feedbackLearning) void this.loadFeedbackLearning();
+  },
+
+  async loadFeedbackLearning() {
+    try {
+      this.feedbackLearning = await requestJson('/api/feedback-learning');
+      if (this.view === 'section' && this.settingsSection === 'learning') {
+        this.renderFeedbackLearningSettings();
+      }
+    } catch (error) {
+      this.setMessage(error.message, 'error');
+    }
+  },
+
+  async proposeLearning() {
+    const kind = this.el('learning-kind').value;
+    const change = kind === 'rank-adjustment' ? {
+      kind,
+      scope: this.el('learning-scope').value,
+      field: this.el('learning-field').value,
+      value: this.el('learning-value').value.trim(),
+      weight: Number(this.el('learning-weight').value),
+      scopeValue: this.el('learning-scope-value').value.trim(),
+    } : {
+      kind,
+      scope: this.el('learning-scope').value,
+      value: this.el('learning-value').value.trim(),
+      profileRuleId: this.el('learning-rule-id').value.trim(),
+    };
+    try {
+      const result = await requestJson('/api/learning/proposals', {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          revision: this.feedbackLearning.revision,
+          sourceEventIds: [this.el('learning-source-event').value],
+          explanation: this.el('learning-explanation').value.trim(),
+          change,
+        }),
+      });
+      this.feedbackLearning = result.ledger;
+      this.renderFeedbackLearningSettings();
+      this.setMessage('Learned preference saved as a pending review proposal.', 'good');
+    } catch (error) {
+      this.setMessage(error.message, 'error');
+      await this.loadFeedbackLearning();
+    }
+  },
+
+  async publishLearning(proposalId) {
+    const confirmed = this.el('setup-body')
+      .querySelector(`[data-learning-publish-confirm="${proposalId}"]`)?.checked;
+    if (!confirmed) {
+      this.setMessage('Confirm that you reviewed this exact learned change.', 'error');
+      return;
+    }
+    try {
+      const result = await requestJson('/api/learning/publish', {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          revision: this.feedbackLearning.revision,
+          proposalId,
+          confirmed: true,
+        }),
+      });
+      this.feedbackLearning = result.ledger;
+      this.renderFeedbackLearningSettings();
+      this.setMessage('Reviewed learned preference published for future ranking.', 'good');
+    } catch (error) {
+      this.setMessage(error.message, 'error');
+      await this.loadFeedbackLearning();
+    }
+  },
+
+  async undoLearning() {
+    if (!this.el('learning-undo-confirm')?.checked) {
+      this.setMessage('Confirm that you reviewed this learning rollback.', 'error');
+      return;
+    }
+    try {
+      const result = await requestJson('/api/learning/undo', {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          revision: this.feedbackLearning.revision,
+          versionId: this.feedbackLearning.active.id,
+          explanation: this.el('learning-undo-explanation').value.trim(),
+          confirmed: true,
+        }),
+      });
+      this.feedbackLearning = result.ledger;
+      this.renderFeedbackLearningSettings();
+      this.setMessage('Previous learned ranking behavior restored.', 'good');
+    } catch (error) {
+      this.setMessage(error.message, 'error');
+      await this.loadFeedbackLearning();
+    }
+  },
+
+  async loadEmployerRegistry() {
+    try {
+      this.employerRegistry = await requestJson('/api/employers');
+      if (this.view === 'section' && this.settingsSection === 'employers') {
+        this.renderEmployerSettings();
+      }
+    } catch (error) {
+      this.setMessage(error.message, 'error');
+    }
+  },
+
+  async saveEmployer(id) {
+    const read = (name) => this.el('setup-body').querySelector(`[data-employer-${name}="${id}"]`);
+    const list = (value) => [...new Set(String(value || '').split(/,|\n/)
+      .map((item) => item.trim()).filter(Boolean))];
+    const confirmed = id
+      ? read('confirm')?.checked
+      : this.el('employer-add-confirm')?.checked;
+    if (!confirmed) {
+      this.setMessage('Confirm that you reviewed this employer update.', 'error');
+      return;
+    }
+    const employer = id ? {
+      id,
+      userPriority: read('priority').value,
+      reason: read('reason').value.trim() || null,
+      careersUrl: read('url').value.trim() || null,
+      aliases: list(read('aliases').value),
+      industries: list(read('industries').value),
+      locations: list(read('locations').value),
+      board: read('adapter').value && read('board').value.trim()
+        ? { adapter: read('adapter').value, boardId: read('board').value.trim() }
+        : null,
+      access: {
+        terms: read('terms').value,
+        robots: read('robots').value,
+        genericEnabled: read('generic').checked,
+        minIntervalMinutes: Number(read('interval').value),
+      },
+    } : {
+      canonicalName: this.el('employer-add-name').value.trim(),
+      careersUrl: this.el('employer-add-url').value.trim() || null,
+      aliases: list(this.el('employer-add-aliases').value),
+      industries: list(this.el('employer-add-industries').value),
+      locations: list(this.el('employer-add-locations').value),
+    };
+    try {
+      const result = await requestJson('/api/employers', {
+        method: 'PUT', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          revision: this.employerRegistry?.revision,
+          confirmed: true,
+          employer,
+        }),
+      });
+      this.employerRegistry = result.registry;
+      this.renderEmployerSettings();
+      this.setMessage(id ? 'Employer monitoring policy saved.' : 'Employer added for review.', 'good');
+    } catch (error) {
+      this.setMessage(error.message, 'error');
+      await this.loadEmployerRegistry();
+    }
+  },
+
+  async undoEmployerReview(employerId, reviewId) {
+    const confirmed = this.el('setup-body')
+      .querySelector(`[data-employer-confirm="${employerId}"]`)?.checked;
+    if (!confirmed) {
+      this.setMessage('Confirm that you reviewed this employer update.', 'error');
+      return;
+    }
+    try {
+      const result = await requestJson('/api/employers/undo', {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          revision: this.employerRegistry?.revision,
+          confirmed: true,
+          employerId,
+          reviewId,
+        }),
+      });
+      this.employerRegistry = result.registry;
+      this.renderEmployerSettings();
+      this.setMessage('Previous employer aliases and metadata restored.', 'good');
+    } catch (error) {
+      this.setMessage(error.message, 'error');
+      await this.loadEmployerRegistry();
     }
   },
 
@@ -763,6 +1477,152 @@ const Setup = {
       <button id="settings-refresh-providers" class="act" type="button">Refresh status</button></p>`;
     this.el('settings-save-provider').addEventListener('click', () => this.saveProviderSetting());
     this.el('settings-refresh-providers').addEventListener('click', () => this.refreshStatus({ keepOpen: true }));
+    this.bindProviderLoginControls();
+    this.ensureProviderLoginStatus();
+  },
+
+  providerLoginVisible() {
+    return (this.view === 'section' && this.settingsSection === 'providers')
+      || (this.view === 'onboarding' && STEPS[this.step] === 'AI provider')
+      || (this.view === 'retune' && STEPS[this.step] === 'AI provider');
+  },
+
+  ensureProviderLoginStatus() {
+    for (const provider of ['codex', 'claude']) {
+      if (!this.providerLoginState[provider]?.csrfToken
+          && !this.providerLoginState[provider]?.loading) {
+        void this.refreshProviderLogin(provider);
+      }
+    }
+  },
+
+  async refreshProviderLogin(provider) {
+    const current = this.providerLoginState[provider];
+    if (current?.mutating) return;
+    const generation = (this.providerLoginGeneration[provider] || 0) + 1;
+    this.providerLoginGeneration[provider] = generation;
+    this.providerLoginState[provider] = { ...current, loading: true };
+    const sessionId = current?.session?.sessionId;
+    const query = new URLSearchParams({ provider });
+    if (sessionId) query.set('sessionId', sessionId);
+    try {
+      const result = await requestJson(`/api/provider-login/status?${query}`);
+      if (this.providerLoginGeneration[provider] !== generation) return;
+      this.providerLoginState[provider] = { ...result, loading: false };
+      const sessionChanged = JSON.stringify(current?.session || null)
+        !== JSON.stringify(result.session || null);
+      if (sessionChanged && this.providerLoginVisible()) {
+        if (this.view === 'section') this.renderProviderSettings();
+        else this.renderProviders();
+      }
+      this.scheduleProviderLoginPoll();
+    } catch (error) {
+      if (this.providerLoginGeneration[provider] !== generation) return;
+      this.providerLoginState[provider] = { ...current, loading: false };
+      this.setMessage('Guided provider sign-in is unavailable. Use the manual fallback shown below.', 'warning');
+    }
+  },
+
+  scheduleProviderLoginPoll() {
+    if (this.providerLoginPollTimer) clearTimeout(this.providerLoginPollTimer);
+    this.providerLoginPollTimer = null;
+    const active = Object.values(this.providerLoginState).some(({ session } = {}) => (
+      ['starting', 'awaiting-code', 'authenticating', 'validating'].includes(session?.state)
+    ));
+    if (!active || !this.providerLoginVisible()) return;
+    this.providerLoginPollTimer = setTimeout(() => {
+      this.providerLoginPollTimer = null;
+      for (const provider of ['codex', 'claude']) {
+        const state = this.providerLoginState[provider]?.session?.state;
+        if (['starting', 'awaiting-code', 'authenticating', 'validating'].includes(state)) {
+          void this.refreshProviderLogin(provider);
+        }
+      }
+    }, 1_000);
+  },
+
+  bindProviderLoginControls() {
+    document.querySelectorAll('[data-provider-login-action]').forEach((button) => {
+      button.addEventListener('click', () => {
+        void this.providerLoginAction(
+          button.dataset.providerLoginAction,
+          button.dataset.provider,
+          button.dataset.sessionId || null,
+        );
+      });
+    });
+  },
+
+  async providerLoginAction(action, provider, sessionId) {
+    let entry = this.providerLoginState[provider];
+    if (entry?.mutating) return;
+    if (!entry?.csrfToken) {
+      await this.refreshProviderLogin(provider);
+      entry = this.providerLoginState[provider];
+    }
+    if (!entry?.csrfToken || entry?.mutating) return;
+    const headers = {
+      'content-type': 'application/json',
+      'x-scout-provider-login-csrf': entry.csrfToken,
+    };
+    let endpoint = action;
+    let payload;
+    if (action === 'start') payload = { provider };
+    else if (action === 'cancel') payload = { sessionId };
+    else if (action === 'retry') payload = { provider, sessionId };
+    else if (action === 'code') {
+      const codeInput = this.el(`provider-login-code-${provider}`);
+      const code = codeInput?.value || '';
+      if (codeInput) codeInput.value = '';
+      payload = { sessionId, code };
+    } else if (action === 'clear') {
+      if (!confirm('Clear the expired Claude sign-in on this device? Scout will never do this automatically.')) return;
+      endpoint = 'clear-claude-credentials';
+      payload = { confirmed: true, sessionId };
+    } else return;
+
+    const generation = (this.providerLoginGeneration[provider] || 0) + 1;
+    this.providerLoginGeneration[provider] = generation;
+    this.providerLoginState[provider] = { ...entry, mutating: true };
+    if (this.providerLoginVisible()) {
+      if (this.view === 'section') this.renderProviderSettings();
+      else this.renderProviders();
+    }
+    this.setMessage(action === 'cancel' ? 'Cancelling provider sign-in…' : 'Updating provider sign-in…');
+    try {
+      const result = await requestJson(`/api/provider-login/${endpoint}`, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify(payload),
+      });
+      if (this.providerLoginGeneration[provider] !== generation) return;
+      const session = result.session || null;
+      this.providerLoginState[provider] = { ...entry, mutating: false, session };
+      if (action === 'clear') {
+        if (result.result?.state !== 'cleared') {
+          throw new Error('Claude credential clearing did not complete');
+        }
+        this.providerLoginState.claude = { ...entry, mutating: false, session: null };
+        this.setMessage('Expired Claude sign-in cleared. Start a new sign-in when ready.', 'good');
+      } else {
+        this.setMessage(
+          session?.state === 'cancelled'
+            ? 'Provider sign-in cancelled.'
+            : 'Provider sign-in updated.',
+          session?.state === 'failed' ? 'error' : 'good',
+        );
+      }
+      if (this.providerLoginVisible()) {
+        if (this.view === 'section') this.renderProviderSettings();
+        else this.renderProviders();
+      }
+      this.scheduleProviderLoginPoll();
+    } catch (error) {
+      if (this.providerLoginGeneration[provider] !== generation) return;
+      this.providerLoginState[provider] = { ...entry, mutating: false };
+      this.setMessage(error.message, 'error');
+      await this.refreshProviderLogin(provider);
+    }
   },
 
   async saveProviderSetting() {
@@ -964,22 +1824,21 @@ const Setup = {
   providerCard(name) {
     const provider = this.status?.providers?.[name] || {};
     const selected = (this.status?.config?.ai?.provider || '') === name;
-    const compatible = Boolean(provider.authenticated && provider.capabilities?.structuredOutput !== false);
-    const state = !provider.installed ? 'Not installed'
-      : !provider.authenticated ? 'Installed; sign-in required'
-        : compatible ? 'Installed, signed in and compatible' : 'Installed and signed in; CLI update required';
-    const login = name === 'codex' ? 'codex' : 'claude auth login';
-    const guide = name === 'codex' ? 'https://developers.openai.com/codex/cli/' : 'https://docs.anthropic.com/en/docs/claude-code/setup';
-    const platform = this.status?.platform === 'win32' ? 'Windows PowerShell'
-      : this.status?.platform === 'darwin' ? 'Terminal on macOS' : 'your Linux terminal';
-    return `<label class="setup-provider ${compatible ? 'available' : ''}">
-      <input type="radio" name="setup-provider" value="${name}" ${selected ? 'checked' : ''} ${compatible ? '' : 'disabled'}>
+    const presentation = providerCardPresentation(provider);
+    return `<section class="setup-provider ${presentation.available ? 'available' : ''}">
+      <label>
+      <input type="radio" name="setup-provider" value="${name}" ${selected ? 'checked' : ''} ${presentation.available ? '' : 'disabled'}>
       <strong>${name[0].toUpperCase() + name.slice(1)}</strong>
-      <span class="meta">${state}</span>
-      ${compatible ? '' : provider.authenticated
-        ? `<span class="meta">Update this CLI from its <a href="${guide}" target="_blank" rel="noreferrer">official installation guide</a>, then refresh. Scout requires schema-constrained output for bounded workflows.</span>`
-        : `<span class="meta"><a href="${guide}" target="_blank" rel="noreferrer">Official installation guide for macOS, Linux and Windows</a>. Install the standalone or user-local CLI, open ${platform}, run <code>${login}</code>, complete its official CLI login flow, then refresh. Scout needs an authenticated command-line provider; a desktop-app login alone is not enough. Your provider account may have separate usage limits or costs.</span>`}
-    </label>`;
+      <span class="meta">${presentation.label}</span>
+      ${presentation.help ? `<span class="meta">${presentation.help}</span>` : ''}
+      </label>
+      ${providerLoginPanelHtml(
+        name,
+        provider,
+        this.providerLoginState[name]?.session,
+        this.providerLoginState[name]?.mutating === true,
+      )}
+    </section>`;
   },
 
   renderProviders() {
@@ -996,6 +1855,8 @@ const Setup = {
       await this.refreshStatus({ keepOpen: true });
       this.setBusy(false);
     });
+    this.bindProviderLoginControls();
+    this.ensureProviderLoginStatus();
     this.el('setup-next').textContent = 'Continue';
   },
 
@@ -1086,6 +1947,8 @@ const Setup = {
     const healthy = Boolean(health.lastRunAt && health.healthy);
     const configuredJobs = (this.status?.config?.schedule?.jobs || []).some((job) => job.enabled !== false);
     const hasHistory = Boolean(health.lastRunAt) || configuredJobs;
+    const freshOnboarding = this.view === 'onboarding' && !hasHistory;
+    const profileReady = firstScanProfileReady(this.searchProfile, hasHistory);
     const provider = this.status?.config?.ai?.provider;
     const primaryId = `${provider}-primary`;
     const primaryRun = (schedule.runs || []).find((run) => run.id === primaryId);
@@ -1113,9 +1976,16 @@ const Setup = {
       <div class="setup-conversation"><div class="setup-scout"><span class="setup-scout-frame" role="img" aria-label="Scout is ready to search"></span></div><div class="scout-bubble tail-left">
       <h2>${hasHistory ? 'Your first scan is ready to review' : 'Run your first search with me'}</h2>
       <p>I search using your approved role families and search lanes, then apply your locations, exclusions, compensation preferences and evidence-based scoring. I do not use unrelated AI conversations.</p>
+      ${freshOnboarding
+        ? this.searchProfile?.published
+          ? '<div class="setup-callout"><strong>Search profile published</strong><p>Your reviewed immutable profile and search lanes are ready for the supervised first scan.</p></div>'
+          : this.searchProfile
+            ? searchProfileReviewHtml(this.searchProfile)
+            : '<div class="setup-callout"><strong>Loading your search-profile draft…</strong><p>Scout must load and publish the complete reviewed profile before the first scan.</p></div>'
+        : ''}
       <div class="setup-callout"><strong>${hasHistory ? 'Supervised scan completed' : 'Supervised first scan'}</strong><p>${healthy ? `Last run: ${this.escape(formatLocalDateTime(health.lastRunAt, this.status?.config?.locale))}.` : 'A full source check can take several minutes and no application will be sent.'}</p>${outcome ? `<p><strong>${this.escape(outcome.headline)}</strong>${outcome.breakdown.length ? ` — ${this.escape(outcome.breakdown.join(', '))}` : ''}. Zero keepers can be a valid strict result.</p><p><a href="#reports" data-report-date="${this.escape(String(health.lastRunAt).slice(0, 10))}">Review the dated scan report</a></p>` : ''}</div>
       ${this.operationPanelHtml('scan')}
-      <p><button id="setup-run-scan" class="act primary" type="button" ${scanning ? 'disabled' : ''}>${scanning ? 'Scan running…' : hasHistory ? 'Scan now' : 'Run first scan now'}</button></p>
+      <p><button id="setup-run-scan" class="act primary" type="button" ${(scanning || !profileReady) ? 'disabled' : ''}>${scanning ? 'Scan running…' : hasHistory ? 'Scan now' : 'Run first scan now'}</button></p>
       <div class="setup-callout"><strong>Daily scan schedule</strong><p>Each provider job is independent. First-run setup only offers your selected provider.</p>
       ${scheduleRow(primaryId, provider, 'primary', primaryRun, '07:30')}
       ${this.view === 'section' && other && !showSecond ? '<p><button id="setup-add-verification" class="act" type="button">Add verification pass</button></p>' : ''}
@@ -1123,6 +1993,10 @@ const Setup = {
       </div></div>
       ${includeBackup ? this.backupPanelHtml() : ''}`;
     this.el('setup-run-scan').addEventListener('click', () => this.runSupervisedScan());
+    this.el('search-profile-adaptive-save')?.addEventListener('click', () => this.saveAdaptiveSearchAnswers());
+    this.el('search-profile-save')?.addEventListener('click', () => this.saveSearchProfileDraft());
+    this.el('search-profile-publish')?.addEventListener('click', () => this.publishSearchProfile());
+    if (freshOnboarding && !this.searchProfile) void this.loadSearchProfileReview();
     this.el('setup-add-verification')?.addEventListener('click', () => { this.showVerificationPass = true; this.renderFirstScan({ includeBackup }); });
     // A preset ticks the day boxes it stands for; editing the boxes directly
     // switches the preset to Custom so the two controls never disagree.
@@ -1155,6 +2029,12 @@ const Setup = {
   },
 
   async runSupervisedScan() {
+    const hasHistory = Boolean(this.status?.scanHealth?.lastRunAt)
+      || (this.status?.config?.schedule?.jobs || []).some((job) => job.enabled !== false);
+    if (this.view === 'onboarding' && !firstScanProfileReady(this.searchProfile, hasHistory)) {
+      this.setMessage('Review and publish the complete search profile before the first scan.', 'error');
+      return;
+    }
     this.setMessage('Starting the supervised scan…');
     try {
       const provider = this.status?.config?.ai?.provider;
@@ -1293,7 +2173,21 @@ const Setup = {
       pending: 'Backup pending', 'needs-attention': 'Needs attention', disabled: 'Not enabled', 'setup-required': 'Git setup required',
     };
     if (this.pendingRecoveryKey) return `<section class="setup-callout recovery-key-panel" role="status" aria-labelledby="recovery-key-title"><strong id="recovery-key-title">Save your emergency recovery key</strong><p>This key can restore Scout if you forget the passphrase. It will disappear after you confirm it is saved.</p><code id="setup-recovery-key" class="recovery-key" tabindex="0">${this.escape(this.pendingRecoveryKey)}</code><p><button id="setup-copy-recovery" class="act" type="button">Copy key</button> <button id="setup-save-recovery" class="act" type="button">Save key to file</button></p><label class="setup-field"><span><input id="setup-confirm-recovery" type="checkbox"> I saved the recovery key somewhere secure</span></label><p><button id="setup-finish-recovery" class="act primary" type="button">Finish backup setup</button></p></section>`;
-    if (sync.enabled) return `<div class="setup-callout"><strong>Private backup: Connected</strong><p>Status: ${this.escape(labels[sync.state] || sync.state)}. Your private GitHub repository is connected. Automatic backup can be turned off without deleting local work or GitHub history.</p><p class="meta">Last successful backup: ${this.escape(sync.lastSuccessfulAt ? formatLocalDateTime(sync.lastSuccessfulAt, this.status?.config?.locale) : 'pending')}</p>${sync.error ? `<details><summary>Technical details</summary><pre class="setup-preview">${this.escape(sync.error)}</pre></details>` : ''}<p><button id="setup-backup-now" class="act" type="button">Back up now</button> ${['offline', 'pending', 'needs-attention'].includes(sync.state) ? '<button id="setup-retry-backup" class="act" type="button">Retry</button> ' : ''}<button id="setup-disable-backup" class="act" type="button">Turn off automatic backup</button></p></div>`;
+    if (sync.enabled) {
+      const resolution = sync.resolution;
+      const list = (items) => (items || []).length
+        ? items.map((item) => this.escape(item)).join(', ')
+        : 'none';
+      const divergence = sync.conflict ? `<section class="backup-divergence" role="status">
+        <p><strong>This Scout host and GitHub both have new backup history.</strong> Both copies are preserved. This host is ${this.escape(sync.ahead ?? resolution?.ahead ?? '?')} commit(s) ahead and ${this.escape(sync.behind ?? resolution?.behind ?? '?')} behind GitHub.</p>
+        ${resolution ? `<p class="meta">This host changed: ${list(resolution.localAreas)}.<br>GitHub changed: ${list(resolution.remoteAreas)}.</p>` : ''}
+        ${resolution?.classification === 'disjoint-safe'
+          ? '<p>Scout verified that the two histories changed separate areas. It can create recovery references, preserve both histories in a normal merge, and sync the result.</p><p><button id="setup-resolve-backup" class="act primary" type="button">Preserve both and sync</button></p>'
+          : `<p class="bad">Scout cannot safely resolve this automatically${resolution?.reason ? `: ${this.escape(resolution.reason)}` : ''}. Preserve both copies and review the Git history manually. Do not reset, rebase, force-push, delete <code>.git</code>, or remove Scout recovery data.</p>`}
+        <p class="meta">Retry alone cannot resolve divergent history.</p>
+      </section>` : '';
+      return `<div class="setup-callout"><strong>Private backup: Connected</strong><p>Status: ${this.escape(labels[sync.state] || sync.state)}. Your private GitHub repository is connected. Automatic backup can be turned off without deleting local work or GitHub history.</p><p class="meta">Last successful backup: ${this.escape(sync.lastSuccessfulAt ? formatLocalDateTime(sync.lastSuccessfulAt, this.status?.config?.locale) : 'pending')}</p>${divergence}${sync.error ? `<details><summary>Technical details</summary><pre class="setup-preview">${this.escape(sync.error)}</pre></details>` : ''}<p><button id="setup-backup-now" class="act" type="button">Back up now</button> ${['offline', 'pending', 'needs-attention'].includes(sync.state) ? '<button id="setup-retry-backup" class="act" type="button">Retry</button> ' : ''}<button id="setup-disable-backup" class="act" type="button">Turn off automatic backup</button></p></div>`;
+    }
     return `<div class="setup-callout"><strong>Private backup: Not set up (optional)</strong><p>Scout works fully on this computer without GitHub. Viewing this guide does not enable backup. A private repository lets you restore on another computer. Tracked career files are readable in that private repository; credentials, generated documents and chat transcripts are encrypted.</p><p><button id="setup-show-backup" class="act" type="button">Set up private backup</button> <button id="setup-skip-backup" class="act" type="button">Not now</button></p><div id="setup-backup-form" class="hidden"><p>${gitReady ? 'Git is ready. Desktop HTTPS uses Git Credential Manager; an unattended VPS can use a repository-scoped SSH deploy key.' : 'Install Git before connecting a private repository.'}</p>${gitReady ? '' : '<p><a href="https://git-scm.com/downloads" target="_blank" rel="noreferrer">Install Git</a> <button id="setup-backup-check-git" class="act" type="button">Check again</button></p>'}<p>Use an empty repository named <code>scout-workspace</code> and select <strong>Private</strong>. For VPS SSH, prepare the key here, add the displayed public key to that repository as a write-enabled deploy key, then connect using its SSH URL.</p><p><button id="setup-prepare-deploy-key" class="act" type="button" ${gitReady ? '' : 'disabled'}>Prepare VPS deploy key</button></p><pre id="setup-deploy-public-key" class="setup-preview hidden"></pre><label class="setup-field">Repository HTTPS or SSH URL<input id="setup-backup-url" type="text" placeholder="git@github.com:your-name/scout-workspace.git"></label><label class="setup-field">Recovery passphrase (at least 12 characters)<input id="setup-backup-passphrase" type="password" autocomplete="new-password"></label><label class="setup-field"><span><input id="setup-backup-confirm" type="checkbox"> I understand tracked career files are readable in my private repository and I will save the emergency recovery key.</span></label><p><button id="setup-connect-backup" class="act primary" type="button" ${gitReady ? '' : 'disabled'}>Connect and create first backup</button></p></div></div>`;
   },
 
@@ -1316,6 +2210,7 @@ const Setup = {
     this.el('setup-connect-backup')?.addEventListener('click', () => this.connectBackup());
     this.el('setup-backup-now')?.addEventListener('click', () => this.backupNow());
     this.el('setup-retry-backup')?.addEventListener('click', () => this.retryBackup());
+    this.el('setup-resolve-backup')?.addEventListener('click', () => this.resolveBackup());
     this.el('setup-disable-backup')?.addEventListener('click', () => this.disableBackup());
     this.el('setup-copy-recovery')?.addEventListener('click', () => this.copyRecoveryKey());
     this.el('setup-save-recovery')?.addEventListener('click', () => this.saveRecoveryKey());
@@ -1399,6 +2294,34 @@ const Setup = {
       await this.refreshStatus({ keepOpen: true }); this.render();
       this.setMessage(result.state === 'synced' ? 'Backup is synced.' : 'Scout still needs attention. Your work remains saved locally.', result.state === 'synced' ? 'good' : 'error');
     } catch (error) { this.setMessage(error.message, 'error'); }
+  },
+
+  async resolveBackup() {
+    const resolution = this.status?.sync?.resolution;
+    if (resolution?.classification !== 'disjoint-safe' || !resolution.analysisToken) {
+      return this.setMessage('Refresh Backup details before resolving this history.', 'error');
+    }
+    if (!window.confirm('Preserve both the Scout host and GitHub histories, create recovery references, and sync the merged result?')) return;
+    this.setMessage('Preserving both backup histories and syncing the result…');
+    try {
+      const result = await requestJson('/api/sync/resolve', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ analysisToken: resolution.analysisToken, confirmed: true }),
+      });
+      await this.refreshStatus({ keepOpen: true });
+      this.render();
+      this.setMessage(
+        result.state === 'synced'
+          ? 'Both histories were preserved and the backup is synced.'
+          : 'Both histories remain preserved, but the GitHub backup is still pending.',
+        result.state === 'synced' ? 'good' : 'error',
+      );
+    } catch (error) {
+      await this.refreshStatus({ keepOpen: true });
+      this.render();
+      this.setMessage(error.message, 'error');
+    }
   },
 
   async disableBackup() {
@@ -1600,7 +2523,6 @@ const Setup = {
         if (!this.status?.ready) throw new Error('Generate, review and activate a complete proposal before the first scan.');
         this.step += 1;
         this.render();
-        if (shouldAutoRunFirstScan(this.status?.scanHealth, this.status?.ready)) setTimeout(() => this.runSupervisedScan(), 0);
         return;
       }
       if (this.step === STEPS.length - 1) {

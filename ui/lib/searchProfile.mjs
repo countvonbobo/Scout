@@ -3,6 +3,9 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { atomicWriteFile } from './atomicWrite.mjs';
 import { backupWorkspace, workspacePaths } from './workspace.mjs';
+import {
+  latestBeta22WorkspaceSnapshot, withBeta22MigrationAuthority,
+} from './workspaceMigration.mjs';
 
 export const PREFERENCE_STRENGTHS = Object.freeze([
   'mandatory', 'strong-preference', 'nice-to-have',
@@ -14,6 +17,36 @@ export const PROVENANCE = Object.freeze([
 ]);
 
 export const UNKNOWN_POLICIES = Object.freeze(['include', 'penalise', 'exclude']);
+export const UNKNOWN_POLICY_FIELDS = Object.freeze([
+  'title', 'responsibilities', 'skills', 'qualifications', 'eligibility',
+  'industry', 'location', 'mobility', 'workingPattern', 'employmentType',
+  'seniority', 'employer',
+]);
+export const COMPENSATION_AMOUNT_TYPES = Object.freeze(['base', 'total', 'rate', 'unknown']);
+export const COMPENSATION_CERTAINTIES = Object.freeze(['exact', 'range', 'estimated', 'unknown']);
+export const SEARCH_BREADTHS = Object.freeze(['focused', 'balanced', 'broad']);
+export const TARGET_RULE_FIELDS = Object.freeze([
+  'primaryTitles', 'adjacentTitles', 'titles', 'responsibilities', 'skills',
+  'qualifications', 'eligibility', 'industries', 'sectors', 'locations',
+  'mobility', 'workingPatterns', 'employmentTypes', 'seniority', 'employers',
+]);
+export const NEGATIVE_RULE_FIELDS = Object.freeze([
+  'excludedTitles', 'excludedResponsibilities', 'excludedSkills',
+  'excludedQualifications', 'excludedEligibility', 'excludedIndustries',
+  'excludedSectors', 'excludedLocations', 'excludedMobility',
+  'excludedWorkingPatterns', 'excludedEmploymentTypes', 'excludedSeniority',
+  'excludedEmployers',
+]);
+export const SEMANTIC_TARGET_RULE_FIELDS = Object.freeze([
+  'responsibilities', 'skills', 'qualifications', 'eligibility', 'mobility',
+  'industries', 'sectors',
+]);
+export const SEMANTIC_NEGATIVE_RULE_FIELDS = Object.freeze([
+  'excludedResponsibilities', 'excludedSkills', 'excludedQualifications',
+  'excludedEligibility', 'excludedMobility', 'excludedIndustries', 'excludedSectors',
+]);
+export const MAX_SEMANTIC_PROFILE_RULES = 64;
+const MAX_PROFILE_RULE_VALUE_LENGTH = 160;
 
 function isPlainObject(value) {
   if (!value || typeof value !== 'object') return false;
@@ -32,6 +65,9 @@ function requireEnum(value, values, name) {
 function validateRule(rule, name) {
   requirePlainObject(rule, name);
   if (typeof rule.value !== 'string' || !rule.value.trim()) throw new Error(`${name}.value must be a non-empty string`);
+  if (rule.value.normalize('NFKC').trim().length > MAX_PROFILE_RULE_VALUE_LENGTH) {
+    throw new Error(`${name}.value must be at most ${MAX_PROFILE_RULE_VALUE_LENGTH} characters`);
+  }
   requireEnum(rule.strength, PREFERENCE_STRENGTHS, `${name}.strength`);
   requireEnum(rule.provenance, PROVENANCE, `${name}.provenance`);
   if (rule.strength === 'hard-exclusion' && !['explicit', 'confirmed-inference'].includes(rule.provenance)) {
@@ -39,8 +75,10 @@ function validateRule(rule, name) {
   }
 }
 
-function validateRuleLists(section, name) {
+function validateRuleLists(section, name, supportedFields) {
   requirePlainObject(section, name);
+  const unsupported = Object.keys(section).find((key) => !supportedFields.includes(key));
+  if (unsupported) throw new Error(`${name} contains unsupported field: ${unsupported}`);
   for (const [key, rules] of Object.entries(section)) {
     if (!Array.isArray(rules)) throw new Error(`${name}.${key} must be an array`);
     rules.forEach((rule, index) => validateRule(rule, `${name}.${key}[${index}]`));
@@ -78,21 +116,67 @@ export function validateSearchProfile(profile) {
   requirePlainObject(profile.target, 'search profile.target');
   requirePlainObject(profile.negative, 'search profile.negative');
   requirePlainObject(profile.compensation, 'search profile.compensation');
-  validateRuleLists(profile.target, 'search profile.target');
-  validateRuleLists(profile.negative, 'search profile.negative');
+  validateRuleLists(profile.target, 'search profile.target', TARGET_RULE_FIELDS);
+  validateRuleLists(profile.negative, 'search profile.negative', NEGATIVE_RULE_FIELDS);
+  const semanticRuleCount = [
+    ...SEMANTIC_TARGET_RULE_FIELDS.map((field) => profile.target[field] || []),
+    ...SEMANTIC_NEGATIVE_RULE_FIELDS.map((field) => profile.negative[field] || []),
+  ].reduce((count, rules) => count + rules.length, 0);
+  if (semanticRuleCount > MAX_SEMANTIC_PROFILE_RULES) {
+    throw new Error(`search profile has more than ${MAX_SEMANTIC_PROFILE_RULES} semantic rules`);
+  }
 
   const {
-    currency, period, rateType, minimum, minimumStrength, unknownPolicy,
+    currency, period, rateType, amountType, certainty, minimum, minimumStrength, unknownPolicy,
   } = profile.compensation;
   if (currency !== null && (typeof currency !== 'string' || !currency.trim())) throw new Error('search profile.compensation.currency must be a currency or null');
   if (typeof period !== 'string' || !period.trim()) throw new Error('search profile.compensation.period is required');
   if (rateType !== undefined && rateType !== null && (typeof rateType !== 'string' || !rateType.trim())) {
     throw new Error('search profile.compensation.rateType must be a rate type or null');
   }
+  if (amountType !== undefined) {
+    requireEnum(amountType, COMPENSATION_AMOUNT_TYPES, 'search profile.compensation.amountType');
+  }
+  if (certainty !== undefined) {
+    requireEnum(certainty, COMPENSATION_CERTAINTIES, 'search profile.compensation.certainty');
+  }
   if (minimum !== null && (!Number.isFinite(minimum) || minimum < 0)) throw new Error('search profile.compensation.minimum must be a non-negative number or null');
   requireEnum(minimumStrength, PREFERENCE_STRENGTHS, 'search profile.compensation.minimumStrength');
   if (minimumStrength === 'hard-exclusion') throw new Error('search profile.compensation hard exclusion requires a rule provenance');
   requireEnum(unknownPolicy, UNKNOWN_POLICIES, 'search profile.compensation.unknownPolicy');
+
+  if (profile.unknownPolicies !== undefined) {
+    requirePlainObject(profile.unknownPolicies, 'search profile.unknownPolicies');
+    const unsupported = Object.keys(profile.unknownPolicies)
+      .find((field) => !UNKNOWN_POLICY_FIELDS.includes(field));
+    if (unsupported) throw new Error(`search profile.unknownPolicies contains unsupported field: ${unsupported}`);
+    for (const field of UNKNOWN_POLICY_FIELDS) {
+      if (profile.unknownPolicies[field] !== undefined) {
+        requireEnum(
+          profile.unknownPolicies[field],
+          UNKNOWN_POLICIES,
+          `search profile.unknownPolicies.${field}`,
+        );
+      }
+    }
+  }
+
+  if (profile.selection !== undefined) {
+    requirePlainObject(profile.selection, 'search profile.selection');
+    const fields = Object.keys(profile.selection);
+    if (fields.some((field) => !['breadth', 'exploration', 'relevanceThreshold'].includes(field))) {
+      throw new Error('search profile.selection contains an unsupported field');
+    }
+    requireEnum(profile.selection.breadth, SEARCH_BREADTHS, 'search profile.selection.breadth');
+    const threshold = profile.selection.relevanceThreshold;
+    if (!Number.isFinite(threshold) || threshold < 0 || threshold > 100) {
+      throw new Error('search profile.selection.relevanceThreshold must be between 0 and 100');
+    }
+    const exploration = profile.selection.exploration;
+    if (!Number.isFinite(exploration) || exploration < 0 || exploration > 1) {
+      throw new Error('search profile.selection.exploration must be between 0 and 1');
+    }
+  }
 
   if (profile.status === 'published') {
     if (typeof profile.publishedAt !== 'string' || Number.isNaN(Date.parse(profile.publishedAt))) throw new Error('published search profile requires a valid publishedAt');
@@ -105,6 +189,38 @@ export function validateSearchProfile(profile) {
 
 export function profileFingerprint(profile) {
   return crypto.createHash('sha256').update(canonicalJson(profile)).digest('hex');
+}
+
+export function profileRuleId(section, field, rule) {
+  if (!['target', 'negative'].includes(section)) throw new TypeError('profile rule section is invalid');
+  const supported = section === 'target' ? TARGET_RULE_FIELDS : NEGATIVE_RULE_FIELDS;
+  if (!supported.includes(field)) throw new TypeError('profile rule field is invalid');
+  const value = String(rule?.value ?? '').normalize('NFKC').trim().toLocaleLowerCase('en');
+  if (!value) throw new TypeError('profile rule value is required');
+  const fieldSlug = field.replace(/([a-z0-9])([A-Z])/g, '$1-$2').toLowerCase();
+  const fingerprint = crypto.createHash('sha256')
+    .update(canonicalJson({
+      section,
+      field,
+      value,
+      strength: rule?.strength,
+      provenance: rule?.provenance,
+    }))
+    .digest('hex')
+    .slice(0, 16);
+  return `rule-${section}-${fieldSlug}-${fingerprint}`;
+}
+
+export function searchProfileRuleIds(profile) {
+  validateSearchProfile(profile);
+  return new Set([
+    ...TARGET_RULE_FIELDS.flatMap((field) => (
+      (profile.target[field] || []).map((rule) => profileRuleId('target', field, rule))
+    )),
+    ...NEGATIVE_RULE_FIELDS.flatMap((field) => (
+      (profile.negative[field] || []).map((rule) => profileRuleId('negative', field, rule))
+    )),
+  ]);
 }
 
 function derivedRules(values, strength) {
@@ -132,9 +248,14 @@ export function draftProfileFromLegacy(config = {}, context = '') {
       currency: typeof config.currency === 'string' && config.currency.trim() ? config.currency : null,
       period: 'year',
       rateType: minimum === null ? null : 'salary',
+      amountType: minimum === null ? 'unknown' : 'base',
+      certainty: minimum === null ? 'unknown' : 'exact',
       minimum,
       minimumStrength: minimum === null ? 'neutral' : 'strong-preference',
       unknownPolicy: 'include',
+    },
+    unknownPolicies: {
+      location: 'include',
     },
   };
   void context;
@@ -150,7 +271,9 @@ export function publishSearchProfile(draft, { publishedAt = new Date().toISOStri
 export function loadPublishedSearchProfile(root) {
   const file = workspacePaths(root).searchProfilePublished;
   if (!fs.existsSync(file)) return null;
-  const profile = validateSearchProfile(JSON.parse(fs.readFileSync(file, 'utf8')));
+  const value = JSON.parse(fs.readFileSync(file, 'utf8'));
+  delete value._scoutMutation;
+  const profile = validateSearchProfile(value);
   if (profile.status !== 'published') throw new Error(`published search profile is not published: ${file}`);
   const expectedId = `profile-${profileFingerprint({ ...profile, id: undefined }).slice(0, 12)}`;
   if (profile.id !== expectedId) throw new Error(`published search profile fingerprint does not match: ${file}`);
@@ -158,10 +281,36 @@ export function loadPublishedSearchProfile(root) {
 }
 
 export function migrateSearchProfile(root, { fileSystem = fs } = {}) {
+  const existingPaths = workspacePaths(root);
+  if (fileSystem.existsSync(existingPaths.searchProfileDraft)
+    || fileSystem.existsSync(existingPaths.searchProfilePublished)) {
+    const rollback = latestBeta22WorkspaceSnapshot(root);
+    if (rollback) {
+      return {
+        migrated: false,
+        draftPath: existingPaths.searchProfileDraft,
+        backupPath: null,
+        rollbackSnapshotPath: rollback.directory,
+      };
+    }
+  }
+  return withBeta22MigrationAuthority(root, ({ createSnapshot, renew }) => {
   const paths = workspacePaths(root);
   if (fileSystem.existsSync(paths.searchProfileDraft) || fileSystem.existsSync(paths.searchProfilePublished)) {
-    return { migrated: false, draftPath: paths.searchProfileDraft, backupPath: null };
+    // No migration boundary remains once a draft or publication exists. Keep
+    // the rollback that authorised that boundary; re-snapshotting the migrated
+    // live tree would manufacture a different historical pre-migration state.
+    const rollback = latestBeta22WorkspaceSnapshot(root)
+      || createSnapshot();
+    return {
+      migrated: false,
+      draftPath: paths.searchProfileDraft,
+      backupPath: null,
+      rollbackSnapshotPath: rollback.directory,
+    };
   }
+  const rollback = createSnapshot();
+  renew();
   if (!fileSystem.existsSync(paths.config)) throw new Error(`workspace config missing: ${paths.config}`);
 
   // Retain the legacy source text itself as evidence, rather than reserialising
@@ -189,5 +338,11 @@ export function migrateSearchProfile(root, { fileSystem = fs } = {}) {
     fileSystem.rmSync(stagingDirectory, { recursive: true, force: true });
     throw error;
   }
-  return { migrated: true, draftPath: paths.searchProfileDraft, backupPath };
+  return {
+    migrated: true,
+    draftPath: paths.searchProfileDraft,
+    backupPath,
+    rollbackSnapshotPath: rollback.directory,
+  };
+  });
 }

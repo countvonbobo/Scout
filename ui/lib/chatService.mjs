@@ -12,10 +12,18 @@ import { runCvQuality } from './cvQuality.mjs';
 import { artifactSlugFor, chooseArtifactSlug } from './cvArtifacts.mjs';
 import { listCvFiles } from './cv.mjs';
 import { readUsage } from './usage.mjs';
-import { detectedModels, isSafeModelId, providerModels } from './providerModels.mjs';
+import {
+  detectedModels, effectiveProviderModel, isSafeModelId, providerModelCatalogue,
+} from './providerModels.mjs';
 import { loadWorkspaceConfig, modelForProvider } from './workspace.mjs';
-import { providerStatus } from './providers.mjs';
+import { detectProviderModelCataloguesAsync, providerStatus } from './providers.mjs';
 import { runStructuredTurn } from './structuredTurn.mjs';
+import { withWorkspaceMutationAuthorityAsync } from './workspaceMutationAuthority.mjs';
+import { recordProviderResultHealth } from './providerHealth.mjs';
+import {
+  acquireProviderWork, assertProviderAuthIdle, createProviderWorkSupervisor,
+  releaseProviderWork, renewProviderWork,
+} from './providerAuthMutation.mjs';
 import {
   interviewPrepAgentPrompt, interviewPrepPrefills, readInterviewPrep,
 } from './interviewPrep.mjs';
@@ -28,6 +36,29 @@ export const ENGINES = {
 const running = new Map(); // opportunity id -> { stop() }
 
 export function activeChatTurnCount() { return running.size; }
+export async function shutdownActiveChatTurns({ timeoutMs = 10_000 } = {}) {
+  const turns = [...new Set(running.values())];
+  for (const turn of turns) turn.stop?.();
+  const completions = turns.map((turn) => turn.finished || turn.completion).filter(Boolean);
+  if (!completions.length) return;
+  const settled = Promise.allSettled(completions);
+  if (timeoutMs === null) {
+    await settled;
+    return;
+  }
+  let timer;
+  try {
+    await Promise.race([
+      settled,
+      new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error('active chat turns did not close before shutdown')), timeoutMs);
+        timer.unref?.();
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
 export const ONBOARDING_CHAT_ID = 'setup-onboarding';
 
 const FIT_SCHEMA = Object.freeze({
@@ -76,6 +107,38 @@ function assistantUpdates(result) {
   return updates.length ? updates : (result?.text ? [result.text] : []);
 }
 
+const TURN_FAILURE_MESSAGES = Object.freeze({
+  'model-rejected': 'The provider rejected that model.',
+  'output-limit': 'Provider output exceeded the safe limit.',
+  'process-start-failed': 'Provider turn could not start.',
+  'provider-error': 'Provider turn failed.',
+  'provider-unavailable': 'Provider CLI is unavailable.',
+  stopped: 'Provider turn stopped.',
+  timeout: 'Provider turn timed out.',
+});
+
+function safeTurnFailure(result) {
+  const reasonCode = Object.hasOwn(TURN_FAILURE_MESSAGES, result?.reasonCode)
+    ? result.reasonCode
+    : 'provider-error';
+  return {
+    reasonCode,
+    message: TURN_FAILURE_MESSAGES[reasonCode],
+  };
+}
+
+function publicToolProjection(event) {
+  const activity = ['searching', 'thinking', 'writing'].includes(event?.activity)
+    ? event.activity
+    : 'thinking';
+  return {
+    label: activity === 'writing'
+      ? 'Editing a file'
+      : activity === 'searching' ? 'Searching provider sources' : 'Using provider tools',
+    activity,
+  };
+}
+
 function stopTurnOnDisconnect(req, res, id) {
   const stop = () => {
     if (res.writableEnded) return;
@@ -88,13 +151,99 @@ function stopTurnOnDisconnect(req, res, id) {
 
 export function registerChatRoutes({
   routes, repoRoot, readTracker, runTurnFn = runTurn, saveChatFn = saveChat, providerStatusFn = providerStatus,
-  runCvQualityFn = runCvQuality, runStructuredTurnFn = runStructuredTurn, onCheckpoint = () => {},
+  providerCataloguesFn = detectProviderModelCataloguesAsync,
+  runCvQualityFn = runCvQuality, runStructuredTurnFn = runStructuredTurn,
+  recordProviderResultHealthFn = recordProviderResultHealth, onCheckpoint = () => {},
+  assertProviderAuthIdleFn = assertProviderAuthIdle,
+  acquireProviderWorkFn = acquireProviderWork,
+  renewProviderWorkFn = renewProviderWork,
+  releaseProviderWorkFn = releaseProviderWork,
+  withWorkspaceMutationAuthorityAsyncFn = withWorkspaceMutationAuthorityAsync,
 }) {
+  let accepting = true;
+  const activeHandlers = new Set();
+  const trackHandler = (task) => {
+    const pending = Promise.resolve(task);
+    activeHandlers.add(pending);
+    void pending.finally(() => activeHandlers.delete(pending)).catch(() => {});
+    return pending;
+  };
+  const catalogueReasonCodes = new Set([
+    'catalogue-check-failed',
+    'command-failed',
+    'command-unsupported',
+    'enumeration-unsupported',
+    'invalid-output',
+    'output-too-large',
+    'provider-unavailable',
+    'timeout',
+  ]);
+  const rejectedModels = new Map(Object.keys(ENGINES).map((engine) => [engine, new Set()]));
+  const safeCheckedAt = (value) => {
+    if (!value || Number.isNaN(Date.parse(value))) return null;
+    return new Date(value).toISOString();
+  };
+  const rememberRejectedModel = (engine, model) => {
+    if (!isSafeModelId(model)) return;
+    const values = rejectedModels.get(engine);
+    values.delete(model);
+    values.add(model);
+    while (values.size > 100) values.delete(values.values().next().value);
+  };
   function checkpoint(reason) { Promise.resolve(onCheckpoint(reason)).catch(() => {}); }
+  function superviseProviderWork(provider) {
+    return createProviderWorkSupervisor(repoRoot, provider, {
+      acquire: acquireProviderWorkFn,
+      renew: renewProviderWorkFn,
+      release: releaseProviderWorkFn,
+    });
+  }
+  async function runEditableProviderTurn(id, phase, start) {
+    let turn = null;
+    const result = await withWorkspaceMutationAuthorityAsyncFn(repoRoot, {
+      kind: 'chat-provider', phase,
+    }, async ({ coordinator }) => {
+      let childOperation = coordinator.beginChild(phase);
+      try {
+        turn = start();
+        if (Number.isSafeInteger(turn?.pid) && turn.pid > 0) {
+          try {
+            coordinator.attachChild(childOperation, turn.pid);
+          } catch (error) {
+            // Attachment is the durable proof that survives a Scout crash. If
+            // it cannot be published, retain authority until the spawned
+            // writer has actually closed; it must never escape unfenced.
+            try { turn.stop?.(); } catch {}
+            try { await turn.finished; } catch {}
+            throw error;
+          }
+        } else {
+          // Injected/test runners may not expose a process. The live authority
+          // still fences their full promise lifetime in this process.
+          coordinator.finishChild(childOperation);
+          childOperation = null;
+        }
+        running.set(id, turn);
+        return await turn.finished;
+      } finally {
+        if (childOperation !== null) coordinator.finishChild(childOperation);
+      }
+    });
+    return { turn, result };
+  }
+  async function observeProviderResult(provider, result) {
+    try {
+      await recordProviderResultHealthFn(repoRoot, provider, result, { purpose: 'manual-run' });
+    } catch {
+      // The provider result remains authoritative. A health-authority failure
+      // must never turn a completed operation into an invitation to resend it.
+    }
+  }
   // A conversation may pin its own model. Without one it follows the provider
   // default from settings, so existing chats keep working unchanged.
   function engineStatus(engine, modelOverride = null) {
     const config = loadWorkspaceConfig(repoRoot);
+    assertProviderAuthIdleFn(repoRoot, engine);
     const status = providerStatusFn(engine);
     if (!status.installed || !status.authenticated) throw new Error(`${engine} CLI is not installed and signed in`);
     return { config, status, model: modelOverride || modelForProvider(config, engine) };
@@ -106,6 +255,11 @@ export function registerChatRoutes({
       model, command: status.executable, env: status.env,
       ...(engine === 'codex' ? { reasoningEffort: 'medium' } : {}),
     });
+  }
+  function turnStartMessage(error, fallback) {
+    return error?.reasonCode === 'provider-auth-in-progress'
+      ? 'Provider sign-in is being updated. Wait for it to finish, then retry.'
+      : fallback;
   }
   function entryOf(id) {
     if (id === ONBOARDING_CHAT_ID) {
@@ -185,10 +339,10 @@ export function registerChatRoutes({
     try { purpose = chatPurpose(url.searchParams.get('purpose') || 'job'); }
     catch (e) { return replyJson(res, 400, { error: e.message }); }
     let entry;
-    try { entry = entryOf(id); } catch (e) { return replyJson(res, 500, { error: `tracker unreadable: ${e.message}` }); }
+    try { entry = entryOf(id); } catch { return replyJson(res, 500, { error: 'Tracker could not be read.' }); }
     if (!entry) return replyJson(res, 404, { error: 'no such opportunity' });
     let chat;
-    try { chat = loadChat(repoRoot, id, purpose); } catch (e) { return replyJson(res, 400, { error: e.message }); }
+    try { chat = loadChat(repoRoot, id, purpose); } catch { return replyJson(res, 400, { error: 'Chat history could not be read.' }); }
     // A failed cold start has no resumable CLI session. Keep its error history,
     // but expose an unset engine so the other installed CLI remains selectable.
     const visibleChat = chat && !chat.cliSessionId && !chat.bounded ? { ...chat, engine: null } : chat;
@@ -217,28 +371,66 @@ export function registerChatRoutes({
   };
 
   routes['GET /api/usage'] = (req, res) => {
-    try { return replyJson(res, 200, readUsage(os.homedir())); } catch (e) { return replyJson(res, 500, { error: e.message }); }
+    try { return replyJson(res, 200, readUsage(os.homedir())); } catch { return replyJson(res, 500, { error: 'Provider usage could not be read.' }); }
   };
 
-  // What the engine picker needs, in one request: how much of each provider's
-  // allowance is gone, and which models that provider can be asked for. Reads
-  // local logs and configuration only — it never spawns a provider CLI, so
-  // opening a chat stays fast.
-  routes['GET /api/engines'] = (req, res) => {
+  // The public picker receives normalized catalogue records only. Raw provider
+  // output, executable locations, account metadata and diagnostics stay behind
+  // the provider boundary.
+  routes['GET /api/engines'] = async (req, res) => {
     try {
       const usage = readUsage(os.homedir());
       const config = loadWorkspaceConfig(repoRoot);
       const detected = detectedModels(usage);
+      let providerCatalogues;
+      const catalogueWork = [];
+      try {
+        for (const provider of Object.keys(ENGINES).sort()) {
+          catalogueWork.push(acquireProviderWork(repoRoot, provider));
+        }
+        providerCatalogues = await providerCataloguesFn();
+      }
+      catch {
+        providerCatalogues = {
+          codex: { state: 'failed', reasonCode: 'catalogue-check-failed', models: [] },
+          claude: { state: 'unsupported', reasonCode: 'enumeration-unsupported', models: [] },
+        };
+      } finally {
+        for (const capability of catalogueWork.reverse()) {
+          releaseProviderWork(repoRoot, capability);
+        }
+      }
       const engines = Object.fromEntries(Object.keys(ENGINES).map((engine) => {
         const configured = modelForProvider(config, engine);
+        const rawCatalogue = providerCatalogues?.[engine] || {
+          state: 'unsupported', reasonCode: 'enumeration-unsupported', models: [],
+        };
+        const models = providerModelCatalogue(engine, {
+          ...rawCatalogue,
+          configured,
+          detected: detected[engine] || [],
+          rejected: [
+            ...(Array.isArray(rawCatalogue.rejected) ? rawCatalogue.rejected : []),
+            ...rejectedModels.get(engine),
+          ],
+        });
+        const effectiveModel = effectiveProviderModel(engine, { configured }, models);
         return [engine, {
           usage: usage[engine] || { unknown: true },
-          models: providerModels(engine, { detected: detected[engine] || [], configured }),
-          defaultModel: configured || null,
+          models,
+          defaultModel: configured && effectiveModel.available !== false ? configured : null,
+          effectiveModel,
+          catalogue: {
+            state: rawCatalogue.state === 'refreshed' ? 'refreshed' : 'fallback',
+            reasonCode: catalogueReasonCodes.has(rawCatalogue.reasonCode)
+              ? rawCatalogue.reasonCode
+              : rawCatalogue.reasonCode ? 'catalogue-check-failed' : null,
+            checkedAt: safeCheckedAt(rawCatalogue.checkedAt),
+          },
         }];
       }));
       return replyJson(res, 200, { engines, checkedAt: usage.checkedAt });
-    } catch (e) { return replyJson(res, 500, { error: e.message }); }
+    } catch { return replyJson(res, 500, { error: 'Provider catalogue could not be read.' }); }
   };
 
   routes['POST /api/chat/stop'] = (req, res, body) => {
@@ -251,20 +443,22 @@ export function registerChatRoutes({
   };
 
   routes['POST /api/chat/send'] = (req, res, body) => {
+    if (!accepting) return replyJson(res, 503, { error: 'Scout is shutting down' });
     const b = parseBody(body);
     if (!b) return replyJson(res, 400, { error: 'bad json' });
-    handleSend(req, res, b);
+    trackHandler(handleSend(req, res, b));
   };
 
   routes['POST /api/chat/handoff'] = (req, res, body) => {
+    if (!accepting) return replyJson(res, 503, { error: 'Scout is shutting down' });
     const b = parseBody(body);
     if (!b) return replyJson(res, 400, { error: 'bad json' });
-    handleHandoff(req, res, b).catch((e) => {
+    trackHandler(handleHandoff(req, res, b)).catch((e) => {
       const id = b.id || '';
       const turn = running.get(id);
       if (turn) turn.stop();
       running.delete(id);
-      const message = `handoff failed: ${e.message}`;
+      const message = 'Handoff failed.';
       if (res.headersSent) {
         sseSend(res, 'error', { message });
         sseEnd(res);
@@ -281,7 +475,7 @@ export function registerChatRoutes({
     catch (e) { return replyJson(res, 400, { error: e.message }); }
     if (running.has(id)) return replyJson(res, 409, { error: 'a turn is already running for this job' });
     let chat;
-    try { chat = loadChat(repoRoot, id, purpose); } catch (e) { return replyJson(res, 400, { error: e.message }); }
+    try { chat = loadChat(repoRoot, id, purpose); } catch { return replyJson(res, 400, { error: 'Chat history could not be read.' }); }
     if (!chat || !chat.cliSessionId) return replyJson(res, 400, { error: 'no conversation to hand off yet' });
     const from = chat.engine;
     if (!ENGINES[from]) return replyJson(res, 400, { error: 'saved chat engine must be claude or codex' });
@@ -292,33 +486,52 @@ export function registerChatRoutes({
 
     sseSend(res, 'status', { message: `asking ${from} for a handoff summary…` });
     let t1;
-    try {
-      t1 = runTurnFn({
-        ...engineBuild(from, chat.cliSessionId),
-        prompt: HANDOFF_SUMMARY_PROMPT,
-        cwd: repoRoot,
-        parseLine: ENGINES[from].parse,
-        onEvent: () => {},
-      });
-    } catch (e) {
-      sseSend(res, 'error', { message: `summary failed: ${e.message}` });
-      return sseEnd(res);
-    }
-    running.set(id, t1);
+    let work1;
     let r1;
+    let r1Health;
+    let r1LifecycleError = null;
+    let r1StartError = null;
     try {
-      r1 = await t1.finished;
+      work1 = superviseProviderWork(from);
+      const execution = await runEditableProviderTurn(id, 'chat-handoff-summary', () => {
+        t1 = runTurnFn({
+          ...engineBuild(from, chat.cliSessionId),
+          prompt: HANDOFF_SUMMARY_PROMPT,
+          cwd: repoRoot,
+          parseLine: ENGINES[from].parse,
+          onEvent: () => {},
+        });
+        work1.setFailureHandler(() => t1.stop?.());
+        return t1;
+      });
+      r1 = execution.result;
+      work1.assertCurrent();
+      r1Health = r1;
     } catch (e) {
-      r1 = { ok: false, error: `summary failed: ${e.message}` };
+      r1LifecycleError = e;
+      r1Health = e;
+      if (!t1) r1StartError = e;
+      r1 = { ok: false, reasonCode: 'provider-error' };
     } finally {
       if (running.get(id) === t1) running.delete(id);
+      if (work1) await work1.release(r1LifecycleError);
+    }
+    if (r1StartError) {
+      sseSend(res, 'error', { message: turnStartMessage(r1StartError, 'Handoff summary could not start.') });
+      return sseEnd(res);
+    }
+    await observeProviderResult(from, r1Health);
+    if (!accepting) {
+      sseSend(res, 'error', { message: 'Scout is shutting down.' });
+      return sseEnd(res);
     }
     if (!r1.ok || !r1.text) {
-      const message = `summary failed: ${r1.error || 'empty summary'}`;
+      const failure = safeTurnFailure(r1);
+      const message = `Summary failed: ${failure.message}`;
       addFilesTouched(chat, r1.filesTouched);
       appendMessage(chat, 'system', message, nowIso());
       try { saveChatFn(repoRoot, id, chat, purpose); } catch (e) {
-        sseSend(res, 'error', { message: `${message}; transcript save failed: ${e.message}` });
+        sseSend(res, 'error', { message: `${message} Chat history could not be saved.` });
         return sseEnd(res);
       }
       sseSend(res, 'error', { message, sessionId: chat.cliSessionId, filesTouched: chat.filesTouched });
@@ -329,7 +542,7 @@ export function registerChatRoutes({
     recordHandoff(chat, to, nowIso());
     appendMessage(chat, 'system', `handoff summary:\n${r1.text}`, nowIso());
     try { saveChatFn(repoRoot, id, chat, purpose); } catch (e) {
-      sseSend(res, 'error', { message: `handoff transcript save failed: ${e.message}` });
+      sseSend(res, 'error', { message: 'Handoff chat history could not be saved.' });
       return sseEnd(res);
     }
     checkpoint(`save chat handoff - ${id}`);
@@ -341,30 +554,44 @@ export function registerChatRoutes({
       ? `${selectedEntryContext(selected)}\n\n${interviewPrepAgentPrompt(selected, handoff)}`
       : `${selectedEntryContext(selected)}\n\n${handoff}`;
     let t2;
+    let work2;
+    let r2;
+    let r2Health;
+    let r2LifecycleError = null;
+    let r2StartError = null;
     try {
-      t2 = runTurnFn({
-        ...engineBuild(to, null),
-        prompt: opening,
-        cwd: repoRoot,
-        parseLine: ENGINES[to].parse,
-        onEvent: (ev) => { if (ev.kind === 'delta') sseSend(res, 'delta', { text: ev.text }); },
+      work2 = superviseProviderWork(to);
+      const execution = await runEditableProviderTurn(id, 'chat-handoff-resume', () => {
+        t2 = runTurnFn({
+          ...engineBuild(to, null),
+          prompt: opening,
+          cwd: repoRoot,
+          parseLine: ENGINES[to].parse,
+          onEvent: (ev) => { if (ev.kind === 'delta') sseSend(res, 'delta', { text: ev.text }); },
+        });
+        work2.setFailureHandler(() => t2.stop?.());
+        return t2;
       });
+      r2 = execution.result;
+      work2.assertCurrent();
+      r2Health = r2;
     } catch (e) {
-      const message = `handoff turn failed: ${e.message}`;
+      r2LifecycleError = e;
+      r2Health = e;
+      if (!t2) r2StartError = e;
+      r2 = { ok: false, reasonCode: 'provider-error' };
+    } finally {
+      if (running.get(id) === t2) running.delete(id);
+      if (work2) await work2.release(r2LifecycleError);
+    }
+    if (r2StartError) {
+      const message = turnStartMessage(r2StartError, 'Handoff provider turn could not start.');
       appendMessage(chat, 'system', message, nowIso());
       try { saveChatFn(repoRoot, id, chat, purpose); } catch { /* the earlier handoff state is already persisted */ }
       sseSend(res, 'error', { message, engine: to, sessionId: chat.cliSessionId });
       return sseEnd(res);
     }
-    running.set(id, t2);
-    let r2;
-    try {
-      r2 = await t2.finished;
-    } catch (e) {
-      r2 = { ok: false, error: `handoff turn failed: ${e.message}` };
-    } finally {
-      if (running.get(id) === t2) running.delete(id);
-    }
+    await observeProviderResult(to, r2Health);
 
     appendMessage(chat, 'user', opening, nowIso());
     if (r2.sessionId) chat.cliSessionId = r2.sessionId;
@@ -373,16 +600,16 @@ export function registerChatRoutes({
     if (r2.ok) {
       for (const update of assistantUpdates(r2)) appendMessage(chat, 'assistant', update, nowIso());
     } else {
-      appendMessage(chat, 'system', r2.error || 'handoff turn failed', nowIso());
+      appendMessage(chat, 'system', safeTurnFailure(r2).message, nowIso());
     }
     try { saveChatFn(repoRoot, id, chat, purpose); } catch (e) {
-      sseSend(res, 'error', { message: `handoff transcript save failed: ${e.message}` });
+      sseSend(res, 'error', { message: 'Handoff chat history could not be saved.' });
       return sseEnd(res);
     }
     checkpoint(`save completed handoff - ${id}`);
     if (r2.ok) sseSend(res, 'done', { engine: to });
     else sseSend(res, 'error', {
-      message: r2.error || 'handoff turn failed',
+      message: safeTurnFailure(r2).message,
       engine: to,
       sessionId: chat.cliSessionId,
       filesTouched: chat.filesTouched,
@@ -396,12 +623,12 @@ export function registerChatRoutes({
     try { purpose = chatPurpose(b.purpose || 'job'); }
     catch (e) { return replyJson(res, 400, { error: e.message }); }
     let entry;
-    try { entry = entryOf(id); } catch (e) { return replyJson(res, 500, { error: `tracker unreadable: ${e.message}` }); }
+    try { entry = entryOf(id); } catch { return replyJson(res, 500, { error: 'Tracker could not be read.' }); }
     if (!entry) return replyJson(res, 404, { error: 'no such opportunity' });
     if (id === ONBOARDING_CHAT_ID) return replyJson(res, 410, { error: 'use Scout’s bounded setup proposal control for onboarding' });
     if (running.has(id)) return replyJson(res, 409, { error: 'a turn is already running for this job' });
     let chat;
-    try { chat = loadChat(repoRoot, id, purpose); } catch (e) { return replyJson(res, 400, { error: e.message }); }
+    try { chat = loadChat(repoRoot, id, purpose); } catch { return replyJson(res, 400, { error: 'Chat history could not be read.' }); }
     const engine = chat && chat.cliSessionId ? chat.engine : b.engine;
     if (!ENGINES[engine]) return replyJson(res, 400, { error: 'engine must be claude or codex' });
     // The model is locked for the same reason the engine is: a resumed CLI
@@ -421,33 +648,64 @@ export function registerChatRoutes({
 
     sseStart(res);
     let built;
-    try { built = engineBuild(engine, chat.cliSessionId, model); } catch (e) {
-      sseSend(res, 'error', { message: e.message });
+    let providerWork;
+    try {
+      providerWork = superviseProviderWork(engine);
+      built = engineBuild(engine, chat.cliSessionId, model);
+    } catch (e) {
+      if (providerWork) await providerWork.release();
+      sseSend(res, 'error', {
+        message: turnStartMessage(e, 'Provider turn could not start.'),
+        reasonCode: e?.reasonCode === 'provider-auth-in-progress'
+          ? 'provider-auth-in-progress' : 'provider-unavailable',
+      });
       return sseEnd(res);
     }
-    const turn = runTurnFn({
-      ...built,
-      prompt: entry.id === ONBOARDING_CHAT_ID
-        ? text
-        : purpose === 'interview-prep'
-          ? `${selectedEntryContext(entry)}\n\n${interviewPrepAgentPrompt(entry, text)}`
-          : `${selectedEntryContext(entry)}\n\nUser request:\n${text}`,
-      cwd: repoRoot,
-      parseLine: ENGINES[engine].parse,
-      onEvent: (ev) => {
-        if (ev.kind === 'delta') sseSend(res, 'delta', { text: ev.text });
-        if (ev.kind === 'tool') sseSend(res, 'tool', { label: ev.label, file: ev.file, activity: ev.activity || 'thinking' });
-      },
-    });
-    running.set(id, turn);
-    stopTurnOnDisconnect(req, res, id);
+    const attemptedModel = model || modelForProvider(loadWorkspaceConfig(repoRoot), engine);
+    let turn;
     let r;
+    let healthResult;
+    let lifecycleError = null;
     try {
-      r = await turn.finished;
+      const execution = await runEditableProviderTurn(id, 'chat-edit', () => {
+        turn = runTurnFn({
+          ...built,
+          prompt: entry.id === ONBOARDING_CHAT_ID
+            ? text
+            : purpose === 'interview-prep'
+              ? `${selectedEntryContext(entry)}\n\n${interviewPrepAgentPrompt(entry, text)}`
+              : `${selectedEntryContext(entry)}\n\nUser request:\n${text}`,
+          cwd: repoRoot,
+          parseLine: ENGINES[engine].parse,
+          onEvent: (ev) => {
+            if (ev.kind === 'delta') sseSend(res, 'delta', { text: ev.text });
+            if (ev.kind === 'tool') sseSend(res, 'tool', publicToolProjection(ev));
+          },
+        });
+        providerWork.setFailureHandler(() => turn.stop?.());
+        stopTurnOnDisconnect(req, res, id);
+        return turn;
+      });
+      r = execution.result;
+      providerWork.assertCurrent();
+      healthResult = r;
     } catch (e) {
-      r = { ok: false, error: `turn failed: ${e.message}` };
+      if (!turn) {
+        await providerWork.release(e);
+        sseSend(res, 'error', { message: turnStartMessage(e, 'Provider turn could not start.') });
+        return sseEnd(res);
+      }
+      lifecycleError = e;
+      healthResult = e;
+      r = { ok: false, reasonCode: 'provider-error' };
     } finally {
       running.delete(id);
+      if (turn) await providerWork.release(lifecycleError);
+    }
+    await observeProviderResult(engine, healthResult);
+    if (attemptedModel && isSafeModelId(attemptedModel)) {
+      if (r.ok) rejectedModels.get(engine).delete(attemptedModel);
+      else if (r.reasonCode === 'model-rejected') rememberRejectedModel(engine, attemptedModel);
     }
 
     appendMessage(chat, 'user', text, nowIso());
@@ -457,7 +715,7 @@ export function registerChatRoutes({
     if (r.ok) {
       for (const update of assistantUpdates(r)) appendMessage(chat, 'assistant', update, nowIso());
     } else {
-      appendMessage(chat, 'system', r.error || 'turn failed', nowIso());
+      appendMessage(chat, 'system', safeTurnFailure(r).message, nowIso());
     }
     try { saveChatFn(repoRoot, id, chat, purpose); } catch (e) {
       console.error('chat transcript save failed:', e.message); // transcript loss only - agent session still resumable
@@ -470,7 +728,7 @@ export function registerChatRoutes({
       });
     } else {
       sseSend(res, 'error', {
-        message: r.error || 'turn failed',
+        message: safeTurnFailure(r).message,
         sessionId: chat.cliSessionId,
         filesTouched: chat.filesTouched,
       });
@@ -480,10 +738,22 @@ export function registerChatRoutes({
 
   async function handleFitAssessment(req, res, { id, entry, engine, text, chat }) {
     sseStart(res);
-    const marker = { stop() {} };
+    let operation = null;
+    let stopRequested = false;
+    let settleMarker;
+    const marker = {
+      completion: new Promise((resolve) => { settleMarker = resolve; }),
+      stop() {
+        stopRequested = true;
+        operation?.stop?.();
+      },
+    };
     running.set(id, marker);
     stopTurnOnDisconnect(req, res, id);
+    let providerWork;
+    let lifecycleError = null;
     try {
+      providerWork = superviseProviderWork(engine);
       const { status, model } = engineStatus(engine);
       const context = {
         selectedOpportunity: JSON.parse(selectedEntryContext(entry).split('\n').slice(1).join('\n')),
@@ -496,7 +766,21 @@ export function registerChatRoutes({
         'Identify unsupported and employer-declared mandatory gaps. Invent nothing. Do not access files, use tools, apply, or send outreach.',
         `User request: ${text}`, JSON.stringify(context),
       ].join('\n\n');
-      const result = await runStructuredTurnFn({ provider: engine, status, schema: FIT_SCHEMA, prompt, model, maxInputTokens: 50_000 });
+      let result;
+      try {
+        operation = runStructuredTurnFn({
+          provider: engine, status, schema: FIT_SCHEMA, prompt, model, maxInputTokens: 50_000,
+        });
+        if (stopRequested) operation.stop?.();
+        providerWork.setFailureHandler(() => operation.stop?.());
+        result = await operation;
+        providerWork.assertCurrent();
+      } catch (error) {
+        lifecycleError = error;
+        await observeProviderResult(engine, error);
+        throw error;
+      }
+      await observeProviderResult(engine, { ...result, ok: true });
       const value = result.value;
       const answer = [
         value.summary, '', `Strengths: ${value.strengths.length ? value.strengths.join('; ') : 'none evidenced'}`,
@@ -512,14 +796,39 @@ export function registerChatRoutes({
       sseSend(res, 'delta', { text: answer });
       sseSend(res, 'done', { text: answer, engine, usage: result.usage, filesTouched: chat.filesTouched });
     } catch (error) {
-      appendMessage(chat, 'user', text, nowIso());
-      appendMessage(chat, 'system', error.message, nowIso());
+      lifecycleError = error;
+      const message = turnStartMessage(error, 'Fit assessment failed.');
+      if (error?.reasonCode !== 'provider-auth-in-progress') {
+        appendMessage(chat, 'user', text, nowIso());
+        appendMessage(chat, 'system', message, nowIso());
+      }
       try { saveChatFn(repoRoot, id, chat); } catch { /* preserve the primary provider error */ }
       checkpoint(`save failed chat - ${id}`);
-      sseSend(res, 'error', { message: error.message, engine, filesTouched: chat.filesTouched });
+      sseSend(res, 'error', {
+        message,
+        reasonCode: error?.reasonCode === 'provider-auth-in-progress'
+          ? 'provider-auth-in-progress' : 'provider-error',
+        engine,
+        filesTouched: chat.filesTouched,
+      });
     } finally {
+      if (providerWork) await providerWork.release(lifecycleError);
       running.delete(id);
+      settleMarker();
       sseEnd(res);
     }
   }
+
+  return {
+    closeAdmission() { accepting = false; },
+    openAdmission() {
+      if (activeHandlers.size || running.size) throw new Error('cannot resume chat admission while work is active');
+      accepting = true;
+    },
+    async shutdown({ timeoutMs = 10_000 } = {}) {
+      accepting = false;
+      await shutdownActiveChatTurns({ timeoutMs });
+      await Promise.allSettled([...activeHandlers]);
+    },
+  };
 }

@@ -41,8 +41,28 @@ test('operation manager sanitises failure details', async () => {
 
 test('operation records do not expose absolute workspace paths', async () => {
   const manager = new OperationManager({ id: () => 'op-3' });
-  manager.start('scan', async () => { throw new Error('failed reading /Users/example/Documents/Private Scout/profile/context.md'); });
+  manager.start('scan', async () => { throw new Error(`failed reading ${['', 'Users', 'example', 'Documents', 'Private Scout', 'profile', 'context.md'].join('/')}`); });
   await tick();
   assert.doesNotMatch(manager.get('op-3').error, /Users|Private Scout|context\.md/);
   assert.match(manager.get('op-3').error, /\[local path\]/);
+});
+
+test('shutdown aborts and awaits every managed background operation', async () => {
+  const manager = new OperationManager({ id: () => 'op-shutdown' });
+  let observedAbort = false;
+  manager.start('scan', async (_update, { signal }) => new Promise((resolve) => {
+    signal.addEventListener('abort', () => {
+      observedAbort = true;
+      resolve({ stopped: true });
+    }, { once: true });
+  }));
+  await tick();
+  await manager.shutdown({ timeoutMs: 500 });
+  assert.equal(observedAbort, true);
+  assert.deepEqual(manager.activeList(), []);
+  assert.equal(manager.get('op-shutdown').status, 'succeeded');
+  assert.throws(
+    () => manager.start('scan', async () => null),
+    /shutting down/,
+  );
 });

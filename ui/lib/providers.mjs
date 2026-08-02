@@ -2,8 +2,107 @@ import { spawn as spawnProcess, spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { parseCodexModelCatalogue } from './providerModels.mjs';
 
 export const PROVIDERS = Object.freeze(['codex', 'claude']);
+const PROVIDER_HEALTH_SOURCES = new Set([
+  'startup',
+  'manual-preflight',
+  'scheduled-preflight',
+  'periodic',
+  'post-auth',
+  'provider-operation',
+]);
+const NETWORK_ERROR_CODES = new Set([
+  'ECONNABORTED',
+  'ECONNREFUSED',
+  'ECONNRESET',
+  'EHOSTUNREACH',
+  'ENETDOWN',
+  'ENETUNREACH',
+  'ENOTFOUND',
+  'ETIMEDOUT',
+]);
+const PROVIDER_HEALTH_REASONS = new Set([
+  'checking',
+  'credentials-found',
+  'signed-out',
+  'login-started',
+  'remote-ok',
+  'authentication-required',
+  'network-unavailable',
+  'rate-limited',
+  'cli-update-required',
+  'provider-error',
+]);
+
+function providerHealthSource(value) {
+  return PROVIDER_HEALTH_SOURCES.has(value) ? value : 'provider-operation';
+}
+
+function providerHealthReason(value, fallback) {
+  const reason = String(value || '');
+  return PROVIDER_HEALTH_REASONS.has(reason) ? reason : fallback;
+}
+
+function healthSignal(kind, source, reasonCode = null) {
+  return {
+    kind,
+    source: providerHealthSource(source),
+    ...(reasonCode ? { reasonCode } : {}),
+  };
+}
+
+function providerFailureText(value) {
+  const error = value?.error;
+  if (typeof error === 'string') return error.slice(0, 8_192);
+  if (error && typeof error.message === 'string') return error.message.slice(0, 8_192);
+  return typeof value?.message === 'string' ? value.message.slice(0, 8_192) : '';
+}
+
+// Provider failures can contain complete response bodies, local paths, account
+// identifiers, and credential material. Reduce them at the adapter boundary to
+// one allowlisted reason code; callers must never carry the inspected text on.
+export function providerFailureClassification(result) {
+  const status = Number(result?.status ?? result?.statusCode);
+  const errorCode = String(result?.errorCode || result?.code || result?.error?.code || '').toUpperCase();
+  const reasonCode = String(result?.reasonCode || '').toLowerCase();
+  const text = providerFailureText(result);
+
+  if (
+    status === 401
+    || status === 403
+    || result?.authenticationFailed === true
+    || reasonCode === 'authentication-required'
+    || /\b(?:401|403)\b|unauthori[sz]ed|forbidden|authentication (?:failed|required)|(?:not|please) (?:logged|signed) in|(?:invalid|expired|missing) (?:api[- ]?)?(?:key|token|credential)/i.test(text)
+  ) {
+    return { reasonCode: 'authentication-required' };
+  }
+  if (
+    status === 429
+    || result?.rateLimited === true
+    || reasonCode === 'rate-limited'
+    || /\b429\b|too many requests|rate[- ]limit(?:ed|ing| exceeded)?/i.test(text)
+  ) {
+    return { reasonCode: 'rate-limited' };
+  }
+  if (
+    result?.networkUnavailable === true
+    || NETWORK_ERROR_CODES.has(errorCode)
+    || reasonCode === 'network-unavailable'
+    || /\b(?:ECONNABORTED|ECONNREFUSED|ECONNRESET|EHOSTUNREACH|ENETDOWN|ENETUNREACH|ENOTFOUND|ETIMEDOUT)\b|network (?:is )?unavailable|connection (?:refused|reset)|could not resolve (?:host|hostname)|socket hang up/i.test(text)
+  ) {
+    return { reasonCode: 'network-unavailable' };
+  }
+  if (
+    result?.cliUpdateRequired === true
+    || ['cli-update', 'cli-update-required', 'unsupported-cli-version'].includes(reasonCode)
+    || /(?:update|upgrade) (?:the )?(?:provider )?cli|cli (?:update|upgrade) required|(?:outdated|unsupported) cli(?: version)?|(?:unknown|unrecognized|unsupported) (?:option|argument|flag).*(?:--output-schema|--json-schema)/i.test(text)
+  ) {
+    return { reasonCode: 'cli-update-required' };
+  }
+  return { reasonCode: 'provider-error' };
+}
 
 function envValue(env, name) {
   const key = Object.keys(env || {}).find((candidate) => candidate.toLowerCase() === name.toLowerCase());
@@ -102,26 +201,112 @@ export function providerStatus(provider, {
   return result;
 }
 
-function runProviderCommand(command, args, options = {}) {
+function terminateProviderCommand(child, {
+  force = false,
+  platform = process.platform,
+  kill = process.kill,
+} = {}) {
+  if (platform === 'win32') {
+    if (Number.isSafeInteger(child?.pid) && child.pid > 0) {
+      try {
+        spawnSync('taskkill.exe', ['/pid', String(child.pid), '/T', '/F'], {
+          windowsHide: true,
+          stdio: 'ignore',
+          timeout: 1_000,
+          shell: false,
+        });
+      } catch { /* fall through to the direct child */ }
+    }
+    try { child?.kill('SIGKILL'); } catch { /* it may already have exited */ }
+    return;
+  }
+  const signal = force ? 'SIGKILL' : 'SIGTERM';
+  try {
+    if (Number.isSafeInteger(child?.pid) && child.pid > 0) kill(-child.pid, signal);
+    else child?.kill(signal);
+  } catch {
+    try { child?.kill(signal); } catch { /* it may already have exited */ }
+  }
+}
+
+export function runProviderCommand(command, args, options = {}) {
   return new Promise((resolve) => {
+    const {
+      timeoutMs = 10_000,
+      maxOutputBytes: configuredMaxOutputBytes = 64 * 1024,
+      terminateGraceMs = 750,
+      spawn = spawnProcess,
+      platform = process.platform,
+      kill = process.kill,
+      ...spawnOptions
+    } = options;
     let child;
     try {
-      child = spawnProcess(command, args, {
-        ...options, stdio: ['ignore', 'pipe', 'pipe'], timeout: options.timeoutMs,
+      child = spawn(command, args, {
+        ...spawnOptions,
+        stdio: ['ignore', 'pipe', 'pipe'],
+        detached: platform !== 'win32',
       });
     } catch (error) {
       resolve({ status: null, stdout: '', stderr: '', error });
       return;
     }
+    const maxOutputBytes = Number(configuredMaxOutputBytes);
     const stdout = [];
     const stderr = [];
+    let stdoutBytes = 0;
+    let stderrBytes = 0;
+    let outputExceeded = false;
+    let timedOut = false;
     let error = null;
-    child.stdout?.on('data', (chunk) => stdout.push(chunk));
-    child.stderr?.on('data', (chunk) => stderr.push(chunk));
+    let closed = false;
+    let forcedTimer = null;
+    let timeout = null;
+    const finish = (status = null) => {
+      if (closed) return;
+      closed = true;
+      clearTimeout(timeout);
+      clearTimeout(forcedTimer);
+      resolve({
+        status,
+        stdout: Buffer.concat(stdout).toString('utf8'),
+        stderr: Buffer.concat(stderr).toString('utf8'),
+        error,
+        outputExceeded,
+        timedOut,
+      });
+    };
+    const stop = () => {
+      terminateProviderCommand(child, { platform, kill });
+      if (!forcedTimer) {
+        forcedTimer = setTimeout(
+          () => terminateProviderCommand(child, { force: true, platform, kill }),
+          terminateGraceMs,
+        );
+        forcedTimer.unref?.();
+      }
+    };
+    timeout = setTimeout(() => {
+      timedOut = true;
+      stop();
+    }, timeoutMs);
+    timeout.unref?.();
+    const collect = (chunks, chunk, stream) => {
+      if (outputExceeded) return;
+      const nextBytes = stream === 'stdout' ? stdoutBytes + chunk.length : stderrBytes + chunk.length;
+      if (nextBytes > maxOutputBytes) {
+        outputExceeded = true;
+        stop();
+        return;
+      }
+      chunks.push(chunk);
+      if (stream === 'stdout') stdoutBytes = nextBytes;
+      else stderrBytes = nextBytes;
+    };
+    child.stdout?.on('data', (chunk) => collect(stdout, chunk, 'stdout'));
+    child.stderr?.on('data', (chunk) => collect(stderr, chunk, 'stderr'));
     child.on('error', (value) => { error = value; });
-    child.on('close', (status) => resolve({
-      status, stdout: Buffer.concat(stdout).toString('utf8'), stderr: Buffer.concat(stderr).toString('utf8'), error,
-    }));
+    child.on('close', (status) => finish(status));
   });
 }
 
@@ -288,6 +473,65 @@ export function detectProviders(options) {
   return Object.fromEntries(PROVIDERS.map((name) => [name, providerStatus(name, options)]));
 }
 
+// Provider CLIs and remote clients can include account identifiers, paths,
+// credentials and complete response bodies. Health persistence needs only this
+// small allowlisted signal vocabulary, so conversion deliberately never copies
+// arbitrary input fields.
+export function providerLocalHealthSignal(status, { source = 'provider-operation' } = {}) {
+  if (status?.installed !== true) {
+    return healthSignal('provider-failure', source, 'provider-error');
+  }
+  if (status?.capabilities?.structuredOutput === false) {
+    return healthSignal('cli-update', source, 'cli-update-required');
+  }
+  if (status?.authenticated === true) {
+    return healthSignal('local-credentials-present', source);
+  }
+  return healthSignal(
+    'local-signed-out',
+    source,
+    'signed-out',
+  );
+}
+
+export function providerRemoteHealthSignal(result, { source = 'provider-operation' } = {}) {
+  const status = Number(result?.status ?? result?.statusCode);
+  const classification = providerFailureClassification(result);
+
+  // Authentication responses are authoritative even if a faulty adapter also
+  // marks the request successful or local credentials still appear present.
+  if (classification.reasonCode === 'authentication-required') {
+    return healthSignal('remote-auth-failure', source, 'authentication-required');
+  }
+  if (classification.reasonCode === 'rate-limited') {
+    return healthSignal('rate-limit', source, 'rate-limited');
+  }
+  if (classification.reasonCode === 'network-unavailable') {
+    return healthSignal('network-failure', source, 'network-unavailable');
+  }
+  if (classification.reasonCode === 'cli-update-required') {
+    return healthSignal('cli-update', source, 'cli-update-required');
+  }
+  if (result?.loginInProgress === true) return healthSignal('login-started', source);
+  if (result?.checking === true) return healthSignal('check-started', source);
+  if (result?.remoteSuccess === true || result?.ok === true || (status >= 200 && status < 300)) {
+    return healthSignal('remote-success', source);
+  }
+  return healthSignal(
+    'provider-failure',
+    source,
+    providerHealthReason(classification.reasonCode, 'provider-error'),
+  );
+}
+
+export function providerHealthSignal({ local = null, remote = null, source = 'provider-operation' } = {}) {
+  // Once a remote check has happened it is stronger evidence than a local CLI
+  // credential-presence probe. A later real remote success clears that barrier.
+  return remote !== null && remote !== undefined
+    ? providerRemoteHealthSignal(remote, { source })
+    : providerLocalHealthSignal(local, { source });
+}
+
 export function createProviderDetector({ status = providerStatusAsync, ttlMs = 5_000, now = Date.now } = {}) {
   let cached = null;
   let expiresAt = 0;
@@ -311,7 +555,7 @@ export const detectProvidersAsync = createProviderDetector();
 
 export function assertSafeModel(value) {
   if (value == null || value === '') return null;
-  if (!/^[A-Za-z0-9._:-]+$/.test(value)) throw new Error('invalid model identifier');
+  if (!/^[A-Za-z0-9._:-]{1,128}$/.test(value)) throw new Error('invalid model identifier');
   return value;
 }
 
@@ -354,3 +598,91 @@ export function commandInvocation(command, args, {
     windowsVerbatimArguments: true,
   };
 }
+
+export async function codexModelCatalogueStatus(status, {
+  run = runProviderCommand,
+  platform = process.platform,
+  timeoutMs = 7_500,
+  maxOutputBytes = 512 * 1024,
+  now = () => new Date().toISOString(),
+} = {}) {
+  if (!status?.installed || !status?.authenticated || !status?.executable) {
+    return { state: 'unsupported', reasonCode: 'provider-unavailable', models: [], checkedAt: now() };
+  }
+  const invocation = commandInvocation(status.executable, ['debug', 'models'], {
+    platform,
+    env: status.env || process.env,
+    resolve: (value) => value,
+  });
+  let result;
+  try {
+    result = await run(invocation.command, invocation.args, {
+      shell: false,
+      windowsHide: true,
+      windowsVerbatimArguments: invocation.windowsVerbatimArguments,
+      env: status.env || process.env,
+      timeoutMs,
+      maxOutputBytes,
+    });
+  } catch {
+    return { state: 'failed', reasonCode: 'command-failed', models: [], checkedAt: now() };
+  }
+  if (result?.outputExceeded) {
+    return { state: 'failed', reasonCode: 'output-too-large', models: [], checkedAt: now() };
+  }
+  if (result?.status !== 0) {
+    const timedOut = result?.timedOut === true || result?.error?.code === 'ETIMEDOUT';
+    return {
+      state: timedOut ? 'failed' : 'unsupported',
+      reasonCode: timedOut ? 'timeout' : 'command-unsupported',
+      models: [],
+      checkedAt: now(),
+    };
+  }
+  try {
+    const parsed = parseCodexModelCatalogue(result.stdout, { maxBytes: maxOutputBytes });
+    return { state: 'refreshed', reasonCode: null, models: parsed.models, checkedAt: now() };
+  } catch (error) {
+    return {
+      state: 'failed',
+      reasonCode: /too large/i.test(error.message) ? 'output-too-large' : 'invalid-output',
+      models: [],
+      checkedAt: now(),
+    };
+  }
+}
+
+export function createProviderModelCatalogueDetector({
+  detect = detectProvidersAsync,
+  catalogue = codexModelCatalogueStatus,
+  ttlMs = 5 * 60 * 1000,
+  now = Date.now,
+} = {}) {
+  let cached = null;
+  let expiresAt = 0;
+  let inFlight = null;
+  return async function detectCatalogues() {
+    const current = now();
+    if (cached && current < expiresAt) return cached;
+    if (inFlight) return inFlight;
+    inFlight = Promise.resolve(detect())
+      .then(async (statuses) => ({
+        codex: await catalogue(statuses?.codex),
+        claude: {
+          state: 'unsupported',
+          reasonCode: 'enumeration-unsupported',
+          models: [],
+          checkedAt: new Date(now()).toISOString(),
+        },
+      }))
+      .then((value) => {
+        cached = value;
+        expiresAt = now() + ttlMs;
+        return value;
+      })
+      .finally(() => { inFlight = null; });
+    return inFlight;
+  };
+}
+
+export const detectProviderModelCataloguesAsync = createProviderModelCatalogueDetector();

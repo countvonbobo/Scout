@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
 await import('./reportView.js');
-const { parse, render } = globalThis.ScoutReportView;
+const { embedMutationMarker, parse, readMutationMarker, render } = globalThis.ScoutReportView;
 
 test('structured reports render semantic sections, safe links and checklists', () => {
   const html = render(`# Scout report - 2026-07-20
@@ -75,4 +75,20 @@ test('headings deeper than the HTML heading range clamp instead of leaking raw m
   assert.match(html, /<h6>Seven<\/h6>/);
   assert.match(html, /<h6>Eight<\/h6>/);
   assert.doesNotMatch(html, /#/);
+});
+
+test('report mutation markers remain verifiable but never render', () => {
+  const marker = {
+    schemaVersion: 1,
+    mutationId: 'mutation-123',
+    mutationKey: 'a'.repeat(64),
+    runKey: 'b'.repeat(64),
+    intendedDigest: 'c'.repeat(64),
+  };
+  const marked = embedMutationMarker('# Daily report\n\n## Headline\n\nSafe body.\n', marker);
+
+  assert.deepEqual(readMutationMarker(marked), marker);
+  assert.doesNotMatch(JSON.stringify(parse(marked)), /scout-mutation/);
+  assert.doesNotMatch(render(marked), /scout-mutation|mutation-123|aaaa/);
+  assert.match(render(marked), /Safe body/);
 });

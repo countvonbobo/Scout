@@ -143,3 +143,101 @@ test('maintainer instructions require operations context, documentation upkeep a
   assert.match(policy, /private workspace data/i);
   assert.match(policy, /Do not create root-level TODO/i);
 });
+
+test('completed implementation plans are not shipped as current documentation', () => {
+  for (const directory of [
+    path.join(root, 'docs', 'implementation'),
+    path.join(root, 'docs', 'superpowers', 'plans'),
+  ]) {
+    const markdown = fs.existsSync(directory)
+      ? fs.readdirSync(directory).filter((name) => name.endsWith('.md'))
+      : [];
+    assert.deepEqual(markdown, [], directory);
+  }
+});
+
+test('beta.23 upgrade guidance explains the one-way fenced lease boundary', () => {
+  const release = fs.readFileSync(path.join(root, 'docs', 'releases', '0.1.0-beta.23.md'), 'utf8');
+  const upgrades = fs.readFileSync(path.join(root, 'docs', 'UPGRADES.md'), 'utf8');
+  const troubleshooting = fs.readFileSync(path.join(root, 'docs', 'TROUBLESHOOTING.md'), 'utf8');
+
+  for (const [name, content] of Object.entries({ release, upgrades, troubleshooting })) {
+    assert.match(content, /old(?:er)? Scout.*(?:stop|stopped)|stop.*old(?:er)? Scout/is, `${name}: stop old Scout`);
+    assert.match(content, /fenced lease.*authoritative|authoritative.*fenced lease/is, `${name}: authoritative lease`);
+    assert.match(content, /downgrade.*coexist|coexist.*downgrade/is, `${name}: downgrade/coexistence refusal`);
+  }
+  assert.match(release, /no manual workspace-data conversion is normally needed/i);
+});
+
+test('beta.23 notes reconcile beta.22 through the candidate and readiness work 70 to 76', () => {
+  const release = fs.readFileSync(path.join(root, 'docs', 'releases', '0.1.0-beta.23.md'), 'utf8');
+
+  assert.match(release, /beta\.22.*candidate|candidate.*beta\.22/is);
+  for (let issue = 70; issue <= 76; issue += 1) {
+    assert.match(release, new RegExp(`#${issue}\\b`), `missing #${issue}`);
+  }
+  assert.match(release, /unknown location facts.*include.*penalise.*exclude/is);
+  assert.match(release, /live.*(?:pending|not yet recorded)|(?:pending|not yet recorded).*live/is);
+});
+
+test('current guides explain the repaired beta.23 safety and review contracts', () => {
+  const release = fs.readFileSync(path.join(root, 'docs', 'releases', '0.1.0-beta.23.md'), 'utf8');
+  const quickStart = fs.readFileSync(path.join(root, 'docs', 'QUICK_START.md'), 'utf8');
+  const providers = fs.readFileSync(path.join(root, 'docs', 'PROVIDERS.md'), 'utf8');
+  const operations = fs.readFileSync(path.join(root, 'docs', 'OPERATIONS.md'), 'utf8');
+  const privacy = fs.readFileSync(path.join(root, 'docs', 'PRIVACY.md'), 'utf8');
+  const supplyChain = fs.readFileSync(path.join(root, 'docs', 'SUPPLY_CHAIN_SECURITY.md'), 'utf8');
+
+  assert.match(quickStart, /returned.*parsed.*new.*eligible.*selected.*promising/is);
+  assert.match(quickStart, /rule value.*strength.*provenance/is);
+  assert.match(providers, /sign-in.*blocks.*same provider.*other provider/is);
+  assert.match(operations, /startup.*periodic.*backup.*fenced lease.*mutation coordinator/is);
+  assert.match(operations, /torn.*queue.*quarantin/is);
+  assert.match(privacy, /private.*redirect.*DNS|DNS.*private.*redirect/is);
+  assert.match(release, /SSRF|server-side request forgery/i);
+  assert.match(release, /orphaned.*Git|Git.*child.*successor/is);
+  assert.match(release, /torn.*queue/i);
+  assert.match(supplyChain, /full commit SHA|immutable commit SHA/i);
+});
+
+test('configuration distinguishes field influence and published-profile authority', () => {
+  const configuration = fs.readFileSync(path.join(root, 'docs', 'CONFIGURATION.md'), 'utf8');
+
+  for (const heading of [
+    'Authoritative scan input',
+    'Workspace runtime configuration',
+    'Legacy compatibility inputs',
+    'Deployment-only configuration',
+    'Readiness and UI claims',
+  ]) {
+    assert.match(configuration, new RegExp(`^## ${heading}$`, 'm'), heading);
+  }
+  assert.match(configuration, /published search profile.*(?:creates|reconciles).*search-lanes\.json/is);
+  assert.match(configuration, /query sources use only its selected active\s+lanes.*Legacy categories are not silently added/is);
+  assert.match(configuration, /published search profile.*filtering.*ranking.*assessment/is);
+  assert.match(configuration, /search\.roleFamilies.*legacy.*collection/is);
+  assert.match(configuration, /search\.salaryMinimum.*legacy.*collection/is);
+  assert.match(configuration, /profile\.displayName.*no scan-decision effect/is);
+  assert.match(configuration, /setup\.completedAt.*does not change\s+collection, filtering, ranking or assessment/is);
+  assert.match(configuration, /deployment-only.*not stored in `workspace\.json`/is);
+  assert.match(configuration, /amountType.*base.*total.*rate.*unknown/is);
+  assert.match(configuration, /certainty.*exact.*range.*estimated.*unknown/is);
+  assert.match(configuration, /selection\.breadth.*relevanceThreshold.*exploration/is);
+});
+
+test('automation documents both non-overlapping two-provider presets', () => {
+  const automation = fs.readFileSync(path.join(root, 'docs', 'AUTOMATION.md'), 'utf8');
+  assert.match(automation, /Alternating with the other provider/);
+  assert.match(automation, /Alternating weekdays \(no weekends\)/);
+  assert.match(automation, /primary.*Monday, Wednesday and Friday/is);
+  assert.match(automation, /verification.*Tuesday and Thursday/is);
+});
+
+test('current security and VPS guides describe the active release and remote-mutation contracts', () => {
+  const security = fs.readFileSync(path.join(root, 'SECURITY.md'), 'utf8');
+  const backup = fs.readFileSync(path.join(root, 'docs', 'VPS_BACKUP_AND_STATE.md'), 'utf8');
+  assert.match(security, /GitHub\/Sigstore.*attestation/is);
+  assert.match(security, /docs\/SUPPLY_CHAIN_SECURITY\.md/);
+  assert.doesNotMatch(backup, /\bBeta 16\b/);
+  assert.match(backup, /remote.*(?:mutation|state-changing request).*backup.*enabled/is);
+});

@@ -4,8 +4,16 @@ import {
   checkAdvert, checkAdverts, classifyStatus, isGenericIndexUrl, looksClosed, partitionLiveCandidates, redirectedToIndex,
 } from './advertLiveness.mjs';
 
+const publicLookup = async () => [{ address: '1.1.1.1', family: 4 }];
+
 function response({ status = 200, url, body = '<html><body>Apply now</body></html>' } = {}) {
-  return { status, url, ok: status >= 200 && status < 300, text: async () => body };
+  return {
+    status,
+    url,
+    ok: status >= 200 && status < 300,
+    headers: { get: (name) => name.toLowerCase() === 'content-type' ? 'text/html' : null },
+    text: async () => body,
+  };
 }
 
 // A fetch stub that answers per URL and records how it was called.
@@ -59,7 +67,10 @@ test('generic board and careers indexes are never accepted as verified adverts',
 test('a 404 advert is closed without fetching its body', async () => {
   const calls = [];
   const url = 'https://board.test/jobs/1';
-  const result = await checkAdvert(url, { fetchFn: stubFetch({ [url]: response({ status: 404 }) }, calls) });
+  const result = await checkAdvert(url, {
+    fetchFn: stubFetch({ [url]: response({ status: 404 }) }, calls),
+    lookupFn: publicLookup,
+  });
   assert.equal(result.state, 'gone');
   assert.match(result.reason, /404/);
   assert.deepEqual(calls.map((call) => call.method), ['HEAD']);
@@ -69,6 +80,7 @@ test('a 200 advert that says it is closed is caught by the body check', async ()
   const url = 'https://board.test/jobs/2';
   const result = await checkAdvert(url, {
     fetchFn: stubFetch({ [url]: response({ body: '<p>This role has been filled.</p>' }) }),
+    lookupFn: publicLookup,
   });
   assert.equal(result.state, 'gone');
   assert.equal(result.reason, 'advert says it is closed');
@@ -77,7 +89,10 @@ test('a 200 advert that says it is closed is caught by the body check', async ()
 test('an open advert is live and confirmed with a GET after HEAD', async () => {
   const calls = [];
   const url = 'https://board.test/jobs/3';
-  const result = await checkAdvert(url, { fetchFn: stubFetch({ [url]: response({}) }, calls) });
+  const result = await checkAdvert(url, {
+    fetchFn: stubFetch({ [url]: response({}) }, calls),
+    lookupFn: publicLookup,
+  });
   assert.equal(result.state, 'live');
   assert.deepEqual(calls.map((call) => call.method), ['HEAD', 'GET']);
   assert.ok(result.checkedAt);
@@ -89,19 +104,54 @@ test('a HEAD that fails still allows the GET to decide', async () => {
     if (options.method === 'HEAD') throw new Error('HEAD not supported');
     return { ...response({}), url: target };
   };
-  assert.equal((await checkAdvert(url, { fetchFn })).state, 'live');
+  assert.equal((await checkAdvert(url, { fetchFn, lookupFn: publicLookup })).state, 'live');
 });
 
 test('network failures are unverified and never close an advert', async () => {
   const url = 'https://board.test/jobs/5';
   const timeout = Object.assign(new Error('timed out'), { name: 'TimeoutError' });
-  const timedOut = await checkAdvert(url, { fetchFn: stubFetch({ [url]: timeout }) });
+  const timedOut = await checkAdvert(url, {
+    fetchFn: stubFetch({ [url]: timeout }), lookupFn: publicLookup,
+  });
   assert.equal(timedOut.state, 'unverified');
   assert.equal(timedOut.reason, 'timed out');
 
-  const dns = await checkAdvert(url, { fetchFn: stubFetch({ [url]: new Error('getaddrinfo ENOTFOUND') }) });
+  const dns = await checkAdvert(url, {
+    fetchFn: stubFetch({ [url]: new Error('getaddrinfo ENOTFOUND') }),
+    lookupFn: publicLookup,
+  });
   assert.equal(dns.state, 'unverified');
   assert.notEqual(dns.state, 'gone');
+});
+
+test('private advert destinations and DNS rebinding answers are never requested', async () => {
+  let requests = 0;
+  for (const [url, lookupFn] of [
+    ['http://127.0.0.1/jobs/5', publicLookup],
+    ['http://[::1]/jobs/5', publicLookup],
+    ['https://board.test/jobs/5', async () => [
+      { address: '1.1.1.1', family: 4 },
+      { address: '169.254.169.254', family: 4 },
+    ]],
+  ]) {
+    const result = await checkAdvert(url, {
+      fetchFn: async () => { requests += 1; return response({}); },
+      lookupFn,
+    });
+    assert.equal(result.state, 'unverified');
+    assert.equal(result.reason, 'destination is not public');
+  }
+  assert.equal(requests, 0);
+});
+
+test('liveness failures expose bounded reasons, not internal DNS or socket details', async () => {
+  const result = await checkAdvert('https://board.test/jobs/5', {
+    lookupFn: async () => { throw new Error('ENOTFOUND database.service.internal 10.0.0.3'); },
+    fetchFn: async () => { throw new Error('must not request'); },
+  });
+  assert.equal(result.state, 'unverified');
+  assert.equal(result.reason, 'destination could not be verified');
+  assert.doesNotMatch(result.reason, /database|10\\.0\\.0\\.3|ENOTFOUND/);
 });
 
 test('concurrency is bounded and each host is paced', async () => {
@@ -117,7 +167,8 @@ test('concurrency is bounded and each host is paced', async () => {
   };
   const waits = [];
   const results = await checkAdverts(urls, {
-    fetchFn, concurrency: 3, hostDelayMs: 5, sleep: async (ms) => { waits.push(ms); },
+    fetchFn, lookupFn: publicLookup, concurrency: 3, hostDelayMs: 5,
+    sleep: async (ms) => { waits.push(ms); },
   });
   assert.equal(results.size, 8);
   assert.ok(peak <= 3, `peak concurrency ${peak} exceeded the limit`);
@@ -129,6 +180,7 @@ test('an exhausted time budget leaves the rest unverified rather than stalling',
   let clock = 0;
   const results = await checkAdverts(urls, {
     fetchFn: async (url) => { clock += 1000; return { ...response({}), url }; },
+    lookupFn: publicLookup,
     concurrency: 1, budgetMs: 1500, hostDelayMs: 0, now: () => clock,
   });
   const states = urls.map((url) => results.get(url).state);
@@ -148,7 +200,9 @@ test('only definitely closed candidates are removed from a scan', async () => {
     'https://board.test/closed': response({ status: 410 }),
     'https://board.test/unreachable': new Error('socket hang up'),
   });
-  const result = await partitionLiveCandidates(candidates, { fetchFn, hostDelayMs: 0 });
+  const result = await partitionLiveCandidates(candidates, {
+    fetchFn, lookupFn: publicLookup, hostDelayMs: 0,
+  });
   assert.deepEqual(result.live.map((item) => item.candidateId), ['candidate-001', 'candidate-003']);
   assert.deepEqual(result.removed.map((item) => item.candidateId), ['candidate-002']);
   assert.equal(result.summary.gone, 1);

@@ -70,9 +70,34 @@ Complete the setup questions for your role families, sectors, locations, minimum
 
 Review the complete search-profile draft and explicitly publish it before ranked discovery starts. Scout stages the draft automatically once setup preferences and profile evidence exist. A published profile is immutable for a scan: it records the approved rules, their strength and how unknown source facts should be handled. A fresh workspace cannot scan until you publish. If you upgrade an established older workspace that already has tracked opportunities, Scout creates an unpublished review draft from its existing preferences and temporarily continues the explicitly marked legacy discovery path until you publish it. A migration preserves your tracker, reports, applications and profile prose; it does not turn inferred preferences into hard exclusions. Unconfirmed inferred mandatory values remain non-blocking, and multiple accepted mandatory values for one field mean “any of these”, not “all of these”.
 
+The structured review starts with universal questions, then offers no more
+than six specialist follow-ups based on fields that are still missing or need
+review. Check only the answers you want to change, inspect the complete draft,
+and publish explicitly. Publication creates traceable search lanes from the
+approved profile; it does not use a built-in occupation, employer, location or
+salary taxonomy.
+
 Setup, Settings, CV options and side drawers keep keyboard focus inside the active dialog and return it to the control that opened the dialog. Press **Escape** to close an optional dialog or drawer. Mandatory first-run setup remains open until its required action is complete.
 
 Scout uses these approved answers, the imported CV and generated search lanes to find and score jobs. It does not inspect unrelated Codex/Claude conversations or automatically infer a career from previous AI usage.
+
+After several scans, open **Settings → Search & profile → Search lanes and run
+history** to see each run's returned, parsed, new, eligible, selected and
+promising counts. Review the profile rule value, strength and provenance shown
+with each lane before making a retirement decision. Scout can offer
+a lane for retirement only after three completed non-failed runs produced no
+new, eligible, selected or promising result. You must confirm retirement, and
+you can restore the lane later without losing its history.
+
+Open **Settings → Employers** to review named and advert-discovered employers.
+You can set explicit priority, pause or exclude an employer reversibly, review
+and undo bounded aliases, industries and locations, review terms and robots
+permission, configure a public ATS board or careers URL, set the minimum check
+interval, and inspect health and recent outcomes. Alias changes are
+revision-bound and explicitly confirmed; one alias cannot identify two
+employers. Generic careers-page parsing is off until you enable it. Scout never
+bypasses sign-in, anti-bot or JavaScript-only pages and never treats an empty
+check as a negative preference.
 
 ### Tailor a CV
 
@@ -96,7 +121,7 @@ Public/ATS sources work without Adzuna. Adzuna is optional and uses `ADZUNA_APP_
 
 ## 6. Run and review the first scan
 
-Scout starts the first supervised scan automatically when the required setup answers have been saved. Keep Scout open while it searches; setup and the dashboard show the current phase, elapsed time and an approximate remaining range. Use **Scan now** in the dashboard header for another scan. The command-line equivalent is:
+After you activate the reviewed five-file proposal, Scout shows the complete staged search profile in the first-scan step. Review its rules and unknown-value policies, publish it explicitly, then choose **Run first scan now**. Scout does not start provider work merely because setup answers were saved. Keep Scout open while it searches; setup and the dashboard show the current phase, elapsed time and an approximate remaining range. Use **Scan now** in the dashboard header for another scan. The command-line equivalent is:
 
 ```powershell
 & $ScoutNode $ScoutCli doctor
@@ -105,7 +130,12 @@ Scout starts the first supervised scan automatically when the required setup ans
 
 Use `claude` instead if selected. Review the dated report and tracker changes. For a published profile, scan health shows source records, source/portal errors separately from failed records, unique vacancies after deduplication, unique confirmed-rule exclusions, the eligible ranked pool, the above-threshold detailed-assessment set and any assessment failures. Zero-score unrelated vacancies are not added merely to fill the assessment budget. Compensation is compared only when currency, period and rate type agree; an `exclude` unknown policy rejects both missing and non-comparable compensation. The selected set is bounded; a scan does not claim that every discovered vacancy received a provider assessment. Confirm that exclusions, salary handling and locations behave as intended before relying on results.
 
-Scout can only rank jobs returned by your configured sources. Missing or ambiguous advert facts remain unknown, and Scout does not yet add employers outside those sources or learn new hard rules from feedback.
+Scout can only rank jobs returned by your configured sources and reviewed
+employer monitoring. Missing or ambiguous advert facts remain unknown.
+**Feedback** on a job records a separate private event; it does not silently
+change status or ranking. Use **Settings → Feedback & learning** to inspect
+events, create a transparent bounded proposal, explicitly publish it, or undo
+the active learned version. One rejection never becomes a hard exclusion.
 
 If the supervised primary scan keeps zero roles, Scout automatically performs one broader discovery pass. It widens source queries, not your approved gates: salary, hard exclusions, location/commute, mandatory evidence and scoring remain in force. The completed result stays visible as “reviewed / kept”; **Review this scan** shows concise reasons for every discarded candidate without adding weak roles to the tracker.
 

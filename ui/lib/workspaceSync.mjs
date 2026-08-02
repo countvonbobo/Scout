@@ -1,28 +1,352 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
-import { spawnSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
+import { spawn, spawnSync } from 'node:child_process';
 import { atomicWriteFile } from './atomicWrite.mjs';
 import {
   initializeRecoveryBackup, loadRecoveryHeader, RECOVERY_DIR, restoreRecoveryBackup, restoreRecoveryBackupWithKey,
-  rotateRecoveryPassphrase, writeRecoveryBackup,
+  restoreRecoveryBackupWithKeyAsync, rotateRecoveryPassphrase, writeRecoveryBackup, writeRecoveryBackupAsync,
 } from './recoveryBackup.mjs';
+import {
+  MutationCoordinatorBusyError, withMutationCoordinator,
+} from './mutationCoordinator.mjs';
+import {
+  LeaseLostError, acquireScanLease, assertCurrentFence, currentLeaseOwner,
+  releaseScanLease, startLeaseHeartbeat, synchronousFenceCallback,
+} from './scanLease.mjs';
+import {
+  withWorkspaceMutationAuthority, withWorkspaceMutationAuthorityAsync,
+} from './workspaceMutationAuthority.mjs';
 
 const SETTINGS = '.scout/sync.json';
 const STATUS = new Map();
 const GITHUB_ED25519_HOST = 'github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl';
+const DEFAULT_COMMAND_TIMEOUT_MS = 30_000;
+const COMMAND_OUTPUT_LIMIT = 64 * 1024;
+const PROCESS_TREE_KILL_GRACE_MS = 100;
+const RUNTIME_FENCE_FAILURE = Symbol('runtime-fence-failure');
+const CHILD_TERMINATION_UNRESOLVED = Symbol('child-termination-unresolved');
+const MARKER_FILTER = 'scout-marker';
+const MARKER_FILTER_PATHS = Object.freeze([
+  'data/opportunities.json',
+  'data/search-lanes.json',
+  'data/employers.json',
+  'data/feedback-learning.json',
+  'data/scan-runs.jsonl',
+  'reports/*.md',
+]);
+const MARKER_CLEANER = fileURLToPath(new URL('../../tools/scout-marker-clean.mjs', import.meta.url))
+  .replaceAll('\\', '/');
+const PUBLIC_SYNC_ERRORS = new Set([
+  'Private backup command timed out',
+  'Recovery key cache is missing',
+  'The safe merge did not complete; both recovery references were preserved',
+  'The Scout host and GitHub both contain new changes',
+  'The Scout host and GitHub both contain new changes that can be safely preserved',
+  'This backup divergence needs manual review',
+  'This device has unsynced work and GitHub contains newer changes',
+]);
+
+class RuntimeCommandTimeoutError extends Error {}
 
 function runGit(cwd, args, options = {}) {
-  const result = (options.spawn || spawnSync)('git', args, {
-    cwd, encoding: 'utf8', windowsHide: true,
-    env: { ...process.env, ...(options.env || {}), GIT_TERMINAL_PROMPT: options.allowPrompt ? '1' : '0' },
-  });
+  const childOperation = options.mutationCoordinator?.beginChild(args[0]);
+  let result;
+  try {
+    result = (options.spawn || spawnSync)('git', args, {
+      cwd, encoding: 'utf8', windowsHide: true,
+      env: { ...process.env, ...(options.env || {}), GIT_TERMINAL_PROMPT: options.allowPrompt ? '1' : '0' },
+    });
+  } finally {
+    if (childOperation !== undefined) options.mutationCoordinator.finishChild(childOperation);
+  }
   return {
     ok: result.status === 0,
     status: result.status,
     stdout: String(result.stdout || '').trim(),
     stderr: String(result.stderr || '').trim(),
     error: String(result.stderr || result.stdout || `git ${args[0]} failed`).trim(),
+  };
+}
+
+function boundedOutput(value) {
+  return String(value || '').slice(-COMMAND_OUTPUT_LIMIT);
+}
+
+function isChildProcess(value) {
+  return value && typeof value.once === 'function' && typeof value.kill === 'function';
+}
+
+function delay(milliseconds) {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds));
+}
+
+function waitForAuxiliaryProcess(child, timeoutMs = PROCESS_TREE_KILL_GRACE_MS) {
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (status) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve(status);
+    };
+    child.once('error', () => finish(null));
+    child.once('close', (status) => finish(status));
+    const timer = setTimeout(() => {
+      try { child.kill?.('SIGKILL'); } catch {}
+      finish(null);
+    }, timeoutMs);
+    timer.unref?.();
+  });
+}
+
+async function terminateProcessTree(child, {
+  spawnAuxiliary = spawn,
+  auxiliaryTimeoutMs = PROCESS_TREE_KILL_GRACE_MS,
+} = {}) {
+  if (!child?.pid) {
+    try { child?.kill('SIGKILL'); } catch {}
+    return;
+  }
+  if (process.platform === 'win32') {
+    const killer = spawnAuxiliary('taskkill.exe', ['/pid', String(child.pid), '/T', '/F'], {
+      windowsHide: true,
+      stdio: 'ignore',
+    });
+    const status = await waitForAuxiliaryProcess(killer, auxiliaryTimeoutMs);
+    if (status !== 0 && child.exitCode === null && child.signalCode === null) {
+      try { child.kill('SIGKILL'); } catch {}
+    }
+    return;
+  }
+
+  let signalledGroup = false;
+  try {
+    process.kill(-child.pid, 'SIGTERM');
+    signalledGroup = true;
+  } catch {
+    try { child.kill('SIGTERM'); } catch {}
+  }
+  await delay(PROCESS_TREE_KILL_GRACE_MS);
+  try {
+    process.kill(-child.pid, 'SIGKILL');
+    signalledGroup = true;
+  } catch {
+    if (!signalledGroup) {
+      try { child.kill('SIGKILL'); } catch {}
+    }
+  }
+}
+
+function collectChildProcess(child, timeoutMs, terminationOptions = {}) {
+  return new Promise((resolve) => {
+    let stdout = '';
+    let stderr = '';
+    let settled = false;
+    let closed = false;
+    let closeStatus = null;
+    let spawnError = null;
+    let timedOut = false;
+    let terminationComplete = true;
+    let unresolvedTimer;
+    const finish = (result) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      clearTimeout(unresolvedTimer);
+      resolve(result);
+    };
+    const finishAfterClose = () => {
+      if (!closed || (timedOut && !terminationComplete)) return;
+      finish({
+        status: closeStatus,
+        stdout,
+        stderr: timedOut ? 'command timed out' : boundedOutput(spawnError?.message || stderr),
+        ...(timedOut ? { timedOut: true } : {}),
+      });
+    };
+    child.stdout?.on('data', (chunk) => { stdout = boundedOutput(stdout + chunk.toString('utf8')); });
+    child.stderr?.on('data', (chunk) => { stderr = boundedOutput(stderr + chunk.toString('utf8')); });
+    child.once('error', (error) => {
+      spawnError = error;
+      if (!child.pid) {
+        closed = true;
+        finishAfterClose();
+      }
+    });
+    child.once('close', (status) => {
+      closed = true;
+      closeStatus = status;
+      finishAfterClose();
+    });
+    const timer = setTimeout(() => {
+      timedOut = true;
+      terminationComplete = false;
+      Promise.resolve()
+        .then(() => terminateProcessTree(child, terminationOptions))
+        .finally(() => {
+          terminationComplete = true;
+          finishAfterClose();
+          if (!closed) {
+            unresolvedTimer = setTimeout(() => finish({
+              status: null,
+              stdout,
+              stderr: 'command timed out and child termination was not confirmed',
+              timedOut: true,
+              terminationUnresolved: true,
+            }), terminationOptions.closeTimeoutMs ?? PROCESS_TREE_KILL_GRACE_MS);
+            unresolvedTimer.unref?.();
+          }
+        });
+    }, timeoutMs);
+    timer.unref?.();
+  });
+}
+
+async function observeSpawnedChild(child, timeoutMs, onSpawn, terminationOptions) {
+  const collected = collectChildProcess(child, timeoutMs, terminationOptions);
+  try {
+    onSpawn?.(child);
+  } catch (error) {
+    await terminateProcessTree(child, terminationOptions);
+    const closure = await collected;
+    if (closure.terminationUnresolved === true) {
+      Object.defineProperty(error, CHILD_TERMINATION_UNRESOLVED, { value: true });
+    }
+    throw error;
+  }
+  return collected;
+}
+
+function defaultSpawnAsync(command, args, spawnOptions, timeoutMs, onSpawn, terminationOptions = {}) {
+  const child = spawn(command, args, {
+    ...spawnOptions,
+    detached: process.platform !== 'win32',
+    encoding: undefined,
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  return observeSpawnedChild(child, timeoutMs, onSpawn, terminationOptions);
+}
+
+async function adapterSpawnAsync(
+  spawnAdapter, command, args, spawnOptions, timeoutMs, onSpawn, terminationOptions = {},
+) {
+  const startedAt = Date.now();
+  let timer;
+  let value;
+  try {
+    const pending = Promise.resolve().then(() => spawnAdapter(command, args, {
+      ...spawnOptions,
+      encoding: 'utf8',
+    }));
+    value = await Promise.race([
+      pending,
+      new Promise((resolve) => {
+        timer = setTimeout(() => resolve({
+          status: null,
+          stdout: '',
+          stderr: 'command timed out',
+          timedOut: true,
+        }), timeoutMs);
+        timer.unref?.();
+      }),
+    ]);
+  } catch (error) {
+    return { status: null, stdout: '', stderr: boundedOutput(error?.message) };
+  } finally {
+    clearTimeout(timer);
+  }
+  if (!isChildProcess(value)) return value;
+  return observeSpawnedChild(
+    value,
+    Math.max(1, timeoutMs - (Date.now() - startedAt)),
+    onSpawn,
+    terminationOptions,
+  );
+}
+
+async function runGitAsync(cwd, args, options = {}) {
+  const timeoutMs = options.commandTimeoutMs ?? DEFAULT_COMMAND_TIMEOUT_MS;
+  if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
+    throw new TypeError('workspace sync command timeout must be positive');
+  }
+  const spawnOptions = {
+    cwd,
+    windowsHide: true,
+    env: { ...process.env, ...(options.env || {}), GIT_TERMINAL_PROMPT: options.allowPrompt ? '1' : '0' },
+  };
+  let result;
+  let operationError = null;
+  const childOperation = options.mutationCoordinator?.beginChild(args[0]);
+  let childFinished = false;
+  let cleanupDelay = 25;
+  const finishChild = () => {
+    if (childOperation === undefined || childFinished) return;
+    options.mutationCoordinator.finishChild(childOperation);
+    childFinished = true;
+  };
+  const onSpawn = childOperation === undefined
+    ? undefined
+    : (child) => {
+      // Keep the durable child fence after a bounded timeout result. The
+      // process close event is the only authority that may retire an
+      // unresolved child operation.
+      child.once('close', function retryFinishChild() {
+        try {
+          finishChild();
+        } catch {
+          cleanupDelay = Math.min(cleanupDelay * 2, 1_000);
+          const scheduler = options._testHooks?.guardCleanupScheduler || setTimeout;
+          const retry = scheduler(retryFinishChild, cleanupDelay);
+          retry.unref?.();
+        }
+      });
+      options._testHooks?.beforeAttachChild?.(child);
+      options.mutationCoordinator.attachChild(childOperation, child.pid);
+    };
+  try {
+    const terminationOptions = {
+      spawnAuxiliary: options._testHooks?.spawnAuxiliary,
+      auxiliaryTimeoutMs: options._testHooks?.auxiliaryTimeoutMs,
+      closeTimeoutMs: options._testHooks?.closeTimeoutMs,
+    };
+    if (options.spawnAsync || options.spawn) {
+      result = await adapterSpawnAsync(
+        options.spawnAsync || options.spawn,
+        'git',
+        args,
+        spawnOptions,
+        timeoutMs,
+        onSpawn,
+        terminationOptions,
+      );
+    } else {
+      result = await defaultSpawnAsync(
+        'git', args, spawnOptions, timeoutMs, onSpawn, terminationOptions,
+      );
+    }
+  } catch (error) {
+    operationError = error;
+    throw error;
+  } finally {
+    if ((result?.terminationUnresolved === true || operationError?.[CHILD_TERMINATION_UNRESOLVED] === true)
+      && !childFinished) {
+      options.mutationCoordinator?.deferChildRelease(childOperation);
+    } else {
+      finishChild();
+    }
+  }
+  const stdout = boundedOutput(result?.stdout).trim();
+  const stderr = boundedOutput(result?.stderr).trim();
+  return {
+    ok: result?.status === 0,
+    status: result?.status ?? null,
+    stdout,
+    stderr,
+    timedOut: result?.timedOut === true,
+    terminationUnresolved: result?.terminationUnresolved === true,
+    error: String(stderr || stdout || `git ${args[0]} failed`).trim(),
   };
 }
 
@@ -103,7 +427,12 @@ export function validateGithubUrl(value) {
 
 export function detectGit(options = {}) {
   const git = runGit(process.cwd(), ['--version'], options);
-  if (!git.ok) return { installed: false, credentialManager: false, error: git.error };
+  if (!git.ok) return {
+    installed: false,
+    credentialManager: false,
+    error: 'Git could not be detected',
+    reasonCode: 'git-unavailable',
+  };
   const manager = runGit(process.cwd(), ['credential-manager', '--version'], options);
   return { installed: true, version: git.stdout, credentialManager: manager.ok, credentialManagerVersion: manager.ok ? manager.stdout : null };
 }
@@ -206,7 +535,15 @@ function remoteUrl(root, options = {}) {
 
 function setState(root, state, details = {}) {
   const checkedAt = new Date().toISOString();
-  const value = { state, checkedAt, ...details, ...(state === 'synced' ? { lastSuccessfulAt: checkedAt } : {}) };
+  const publicDetails = { ...details };
+  if (Object.hasOwn(publicDetails, 'error')) {
+    const proposed = String(publicDetails.error || '');
+    publicDetails.error = PUBLIC_SYNC_ERRORS.has(proposed)
+      ? proposed
+      : state === 'offline' ? 'GitHub backup is temporarily unavailable' : 'Private backup needs attention';
+    publicDetails.reasonCode = state === 'offline' ? 'backup-offline' : 'backup-error';
+  }
+  const value = { state, checkedAt, ...publicDetails, ...(state === 'synced' ? { lastSuccessfulAt: checkedAt } : {}) };
   if (state === 'synced') {
     const settings = loadSyncSettings(root);
     if (settings.enabled) saveSyncSettings(root, { ...settings, lastSuccessfulAt: checkedAt });
@@ -215,11 +552,183 @@ function setState(root, state, details = {}) {
   return value;
 }
 
+function affectedArea(file) {
+  const value = String(file || '').replaceAll('\\', '/');
+  if (value.startsWith('.scout-backup/')) return 'encrypted recovery data';
+  if (value.startsWith('applications/')) return 'applications';
+  if (value.startsWith('data/opportunities')) return 'opportunity tracker';
+  if (value.startsWith('data/companies')) return 'company history';
+  if (value.startsWith('reports/')) return 'reports';
+  if (value.startsWith('profile/')) return 'profile and preferences';
+  if (value === 'workspace.json' || value.startsWith('config/')) return 'workspace settings';
+  return 'workspace files';
+}
+
+function divergenceToken(localCommit, remoteCommit, branch) {
+  return crypto.createHash('sha256')
+    .update(`${branch}\n${localCommit}\n${remoteCommit}`)
+    .digest('hex');
+}
+
+function changedPaths(root, range, options = {}) {
+  const result = runGit(root, ['diff', '--raw', '--no-abbrev', '-z', '--find-renames', range], options);
+  if (!result.ok) return { ok: false, paths: [], complex: true };
+  if (!result.stdout) return { ok: true, paths: [], complex: false };
+  const records = result.stdout.split('\0');
+  if (records.at(-1) === '') records.pop();
+  const paths = [];
+  let complex = false;
+  for (let index = 0; index < records.length;) {
+    const header = records[index++];
+    const match = header.match(
+      /^:([0-7]{6}) ([0-7]{6}) ((?:[0-9a-f]{40}|[0-9a-f]{64})) ((?:[0-9a-f]{40}|[0-9a-f]{64})) ([A-Z])(\d{0,3})$/,
+    );
+    if (!match) return { ok: false, paths: [], complex: true };
+    const [, oldMode, newMode, , , status, score] = match;
+    if ((status === 'R' || status === 'C') !== Boolean(score)) {
+      return { ok: false, paths: [], complex: true };
+    }
+    const firstPath = records[index++];
+    if (!firstPath) return { ok: false, paths: [], complex: true };
+    paths.push(firstPath);
+    if (status === 'R' || status === 'C') {
+      const secondPath = records[index++];
+      if (!secondPath) return { ok: false, paths: [], complex: true };
+      paths.push(secondPath);
+      complex = true;
+      continue;
+    }
+    const regularModes = new Set(['100644', '100755']);
+    const ordinaryAddition = status === 'A'
+      && oldMode === '000000'
+      && regularModes.has(newMode);
+    const ordinaryModification = status === 'M'
+      && regularModes.has(oldMode)
+      && oldMode === newMode;
+    if (!ordinaryAddition && !ordinaryModification) complex = true;
+  }
+  return { ok: true, paths: [...new Set(paths)], complex };
+}
+
+function manualDivergence(reason, details = {}) {
+  return {
+    classification: 'manual-required',
+    canResolve: false,
+    reason,
+    localAreas: [],
+    remoteAreas: [],
+    ...details,
+  };
+}
+
+function pathsOverlap(left, right) {
+  const local = String(left).replaceAll('\\', '/').toLowerCase();
+  const remote = String(right).replaceAll('\\', '/').toLowerCase();
+  return local === remote || local.startsWith(`${remote}/`) || remote.startsWith(`${local}/`);
+}
+
+export function analyseBackupDivergence(root, options = {}) {
+  if (!repoReady(root, options)) return manualDivergence('backup repository is not ready');
+  const branchResult = runGit(root, ['branch', '--show-current'], options);
+  if (!branchResult.ok || !branchResult.stdout) {
+    return manualDivergence('backup branch is unavailable');
+  }
+  const branch = branchResult.stdout;
+  const upstream = `refs/remotes/origin/${branch}`;
+  if (!runGit(root, ['show-ref', '--verify', '--quiet', upstream], options).ok) {
+    return manualDivergence('GitHub branch has not been fetched');
+  }
+  const counts = runGit(root, ['rev-list', '--left-right', '--count', `HEAD...${upstream}`], options);
+  if (!counts.ok) return manualDivergence('backup history could not be compared');
+  const [ahead, behind] = counts.stdout.split(/\s+/).map(Number);
+  if (!(ahead > 0 && behind > 0)) return null;
+
+  const local = runGit(root, ['rev-parse', 'HEAD'], options);
+  const remote = runGit(root, ['rev-parse', upstream], options);
+  const base = runGit(root, ['merge-base', 'HEAD', upstream], options);
+  if (!local.ok || !remote.ok || !base.ok) {
+    return manualDivergence('backup branch tips could not be verified', { ahead, behind });
+  }
+  const common = {
+    ahead,
+    behind,
+    analysisToken: divergenceToken(local.stdout, remote.stdout, branch),
+  };
+  const tracked = runGit(root, ['status', '--porcelain', '--untracked-files=no'], options);
+  if (!tracked.ok || tracked.stdout) {
+    return manualDivergence('tracked workspace files have uncommitted changes', common);
+  }
+  const untracked = runGit(root, ['ls-files', '--others', '--exclude-standard', '-z'], options);
+  if (!untracked.ok) {
+    return manualDivergence('untracked workspace files could not be checked', common);
+  }
+  const unsafeUntracked = untracked.stdout.split('\0').filter(Boolean)
+    .filter((file) => !sensitiveTrackedPath(file));
+  if (unsafeUntracked.length) {
+    return manualDivergence('untracked workspace files need review', common);
+  }
+
+  const localChanges = changedPaths(root, `${base.stdout}..HEAD`, options);
+  const remoteChanges = changedPaths(root, `${base.stdout}..${upstream}`, options);
+  if (!localChanges.ok || !remoteChanges.ok) {
+    return manualDivergence('changed workspace areas could not be compared', common);
+  }
+  const details = {
+    ...common,
+    localAreas: [...new Set(localChanges.paths.map(affectedArea))].sort(),
+    remoteAreas: [...new Set(remoteChanges.paths.map(affectedArea))].sort(),
+  };
+  if (localChanges.complex || remoteChanges.complex) {
+    return manualDivergence('renamed, deleted, or non-standard changes need review', details);
+  }
+  if (localChanges.paths.some((localPath) => (
+    remoteChanges.paths.some((remotePath) => pathsOverlap(localPath, remotePath))
+  ))) {
+    return {
+      classification: 'overlapping',
+      canResolve: false,
+      reason: 'the Scout host and GitHub changed at least one of the same files',
+      ...details,
+    };
+  }
+  return {
+    classification: 'disjoint-safe',
+    canResolve: true,
+    reason: 'the Scout host and GitHub changed separate files',
+    ...details,
+  };
+}
+
 export function syncStatus(root, options = {}) {
   const settings = loadSyncSettings(root);
   const git = detectGit(options);
   if (!settings.enabled) return { state: git.installed ? 'disabled' : 'setup-required', enabled: false, git, remoteUrl: remoteUrl(root, options) };
-  return { state: 'pending', enabled: true, git, remoteUrl: settings.remoteUrl, lastSuccessfulAt: settings.lastSuccessfulAt || null, ...(STATUS.get(path.resolve(root)) || {}) };
+  const current = {
+    state: 'pending',
+    enabled: true,
+    git,
+    remoteUrl: settings.remoteUrl,
+    lastSuccessfulAt: settings.lastSuccessfulAt || null,
+    ...(STATUS.get(path.resolve(root)) || {}),
+  };
+  if (current.state === 'pending' || current.state === 'needs-attention') {
+    const resolution = analyseBackupDivergence(root, options);
+    if (resolution) {
+      return {
+        ...current,
+        state: 'needs-attention',
+        pending: true,
+        conflict: true,
+        ahead: resolution.ahead,
+        behind: resolution.behind,
+        error: resolution.classification === 'disjoint-safe'
+          ? 'The Scout host and GitHub both contain new changes that can be safely preserved'
+          : 'The Scout host and GitHub both contain new changes',
+        resolution,
+      };
+    }
+  }
+  return current;
 }
 
 function sameGithubRepository(left, right) {
@@ -227,10 +736,56 @@ function sameGithubRepository(left, right) {
   catch { return left === right; }
 }
 
+function markerFilterAttributes(root) {
+  const file = path.join(root, '.git', 'info', 'attributes');
+  const managed = [
+    '# scout marker clean filter begin',
+    'data/opportunities.json filter=scout-marker',
+    'data/search-lanes.json filter=scout-marker',
+    'data/employers.json filter=scout-marker',
+    'data/feedback-learning.json filter=scout-marker',
+    'data/scan-runs.jsonl filter=scout-marker',
+    'reports/*.md filter=scout-marker',
+    '# scout marker clean filter end',
+  ].join('\n');
+  const current = fs.existsSync(file) ? fs.readFileSync(file, 'utf8') : '';
+  const withoutManaged = current.replace(
+    /(?:^|\n)# scout marker clean filter begin[\s\S]*?# scout marker clean filter end\n?/g,
+    '\n',
+  ).trim();
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  atomicWriteFile(file, `${withoutManaged ? `${withoutManaged}\n` : ''}${managed}\n`, { mode: 0o600 });
+}
+
+function markerFilterTrackedPaths(root, options) {
+  const tracked = runGit(root, ['ls-files', '--', ...MARKER_FILTER_PATHS], options);
+  if (!tracked.ok) throw new Error(tracked.error);
+  return tracked.stdout.split(/\r?\n/).filter(Boolean);
+}
+
+function ensureMarkerCleanFilter(root, options = {}) {
+  markerFilterAttributes(root);
+  const command = `node "${MARKER_CLEANER}" %f`;
+  for (const [key, value] of [
+    [`filter.${MARKER_FILTER}.clean`, command],
+    [`filter.${MARKER_FILTER}.required`, 'true'],
+  ]) {
+    const configured = runGit(root, ['config', key, value], options);
+    if (!configured.ok) throw new Error(configured.error);
+  }
+  const paths = markerFilterTrackedPaths(root, options);
+  if (!paths.length) return;
+  for (const flag of ['--no-assume-unchanged', '--no-skip-worktree']) {
+    const cleared = runGit(root, ['update-index', flag, '--', ...paths], options);
+    if (!cleared.ok) throw new Error(cleared.error);
+  }
+}
+
 function commitAll(root, message, options = {}) {
   untrackLegacyChats(root, options);
   untrackLegacyManagedInstructions(root, options);
   assertNoTrackedSecrets(root, options);
+  ensureMarkerCleanFilter(root, options);
   const update = runGit(root, ['add', '-u'], options);
   if (!update.ok) throw new Error(update.error);
   const untracked = runGit(root, ['ls-files', '--others', '--exclude-standard', '-z'], options);
@@ -241,8 +796,172 @@ function commitAll(root, message, options = {}) {
     if (!add.ok) throw new Error(add.error);
   }
   const commit = runGit(root, ['commit', '-m', message], options);
-  if (commit.ok || /nothing to commit|nothing added|no changes added/i.test(commit.error)) return;
-  throw new Error(commit.error);
+  if (!commit.ok && !/nothing to commit|nothing added|no changes added/i.test(commit.error)) {
+    throw new Error(commit.error);
+  }
+}
+
+function assertRuntimeFence(options) {
+  if (typeof options.assertFence !== 'function') return;
+  try {
+    options.assertFence();
+  } catch (error) {
+    Object.defineProperty(error, RUNTIME_FENCE_FAILURE, { value: true });
+    throw error;
+  }
+}
+
+async function runtimeGit(root, args, options, { mutation = false } = {}) {
+  if (mutation) assertRuntimeFence(options);
+  const result = await runGitAsync(root, args, options);
+  if (mutation) assertRuntimeFence(options);
+  if (result.timedOut) throw new RuntimeCommandTimeoutError(`git ${args[0]} timed out`);
+  return result;
+}
+
+async function repoReadyAsync(root, options) {
+  const result = await runtimeGit(root, ['rev-parse', '--show-toplevel'], options);
+  if (!result.ok) return false;
+  const canonical = (value) => {
+    const resolved = path.resolve(value);
+    try { return fs.realpathSync.native(resolved); } catch { return resolved; }
+  };
+  const top = canonical(result.stdout);
+  const workspace = canonical(root);
+  return process.platform === 'win32'
+    ? top.toLowerCase() === workspace.toLowerCase()
+    : top === workspace;
+}
+
+async function ensureRepoAsync(root, options) {
+  if (!await repoReadyAsync(root, options)) {
+    const enclosing = await runtimeGit(root, ['rev-parse', '--show-toplevel'], options);
+    if (enclosing.ok) {
+      throw new Error('Private backup refuses a workspace nested inside another Git repository');
+    }
+    const init = await runtimeGit(root, ['init'], options, { mutation: true });
+    if (!init.ok) throw new Error(init.error);
+  }
+  const name = await runtimeGit(root, ['config', '--get', 'user.name'], options);
+  if (!name.ok) {
+    const configured = await runtimeGit(root, ['config', 'user.name', 'Scout'], options, { mutation: true });
+    if (!configured.ok) throw new Error(configured.error);
+  }
+  const email = await runtimeGit(root, ['config', '--get', 'user.email'], options);
+  if (!email.ok) {
+    const configured = await runtimeGit(root, ['config', 'user.email', 'scout@local'], options, { mutation: true });
+    if (!configured.ok) throw new Error(configured.error);
+  }
+}
+
+async function untrackLegacyChatsAsync(root, options) {
+  const tracked = await runtimeGit(root, ['ls-files', '-z', '--', 'data/chats'], options);
+  if (!tracked.ok) throw new Error(tracked.error);
+  if (!tracked.stdout.split('\0').filter(Boolean).length) return;
+  const removed = await runtimeGit(
+    root,
+    ['rm', '--cached', '-r', '--ignore-unmatch', '--', 'data/chats'],
+    options,
+    { mutation: true },
+  );
+  if (!removed.ok) throw new Error(`Private backup could not make chats device-local: ${removed.error}`);
+}
+
+async function untrackLegacyManagedInstructionsAsync(root, options) {
+  const tracked = await runtimeGit(root, ['ls-files', '-z', '--', 'AGENTS.md', 'CLAUDE.md'], options);
+  if (!tracked.ok) throw new Error(tracked.error);
+  if (!tracked.stdout.split('\0').filter(Boolean).length) return;
+  const removed = await runtimeGit(
+    root,
+    ['rm', '--cached', '--ignore-unmatch', '--', 'AGENTS.md', 'CLAUDE.md'],
+    options,
+    { mutation: true },
+  );
+  if (!removed.ok) throw new Error(`Private backup could not make managed instructions device-local: ${removed.error}`);
+}
+
+async function assertNoTrackedSecretsAsync(root, options) {
+  const tracked = await runtimeGit(root, ['ls-files', '-z'], options);
+  if (!tracked.ok) throw new Error(tracked.error);
+  const unsafe = tracked.stdout.split('\0').filter(sensitiveTrackedPath);
+  if (unsafe.length) {
+    throw new Error(
+      `Private backup cannot continue because sensitive ignored files are already tracked: ${unsafe.slice(0, 5).join(', ')}`,
+    );
+  }
+}
+
+async function ensureMarkerCleanFilterAsync(root, options) {
+  assertRuntimeFence(options);
+  markerFilterAttributes(root);
+  assertRuntimeFence(options);
+  const command = `node "${MARKER_CLEANER}" %f`;
+  for (const [key, value] of [
+    [`filter.${MARKER_FILTER}.clean`, command],
+    [`filter.${MARKER_FILTER}.required`, 'true'],
+  ]) {
+    const configured = await runtimeGit(root, ['config', key, value], options, { mutation: true });
+    if (!configured.ok) throw new Error(configured.error);
+  }
+  const tracked = await runtimeGit(root, ['ls-files', '--', ...MARKER_FILTER_PATHS], options);
+  if (!tracked.ok) throw new Error(tracked.error);
+  const paths = tracked.stdout.split(/\r?\n/).filter(Boolean);
+  if (!paths.length) return;
+  for (const flag of ['--no-assume-unchanged', '--no-skip-worktree']) {
+    const cleared = await runtimeGit(
+      root,
+      ['update-index', flag, '--', ...paths],
+      options,
+      { mutation: true },
+    );
+    if (!cleared.ok) throw new Error(cleared.error);
+  }
+}
+
+async function commitAllAsync(root, message, options) {
+  await untrackLegacyChatsAsync(root, options);
+  await untrackLegacyManagedInstructionsAsync(root, options);
+  await assertNoTrackedSecretsAsync(root, options);
+  await ensureMarkerCleanFilterAsync(root, options);
+  const update = await runtimeGit(root, ['add', '-u'], options, { mutation: true });
+  if (!update.ok) throw new Error(update.error);
+  const untracked = await runtimeGit(root, ['ls-files', '--others', '--exclude-standard', '-z'], options);
+  if (!untracked.ok) throw new Error(untracked.error);
+  const files = untracked.stdout.split('\0').filter(Boolean).filter((file) => !sensitiveTrackedPath(file));
+  for (let index = 0; index < files.length; index += 100) {
+    const add = await runtimeGit(
+      root,
+      ['add', '--', ...files.slice(index, index + 100)],
+      options,
+      { mutation: true },
+    );
+    if (!add.ok) throw new Error(add.error);
+  }
+  const commit = await runtimeGit(root, ['commit', '-m', message], options, { mutation: true });
+  if (!commit.ok && !/nothing to commit|nothing added|no changes added/i.test(commit.error)) {
+    throw new Error(commit.error);
+  }
+}
+
+async function worktreeDirtyAsync(root, options) {
+  const status = await runtimeGit(root, ['status', '--porcelain', '--untracked-files=normal'], options);
+  if (!status.ok) throw new Error(status.error);
+  return Boolean(status.stdout);
+}
+
+async function checkpointLocallyAsync(root, settings, options, reason) {
+  if (settings.enabled) {
+    const key = Buffer.from(String(settings.dataKey || ''), 'base64url');
+    if (key.length !== 32) throw new Error('Recovery key cache is missing');
+    const header = loadRecoveryHeader(root);
+    assertRuntimeFence(options);
+    await writeRecoveryBackupAsync(root, key, header, {
+      devicePreferences: deviceBackupPreferences(options.deviceSettings),
+      assertFence: () => assertRuntimeFence(options),
+    });
+    assertRuntimeFence(options);
+  }
+  await commitAllAsync(root, `scout: ${reason}`, options);
 }
 
 function deviceBackupPreferences(settings) {
@@ -269,68 +988,239 @@ function checkpointLocally(root, settings, options, reason) {
   commitAll(root, `scout: ${reason}`, options);
 }
 
-export async function runWorkspaceSync(root, reason = 'workspace update', options = {}) {
-  const settings = loadSyncSettings(root);
-  if (!repoReady(root, options)) return setState(root, 'disabled', { enabled: false });
-  ensureRepo(root, options);
-  untrackLegacyChats(root, options);
-  untrackLegacyManagedInstructions(root, options);
-  assertNoTrackedSecrets(root, options);
-  if (!settings.enabled) {
-    commitAll(root, `scout: ${reason}`, options);
-    return setState(root, 'disabled', { enabled: false, committed: true });
-  }
-  const key = Buffer.from(String(settings.dataKey || ''), 'base64url');
-  if (key.length !== 32) return setState(root, 'needs-attention', { enabled: true, error: 'Recovery key cache is missing' });
+async function runWorkspaceSyncUncoordinated(root, reason = 'workspace update', options = {}) {
+  try {
+    const settings = loadSyncSettings(root);
+    if (!await repoReadyAsync(root, options)) return setState(root, 'disabled', { enabled: false });
+    await ensureRepoAsync(root, options);
+    await ensureMarkerCleanFilterAsync(root, options);
+    await untrackLegacyChatsAsync(root, options);
+    await untrackLegacyManagedInstructionsAsync(root, options);
+    await assertNoTrackedSecretsAsync(root, options);
+    if (!settings.enabled) {
+      await commitAllAsync(root, `scout: ${reason}`, options);
+      return setState(root, 'disabled', { enabled: false, committed: true });
+    }
+    const key = Buffer.from(String(settings.dataKey || ''), 'base64url');
+    if (key.length !== 32) {
+      return setState(root, 'needs-attention', {
+        enabled: true,
+        error: 'Recovery key cache is missing',
+      });
+    }
 
-  setState(root, 'syncing', { enabled: true });
-  const fetch = runGit(root, ['fetch', 'origin'], options);
-  if (!fetch.ok) {
-    checkpointLocally(root, settings, options, reason);
-    return setState(root, 'offline', { enabled: true, pending: true, error: fetch.error });
-  }
-  const branchResult = runGit(root, ['branch', '--show-current'], options);
-  const branch = branchResult.stdout || 'master';
-  const upstream = `refs/remotes/origin/${branch}`;
-  if (!runGit(root, ['show-ref', '--verify', '--quiet', upstream], options).ok) {
-    checkpointLocally(root, settings, options, reason);
-    const pushInitial = runGit(root, ['push', '-u', 'origin', 'HEAD'], { ...options, allowPrompt: true });
-    return pushInitial.ok
-      ? setState(root, 'synced', { enabled: true, pending: false })
-      : setState(root, 'offline', { enabled: true, pending: true, error: pushInitial.error });
-  }
-  const counts = runGit(root, ['rev-list', '--left-right', '--count', `HEAD...${upstream}`], options);
-  if (!counts.ok) return setState(root, 'needs-attention', { enabled: true, error: counts.error });
-  const [ahead, behind] = counts.stdout.split(/\s+/).map(Number);
-  if (ahead > 0 && behind > 0) {
-    checkpointLocally(root, settings, options, reason);
-    return setState(root, 'needs-attention', { enabled: true, pending: true, conflict: true, ahead, behind, error: 'This device and GitHub both contain new changes' });
-  }
-  if (behind > 0) {
-    if (worktreeDirty(root, options)) {
-      checkpointLocally(root, settings, options, reason);
-      return setState(root, 'needs-attention', { enabled: true, pending: true, conflict: true, ahead: Math.max(1, ahead), behind, error: 'This device has unsynced work and GitHub contains newer changes' });
+    setState(root, 'syncing', { enabled: true });
+    const fetch = await runtimeGit(root, ['fetch', 'origin'], options, { mutation: true });
+    if (!fetch.ok) {
+      await checkpointLocallyAsync(root, settings, options, reason);
+      return setState(root, 'offline', {
+        enabled: true,
+        pending: true,
+        error: fetch.error,
+      });
     }
-    const ff = runGit(root, ['merge', '--ff-only', upstream], options);
-    if (!ff.ok) return setState(root, 'needs-attention', { enabled: true, conflict: true, error: ff.error });
-    try {
-      restoreRecoveryBackupWithKey(root, root, key);
-    } catch (error) {
-      return setState(root, 'needs-attention', { enabled: true, error: `Remote recovery data could not be applied: ${error.message}` });
+    const branchResult = await runtimeGit(root, ['branch', '--show-current'], options);
+    const branch = branchResult.stdout || 'master';
+    const upstream = `refs/remotes/origin/${branch}`;
+    const upstreamExists = await runtimeGit(
+      root,
+      ['show-ref', '--verify', '--quiet', upstream],
+      options,
+    );
+    if (!upstreamExists.ok) {
+      await checkpointLocallyAsync(root, settings, options, reason);
+      const pushInitial = await runtimeGit(
+        root,
+        ['push', '-u', 'origin', 'HEAD'],
+        { ...options, allowPrompt: true },
+        { mutation: true },
+      );
+      if (pushInitial.ok) {
+        assertRuntimeFence(options);
+        const synced = setState(root, 'synced', { enabled: true, pending: false });
+        assertRuntimeFence(options);
+        return synced;
+      }
+      return setState(root, 'offline', {
+        enabled: true,
+        pending: true,
+        error: pushInitial.error,
+      });
+    }
+    const counts = await runtimeGit(
+      root,
+      ['rev-list', '--left-right', '--count', `HEAD...${upstream}`],
+      options,
+    );
+    if (!counts.ok) {
+      return setState(root, 'needs-attention', { enabled: true, error: counts.error });
+    }
+    const [ahead, behind] = counts.stdout.split(/\s+/).map(Number);
+    if (ahead > 0 && behind > 0) {
+      await checkpointLocallyAsync(root, settings, options, reason);
+      const resolution = analyseBackupDivergence(root, options);
+      return setState(root, 'needs-attention', {
+        enabled: true,
+        pending: true,
+        conflict: true,
+        ahead: resolution?.ahead ?? ahead,
+        behind: resolution?.behind ?? behind,
+        error: resolution?.classification === 'disjoint-safe'
+          ? 'The Scout host and GitHub both contain new changes that can be safely preserved'
+          : 'The Scout host and GitHub both contain new changes',
+        ...(resolution ? { resolution } : {}),
+      });
+    }
+    if (behind > 0) {
+      if (await worktreeDirtyAsync(root, options)) {
+        await checkpointLocallyAsync(root, settings, options, reason);
+        const resolution = analyseBackupDivergence(root, options);
+        return setState(root, 'needs-attention', {
+          enabled: true,
+          pending: true,
+          conflict: true,
+          ahead: resolution?.ahead ?? Math.max(1, ahead),
+          behind: resolution?.behind ?? behind,
+          error: resolution?.classification === 'disjoint-safe'
+            ? 'The Scout host and GitHub both contain new changes that can be safely preserved'
+            : 'This device has unsynced work and GitHub contains newer changes',
+          ...(resolution ? { resolution } : {}),
+        });
+      }
+      const ff = await runtimeGit(
+        root,
+        ['merge', '--ff-only', upstream],
+        options,
+        { mutation: true },
+      );
+      if (!ff.ok) {
+        return setState(root, 'needs-attention', {
+          enabled: true,
+          conflict: true,
+          error: ff.error,
+        });
+      }
+      try {
+        assertRuntimeFence(options);
+        await restoreRecoveryBackupWithKeyAsync(root, root, key, null, {
+          assertFence: () => assertRuntimeFence(options),
+        });
+        assertRuntimeFence(options);
+      } catch (error) {
+        if (error?.[RUNTIME_FENCE_FAILURE]) throw error;
+        return setState(root, 'needs-attention', {
+          enabled: true,
+          error: `Remote recovery data could not be applied: ${error.message}`,
+        });
+      }
+    }
+    await checkpointLocallyAsync(root, settings, options, reason);
+    const after = await runtimeGit(
+      root,
+      ['rev-list', '--left-right', '--count', `HEAD...${upstream}`],
+      options,
+    );
+    if (!after.ok) {
+      return setState(root, 'needs-attention', { enabled: true, error: after.error });
+    }
+    const [aheadAfter] = after.stdout.split(/\s+/).map(Number);
+    if (aheadAfter > 0) {
+      const push = await runtimeGit(
+        root,
+        ['push', 'origin', 'HEAD'],
+        { ...options, allowPrompt: true },
+        { mutation: true },
+      );
+      if (!push.ok) {
+        return setState(root, 'offline', {
+          enabled: true,
+          pending: true,
+          error: push.error,
+        });
+      }
+    }
+    assertRuntimeFence(options);
+    const synced = setState(root, 'synced', {
+      enabled: true,
+      pending: false,
+      pulled: behind > 0,
+      ...(behind > 0 ? { pulledAt: new Date().toISOString() } : {}),
+    });
+    assertRuntimeFence(options);
+    return synced;
+  } catch (error) {
+    if (error?.[RUNTIME_FENCE_FAILURE]) throw error;
+    if (error instanceof RuntimeCommandTimeoutError) {
+      return setState(root, 'needs-attention', {
+        enabled: loadSyncSettings(root).enabled,
+        pending: true,
+        error: 'Private backup command timed out',
+      });
+    }
+    throw error;
+  }
+}
+
+function fencedSyncOptions(lease, options) {
+  const callerFence = options.assertFence;
+  return {
+    ...options,
+    assertFence: () => {
+      assertCurrentFence(lease, synchronousFenceCallback(() => true));
+      callerFence?.();
+    },
+  };
+}
+
+function pendingCheckpoint(root) {
+  let enabled = false;
+  try { enabled = loadSyncSettings(root).enabled; } catch {}
+  return {
+    state: 'pending',
+    enabled,
+    pending: true,
+    error: 'Private backup is waiting for another workspace update',
+    reasonCode: 'mutation-busy',
+  };
+}
+
+export async function runWorkspaceSync(root, reason = 'workspace update', options = {}) {
+  const suppliedLease = options.lease;
+  const lease = suppliedLease || acquireScanLease(
+    root,
+    currentLeaseOwner(),
+    {
+      kind: 'backup',
+      runId: `backup-${crypto.randomUUID()}`,
+      phase: 'checkpoint',
+    },
+  );
+  if (!lease) return pendingCheckpoint(root);
+  const heartbeat = suppliedLease ? null : startLeaseHeartbeat(lease);
+  try {
+    return await withMutationCoordinator(root, lease, (mutationCoordinator) => (
+      runWorkspaceSyncUncoordinated(
+        root,
+        reason,
+        {
+          ...fencedSyncOptions(lease, options),
+          mutationCoordinator,
+        },
+      )
+    ));
+  } catch (error) {
+    if (error instanceof LeaseLostError || error instanceof MutationCoordinatorBusyError) {
+      return pendingCheckpoint(root);
+    }
+    throw error;
+  } finally {
+    heartbeat?.stop();
+    if (!suppliedLease) {
+      try { releaseScanLease(lease); } catch (error) {
+        if (!(error instanceof LeaseLostError)) throw error;
+      }
     }
   }
-  checkpointLocally(root, settings, options, reason);
-  const after = runGit(root, ['rev-list', '--left-right', '--count', `HEAD...${upstream}`], options);
-  if (!after.ok) return setState(root, 'needs-attention', { enabled: true, error: after.error });
-  const [aheadAfter] = after.stdout.split(/\s+/).map(Number);
-  if (aheadAfter > 0) {
-    const push = runGit(root, ['push', 'origin', 'HEAD'], { ...options, allowPrompt: true });
-    if (!push.ok) return setState(root, 'offline', { enabled: true, pending: true, error: push.error });
-  }
-  return setState(root, 'synced', {
-    enabled: true, pending: false, pulled: behind > 0,
-    ...(behind > 0 ? { pulledAt: new Date().toISOString() } : {}),
-  });
 }
 
 const QUEUES = new Map();
@@ -338,6 +1228,110 @@ export function queueWorkspaceSync(root, reason, options = {}) {
   const key = path.resolve(root);
   const previous = QUEUES.get(key) || Promise.resolve();
   const next = previous.catch(() => {}).then(() => runWorkspaceSync(root, reason, options));
+  const tracked = next.finally(() => { if (QUEUES.get(key) === tracked) QUEUES.delete(key); });
+  QUEUES.set(key, tracked);
+  return next;
+}
+
+export async function resolveBackupDivergence(root, analysisToken, lease, options = {}) {
+  if (!/^[a-f0-9]{64}$/.test(String(analysisToken || ''))) {
+    throw new Error('Backup history changed; review the refreshed diagnosis before fixing it');
+  }
+  const settings = loadSyncSettings(root);
+  if (!settings.enabled) throw new Error('Private backup is not enabled');
+  const fenced = fencedSyncOptions(lease, options);
+
+  return withMutationCoordinator(root, lease, async (mutationCoordinator) => {
+    Object.assign(fenced, { mutationCoordinator });
+    const fetch = await runtimeGit(root, ['fetch', 'origin'], fenced, { mutation: true });
+    if (!fetch.ok) {
+      return setState(root, 'offline', { enabled: true, pending: true, error: fetch.error });
+    }
+    let resolution = analyseBackupDivergence(root, fenced);
+    if (!resolution) return { ...syncStatus(root, fenced), alreadyResolved: true };
+    if (resolution.classification !== 'disjoint-safe' || !resolution.canResolve) {
+      return setState(root, 'needs-attention', {
+        enabled: true,
+        pending: true,
+        conflict: true,
+        ahead: resolution.ahead,
+        behind: resolution.behind,
+        error: 'This backup divergence needs manual review',
+        resolution,
+      });
+    }
+    if (analysisToken !== resolution.analysisToken) {
+      throw new Error('Backup history changed; review the refreshed diagnosis before fixing it');
+    }
+
+    const branchResult = await runtimeGit(root, ['branch', '--show-current'], fenced);
+    const localResult = await runtimeGit(root, ['rev-parse', 'HEAD'], fenced);
+    const remoteResult = branchResult.ok && branchResult.stdout
+      ? await runtimeGit(root, ['rev-parse', `refs/remotes/origin/${branchResult.stdout}`], fenced)
+      : { ok: false };
+    if (!branchResult.ok || !branchResult.stdout || !localResult.ok || !remoteResult.ok
+      || divergenceToken(localResult.stdout, remoteResult.stdout, branchResult.stdout) !== analysisToken) {
+      throw new Error('Backup history changed; review the refreshed diagnosis before fixing it');
+    }
+
+    const stamp = new Date().toISOString().replace(/\D/g, '').slice(0, 17);
+    const refRoot = `refs/scout-recovery/${stamp}-${analysisToken.slice(0, 12)}`;
+    const localSaved = await runtimeGit(
+      root,
+      ['update-ref', `${refRoot}/local`, localResult.stdout],
+      fenced,
+      { mutation: true },
+    );
+    const remoteSaved = await runtimeGit(
+      root,
+      ['update-ref', `${refRoot}/github`, remoteResult.stdout],
+      fenced,
+      { mutation: true },
+    );
+    if (!localSaved.ok || !remoteSaved.ok) {
+      throw new Error('Scout could not create backup recovery references');
+    }
+
+    resolution = analyseBackupDivergence(root, fenced);
+    if (!resolution || resolution.analysisToken !== analysisToken
+      || resolution.classification !== 'disjoint-safe' || !resolution.canResolve) {
+      throw new Error('Backup history changed; review the refreshed diagnosis before fixing it');
+    }
+    const merge = await runtimeGit(
+      root,
+      ['merge', '--no-ff', '--no-edit', remoteResult.stdout],
+      fenced,
+      { mutation: true },
+    );
+    if (!merge.ok) {
+      const mergeHead = await runtimeGit(root, ['rev-parse', '--verify', '--quiet', 'MERGE_HEAD'], fenced);
+      if (mergeHead.ok) {
+        await runtimeGit(root, ['merge', '--abort'], fenced, { mutation: true });
+      }
+      return setState(root, 'needs-attention', {
+        enabled: true,
+        pending: true,
+        conflict: true,
+        error: 'The safe merge did not complete; both recovery references were preserved',
+        resolution,
+      });
+    }
+
+    const status = await runWorkspaceSyncUncoordinated(root, 'resolve backup divergence', fenced);
+    return {
+      ...status,
+      resolved: status.state === 'synced',
+      recoveryRefsCreated: true,
+    };
+  });
+}
+
+export function queueWorkspaceResolution(root, analysisToken, lease, options = {}) {
+  const key = path.resolve(root);
+  const previous = QUEUES.get(key) || Promise.resolve();
+  const next = previous.catch(() => {}).then(
+    () => resolveBackupDivergence(root, analysisToken, lease, options),
+  );
   const tracked = next.finally(() => { if (QUEUES.get(key) === tracked) QUEUES.delete(key); });
   QUEUES.set(key, tracked);
   return next;
@@ -351,24 +1345,33 @@ export async function connectWorkspaceSync(root, { remoteUrl: value, passphrase 
     : await verifyPrivateGithubRemote(value, { ...options, cwd: root });
   const transport = verified.transport || (() => { try { return validateGithubUrl(value).transport; } catch { return 'https'; } })();
   if (transport === 'https' && !git.credentialManager) throw new Error('Install Git Credential Manager before setting up an HTTPS private backup');
-  ensureRepo(root, options);
-  untrackLegacyChats(root, options);
-  untrackLegacyManagedInstructions(root, options);
-  assertNoTrackedSecrets(root, options);
-  const current = remoteUrl(root, options);
-  if (current && !sameGithubRepository(current, verified.url)) throw new Error('This workspace is already connected to a different origin');
-  if (!verified.empty && !current) throw new Error('This repository is not empty. Use Restore existing workspace instead');
-  if (!current) {
-    const add = runGit(root, ['remote', 'add', 'origin', verified.url], options);
-    if (!add.ok) throw new Error(add.error);
-  } else if (current !== verified.url) {
-    const update = runGit(root, ['remote', 'set-url', 'origin', verified.url], options);
-    if (!update.ok) throw new Error(update.error);
-  }
-  const created = initializeRecoveryBackup(root, passphrase, { devicePreferences: deviceBackupPreferences(options.deviceSettings) });
-  saveSyncSettings(root, {
-    enabled: true, remoteUrl: verified.url, dataKey: created.dataKey.toString('base64url'),
-    pendingRecoveryKey: created.recoveryKey,
+  const created = await withWorkspaceMutationAuthorityAsync(root, {
+    kind: 'backup-setup', phase: 'connect-backup',
+  }, async ({ coordinator, renew }) => {
+    const guardedOptions = {
+      ...options, mutationCoordinator: coordinator, assertFence: renew,
+    };
+    await ensureRepoAsync(root, guardedOptions);
+    await untrackLegacyChatsAsync(root, guardedOptions);
+    await untrackLegacyManagedInstructionsAsync(root, guardedOptions);
+    await assertNoTrackedSecretsAsync(root, guardedOptions);
+    const currentResult = await runtimeGit(root, ['remote', 'get-url', 'origin'], guardedOptions);
+    const current = currentResult.ok ? currentResult.stdout : null;
+    if (current && !sameGithubRepository(current, verified.url)) throw new Error('This workspace is already connected to a different origin');
+    if (!verified.empty && !current) throw new Error('This repository is not empty. Use Restore existing workspace instead');
+    if (!current) {
+      const add = await runtimeGit(root, ['remote', 'add', 'origin', verified.url], guardedOptions, { mutation: true });
+      if (!add.ok) throw new Error(add.error);
+    } else if (current !== verified.url) {
+      const update = await runtimeGit(root, ['remote', 'set-url', 'origin', verified.url], guardedOptions, { mutation: true });
+      if (!update.ok) throw new Error(update.error);
+    }
+    const recovery = initializeRecoveryBackup(root, passphrase, { devicePreferences: deviceBackupPreferences(options.deviceSettings) });
+    saveSyncSettings(root, {
+      enabled: true, remoteUrl: verified.url, dataKey: recovery.dataKey.toString('base64url'),
+      pendingRecoveryKey: recovery.recoveryKey,
+    });
+    return recovery;
   });
   let status;
   try {
@@ -458,7 +1461,9 @@ export async function rotateWorkspaceRecoveryPassphrase(root, passphrase, option
   if (!settings.enabled) throw new Error('Encrypted private backup is not enabled');
   const dataKey = Buffer.from(String(settings.dataKey || ''), 'base64url');
   if (dataKey.length !== 32) throw new Error('Recovery key cache is missing');
-  rotateRecoveryPassphrase(root, dataKey, passphrase);
+  withWorkspaceMutationAuthority(root, {
+    kind: 'backup-rotation', phase: 'rotate-recovery',
+  }, () => rotateRecoveryPassphrase(root, dataKey, passphrase));
   const status = await runWorkspaceSync(root, 'rotate recovery passphrase', options);
   return { ok: status.state === 'synced', status };
 }

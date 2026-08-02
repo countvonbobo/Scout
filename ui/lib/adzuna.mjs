@@ -84,11 +84,20 @@ export async function fetchAdzuna(options, fetchImpl = globalThis.fetch) {
       const response = await fetchImpl(adzunaUrl(query, values));
       if (!response || !response.ok) throw new Error(`fetch failed ${response?.status || ''}`.trim());
       const data = await response.json();
-      const found = (data.results || []).map((item) => normalise(item, values));
+      const found = (data.results || []).map((item) => ({
+        ...normalise(item, values),
+        searchQueries: [query],
+      }));
       sources[query] = found.length;
       for (const job of found) {
         const key = job.providerId || job.url || `${job.company.toLowerCase().trim()}|${job.title.toLowerCase().trim()}|${job.location.toLowerCase().trim()}`;
-        if (seen.has(key)) continue;
+        if (seen.has(key)) {
+          const existing = jobs.find((item) => (
+            (item.providerId || item.url || `${item.company.toLowerCase().trim()}|${item.title.toLowerCase().trim()}|${item.location.toLowerCase().trim()}`) === key
+          ));
+          if (existing && !existing.searchQueries.includes(query)) existing.searchQueries.push(query);
+          continue;
+        }
         seen.add(key);
         jobs.push(job);
       }

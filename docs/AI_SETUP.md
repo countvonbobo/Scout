@@ -21,6 +21,11 @@ Choose **Generate proposal**. Scout gives every supplied field and imported CV l
 
 Proposal generation runs as a local background operation. Setup shows the current phase, step progress and elapsed time. You may choose **Continue in background**, close setup or close the browser; reopening setup reattaches to the same operation. Do not quit Scout while it is working, because quitting stops local provider work.
 
+Do not start or clear that provider's sign-in while proposal generation is
+running. If a guided authentication mutation is already active, Scout blocks
+the proposal before provider work starts and asks you to retry after sign-in;
+it does not stage or resend a partial proposal.
+
 1. `workspace.json`
 2. `profile/context.md`
 3. `profile/calibration.md`

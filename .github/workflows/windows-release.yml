@@ -29,8 +29,8 @@ jobs:
     outputs:
       version: ${{ steps.version.outputs.value }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with: { node-version: 24, cache: npm }
       - run: npm ci --omit=dev
       - run: node tools/typst-runtime.mjs install
@@ -40,14 +40,19 @@ jobs:
       - name: Select and validate version
         id: version
         shell: pwsh
+        env:
+          REQUESTED_VERSION: ${{ inputs.version }}
+          RELEASE_REF_NAME: ${{ github.ref_name }}
+          RELEASE_REF_TYPE: ${{ github.ref_type }}
         run: |
-          $version = '${{ inputs.version }}'
-          if ([string]::IsNullOrWhiteSpace($version)) { $version = '${{ github.ref_name }}'.TrimStart('v') }
+          $version = $env:REQUESTED_VERSION
+          if ([string]::IsNullOrWhiteSpace($version)) { $version = $env:RELEASE_REF_NAME.TrimStart('v') }
           $packageVersion = (Get-Content package.json | ConvertFrom-Json).version
           if ($version -ne $packageVersion) { throw 'Requested version does not match package version' }
-          if ('${{ github.ref_type }}' -eq 'tag' -and '${{ github.ref_name }}' -ne "v$packageVersion") { throw 'Tag does not match package version' }
+          if ($env:RELEASE_REF_TYPE -eq 'tag' -and $env:RELEASE_REF_NAME -ne "v$packageVersion") { throw 'Tag does not match package version' }
           "value=$version" | Out-File $env:GITHUB_OUTPUT -Append
       - run: node tools/build-release.mjs --installer --version "${{ steps.version.outputs.value }}"
+        env: { SCOUT_RELEASE_MARKERS: "${{ secrets.SCOUT_RELEASE_MARKERS }}" }
       - run: npm run release:audit -- --root dist/release/stage --stage --require-markers
         env: { SCOUT_RELEASE_MARKERS: "${{ secrets.SCOUT_RELEASE_MARKERS }}" }
       - name: Smoke install and preserve workspace
@@ -62,7 +67,7 @@ jobs:
           if (-not (Test-Path "$installed\Scout.exe")) { throw 'Scout host missing' }
           $u = Start-Process "$installed\unins000.exe" -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART' -Wait -PassThru
           if ($u.ExitCode -or -not (Test-Path "$workspace\workspace.json")) { throw 'Uninstall smoke failed' }
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: windows
           path: installer/output/*.exe
@@ -74,15 +79,16 @@ jobs:
         os: [macos-15, macos-15-intel]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with: { node-version: 24, cache: npm }
       - run: npm ci --omit=dev
       - run: node tools/typst-runtime.mjs install
       - run: node tools/typst-runtime.mjs verify --compile
       - run: npm test
       - run: node tools/build-platform.mjs mac
-      - run: npm run release:audit -- --root "dist/release/macos-$(node -p process.arch)" --stage --require-markers
+        env: { SCOUT_RELEASE_MARKERS: "${{ secrets.SCOUT_RELEASE_MARKERS }}" }
+      - run: npm run release:audit -- --root "dist/release/macos-$(node -p process.arch)/dmg-root/Scout.app" --stage --require-markers
         env: { SCOUT_RELEASE_MARKERS: "${{ secrets.SCOUT_RELEASE_MARKERS }}" }
       - name: Mount and initialise workspace
         run: |
@@ -121,7 +127,7 @@ jobs:
           test -f "$workspace/logs/ui-stdout.log"
           hdiutil detach "$mount"
           test -f "$workspace/workspace.json"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: macos-${{ matrix.os }}
           path: installer/output/*.dmg
@@ -129,14 +135,15 @@ jobs:
   linux:
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with: { node-version: 24, cache: npm }
       - run: npm ci --omit=dev
       - run: node tools/typst-runtime.mjs install
       - run: node tools/typst-runtime.mjs verify --compile
       - run: npm test
       - run: node tools/build-platform.mjs linux
+        env: { SCOUT_RELEASE_MARKERS: "${{ secrets.SCOUT_RELEASE_MARKERS }}" }
       - run: npm run release:audit -- --root dist/release/linux-x64 --stage --require-markers
         env: { SCOUT_RELEASE_MARKERS: "${{ secrets.SCOUT_RELEASE_MARKERS }}" }
       - name: Install, initialise and uninstall DEB
@@ -146,7 +153,7 @@ jobs:
           /opt/scout/runtime/node /opt/scout/app/tools/typst-runtime.mjs verify --compile
           sudo apt-get remove -y scout; test -f "$workspace/workspace.json"
           tar -tzf installer/output/*.tar.gz | grep -q scout-dashboard
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: linux
           path: |
@@ -164,9 +171,9 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Join the private deployment tailnet
-        uses: tailscale/github-action@v4
+        uses: tailscale/github-action@306e68a486fd2350f2bfc3b19fcd143891a4a2d8 # v4
         with:
           oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
           oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
@@ -227,12 +234,34 @@ jobs:
     runs-on: ubuntu-22.04
     permissions:
       contents: write
+      id-token: write
+      attestations: write
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with: { path: release-assets, merge-multiple: true }
       - name: Create combined checksums
         run: cd release-assets && sha256sum Scout-* > checksums.txt
+      - name: Attest every release package from the checksum manifest
+        id: attest
+        uses: actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d # v4
+        with:
+          subject-checksums: release-assets/checksums.txt
+      - name: Preserve and verify the keyless attestation bundle
+        env:
+          ATTESTATION_BUNDLE: ${{ steps.attest.outputs.bundle-path }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          (cd release-assets && sha256sum --check checksums.txt)
+          cp "$ATTESTATION_BUNDLE" release-assets/checksums.intoto.jsonl
+          while read -r digest asset; do
+            test -n "$digest"
+            test -f "release-assets/$asset"
+            gh attestation verify "release-assets/$asset" \
+              --repo "$GITHUB_REPOSITORY" \
+              --bundle release-assets/checksums.intoto.jsonl
+          done < release-assets/checksums.txt
       - name: Publish prerelease
         env: { GH_TOKEN: "${{ github.token }}" }
         run: |

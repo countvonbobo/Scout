@@ -29,6 +29,8 @@ export class OperationManager {
     this.now = now;
     this.id = id;
     this.records = new Map();
+    this.executions = new Map();
+    this.accepting = true;
   }
 
   get(operationId) { return clone(this.records.get(operationId)); }
@@ -47,7 +49,37 @@ export class OperationManager {
 
   activeList() { return [...this.records.values()].filter((record) => ACTIVE.has(record.status)).map(clone); }
 
+  resumeAdmission() {
+    if (this.executions.size) throw new Error('cannot resume operation admission while work is active');
+    this.accepting = true;
+  }
+
+  async shutdown({ timeoutMs = 10_000 } = {}) {
+    this.accepting = false;
+    const active = [...this.executions.values()];
+    for (const execution of active) execution.controller.abort(new Error('operation cancelled for shutdown'));
+    if (!active.length) return;
+    const settled = Promise.allSettled(active.map(({ finished }) => finished));
+    if (timeoutMs === null) {
+      await settled;
+      return;
+    }
+    let timer;
+    try {
+      await Promise.race([
+        settled,
+        new Promise((_, reject) => {
+          timer = setTimeout(() => reject(new Error('active operations did not close before shutdown')), timeoutMs);
+          timer.unref?.();
+        }),
+      ]);
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
   start(type, executor, { phase = 'Queued', total = 1, estimate = null } = {}) {
+    if (!this.accepting) throw new Error('operation manager is shutting down');
     const active = this.active(type);
     if (active) throw new OperationConflictError(type, active);
     const timestamp = this.now().toISOString();
@@ -59,6 +91,10 @@ export class OperationManager {
       result: null, error: null,
     };
     this.records.set(record.id, record);
+    const controller = new AbortController();
+    let settle;
+    const finished = new Promise((resolve) => { settle = resolve; });
+    this.executions.set(record.id, { controller, finished });
 
     setImmediate(async () => {
       record.status = 'running';
@@ -71,7 +107,8 @@ export class OperationManager {
         record.updatedAt = this.now().toISOString();
       };
       try {
-        record.result = await executor(update);
+        controller.signal.throwIfAborted();
+        record.result = await executor(update, { signal: controller.signal });
         record.status = 'succeeded';
         record.progress.current = record.progress.total;
       } catch (error) {
@@ -80,6 +117,8 @@ export class OperationManager {
       } finally {
         record.finishedAt = this.now().toISOString();
         record.updatedAt = record.finishedAt;
+        this.executions.delete(record.id);
+        settle();
       }
     });
     return clone(record);

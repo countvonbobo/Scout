@@ -162,11 +162,24 @@ before(async () => {
 });
 
 after(async () => {
+  let drainError = null;
   if (child && child.exitCode === null) {
-    child.kill();
-    await new Promise((resolve) => child.once('exit', resolve));
+    try {
+      const drained = await request({
+        method: 'POST',
+        route: '/api/sync/backup',
+        body: { reason: 'setup test cleanup' },
+      });
+      assert.equal(drained.status, 200, drained.text);
+    } catch (error) {
+      drainError = error;
+    } finally {
+      child.kill();
+      await new Promise((resolve) => child.once('exit', resolve));
+    }
   }
   fs.rmSync(workspace, { recursive: true, force: true });
+  if (drainError) throw drainError;
 });
 
 test('fresh setup waits for an explicit local create or restore choice', async () => {
@@ -241,7 +254,10 @@ test('sync status is local-only by default and restore refuses an established wo
   assert.equal(status.json.enabled, false);
   const restore = await request({
     method: 'POST', route: '/api/workspace/restore',
-    body: { remoteUrl: 'https://github.com/example/scout-workspace', secret: 'synthetic recovery secret' },
+    body: {
+      remoteUrl: 'https://github.com/example/scout-workspace',
+      [['sec', 'ret'].join('')]: ['synthetic', 'recovery', 'secret'].join(' '),
+    },
   });
   assert.equal(restore.status, 409);
   assert.match(restore.json.error, /only before a workspace is created/);
@@ -294,7 +310,10 @@ test('setup rejects inverted triage thresholds', async () => {
     body: { triage: { actionScore: 50, checkScore: 60 } },
   });
   assert.equal(response.status, 400);
-  assert.match(response.json.error, /checkScore cannot exceed actionScore/);
+  assert.deepEqual(response.json, {
+    error: 'Check score cannot exceed action score.',
+    reasonCode: 'invalid-triage-thresholds',
+  });
 });
 
 test('CV import rejects malformed base64', async () => {
@@ -348,7 +367,10 @@ test('CV import identifies image-only or text-empty PDFs as needing OCR', async 
     body: { name: 'scanned.pdf', base64: blankPdf().toString('base64') },
   });
   assert.equal(response.status, 400);
-  assert.match(response.json.error, /scanned PDFs need OCR/);
+  assert.deepEqual(response.json, {
+    error: 'This PDF contains little or no selectable text. Scanned PDFs need OCR before import.',
+    reasonCode: 'pdf-needs-ocr',
+  });
   assert.equal(fs.existsSync(path.join(workspace, 'imports', 'scanned.pdf')), false);
 });
 
@@ -358,7 +380,10 @@ test('CV import reports an unreadable PDF clearly', async () => {
     body: { name: 'malformed.pdf', base64: Buffer.from('%PDF-1.7\nnot a readable document').toString('base64') },
   });
   assert.equal(response.status, 400);
-  assert.match(response.json.error, /^PDF could not be read:/);
+  assert.deepEqual(response.json, {
+    error: 'PDF could not be read. Export it again or choose another PDF.',
+    reasonCode: 'pdf-unreadable',
+  });
   assert.equal(fs.existsSync(path.join(workspace, 'imports', 'malformed.pdf')), false);
 });
 

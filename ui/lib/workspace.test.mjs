@@ -4,9 +4,11 @@ import os from 'node:os';
 import path from 'node:path';
 import { afterEach, test } from 'node:test';
 import {
-  CURRENT_WORKSPACE_SCHEMA, backupWorkspace, defaultWorkspaceRoot, mergeWorkspaceDefaults, migrateWorkspace, resolveWorkspaceRoot,
-  modelForProvider, syncManagedInstructions, validateWorkspaceConfig, workspacePaths,
+  CURRENT_WORKSPACE_SCHEMA, backupWorkspace, defaultWorkspaceRoot, ensureWorkspaceDirectories, mergeWorkspaceDefaults, migrateWorkspace, resolveWorkspaceRoot,
+  modelForProvider, mutateWorkspaceConfig, mutateWorkspaceConfigAsync, syncManagedInstructions,
+  validateWorkspaceConfig, workspacePaths, writeWorkspaceConfig,
 } from './workspace.mjs';
+import { withWorkspaceMutationAuthorityAsync } from './workspaceMutationAuthority.mjs';
 
 const roots = [];
 afterEach(() => { for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true }); });
@@ -37,6 +39,68 @@ test('workspace paths reserve the search-profile artifacts under profile/search'
   assert.match(paths.searchProfileDraft, /profile[\\/]search[\\/]draft\.json$/);
   assert.match(paths.searchProfilePublished, /profile[\\/]search[\\/]published\.json$/);
   assert.match(paths.profileContext, /profile[\\/]context\.md$/);
+});
+
+test('workspace paths reserve private per-run journal directories without changing legacy paths', () => {
+  const root = temp();
+  const paths = workspacePaths(root);
+  assert.equal(paths.runs, path.join(root, '.scout', 'runs'));
+  assert.equal(paths.scanRuns, path.join(root, 'data', 'scan-runs.jsonl'));
+});
+
+test('workspace provisioning creates the private per-run journal directory', () => {
+  const root = temp();
+  const paths = ensureWorkspaceDirectories(root);
+  assert.equal(fs.statSync(paths.runs).isDirectory(), true);
+});
+
+test('workspace config writes cannot cross an active mutation authority', async () => {
+  const root = temp();
+  let signalEntered;
+  const entered = new Promise((resolve) => { signalEntered = resolve; });
+  let release;
+  const active = withWorkspaceMutationAuthorityAsync(root, {
+    kind: 'test-writer', phase: 'hold-writer',
+  }, async () => {
+    signalEntered();
+    await new Promise((resolve) => { release = resolve; });
+  });
+  await entered;
+  assert.throws(
+    () => writeWorkspaceConfig(root, mergeWorkspaceDefaults()),
+    /another workspace mutation is in progress/,
+  );
+  release();
+  await active;
+  writeWorkspaceConfig(root, mergeWorkspaceDefaults());
+  assert.equal(JSON.parse(fs.readFileSync(path.join(root, 'workspace.json'), 'utf8')).schemaVersion, CURRENT_WORKSPACE_SCHEMA);
+});
+
+test('async config read-modify-write excludes a concurrent disjoint update', async () => {
+  const root = temp();
+  writeWorkspaceConfig(root, mergeWorkspaceDefaults());
+  let entered;
+  const transformEntered = new Promise((resolve) => { entered = resolve; });
+  let release;
+  const first = mutateWorkspaceConfigAsync(root, {
+    kind: 'first-config', phase: 'update-config',
+  }, async (current) => {
+    entered();
+    await new Promise((resolve) => { release = resolve; });
+    return { ...current, locale: 'en-US' };
+  });
+  await transformEntered;
+  assert.throws(
+    () => mutateWorkspaceConfig(root, {
+      kind: 'second-config', phase: 'update-config',
+    }, (current) => ({ ...current, currency: 'USD' })),
+    /another workspace mutation is in progress/,
+  );
+  release();
+  await first;
+  const saved = JSON.parse(fs.readFileSync(path.join(root, 'workspace.json'), 'utf8'));
+  assert.equal(saved.locale, 'en-US');
+  assert.equal(saved.currency, 'GBP');
 });
 
 test('search-profile migration backups use a distinct reviewable label', () => {

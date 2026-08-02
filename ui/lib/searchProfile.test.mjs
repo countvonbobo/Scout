@@ -8,9 +8,15 @@ import {
   draftProfileFromLegacy,
   loadPublishedSearchProfile,
   migrateSearchProfile,
+  MAX_SEMANTIC_PROFILE_RULES,
+  NEGATIVE_RULE_FIELDS,
   profileFingerprint,
+  profileRuleId,
   publishSearchProfile,
+  searchProfileRuleIds,
+  TARGET_RULE_FIELDS,
 } from './searchProfile.mjs';
+import { PROFILE_RULE_SUPPORT } from './vacancyFilter.mjs';
 import { workspacePaths } from './workspace.mjs';
 
 const NOW = '2026-07-26T20:00:00.000Z';
@@ -55,12 +61,175 @@ test('published profile preserves strengths, provenance and unknown policies', (
     primaryTitles: [{ value: 'Commercial solicitor', strength: 'mandatory', provenance: 'explicit' }],
     compensation: { currency: 'EUR', period: 'day', minimum: 450, minimumStrength: 'strong-preference', unknownPolicy: 'include' },
   });
+  draft.unknownPolicies = { location: 'penalise' };
   const profile = publishSearchProfile(draft, { publishedAt: NOW });
   assert.equal(profile.version, 1);
   assert.equal(profile.target.primaryTitles[0].provenance, 'explicit');
   assert.equal(profile.compensation.period, 'day');
   assert.equal(profile.compensation.unknownPolicy, 'include');
+  assert.equal(profile.unknownPolicies.location, 'penalise');
   assert.match(profile.id, /^profile-[a-f0-9]{12}$/);
+});
+
+test('profile rule IDs are field-scoped, bounded and enumerate only published rules', () => {
+  const sameText = { value: 'Shared phrase', strength: 'strong-preference', provenance: 'explicit' };
+  const draft = genericProfileDraft({ primaryTitles: [sameText] });
+  draft.target.skills = [sameText];
+  draft.negative.excludedResponsibilities = [{
+    ...sameText, strength: 'hard-exclusion',
+  }];
+  const profile = publishSearchProfile(draft, { publishedAt: NOW });
+  const ids = [
+    profileRuleId('target', 'primaryTitles', profile.target.primaryTitles[0]),
+    profileRuleId('target', 'skills', profile.target.skills[0]),
+    profileRuleId('negative', 'excludedResponsibilities', profile.negative.excludedResponsibilities[0]),
+  ];
+  assert.equal(new Set(ids).size, 3);
+  assert.ok(ids.every((id) => id.length <= 80));
+  assert.deepEqual(searchProfileRuleIds(profile), new Set(ids));
+});
+
+test('profile rule IDs distinguish strength and provenance for the same field value', () => {
+  const explicitMandatory = {
+    value: 'Shared phrase', strength: 'mandatory', provenance: 'explicit',
+  };
+  const derivedPreference = {
+    value: 'Shared phrase',
+    strength: 'strong-preference',
+    provenance: 'deterministic-derivation',
+  };
+  const draft = genericProfileDraft({
+    primaryTitles: [explicitMandatory, derivedPreference],
+  });
+  const profile = publishSearchProfile(draft, { publishedAt: NOW });
+  const ids = profile.target.primaryTitles.map((rule) => (
+    profileRuleId('target', 'primaryTitles', rule)
+  ));
+  assert.equal(new Set(ids).size, 2);
+  assert.deepEqual(searchProfileRuleIds(profile), new Set(ids));
+});
+
+test('published profile supports the complete domain-neutral preference foundation', () => {
+  const preference = (value, strength = 'nice-to-have') => ({
+    value, strength, provenance: 'explicit',
+  });
+  const draft = genericProfileDraft({
+    primaryTitles: [preference('Operations lead', 'strong-preference')],
+    compensation: {
+      currency: 'EUR',
+      period: 'month',
+      rateType: 'salary',
+      amountType: 'base',
+      certainty: 'exact',
+      minimum: 4200,
+      minimumStrength: 'strong-preference',
+      unknownPolicy: 'penalise',
+    },
+  });
+  draft.target = {
+    ...draft.target,
+    adjacentTitles: [preference('Programme coordinator')],
+    responsibilities: [preference('Service improvement')],
+    skills: [preference('Stakeholder facilitation')],
+    qualifications: [preference('Professional registration', 'mandatory')],
+    eligibility: [preference('Work authorisation', 'mandatory')],
+    mobility: [preference('Regional travel')],
+    seniority: [preference('lead')],
+    workingPatterns: [preference('hybrid')],
+    employmentTypes: [preference('permanent')],
+    employers: [preference('Public service')],
+    industries: [preference('Healthcare')],
+  };
+  draft.negative = {
+    ...draft.negative,
+    excludedLocations: [preference('Overseas-only', 'strong-negative')],
+    excludedSeniority: [preference('executive', 'strong-negative')],
+    excludedWorkingPatterns: [preference('night-only', 'strong-negative')],
+    excludedEmployers: [preference('Unregulated broker', 'hard-exclusion')],
+  };
+  draft.selection = { breadth: 'balanced', relevanceThreshold: 45, exploration: 0.1 };
+  draft.unknownPolicies = {
+    location: 'penalise',
+    workingPattern: 'exclude',
+    seniority: 'include',
+  };
+
+  const profile = publishSearchProfile(draft, { publishedAt: NOW });
+
+  assert.equal(profile.target.adjacentTitles[0].value, 'Programme coordinator');
+  assert.equal(profile.target.responsibilities[0].value, 'Service improvement');
+  assert.equal(profile.target.qualifications[0].strength, 'mandatory');
+  assert.equal(profile.target.eligibility[0].strength, 'mandatory');
+  assert.equal(profile.compensation.amountType, 'base');
+  assert.equal(profile.compensation.certainty, 'exact');
+  assert.deepEqual(profile.selection, {
+    breadth: 'balanced', relevanceThreshold: 45, exploration: 0.1,
+  });
+  assert.equal(profile.unknownPolicies.workingPattern, 'exclude');
+});
+
+test('profile validation rejects unsupported and silently truncatable rule evidence', () => {
+  const unsupported = genericProfileDraft();
+  unsupported.target.futureField = [{
+    value: 'ignored by runtime', strength: 'nice-to-have', provenance: 'explicit',
+  }];
+  assert.throws(
+    () => publishSearchProfile(unsupported, { publishedAt: NOW }),
+    /unsupported field: futureField/,
+  );
+
+  const oversized = genericProfileDraft();
+  oversized.negative.excludedResponsibilities = Array.from(
+    { length: MAX_SEMANTIC_PROFILE_RULES + 1 },
+    (_, index) => ({
+      value: `excluded activity ${index}`,
+      strength: 'hard-exclusion',
+      provenance: 'explicit',
+    }),
+  );
+  assert.throws(
+    () => publishSearchProfile(oversized, { publishedAt: NOW }),
+    /more than 64 semantic rules/,
+  );
+});
+
+test('validated profile rule fields exactly cover filtering support', () => {
+  const supportedTarget = [...new Set(PROFILE_RULE_SUPPORT.flatMap(({ target }) => target))].sort();
+  const supportedNegative = [...new Set(PROFILE_RULE_SUPPORT.flatMap(({ negative }) => negative))].sort();
+  assert.deepEqual([...TARGET_RULE_FIELDS].sort(), supportedTarget);
+  assert.deepEqual([...NEGATIVE_RULE_FIELDS].sort(), supportedNegative);
+});
+
+test('profile publication rejects invalid compensation and unbounded search behaviour', () => {
+  assert.throws(() => publishSearchProfile(genericProfileDraft({
+    compensation: { amountType: 'mystery' },
+  }), { publishedAt: NOW }), /compensation\.amountType/i);
+  assert.throws(() => publishSearchProfile(genericProfileDraft({
+    compensation: { certainty: 'probably' },
+  }), { publishedAt: NOW }), /compensation\.certainty/i);
+
+  const invalidSelection = genericProfileDraft();
+  invalidSelection.selection = {
+    breadth: 'everything', relevanceThreshold: -1, exploration: 1000,
+  };
+  assert.throws(
+    () => publishSearchProfile(invalidSelection, { publishedAt: NOW }),
+    /search profile\.selection/i,
+  );
+
+  const invalidUnknownPolicy = genericProfileDraft();
+  invalidUnknownPolicy.unknownPolicies = { location: 'guess' };
+  assert.throws(
+    () => publishSearchProfile(invalidUnknownPolicy, { publishedAt: NOW }),
+    /unknownPolicies\.location/i,
+  );
+
+  const unsupportedUnknownPolicy = genericProfileDraft();
+  unsupportedUnknownPolicy.unknownPolicies = { privateField: 'exclude' };
+  assert.throws(
+    () => publishSearchProfile(unsupportedUnknownPolicy, { publishedAt: NOW }),
+    /unsupported field/i,
+  );
 });
 
 test('unconfirmed inference cannot publish as a hard exclusion', () => {
@@ -93,6 +262,7 @@ test('legacy preferences become a conservative, reviewable draft', () => {
   assert.notEqual(draft.negative.excludedResponsibilities[0].strength, 'hard-exclusion');
   assert.equal(draft.compensation.minimumStrength, 'strong-preference');
   assert.equal(draft.compensation.unknownPolicy, 'include');
+  assert.equal(draft.unknownPolicies.location, 'include');
 });
 
 test('compensation cannot publish as a hard exclusion without confirmation provenance', () => {
@@ -170,6 +340,8 @@ test('migration stages byte-preserved legacy evidence in an unpublished draft', 
   assert.equal(result.migrated, true);
   assert.equal(result.draftPath, paths.searchProfileDraft);
   assert.match(result.backupPath, /search-profile-v1\.json$/);
+  assert.match(result.rollbackSnapshotPath, /beta22-compatible$/);
+  assert.equal(fs.existsSync(`${result.rollbackSnapshotPath}.manifest.json`), true);
   assert.equal(raw.workspaceJson, workspaceJson);
   assert.equal(raw.context, context);
   assert.equal(draft.status, 'draft');
@@ -185,26 +357,32 @@ test('migration stages byte-preserved legacy evidence in an unpublished draft', 
   assert.equal(fs.readFileSync(path.join(paths.applications, 'example', 'outreach.md'), 'utf8'), 'Existing application\n');
   assert.equal(fs.readFileSync(paths.profileContext, 'utf8'), context);
   assert.deepEqual(migrateSearchProfile(root), {
-    migrated: false, draftPath: paths.searchProfileDraft, backupPath: null,
+    migrated: false,
+    draftPath: paths.searchProfileDraft,
+    backupPath: null,
+    rollbackSnapshotPath: result.rollbackSnapshotPath,
   });
 });
 
 test('migration is idempotent when a draft or published profile already exists', () => {
   const root = temp();
-  fs.writeFileSync(path.join(root, 'workspace.json'), '{"locale":"en-GB","search":{}}\n');
+  fs.writeFileSync(path.join(root, 'workspace.json'), '{"schemaVersion":2,"locale":"en-GB","search":{}}\n');
   const paths = workspacePaths(root);
   fs.mkdirSync(path.dirname(paths.searchProfileDraft), { recursive: true });
   fs.writeFileSync(paths.searchProfileDraft, '{"status":"draft"}\n');
 
   const result = migrateSearchProfile(root);
 
-  assert.deepEqual(result, { migrated: false, draftPath: paths.searchProfileDraft, backupPath: null });
+  assert.equal(result.migrated, false);
+  assert.equal(result.draftPath, paths.searchProfileDraft);
+  assert.equal(result.backupPath, null);
+  assert.match(result.rollbackSnapshotPath, /beta22-compatible$/);
   assert.equal(fs.existsSync(paths.searchProfileRaw), false);
 });
 
 test('migration leaves the legacy config untouched when its paired artifact swap fails', () => {
   const root = temp();
-  const workspaceJson = '{"locale":"en-GB","search":{}}\n';
+  const workspaceJson = '{"schemaVersion":2,"locale":"en-GB","search":{}}\n';
   fs.writeFileSync(path.join(root, 'workspace.json'), workspaceJson);
   const searchDirectory = path.dirname(workspacePaths(root).searchProfileRaw);
   const fileSystem = {

@@ -1,6 +1,10 @@
 import crypto from 'node:crypto';
 
-const TRACKING_PARAMETERS = /^(?:utm_[^=]+|gclid|fbclid|mc_[^=]+)$/i;
+const TRACKING_PARAMETERS = /^(?:utm_[^=]+|gclid|fbclid|msclkid|mc_[^=]+)$/i;
+const CREDENTIAL_PARAMETERS = /^(?:(?:access|auth|client|id|oauth|private|refresh|secret|session)[-_]?(?:key|secret|token)|api[-_]?(?:key|token)|auth(?:orization)?|key|password|secret|session[-_]?id|sig(?:nature)?|token)$/i;
+const IDENTITY_ONLY_PARAMETERS = /^(?:code|cookie|credential|gh_src|jwt|redirect|ref(?:errer)?|session|source|state|tracking|trk)$/i;
+const CREDENTIAL_VALUE = /(?:\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b)|(?:\b(?:access[-_ ]?token|api[-_ ]?(?:key|token)|authorization|password|secret|session[-_ ]?id|token)\s*[:=]\s*\S+)|(?:\bbearer\s+[A-Za-z0-9._~+/-]{8,})|(?:\bsk-[A-Za-z0-9_-]{16,})|(?:\bgh[pousr]_[A-Za-z0-9]{20,})|(?:\bxox[baprs]-[A-Za-z0-9-]{10,})|(?:\bAKIA[0-9A-Z]{16}\b)/i;
+const MAX_SOURCE_RECORD_ID_LENGTH = 160;
 
 function fingerprint(value) {
   return crypto.createHash('sha256').update(value).digest('hex');
@@ -19,8 +23,27 @@ function text(value) {
   return result || null;
 }
 
+function metadataText(value) {
+  return text(value)?.slice(0, 120) || null;
+}
+
 function field(value, provenance) {
   return { value: value ?? null, provenance: value == null ? 'unknown' : provenance };
+}
+
+function list(value) {
+  const values = Array.isArray(value) ? value : value == null ? [] : [value];
+  const seen = new Set();
+  return values.map((item) => text(item)?.slice(0, 300) || null).filter((item) => {
+    if (!item || seen.has(item)) return false;
+    seen.add(item);
+    return true;
+  }).slice(0, 32);
+}
+
+function listField(value) {
+  const values = list(value);
+  return field(values.length ? values : null, 'explicit-source');
 }
 
 export function canonicaliseUrl(value) {
@@ -28,14 +51,39 @@ export function canonicaliseUrl(value) {
   if (!url) return null;
   try {
     const parsed = new URL(url);
+    if (!['http:', 'https:'].includes(parsed.protocol)) return null;
+    parsed.username = '';
+    parsed.password = '';
     for (const key of [...parsed.searchParams.keys()]) {
-      if (TRACKING_PARAMETERS.test(key)) parsed.searchParams.delete(key);
+      if (TRACKING_PARAMETERS.test(key) || CREDENTIAL_PARAMETERS.test(key)) {
+        parsed.searchParams.delete(key);
+      }
     }
     parsed.hash = '';
     parsed.searchParams.sort();
     return parsed.toString().replace(/\/$/, '');
   } catch {
-    return url;
+    return null;
+  }
+}
+
+export function queryAddressedUrlIdentityDigest(
+  value,
+  supplied,
+  { trustedSupplied = false } = {},
+) {
+  const provided = String(supplied || '');
+  const canonicalUrl = canonicaliseUrl(value);
+  try {
+    const parsed = new URL(String(canonicalUrl || ''));
+    for (const key of [...parsed.searchParams.keys()]) {
+      if (IDENTITY_ONLY_PARAMETERS.test(key)) parsed.searchParams.delete(key);
+    }
+    parsed.searchParams.sort();
+    if (parsed.search) return fingerprint(parsed.toString());
+    return trustedSupplied && /^[a-f0-9]{64}$/.test(provided) ? provided : null;
+  } catch {
+    return null;
   }
 }
 
@@ -58,6 +106,8 @@ function compensation(job, warnings) {
   const currency = text(job.salaryCurrency);
   const period = text(job.salaryPeriod);
   const rateType = text(job.salaryRateType || job.compensationRateType || job.rateType);
+  const amountType = text(job.compensationAmountType || job.salaryAmountType)?.toLowerCase() || null;
+  const certainty = text(job.compensationCertainty || job.salaryCertainty)?.toLowerCase() || null;
   if (minimum !== null || maximum !== null) {
     return field({
       minimum,
@@ -65,6 +115,8 @@ function compensation(job, warnings) {
       currency,
       period: period?.toLowerCase() || null,
       rateType: rateType?.toLowerCase() || null,
+      ...(amountType ? { amountType } : {}),
+      ...(certainty ? { certainty } : {}),
     }, 'explicit-source');
   }
   if (text(job.salary)) {
@@ -77,13 +129,54 @@ function compensation(job, warnings) {
 
 function sourceRecordId(job, canonicalUrl) {
   const providerId = text(job.sourceRecordId) || text(job.providerId);
-  return providerId || (canonicalUrl ? `url-${fingerprint(canonicalUrl).slice(0, 16)}` : null);
+  if (!providerId) return canonicalUrl ? `url-${fingerprint(canonicalUrl).slice(0, 16)}` : null;
+  return durableProviderIdentifier(providerId);
 }
 
-export function normaliseObservation(job, { sourceName, fetchedAt, laneId } = {}) {
-  const source = text(sourceName) || text(job?.source);
+export function durableProviderIdentifier(value) {
+  const providerId = text(value);
+  if (!providerId) return null;
+  let urlIdentity = null;
+  try {
+    const parsed = new URL(providerId);
+    if (['http:', 'https:'].includes(parsed.protocol)) {
+      urlIdentity = canonicaliseUrl(providerId);
+      if (urlIdentity) {
+        const identityDigest = queryAddressedUrlIdentityDigest(urlIdentity);
+        urlIdentity = identityDigest || urlIdentity;
+      }
+    }
+  } catch {}
+  if (urlIdentity || providerId.includes('?')
+    || providerId.length > MAX_SOURCE_RECORD_ID_LENGTH || CREDENTIAL_VALUE.test(providerId)) {
+    return `provider-${fingerprint(urlIdentity || providerId).slice(0, 32)}`;
+  }
+  return providerId;
+}
+
+export function durableSourceIdentifier(value) {
+  const source = metadataText(value);
+  if (!source) return null;
+  return CREDENTIAL_VALUE.test(source)
+    ? `source-${fingerprint(source).slice(0, 32)}`
+    : source;
+}
+
+function diagnosticCode(warning) {
+  if (/working pattern/i.test(warning)) return 'ambiguous-working-pattern';
+  if (/employment type/i.test(warning)) return 'ambiguous-employment-type';
+  if (/seniority/i.test(warning)) return 'ambiguous-seniority';
+  if (/compensation/i.test(warning)) return 'ambiguous-compensation';
+  return 'normalisation-warning';
+}
+
+export function normaliseObservation(job, {
+  sourceName, collectionSource, fetchedAt, laneId, laneIds, roleFamily,
+} = {}) {
+  const source = durableSourceIdentifier(sourceName) || durableSourceIdentifier(job?.source);
   if (!job || !source) return null;
   const canonicalUrl = canonicaliseUrl(job.url || job.sourceUrl);
+  const identityDigest = queryAddressedUrlIdentityDigest(canonicalUrl);
   const title = text(job.title);
   const recordId = sourceRecordId(job, canonicalUrl);
   if (!title || !recordId) return null;
@@ -106,18 +199,55 @@ export function normaliseObservation(job, { sourceName, fetchedAt, laneId } = {}
   ], warnings, 'seniority');
   const fullTime = extraction(description, [['full-time', /\bfull[ -]?time\b/i], ['part-time', /\bpart[ -]?time\b/i]]);
   if (fullTime.ambiguous) warnings.push('ambiguous working pattern was left unknown');
-  const fingerprintInput = { ...job, url: canonicalUrl || text(job.url), sourceUrl: canonicalUrl || text(job.sourceUrl) };
+  const observationLaneIds = [...new Set([
+    ...(Array.isArray(job.laneIds) ? job.laneIds : []),
+    ...(Array.isArray(laneIds) ? laneIds : []),
+    job.laneId,
+    laneId,
+  ].map(metadataText).filter(Boolean))].sort().slice(0, 32);
+  const observationLaneId = observationLaneIds[0] || null;
+  const observationCollectionSource = metadataText(collectionSource || source);
+  const observationRoleFamily = metadataText(
+    job.roleFamilyId || job.roleFamily || job.targetRoleFamily || roleFamily,
+  );
+  const {
+    laneId: _laneId,
+    laneIds: _laneIds,
+    searchQueries: _searchQueries,
+    roleFamily: _roleFamily,
+    roleFamilyId: _roleFamilyId,
+    targetRoleFamily: _targetRoleFamily,
+    providerId: _providerId,
+    sourceRecordId: _sourceRecordId,
+    ...sourceJob
+  } = job;
+  const fingerprintInput = {
+    ...sourceJob,
+    sourceRecordId: recordId,
+    url: canonicalUrl,
+    sourceUrl: canonicalUrl,
+  };
   const rawFingerprint = fingerprint(stableJson(fingerprintInput));
-  const observationId = fingerprint(`${source}\n${recordId || canonicalUrl || ''}\n${rawFingerprint}`);
+  const observationId = fingerprint(
+    `${source}\n${observationCollectionSource || ''}\n${recordId || canonicalUrl || ''}\n${observationLaneIds.join(',')}\n${observationRoleFamily || ''}\n${rawFingerprint}`,
+  );
   const result = {
     observationId,
     source,
+    collectionSource: observationCollectionSource,
     sourceRecordId: recordId,
-    sourceUrl: text(job.url || job.sourceUrl),
+    sourceUrl: canonicalUrl,
     canonicalUrl,
+    ...(identityDigest ? { urlIdentityDigest: identityDigest } : {}),
     employer: field(text(job.company || job.employer), 'explicit-source'),
+    employerReference: field(text(job.employerReference || job.companyReference || job.employerId), 'explicit-source'),
     title: field(title, 'explicit-source'),
     description,
+    responsibilities: listField(job.responsibilities),
+    skills: listField(job.skills),
+    qualifications: listField(job.qualifications),
+    eligibility: listField(job.eligibility),
+    industry: field(text(job.industry || job.sector || job.category), 'explicit-source'),
     location,
     workingPattern: workingPattern.value || workingPatternAmbiguous
       ? workingPattern
@@ -126,13 +256,25 @@ export function normaliseObservation(job, { sourceName, fetchedAt, laneId } = {}
     seniority,
     compensation: compensation(job, warnings),
     postedAt: text(job.postedDate || job.postedAt),
+    closingAt: text(job.closingDate || job.closingAt || job.expiresAt),
     fetchedAt: text(fetchedAt),
-    laneId: text(laneId),
+    firstSeenAt: text(job.firstSeenAt) || text(fetchedAt),
+    lastSeenAt: text(job.lastSeenAt) || text(fetchedAt),
+    laneId: observationLaneId,
+    laneIds: observationLaneIds,
+    roleFamily: observationRoleFamily,
     warnings,
     rawFingerprint,
+    diagnostics: {
+      codes: [...new Set(warnings.map(diagnosticCode))].slice(0, 16),
+      rawPayloadRetained: false,
+      retention: 'fingerprint-only',
+    },
   };
   result.fieldProvenance = Object.fromEntries([
-    'employer', 'title', 'location', 'workingPattern', 'employmentType', 'seniority', 'compensation',
+    'employer', 'employerReference', 'title', 'responsibilities', 'skills', 'qualifications',
+    'eligibility', 'industry', 'location', 'workingPattern', 'employmentType', 'seniority',
+    'compensation',
   ].map((name) => [name, result[name].provenance]));
   return deepFreeze(result);
 }

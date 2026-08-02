@@ -3,6 +3,12 @@ import os from 'node:os';
 import path from 'node:path';
 import { atomicWriteFile } from './atomicWrite.mjs';
 import { normaliseScheduleDays } from './scheduler.mjs';
+import {
+  withWorkspaceMutationAuthority, withWorkspaceMutationAuthorityAsync,
+} from './workspaceMutationAuthority.mjs';
+import { workspacePaths } from './workspacePaths.mjs';
+
+export { workspacePaths } from './workspacePaths.mjs';
 
 export const CURRENT_WORKSPACE_SCHEMA = 2;
 
@@ -82,32 +88,6 @@ export function resolveWorkspaceRoot({ appRoot, argv = process.argv.slice(2), en
   // omit data/opportunities.json and therefore use the separate Documents path.
   if (fs.existsSync(path.join(appRoot, 'data', 'opportunities.json'))) return path.resolve(appRoot);
   return defaultWorkspaceRoot();
-}
-
-export function workspacePaths(root) {
-  const workspaceRoot = path.resolve(root);
-  return Object.freeze({
-    root: workspaceRoot,
-    config: path.join(workspaceRoot, 'workspace.json'),
-    env: path.join(workspaceRoot, '.env'),
-    tracker: path.join(workspaceRoot, 'data', 'opportunities.json'),
-    scanRuns: path.join(workspaceRoot, 'data', 'scan-runs.jsonl'),
-    categories: path.join(workspaceRoot, 'data', 'search-categories.json'),
-    portals: path.join(workspaceRoot, 'data', 'ats-portals.json'),
-    employers: path.join(workspaceRoot, 'data', 'employers.json'),
-    sources: path.join(workspaceRoot, 'data', 'sources.md'),
-    reports: path.join(workspaceRoot, 'reports'),
-    applications: path.join(workspaceRoot, 'applications'),
-    profile: path.join(workspaceRoot, 'profile'),
-    profileContext: path.join(workspaceRoot, 'profile', 'context.md'),
-    searchProfileRaw: path.join(workspaceRoot, 'profile', 'search', 'raw.json'),
-    searchProfileDraft: path.join(workspaceRoot, 'profile', 'search', 'draft.json'),
-    searchProfilePublished: path.join(workspaceRoot, 'profile', 'search', 'published.json'),
-    cv: path.join(workspaceRoot, 'cv'),
-    imports: path.join(workspaceRoot, 'imports'),
-    logs: path.join(workspaceRoot, 'logs'),
-    backups: path.join(workspaceRoot, '.scout', 'backups'),
-  });
 }
 
 function cloneDefaults() {
@@ -218,17 +198,42 @@ export function loadWorkspaceConfig(root, { allowMissing = true } = {}) {
     if (!allowMissing) throw new Error(`workspace config missing: ${file}`);
     return cloneDefaults();
   }
-  return validateWorkspaceConfig(mergeWorkspaceDefaults(JSON.parse(fs.readFileSync(file, 'utf8'))));
+  const value = JSON.parse(fs.readFileSync(file, 'utf8'));
+  delete value._scoutMutation;
+  return validateWorkspaceConfig(mergeWorkspaceDefaults(value));
+}
+
+function persistWorkspaceConfig(root, config) {
+  const checked = validateWorkspaceConfig(config);
+  atomicWriteFile(workspacePaths(root).config, `${JSON.stringify(checked, null, 2)}\n`);
+  return checked;
 }
 
 export function writeWorkspaceConfig(root, config) {
-  const checked = validateWorkspaceConfig(config);
-  atomicWriteFile(workspacePaths(root).config, `${JSON.stringify(checked, null, 2)}\n`);
+  return withWorkspaceMutationAuthority(root, {
+    kind: 'workspace-config', phase: 'persist-config',
+  }, () => persistWorkspaceConfig(root, config));
+}
+
+export function mutateWorkspaceConfig(root, { kind, phase }, transform) {
+  if (typeof transform !== 'function') throw new TypeError('workspace config transform is required');
+  return withWorkspaceMutationAuthority(root, { kind, phase }, () => {
+    const next = transform(loadWorkspaceConfig(root));
+    return next === null ? null : persistWorkspaceConfig(root, next);
+  });
+}
+
+export function mutateWorkspaceConfigAsync(root, { kind, phase }, transform) {
+  if (typeof transform !== 'function') throw new TypeError('workspace config transform is required');
+  return withWorkspaceMutationAuthorityAsync(root, { kind, phase }, async () => {
+    const next = await transform(loadWorkspaceConfig(root));
+    return next === null ? null : persistWorkspaceConfig(root, next);
+  });
 }
 
 export function ensureWorkspaceDirectories(root) {
   const p = workspacePaths(root);
-  for (const dir of [p.root, p.profile, p.cv, path.dirname(p.tracker), p.reports, p.applications, p.imports, p.logs, p.backups]) {
+  for (const dir of [p.root, p.profile, p.cv, path.dirname(p.tracker), p.reports, p.applications, p.imports, p.logs, p.backups, p.runs]) {
     fs.mkdirSync(dir, { recursive: true });
   }
   return p;

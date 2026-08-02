@@ -3,6 +3,56 @@ import { currentStage, isInterviewStage, lastCompletedStage, stagesOf } from './
 
 import { ACTIVE_STATUSES, OPEN_STATUSES, isOpen } from './statusGroups.mjs';
 
+const BASE_RECOVERY_REQUIREMENTS = Object.freeze([
+  'mode',
+  'purpose',
+  'profileVersion',
+  'sourceConfigFingerprint',
+  'journalSchemaVersion',
+  'artifactSchemaVersion',
+  'stageArtifactSchemaVersion',
+  'pipelineVersion',
+  'lanePlanGeneration',
+  'lanePlanRevision',
+  'laneSelectionFingerprint',
+  'scheduleJobId',
+  'logicalWindowId',
+]);
+const RANKING_RECOVERY_REQUIREMENTS = Object.freeze([
+  ...BASE_RECOVERY_REQUIREMENTS,
+  'rankingVersion',
+]);
+const ASSESSMENT_RECOVERY_REQUIREMENTS = Object.freeze([
+  ...RANKING_RECOVERY_REQUIREMENTS,
+  'promptVersion',
+  'assessmentSchemaVersion',
+  'provider',
+  'model',
+]);
+const MUTATION_RECOVERY_REQUIREMENTS = Object.freeze([
+  ...BASE_RECOVERY_REQUIREMENTS,
+  'mutationSchemaVersion',
+  'targetRevision',
+]);
+
+export const RECOVERABLE_PIPELINE_STAGES = Object.freeze([
+  Object.freeze({ id: 'collect', requirements: BASE_RECOVERY_REQUIREMENTS }),
+  Object.freeze({ id: 'normalise', requirements: RANKING_RECOVERY_REQUIREMENTS }),
+  Object.freeze({ id: 'deduplicate', requirements: RANKING_RECOVERY_REQUIREMENTS }),
+  Object.freeze({ id: 'filter', requirements: RANKING_RECOVERY_REQUIREMENTS }),
+  Object.freeze({ id: 'rank', requirements: RANKING_RECOVERY_REQUIREMENTS }),
+  Object.freeze({ id: 'select', requirements: RANKING_RECOVERY_REQUIREMENTS }),
+  Object.freeze({ id: 'assess', requirements: ASSESSMENT_RECOVERY_REQUIREMENTS }),
+  Object.freeze({ id: 'tracker', requirements: MUTATION_RECOVERY_REQUIREMENTS }),
+  Object.freeze({ id: 'report', requirements: MUTATION_RECOVERY_REQUIREMENTS }),
+]);
+
+export function recoveryRequirementsForStage(stageId) {
+  const stage = RECOVERABLE_PIPELINE_STAGES.find((candidate) => candidate.id === stageId);
+  if (!stage) throw new TypeError(`unknown recovery stage: ${stageId}`);
+  return stage.requirements;
+}
+
 function latestDate(dates) {
   return dates.filter(Boolean).sort().at(-1) || null;
 }
