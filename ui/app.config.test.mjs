@@ -310,6 +310,19 @@ test('index.html defines static Jobs, Speculative and Shortlist tabs, not catego
   assert.doesNotMatch(html, /data-category="true"/);
 });
 
+test('index.html orders the Speculative tab before Jobs in both nav and sections', () => {
+  const html = fs.readFileSync(new URL('./index.html', import.meta.url), 'utf8');
+  assert.ok(
+    html.indexOf('data-tab="speculative"') < html.indexOf('data-tab="jobs"'),
+    'the Speculative nav button must precede the Jobs nav button',
+  );
+  assert.ok(
+    html.indexOf('id="tab-speculative"') < html.indexOf('id="tab-jobs"'),
+    'the Speculative section must precede the Jobs section',
+  );
+  assert.match(html, /data-tab="jobs" class="active"/);
+});
+
 function withJobsDom() {
   const sections = {};
   const make = () => ({ innerHTML: '', classList: { toggle() {}, add() {}, remove() {} }, addEventListener() {}, querySelector: () => null });
