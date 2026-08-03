@@ -243,6 +243,7 @@ test('packaging consumes the audit-created read-only content snapshot', () => {
   const audit = auditStageBeforePackaging(stageDir, {
     env: { ...process.env, SCOUT_RELEASE_MARKERS: 'SyntheticPackagingMarker' },
   });
+  assert.doesNotThrow(() => assertAuditedStage(audit));
   fs.writeFileSync(path.join(stageDir, 'a.txt'), 'changed-after-audit');
   assert.equal(fs.readFileSync(path.join(audit.stageDir, 'a.txt'), 'utf8'), 'audited-a');
   assert.throws(
