@@ -144,16 +144,18 @@ test('maintainer instructions require operations context, documentation upkeep a
   assert.match(policy, /Do not create root-level TODO/i);
 });
 
-test('completed implementation plans are not shipped as current documentation', () => {
-  for (const directory of [
-    path.join(root, 'docs', 'implementation'),
-    path.join(root, 'docs', 'superpowers', 'plans'),
-  ]) {
-    const markdown = fs.existsSync(directory)
-      ? fs.readdirSync(directory).filter((name) => name.endsWith('.md'))
-      : [];
-    assert.deepEqual(markdown, [], directory);
-  }
+test('only the active Epic 77 audit ledger is retained with implementation plans', () => {
+  const implementation = path.join(root, 'docs', 'implementation');
+  const implementationMarkdown = fs.existsSync(implementation)
+    ? fs.readdirSync(implementation).filter((name) => name.endsWith('.md')).sort()
+    : [];
+  assert.deepEqual(implementationMarkdown, ['epic-77-post-merge-audit-remediation.md']);
+
+  const completedPlans = path.join(root, 'docs', 'superpowers', 'plans');
+  const completedMarkdown = fs.existsSync(completedPlans)
+    ? fs.readdirSync(completedPlans).filter((name) => name.endsWith('.md'))
+    : [];
+  assert.deepEqual(completedMarkdown, [], completedPlans);
 });
 
 test('beta.23 upgrade guidance explains the one-way fenced lease boundary', () => {
