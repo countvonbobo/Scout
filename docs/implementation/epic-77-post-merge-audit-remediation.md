@@ -146,6 +146,63 @@ Additional operator/release-only gates from the Epic remain: native Windows/macO
 - Preserve fail-closed full journal validation fallback when optimizing append cost.
 - Never silently delete recovery-critical partial/failed runs or private adoption residue.
 
+## F-1 focused design and implementation plan
+
+Independent reproduction on 2026-08-03 used the real `auditStageBeforePackaging`,
+`verifiedAuditTreeDigest` and `assertAuditedStage` against a synthetic one-file
+stage outside the repository. The file changed from mode `0644` to `0444` during
+sealing; the audit digest and sealed digest differed; the untouched clean
+snapshot then failed with `audited release payload differs from the
+privacy-authorized snapshot`. No private marker, workspace or package was used.
+
+Root cause: `auditStagedRelease` correctly authorises the copied snapshot before
+sealing and the code correctly verifies that inspected digest before changing
+anything. `seal()` then intentionally changes protected file modes. The return
+value nevertheless carries the pre-seal digest, so every later assertion compares
+the sealed state with an authority that describes a state which no longer exists.
+
+The focused repair will use this protocol:
+
+1. Keep the current audit and pre-seal `verifiedAuditTreeDigest(snapshot) ===
+   result.treeDigest` check unchanged. This continues to prove that the inspected
+   bytes/metadata are the copied bytes/metadata before any intentional mutation.
+2. Seal the snapshot read-only exactly as today.
+3. Traverse the sealed snapshot with the existing no-follow, ancestor-identity-
+   checked audit reader and capture one sealed authorization state containing:
+   the content/path/mode/link digest and a local identity digest over every file,
+   directory and allowed link (`dev`, `ino`, size, mode and change timestamps as
+   applicable). The identity digest is local ephemeral authority, not a release
+   reproducibility digest.
+4. Return the sealed content digest plus sealed identity digest. Recompute and
+   compare both immediately before and after packaging. Content, mode, path,
+   link, addition and deletion changes fail through the tree digest; same-byte,
+   same-mode replacement also fails through the identity digest.
+5. Keep the protocol local to release audit/build code. Do not unify the separate
+   release digest formats or remove modes/sealing in this PR.
+6. Add cleanup finalisation that preserves the primary packaging error when
+   cleanup also fails, while appending only a fixed privacy-safe statement that
+   a sealed payload was retained for runner cleanup. A cleanup-only failure also
+   throws that bounded statement. No retained path or raw filesystem error is
+   emitted.
+
+Test order and acceptance:
+
+1. First product-code change: add and run the clean production-function
+   composition assertion; record the expected RED failure.
+2. Make only the sealed authorization change and record the clean GREEN result.
+3. Add a fresh-snapshot tamper matrix for content, file mode, rename/path,
+   symlink (or supported platform equivalent), addition, deletion and same-byte
+   replacement, plus cleanup-primary-error precedence.
+4. Replace the source-regex packaging assertion with behaviour evidence while
+   retaining useful structural assertions. Add a Linux CI step that executes
+   the real `buildLinux` path after normal dependency/Typst setup and creates the
+   native DEB and tar payload using a synthetic release marker.
+5. Run focused release/build/workflow/privacy tests, staged audit, synthetic
+   marker canary, `npm audit --omit=dev`, then the proportionate full Node and
+   browser suites. Inspect the exact-head cross-platform CI logs and obtain
+   independent specification, code and security/privacy reviews before any
+   acceptance claim.
+
 ## Evidence update protocol
 
 For every finding, update its row only after independent reproduction/static proof. Record RED test evidence before the fix, then exact commits, PR URL, focused and full counts, CI URL/status/log inspection, independent spec/code/security/documentation reviews, privacy and metadata audit, platform limitations, rollback considerations and remaining operator work. A claim reaches `fixed` only at the exact pushed SHA reviewed and tested. A merged-main Epic checkbox requires a separate main-SHA reconciliation; a feature-branch result is insufficient.
