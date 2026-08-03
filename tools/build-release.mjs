@@ -285,11 +285,46 @@ function copyTree(
   copyRegularFile(source, target, verifiedRoot, stat);
 }
 
+function auditedAncestorIdentityDigest(entry, authorityRoot) {
+  const boundary = path.resolve(authorityRoot);
+  let current = path.dirname(path.resolve(entry));
+  const relative = path.relative(boundary, current);
+  if (relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
+    throw new Error('audited release payload is outside its authorization root');
+  }
+  const hash = crypto.createHash('sha256');
+  while (true) {
+    const stat = fs.lstatSync(current, { bigint: true });
+    if (!stat.isDirectory() || stat.isSymbolicLink()) {
+      throw new Error('audited release payload ancestor is not a real directory');
+    }
+    hash.update(JSON.stringify({
+      path: path.relative(boundary, current).split(path.sep).join('/'),
+      dev: String(stat.dev),
+      ino: String(stat.ino),
+      mode: Number(stat.mode & 0o777n),
+      mtimeNs: String(stat.mtimeNs),
+      ctimeNs: String(stat.ctimeNs),
+    }));
+    hash.update('\0');
+    if (current === boundary) break;
+    const parent = path.dirname(current);
+    if (parent === current) throw new Error('audited release payload authorization root is unreachable');
+    current = parent;
+  }
+  return hash.digest('hex');
+}
+
 export function auditStageBeforePackaging(stageDir, {
   env = process.env,
   requireMarkers = true,
+  sealedState = verifiedAuditTreeState,
+  removeAuditedSnapshot = removeAuditedStage,
+  authorizationRoot = null,
+  sealedDirectoryModes = {},
 } = {}) {
   const source = path.resolve(stageDir);
+  const authorityRoot = path.resolve(authorizationRoot || path.dirname(source));
   const markerFile = env.SCOUT_RELEASE_MARKERS_FILE
     ? path.resolve(DEFAULT_ROOT, env.SCOUT_RELEASE_MARKERS_FILE) : null;
   const markers = loadMarkers({ markerFile, envMarkers: env.SCOUT_RELEASE_MARKERS });
@@ -311,34 +346,42 @@ export function auditStageBeforePackaging(stageDir, {
       if (stat.isSymbolicLink()) return;
       if (stat.isDirectory()) {
         for (const name of fs.readdirSync(entry)) seal(path.join(entry, name));
-        fs.chmodSync(entry, 0o555);
+        const relative = path.relative(snapshot, entry).split(path.sep).join('/');
+        const requiredMode = Object.hasOwn(sealedDirectoryModes, relative)
+          ? sealedDirectoryModes[relative] : 0o555;
+        if (requiredMode !== 0o555 && requiredMode !== 0o755) {
+          throw new Error('unsupported sealed release directory mode');
+        }
+        fs.chmodSync(entry, requiredMode);
       } else if (stat.isFile()) {
         fs.chmodSync(entry, stat.mode & ~0o222);
       }
     };
     seal(snapshot);
-    const sealedAuthorization = verifiedAuditTreeState(snapshot);
+    const sealedAuthorization = sealedState(snapshot);
+    const ancestorIdentityDigest = auditedAncestorIdentityDigest(snapshot, authorityRoot);
     const output = [
       `Release audit scanned ${result.filesScanned} files with ${result.markerCount} configured personal markers.`,
       `Release audit tree digest: ${sealedAuthorization.treeDigest}`,
       'Release audit passed.',
       '',
     ].join('\n');
-    return { output, ...sealedAuthorization, stageDir: snapshot };
+    return {
+      output,
+      ...sealedAuthorization,
+      ancestorIdentityDigest,
+      authorityRoot,
+      stageDir: snapshot,
+    };
   } catch (error) {
-    try {
-      const restoreWrite = (entry) => {
-        if (!fs.existsSync(entry)) return;
-        const stat = fs.lstatSync(entry);
-        if (stat.isDirectory()) {
-          fs.chmodSync(entry, 0o755);
-          for (const name of fs.readdirSync(entry)) restoreWrite(path.join(entry, name));
-        } else if (!stat.isSymbolicLink()) fs.chmodSync(entry, stat.mode | 0o200);
-      };
-      restoreWrite(snapshot);
-      fs.rmSync(snapshot, { recursive: true, force: true });
-    } catch {}
-    throw error;
+    const primaryError = error instanceof Error
+      ? error : new Error('pre-package release preparation failed');
+    finishAuditedStageCleanup(snapshot, {
+      primaryError,
+      remove: removeAuditedSnapshot,
+      retainedState: 'release-audit payload',
+    });
+    throw primaryError;
   }
 }
 
@@ -359,12 +402,13 @@ export function removeAuditedStage(stageDir) {
 export function finishAuditedStageCleanup(stageDir, {
   primaryError = null,
   remove = removeAuditedStage,
+  retainedState = 'sealed payload',
 } = {}) {
   try {
     remove(stageDir);
     return { removed: true };
   } catch {
-    const message = 'Audited release payload cleanup failed; the sealed payload was retained for runner cleanup.';
+    const message = `Audited release payload cleanup failed; the ${retainedState} was retained for runner cleanup.`;
     if (primaryError instanceof Error) {
       primaryError.message = `${primaryError.message}\n${message}`;
       return { removed: false };
@@ -375,16 +419,22 @@ export function finishAuditedStageCleanup(stageDir, {
 
 export function assertAuditedStage(audit) {
   if (!audit?.stageDir || !/^[a-f0-9]{64}$/.test(String(audit.treeDigest || ''))
-    || !/^[a-f0-9]{64}$/.test(String(audit.identityDigest || ''))) {
+    || !/^[a-f0-9]{64}$/.test(String(audit.identityDigest || ''))
+    || !/^[a-f0-9]{64}$/.test(String(audit.ancestorIdentityDigest || ''))
+    || !audit.authorityRoot) {
     throw new Error('audited release payload differs from the privacy-authorized snapshot');
   }
   let current;
+  let ancestorIdentityDigest;
   try {
     current = verifiedAuditTreeState(audit.stageDir);
+    ancestorIdentityDigest = auditedAncestorIdentityDigest(audit.stageDir, audit.authorityRoot);
   } catch {
     throw new Error('audited release payload differs from the privacy-authorized snapshot');
   }
-  if (current.treeDigest !== audit.treeDigest || current.identityDigest !== audit.identityDigest) {
+  if (current.treeDigest !== audit.treeDigest
+    || current.identityDigest !== audit.identityDigest
+    || ancestorIdentityDigest !== audit.ancestorIdentityDigest) {
     throw new Error('audited release payload differs from the privacy-authorized snapshot');
   }
 }
@@ -618,7 +668,7 @@ export function buildInstaller({ root = DEFAULT_ROOT, stageDir, version, isccPat
   ) {
     throw new Error('verified Windows package input changed during compilation');
   }
-  const audit = auditStageBeforePackaging(staged.stageDir);
+  const audit = auditStageBeforePackaging(staged.stageDir, { authorizationRoot: root });
   const auditedStage = audit.stageDir;
   let primaryError = null;
   try {

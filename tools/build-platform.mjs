@@ -43,7 +43,7 @@ export function buildMac({ arch = process.arch, nodeExecutable = process.execPat
   const plist = `<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd"><plist version="1.0"><dict><key>CFBundleName</key><string>Scout</string><key>CFBundleDisplayName</key><string>Scout</string><key>CFBundleIdentifier</key><string>app.scout.local</string><key>CFBundleVersion</key><string>${VERSION}</string><key>CFBundleShortVersionString</key><string>${VERSION}</string><key>CFBundleExecutable</key><string>Scout</string><key>CFBundlePackageType</key><string>APPL</string><key>LSMinimumSystemVersion</key><string>13.0</string><key>NSHighResolutionCapable</key><true/></dict></plist>`;
   fs.writeFileSync(path.join(contents, 'Info.plist'), plist);
   fs.symlinkSync('/Applications', path.join(stage, 'dmg-root', 'Applications'));
-  const audit = auditStageBeforePackaging(stage);
+  const audit = auditStageBeforePackaging(stage, { authorizationRoot: ROOT });
   const auditedStage = audit.stageDir;
   let primaryError = null;
   try {
@@ -104,7 +104,10 @@ export function buildLinux({ nodeExecutable = process.execPath } = {}) {
   if (verifiedReleaseFileDigest(launcherSource, { verifiedRoot: stage }) !== launcherSourceDigest) {
     throw new Error('verified Linux package input changed during staging');
   }
-  const audit = auditStageBeforePackaging(stage);
+  const audit = auditStageBeforePackaging(stage, {
+    authorizationRoot: ROOT,
+    sealedDirectoryModes: { 'deb/DEBIAN': 0o755 },
+  });
   const auditedStage = audit.stageDir;
   let primaryError = null;
   try {

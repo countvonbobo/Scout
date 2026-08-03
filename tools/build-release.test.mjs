@@ -327,6 +327,51 @@ test('sealed release authorization rejects the complete tamper matrix', () => {
   }
 });
 
+test('sealed release authorization rejects a restored ancestor substitution', () => {
+  const top = fs.mkdtempSync(path.join(os.tmpdir(), 'scout-audit-ancestor-'));
+  const releaseDir = path.join(top, 'release');
+  const heldDir = path.join(top, 'release-held');
+  const stageDir = path.join(releaseDir, 'stage');
+  fs.mkdirSync(stageDir, { recursive: true });
+  fs.writeFileSync(path.join(stageDir, 'a.txt'), 'audited-a');
+  const audit = auditStageBeforePackaging(stageDir, {
+    env: { ...process.env, SCOUT_RELEASE_MARKERS: 'SyntheticPackagingMarker' },
+  });
+  try {
+    assert.doesNotThrow(() => assertAuditedStage(audit));
+    fs.renameSync(releaseDir, heldDir);
+    fs.renameSync(heldDir, releaseDir);
+    assert.throws(() => assertAuditedStage(audit), /privacy-authorized snapshot/);
+  } finally {
+    removeAuditedStage(audit.stageDir);
+    fs.rmSync(top, { recursive: true, force: true });
+  }
+});
+
+test('a required packager directory mode keeps its files sealed and remains tamper-evident', () => {
+  const stageDir = fs.mkdtempSync(path.join(os.tmpdir(), 'scout-audit-directory-mode-'));
+  const controlDir = path.join(stageDir, 'deb', 'DEBIAN');
+  fs.mkdirSync(controlDir, { recursive: true });
+  fs.writeFileSync(path.join(controlDir, 'control'), 'Package: scout\n');
+  const audit = auditStageBeforePackaging(stageDir, {
+    env: { ...process.env, SCOUT_RELEASE_MARKERS: 'SyntheticPackagingMarker' },
+    sealedDirectoryModes: { 'deb/DEBIAN': 0o755 },
+  });
+  try {
+    const sealedControlDir = path.join(audit.stageDir, 'deb', 'DEBIAN');
+    const sealedControl = path.join(sealedControlDir, 'control');
+    assert.equal(fs.statSync(sealedControlDir).mode & 0o777, 0o755);
+    assert.equal(fs.statSync(sealedControl).mode & 0o777, 0o444);
+    assert.doesNotThrow(() => assertAuditedStage(audit));
+    fs.renameSync(sealedControl, path.join(sealedControlDir, 'control-held'));
+    fs.renameSync(path.join(sealedControlDir, 'control-held'), sealedControl);
+    assert.throws(() => assertAuditedStage(audit), /privacy-authorized snapshot/);
+  } finally {
+    removeAuditedStage(audit.stageDir);
+    fs.rmSync(stageDir, { recursive: true, force: true });
+  }
+});
+
 test('audited stage cleanup preserves the primary error and reports retained payload safely', () => {
   const primary = new Error('primary packaging failure');
   assert.doesNotThrow(() => finishAuditedStageCleanup('/synthetic/audited-stage', {
@@ -343,6 +388,30 @@ test('audited stage cleanup preserves the primary error and reports retained pay
     (error) => error.message
       === 'Audited release payload cleanup failed; the sealed payload was retained for runner cleanup.',
   );
+});
+
+test('audit preparation cleanup preserves its primary error and reports retained payload safely', () => {
+  const stageDir = fs.mkdtempSync(path.join(os.tmpdir(), 'scout-audit-cleanup-'));
+  fs.writeFileSync(path.join(stageDir, 'a.txt'), 'audited-a');
+  try {
+    assert.throws(
+      () => auditStageBeforePackaging(stageDir, {
+        env: { ...process.env, SCOUT_RELEASE_MARKERS: 'SyntheticPackagingMarker' },
+        sealedState: () => { throw new Error('primary authorization failure'); },
+        removeAuditedSnapshot: () => { throw new Error('/private/path must not escape'); },
+      }),
+      (error) => {
+        assert.equal(
+          error.message,
+          'primary authorization failure\nAudited release payload cleanup failed; the release-audit payload was retained for runner cleanup.',
+        );
+        assert.doesNotMatch(error.message, /private\/path/);
+        return true;
+      },
+    );
+  } finally {
+    fs.rmSync(stageDir, { recursive: true, force: true });
+  }
 });
 
 test('public and release staging refuse allowlisted leaf symlinks', () => {
