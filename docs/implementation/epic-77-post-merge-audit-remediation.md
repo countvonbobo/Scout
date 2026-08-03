@@ -43,7 +43,7 @@ Verification status in this initial ledger is deliberately `unverified`: the aud
 
 | ID | Severity | Provenance | Verification | Beta gate | Workstream | Required disposition and evidence | Branch / commit / PR / tests / CI / review |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| F-1 | Critical | Epic-introduced | unverified | **BLOCK** | 1 | Reproduce clean seal→assert failure; preserve pre-seal audit and read-only seal; authorise sealed digest; clean pass plus content/mode/path/link/add/delete/replace tamper failures; pre/post packager checks; primary error not masked by cleanup; execute a real packager round trip. | `codex/epic-77-f1-release-packaging`; evidence pending |
+| F-1 | Critical | Epic-introduced | verified; local repair complete, pushed-head acceptance pending | **BLOCK pending CI/review** | 1 | Reproduce clean seal→assert failure; preserve pre-seal audit and read-only seal; authorise sealed digest; clean pass plus content/mode/path/link/add/delete/replace tamper failures; pre/post packager checks; primary error not masked by cleanup; execute a real packager round trip. | Draft PR #84; local head `7e075813f091d78e510d3c295024f4e38bd9437c`; RED, focused/full suites and native macOS package pass; remote head/CI/reviews still pending; see F-1 evidence below. |
 | D-1 | Critical | Pre-existing but amplified by Epic authority model | unverified | **BLOCK** | 2 | Put adoption under shared mutation/OS exclusion; heartbeat and recheck fence through renames/receipt/publication; advance generation lineage; prove stale owners cannot write; crash-safe rollback; require service stop/restart ordering in workflow and operations docs. Synthetic roots only. | pending |
 | E-1 | Important | Epic-introduced | unverified | **BLOCK** | 3/7 | Upgraded users must be gated on publication or shown an explicit legacy-discovery disclosure; ranked-stage/UI claims must match the actual engine; update troubleshooting and composition/browser coverage. | pending |
 | E-2 | Important | Epic-introduced | unverified | **BLOCK** | 3 | Derive provider card, sign-in panel and verification offer from one health-gated presentation authority; contradictory signed-in/blocked states and suppressed remedies must be impossible. | pending |
@@ -202,6 +202,65 @@ Test order and acceptance:
    browser suites. Inspect the exact-head cross-platform CI logs and obtain
    independent specification, code and security/privacy reviews before any
    acceptance claim.
+
+## F-1 implementation and local verification evidence
+
+- Draft PR: `https://github.com/oliver-hitchings/Scout/pull/84`.
+- Branch: `codex/epic-77-f1-release-packaging`, based directly on
+  `1f8310c0af50935c68978e95a916682bbb9cecec`.
+- Local exact head: `7e075813f091d78e510d3c295024f4e38bd9437c`.
+  The remote PR head is still `e7294263331ec7abcc2453f3fd462d2d5153190d`;
+  therefore the repair is not yet an exact-pushed-head acceptance candidate.
+- Commit map:
+  - `e7294263331ec7abcc2453f3fd462d2d5153190d` — initial remediation ledger.
+  - `143ffb7edb0b88411919fe3d8007398626a53d06` — focused sealed-snapshot design.
+  - `0e3b42ed4f0f45eebd78b89ed398bfb6e1ffbbf7` — first product-code change:
+    clean production composition RED test.
+  - `514b0a385233f56043a0334d153455a583c93f90` — sealed tree/identity
+    authorization, pre/post packager assertion, privacy-safe cleanup precedence,
+    tamper matrix and real Linux CI packaging step.
+  - `7e075813f091d78e510d3c295024f4e38bd9437c` — retain this active ledger while
+    preserving the stale-plan documentation guard.
+- Independent reproduction: a synthetic one-file stage changed from mode `0644`
+  to `0444`; pre-seal digest
+  `df3328...` and sealed digest `9da773...` differed, and the untouched clean
+  stage failed the real `assertAuditedStage` call with the bounded expected
+  mismatch. No private workspace, provider, release or package was involved.
+- RED evidence: the first production-code change ran one clean seal→assert test:
+  1 total, 0 passed, 1 failed as expected. The same test passed after the repair.
+- Focused release/build/workflow/privacy verification: 76 passed, 0 failed.
+  This includes content, mode, rename/path, symlink, addition, deletion and
+  same-byte replacement cases. The replacement case proves the reproducible
+  tree digest remains equal and the local identity authorization rejects it.
+- Full Node suite at local head: 1,458 total; 1,452 passed; 0 failed; 6 genuine
+  platform skips; 224.2109 seconds.
+- Full Playwright suite at local head: 186 total; 175 passed; 0 failed; 11
+  intentional skips; Chromium and Firefox; 3.6 minutes.
+- Documentation policy focus: 13 passed, 0 failed.
+- Production dependency audit: `npm audit --omit=dev` found 0 vulnerabilities.
+- Stage-only build passed. Required-marker release audit scanned 1,596 files
+  with one synthetic marker, produced tree digest
+  `eb8f75b1e87a0964fe60377584d6a7e43e25ea4c8d346995d98e99e246e836cd`,
+  and passed.
+- Native macOS packaging passed through the real `build-platform.mjs mac` path
+  after installing the pinned Typst 0.14.2 runtime. Artifact:
+  `Scout-0.1.0-beta.23-macos-arm64.dmg`; SHA-256
+  `109bdb19b93a6f6e32b040ae9e5ebe27864676e07980fe2dfc486412b69c1fdb`.
+  The artifact remains ignored in the disposable worktree and is not published.
+- Interrupted/environment-limited attempts: the first unprivileged native macOS
+  build could not use the host Clang cache/SDK, then passed under the approved
+  host execution. The first sandboxed full Node run could not inspect process
+  start identity and was stopped after an isolated chat-service test spun; the
+  same full suite then passed under approved host execution. The first sandboxed
+  npm audit lacked registry DNS access; the approved network retry passed. These
+  were environment limitations, not product-test failures.
+- Still required before F-1 acceptance: publish the four local commits after a
+  fresh remote-state check; inspect the exact-head GitHub CI run, including the
+  real Linux DEB/tar packaging step and Windows coverage; obtain independent
+  specification, code-quality and security/privacy reviews; resolve every
+  review finding; then update this row with exact CI/review evidence. Native
+  Windows packaging/installation and installer smoke remain operator release
+  gates. No merge is authorised.
 
 ## Evidence update protocol
 
