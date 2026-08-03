@@ -6,7 +6,7 @@ import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { isMainModule } from '../ui/lib/mainModule.mjs';
 import {
-  auditStagedRelease, loadMarkers, verifiedAuditTreeDigest,
+  auditStagedRelease, loadMarkers, verifiedAuditTreeDigest, verifiedAuditTreeState,
 } from './release-audit.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -317,13 +317,14 @@ export function auditStageBeforePackaging(stageDir, {
       }
     };
     seal(snapshot);
+    const sealedAuthorization = verifiedAuditTreeState(snapshot);
     const output = [
       `Release audit scanned ${result.filesScanned} files with ${result.markerCount} configured personal markers.`,
-      `Release audit tree digest: ${result.treeDigest}`,
+      `Release audit tree digest: ${sealedAuthorization.treeDigest}`,
       'Release audit passed.',
       '',
     ].join('\n');
-    return { output, treeDigest: result.treeDigest, stageDir: snapshot };
+    return { output, ...sealedAuthorization, stageDir: snapshot };
   } catch (error) {
     try {
       const restoreWrite = (entry) => {
@@ -355,9 +356,35 @@ export function removeAuditedStage(stageDir) {
   fs.rmSync(root, { recursive: true, force: true });
 }
 
+export function finishAuditedStageCleanup(stageDir, {
+  primaryError = null,
+  remove = removeAuditedStage,
+} = {}) {
+  try {
+    remove(stageDir);
+    return { removed: true };
+  } catch {
+    const message = 'Audited release payload cleanup failed; the sealed payload was retained for runner cleanup.';
+    if (primaryError instanceof Error) {
+      primaryError.message = `${primaryError.message}\n${message}`;
+      return { removed: false };
+    }
+    throw new Error(message);
+  }
+}
+
 export function assertAuditedStage(audit) {
   if (!audit?.stageDir || !/^[a-f0-9]{64}$/.test(String(audit.treeDigest || ''))
-    || verifiedAuditTreeDigest(audit.stageDir) !== audit.treeDigest) {
+    || !/^[a-f0-9]{64}$/.test(String(audit.identityDigest || ''))) {
+    throw new Error('audited release payload differs from the privacy-authorized snapshot');
+  }
+  let current;
+  try {
+    current = verifiedAuditTreeState(audit.stageDir);
+  } catch {
+    throw new Error('audited release payload differs from the privacy-authorized snapshot');
+  }
+  if (current.treeDigest !== audit.treeDigest || current.identityDigest !== audit.identityDigest) {
     throw new Error('audited release payload differs from the privacy-authorized snapshot');
   }
 }
@@ -593,6 +620,7 @@ export function buildInstaller({ root = DEFAULT_ROOT, stageDir, version, isccPat
   }
   const audit = auditStageBeforePackaging(staged.stageDir);
   const auditedStage = audit.stageDir;
+  let primaryError = null;
   try {
     assertAuditedStage(audit);
     const auditedPayloadDigest = verifiedReleaseTreeDigest(auditedStage);
@@ -616,8 +644,11 @@ export function buildInstaller({ root = DEFAULT_ROOT, stageDir, version, isccPat
     assertAuditedStage(audit);
     const checksums = writeChecksums(outputDir);
     return { ...staged, outputDir, checksums, version: selectedVersion };
+  } catch (error) {
+    primaryError = error;
+    throw error;
   } finally {
-    removeAuditedStage(auditedStage);
+    finishAuditedStageCleanup(auditedStage, { primaryError });
   }
 }
 

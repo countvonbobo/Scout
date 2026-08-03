@@ -28,6 +28,13 @@ test('CI audits fork pull requests without exposing private release markers', ()
   assert.match(ci, /Audit staged public tree with required private markers[\s\S]*if: github\.event_name != 'pull_request' \|\| github\.event\.pull_request\.head\.repo\.full_name == github\.repository[\s\S]*--require-markers[\s\S]*SCOUT_RELEASE_MARKERS: \$\{\{ secrets\.SCOUT_RELEASE_MARKERS \}\}/);
 });
 
+test('CI executes a native Linux packager against the audited sealed snapshot', () => {
+  assert.match(
+    ci,
+    /Exercise native Linux packaging[\s\S]*if: runner\.os == 'Linux'[\s\S]*node tools\/build-platform\.mjs linux[\s\S]*SCOUT_RELEASE_MARKERS: SyntheticCiPackagingMarker/,
+  );
+});
+
 test('release publication has scoped write permission and publishes checksum', () => {
   assert.match(workflow, /publish:[\s\S]*permissions:\s*\n\s*contents: write/);
   assert.match(workflow, /gh release create/);

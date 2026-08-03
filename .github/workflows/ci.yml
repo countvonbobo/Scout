@@ -35,6 +35,11 @@ jobs:
         run: npm run release:audit -- --root dist/release/stage --stage --require-markers
         env:
           SCOUT_RELEASE_MARKERS: ${{ secrets.SCOUT_RELEASE_MARKERS }}
+      - name: Exercise native Linux packaging
+        if: runner.os == 'Linux'
+        run: node tools/build-platform.mjs linux
+        env:
+          SCOUT_RELEASE_MARKERS: SyntheticCiPackagingMarker
 
   browser-acceptance:
     strategy:

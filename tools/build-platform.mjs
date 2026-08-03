@@ -6,7 +6,7 @@ import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { isMainModule } from '../ui/lib/mainModule.mjs';
 import {
-  assertAuditedStage, auditStageBeforePackaging, copyVerifiedReleaseFile, removeAuditedStage, sha256, stageRelease,
+  assertAuditedStage, auditStageBeforePackaging, copyVerifiedReleaseFile, finishAuditedStageCleanup, sha256, stageRelease,
   verifiedReleaseFileDigest, verifiedReleaseTreeDigest, writeChecksums,
 } from './build-release.mjs';
 
@@ -45,6 +45,7 @@ export function buildMac({ arch = process.arch, nodeExecutable = process.execPat
   fs.symlinkSync('/Applications', path.join(stage, 'dmg-root', 'Applications'));
   const audit = auditStageBeforePackaging(stage);
   const auditedStage = audit.stageDir;
+  let primaryError = null;
   try {
     assertAuditedStage(audit);
     const auditedPayloadDigest = verifiedMacDmgRootDigest(path.join(auditedStage, 'dmg-root'));
@@ -55,8 +56,11 @@ export function buildMac({ arch = process.arch, nodeExecutable = process.execPat
     }
     assertAuditedStage(audit);
     return { output: path.join(output, name), sha256: sha256(path.join(output, name)) };
+  } catch (error) {
+    primaryError = error;
+    throw error;
   } finally {
-    removeAuditedStage(auditedStage);
+    finishAuditedStageCleanup(auditedStage, { primaryError });
   }
 }
 
@@ -102,6 +106,7 @@ export function buildLinux({ nodeExecutable = process.execPath } = {}) {
   }
   const audit = auditStageBeforePackaging(stage);
   const auditedStage = audit.stageDir;
+  let primaryError = null;
   try {
     assertAuditedStage(audit);
     const auditedPayloadDigest = verifiedReleaseTreeDigest(auditedStage);
@@ -112,8 +117,11 @@ export function buildLinux({ nodeExecutable = process.execPath } = {}) {
     }
     assertAuditedStage(audit);
     writeChecksums(output); return { deb, tar };
+  } catch (error) {
+    primaryError = error;
+    throw error;
   } finally {
-    removeAuditedStage(auditedStage);
+    finishAuditedStageCleanup(auditedStage, { primaryError });
   }
 }
 

@@ -484,12 +484,12 @@ function filesUnder(directory, {
   if (!fs.existsSync(directory)) return [];
   const result = [];
   const visit = (entry) => {
-    const stat = fs.lstatSync(entry);
+    const stat = fs.lstatSync(entry, { bigint: true });
     if (stat.isSymbolicLink()) {
       const relative = normaliseRelative(directory, entry);
       const target = fs.readlinkSync(entry);
       if (allowStageLinks && relative === 'dmg-root/Applications' && target === '/Applications') {
-        linkSnapshots.push({ file: entry, target });
+        linkSnapshots.push({ file: entry, target, identity: stat });
         return;
       }
       throw new Error(`release audit refuses symbolic link: ${entry}`);
@@ -593,7 +593,37 @@ function auditedTreeDigest(root, files, directories, links = []) {
   return crypto.createHash('sha256').update(JSON.stringify(records)).digest('hex');
 }
 
-export function verifiedAuditTreeDigest(root) {
+function auditedTreeIdentityDigest(root, files, directories, links = []) {
+  const identity = (value) => ({
+    dev: String(value.dev),
+    ino: String(value.ino),
+    mode: Number(value.mode & 0o777n),
+    size: String(value.size),
+    mtimeNs: String(value.mtimeNs),
+    ctimeNs: String(value.ctimeNs),
+  });
+  const records = [
+    ...directories.map((snapshot) => ({
+      type: 'directory',
+      path: normaliseRelative(root, snapshot.directory),
+      ...identity(snapshot.identity),
+    })),
+    ...files.map((record) => ({
+      type: 'file',
+      path: normaliseRelative(root, record.file),
+      ...identity(record.identity),
+    })),
+    ...links.map((record) => ({
+      type: 'link',
+      path: normaliseRelative(root, record.file),
+      target: record.target,
+      ...identity(record.identity),
+    })),
+  ].sort((a, b) => a.path.localeCompare(b.path, 'en') || a.type.localeCompare(b.type, 'en'));
+  return crypto.createHash('sha256').update(JSON.stringify(records)).digest('hex');
+}
+
+export function verifiedAuditTreeState(root) {
   const absoluteRoot = path.resolve(root);
   const directories = [];
   const links = [];
@@ -604,7 +634,14 @@ export function verifiedAuditTreeDigest(root) {
     allowStageLinks: true,
   }).map((file) => ({ file, ...readAuditedRegularFile(absoluteRoot, file) }));
   for (const snapshot of directories) verifyDirectorySnapshot(snapshot);
-  return auditedTreeDigest(absoluteRoot, files, directories, links);
+  return {
+    treeDigest: auditedTreeDigest(absoluteRoot, files, directories, links),
+    identityDigest: auditedTreeIdentityDigest(absoluteRoot, files, directories, links),
+  };
+}
+
+export function verifiedAuditTreeDigest(root) {
+  return verifiedAuditTreeState(root).treeDigest;
 }
 
 export function collectTrackedFiles(root) {

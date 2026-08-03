@@ -8,10 +8,12 @@ import {
   assertAuditedStage,
   auditStageBeforePackaging,
   auditPublicSourceStage,
+  finishAuditedStageCleanup,
   includePublicSourcePath, includeReleasePath, productionDependencyFilter, productionLockfile,
   productionPackageManifest, PUBLIC_SOURCE_FILES, RELEASE_FILES,
   removeAuditedStage, sha256, stagePublicSource, stageRelease, verifiedReleaseTreeDigest, writeChecksums,
 } from './build-release.mjs';
+import { verifiedAuditTreeDigest } from './release-audit.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const PRIVATE_COPY_FIXTURES = Object.freeze([
@@ -255,6 +257,92 @@ test('packaging consumes the audit-created read-only content snapshot', () => {
   fs.writeFileSync(path.join(audit.stageDir, 'a.txt'), 'SyntheticPackagingMarker');
   assert.throws(() => assertAuditedStage(audit), /privacy-authorized snapshot/);
   removeAuditedStage(audit.stageDir);
+});
+
+test('sealed release authorization rejects the complete tamper matrix', () => {
+  const cases = [
+    ['content', ({ file }) => {
+      fs.chmodSync(file, 0o644);
+      fs.writeFileSync(file, 'changed-content');
+      fs.chmodSync(file, 0o444);
+    }],
+    ['mode', ({ file }) => fs.chmodSync(file, 0o644)],
+    ['path', ({ root, file }) => {
+      fs.chmodSync(root, 0o755);
+      fs.renameSync(file, path.join(root, 'renamed.txt'));
+      fs.chmodSync(root, 0o555);
+    }],
+    ['link', ({ root, file }) => {
+      fs.chmodSync(root, 0o755);
+      fs.unlinkSync(file);
+      fs.symlinkSync('b.txt', file, process.platform === 'win32' ? 'file' : undefined);
+      fs.chmodSync(root, 0o555);
+    }],
+    ['addition', ({ root }) => {
+      const added = path.join(root, 'added.txt');
+      fs.chmodSync(root, 0o755);
+      fs.writeFileSync(added, 'added');
+      fs.chmodSync(added, 0o444);
+      fs.chmodSync(root, 0o555);
+    }],
+    ['deletion', ({ root, file }) => {
+      fs.chmodSync(root, 0o755);
+      fs.unlinkSync(file);
+      fs.chmodSync(root, 0o555);
+    }],
+    ['replacement', ({ root, file, outside }) => {
+      const content = fs.readFileSync(file);
+      fs.chmodSync(root, 0o755);
+      fs.renameSync(file, path.join(outside, 'displaced.txt'));
+      fs.writeFileSync(file, content, { mode: 0o444 });
+      fs.chmodSync(file, 0o444);
+      fs.chmodSync(root, 0o555);
+    }],
+  ];
+
+  for (const [name, tamper] of cases) {
+    const stageDir = fs.mkdtempSync(path.join(os.tmpdir(), `scout-audit-${name}-`));
+    const outside = fs.mkdtempSync(path.join(os.tmpdir(), `scout-audit-${name}-outside-`));
+    fs.writeFileSync(path.join(stageDir, 'a.txt'), 'audited-a');
+    fs.writeFileSync(path.join(stageDir, 'b.txt'), 'audited-b');
+    const audit = auditStageBeforePackaging(stageDir, {
+      env: { ...process.env, SCOUT_RELEASE_MARKERS: 'SyntheticPackagingMarker' },
+    });
+    try {
+      assert.doesNotThrow(() => assertAuditedStage(audit), `${name}: clean stage`);
+      tamper({ root: audit.stageDir, file: path.join(audit.stageDir, 'a.txt'), outside });
+      if (name === 'replacement') {
+        assert.equal(verifiedAuditTreeDigest(audit.stageDir), audit.treeDigest);
+      }
+      assert.throws(
+        () => assertAuditedStage(audit),
+        /privacy-authorized snapshot/,
+        `${name}: tampered stage`,
+      );
+    } finally {
+      removeAuditedStage(audit.stageDir);
+      fs.rmSync(stageDir, { recursive: true, force: true });
+      fs.rmSync(outside, { recursive: true, force: true });
+    }
+  }
+});
+
+test('audited stage cleanup preserves the primary error and reports retained payload safely', () => {
+  const primary = new Error('primary packaging failure');
+  assert.doesNotThrow(() => finishAuditedStageCleanup('/synthetic/audited-stage', {
+    primaryError: primary,
+    remove: () => { throw new Error('/private/path must not escape'); },
+  }));
+  assert.match(primary.message, /^primary packaging failure\nAudited release payload cleanup failed;/);
+  assert.doesNotMatch(primary.message, /private\/path/);
+
+  assert.throws(
+    () => finishAuditedStageCleanup('/synthetic/audited-stage', {
+      remove: () => { throw new Error('/private/path must not escape'); },
+    }),
+    (error) => error.message
+      === 'Audited release payload cleanup failed; the sealed payload was retained for runner cleanup.',
+  );
 });
 
 test('public and release staging refuse allowlisted leaf symlinks', () => {
