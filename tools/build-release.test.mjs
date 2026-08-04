@@ -327,7 +327,7 @@ test('sealed release authorization rejects the complete tamper matrix', () => {
   }
 });
 
-test('sealed release authorization rejects a restored ancestor substitution', () => {
+test('sealed release authorization rejects an active ancestor substitution', () => {
   const top = fs.mkdtempSync(path.join(os.tmpdir(), 'scout-audit-ancestor-'));
   const releaseDir = path.join(top, 'release');
   const heldDir = path.join(top, 'release-held');
@@ -340,8 +340,10 @@ test('sealed release authorization rejects a restored ancestor substitution', ()
   try {
     assert.doesNotThrow(() => assertAuditedStage(audit));
     fs.renameSync(releaseDir, heldDir);
-    fs.renameSync(heldDir, releaseDir);
+    fs.mkdirSync(releaseDir);
     assert.throws(() => assertAuditedStage(audit), /privacy-authorized snapshot/);
+    fs.rmSync(releaseDir, { recursive: true, force: true });
+    fs.renameSync(heldDir, releaseDir);
   } finally {
     removeAuditedStage(audit.stageDir);
     fs.rmSync(top, { recursive: true, force: true });
