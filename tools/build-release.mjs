@@ -322,6 +322,7 @@ export function auditStageBeforePackaging(stageDir, {
   removeAuditedSnapshot = removeAuditedStage,
   authorizationRoot = null,
   sealedDirectoryModes = {},
+  randomUUID = crypto.randomUUID,
 } = {}) {
   const source = path.resolve(stageDir);
   const authorityRoot = path.resolve(authorizationRoot || path.dirname(source));
@@ -331,9 +332,17 @@ export function auditStageBeforePackaging(stageDir, {
   if (requireMarkers && markers.length === 0) {
     throw new Error('pre-package release audit failed: release audit requires at least one configured personal marker');
   }
-  const snapshot = `${source}.audited-${crypto.randomUUID()}`;
+  const snapshot = `${source}.audited-${randomUUID()}`;
+  let snapshotRecord = null;
   try {
-    const result = auditStagedRelease({ root: source, markers, snapshotRoot: snapshot });
+    fs.mkdirSync(snapshot, { recursive: false, mode: 0o700 });
+    snapshotRecord = publicationDirectoryRecord(snapshot);
+    const result = auditStagedRelease({
+      root: source,
+      markers,
+      snapshotRoot: snapshot,
+      preparedSnapshotRoot: true,
+    });
     if (!result.ok) {
       const findings = result.findings.map(({ file, line, rule }) => `${file}:${line} ${rule}`).join('\n');
       throw new Error(`pre-package release audit failed:\n${findings}`);
@@ -374,13 +383,25 @@ export function auditStageBeforePackaging(stageDir, {
       stageDir: snapshot,
     };
   } catch (error) {
-    const primaryError = error instanceof Error
-      ? error : new Error('pre-package release preparation failed');
-    finishAuditedStageCleanup(snapshot, {
-      primaryError,
-      remove: removeAuditedSnapshot,
-      retainedState: 'release-audit payload',
-    });
+    const primaryError = !snapshotRecord && error?.code === 'EEXIST'
+      ? new Error('pre-package release preparation failed: audit snapshot destination already exists')
+      : error instanceof Error
+        ? error : new Error('pre-package release preparation failed');
+    if (snapshotRecord) {
+      let stillOwned = false;
+      try {
+        stillOwned = samePublicationDirectory(publicationDirectoryRecord(snapshot), snapshotRecord);
+      } catch {}
+      if (stillOwned) {
+        finishAuditedStageCleanup(snapshot, {
+          primaryError,
+          remove: removeAuditedSnapshot,
+          retainedState: 'release-audit payload',
+        });
+      } else {
+        primaryError.message = `${primaryError.message}\nAudited release payload cleanup failed; the release-audit payload was retained for runner cleanup.`;
+      }
+    }
     throw primaryError;
   }
 }
@@ -441,6 +462,9 @@ export function assertAuditedStage(audit) {
 
 const ARTIFACT_PUBLICATION_LOCK = '.scout-release-publication.lock';
 const ARTIFACT_PENDING_PREFIX = '.scout-release-pending-';
+const ARTIFACT_SEALED_PREFIX = '.sealed-';
+const ARTIFACT_CLEANUP_PREFIX = '.scout-release-cleanup-';
+const ARTIFACT_TRANSACTION_RECORD = 'transaction.json';
 
 function publicationError(message) {
   return new Error(message);
@@ -463,16 +487,12 @@ function samePublicationDirectory(left, right) {
 }
 
 const WINDOWS_PRIVATE_DIRECTORY_SCRIPT = [
+  'param([string]$entry,[string]$operation)',
   "$ErrorActionPreference='Stop'",
-  '$entry=$args[0]',
-  '$operation=$args[1]',
   '$identity=[System.Security.Principal.WindowsIdentity]::GetCurrent()',
   "if($operation -eq 'create') {",
   '  $privateAcl=[System.Security.AccessControl.DirectorySecurity]::new()',
-  '  $privateAcl.SetAccessRuleProtection($true,$false)',
-  '  $inheritance=[System.Security.AccessControl.InheritanceFlags]::ContainerInherit -bor [System.Security.AccessControl.InheritanceFlags]::ObjectInherit',
-  '  $rule=[System.Security.AccessControl.FileSystemAccessRule]::new($identity.User,[System.Security.AccessControl.FileSystemRights]::FullControl,$inheritance,[System.Security.AccessControl.PropagationFlags]::None,[System.Security.AccessControl.AccessControlType]::Allow)',
-  '  [void]$privateAcl.AddAccessRule($rule)',
+  '  $privateAcl.SetSecurityDescriptorSddlForm(("D:P(A;OICI;FA;;;{0})" -f $identity.User.Value),[System.Security.AccessControl.AccessControlSections]::Access)',
   '  Set-Acl -LiteralPath $entry -AclObject $privateAcl',
   '}',
   '$acl=Get-Acl -LiteralPath $entry',
@@ -484,7 +504,7 @@ const WINDOWS_PRIVATE_DIRECTORY_SCRIPT = [
   '  if(($candidate.FileSystemRights -band [System.Security.AccessControl.FileSystemRights]::FullControl) -eq [System.Security.AccessControl.FileSystemRights]::FullControl) { $hasFullControl=$true }',
   '}',
   'if(-not $hasFullControl) { exit 43 }',
-  '$acl.Sddl',
+  '$acl.GetSecurityDescriptorSddlForm([System.Security.AccessControl.AccessControlSections]::Access)',
 ].join('\n');
 
 function privatePublicationSecurityRecord(entry, { create = false } = {}) {
@@ -498,7 +518,7 @@ function privatePublicationSecurityRecord(entry, { create = false } = {}) {
   }
   const result = spawnSync('powershell.exe', [
     '-NoLogo', '-NoProfile', '-NonInteractive', '-Command',
-    WINDOWS_PRIVATE_DIRECTORY_SCRIPT, entry, create ? 'create' : 'verify',
+    `& { ${WINDOWS_PRIVATE_DIRECTORY_SCRIPT} }`, entry, create ? 'create' : 'verify',
   ], { encoding: 'utf8', windowsHide: true });
   const descriptor = String(result.stdout || '').trim();
   if (result.status !== 0 || !descriptor) {
@@ -552,16 +572,29 @@ function ensureArtifactOutputDirectory(outputDir, authorityRoot) {
 function createPrivatePublicationDirectory(outputDir, name) {
   const entry = path.join(outputDir, name);
   let created = false;
+  let record = null;
   try {
     fs.mkdirSync(entry, { mode: 0o700 });
     created = true;
+    record = publicationDirectoryRecord(entry);
     const securityRecord = privatePublicationSecurityRecord(entry, { create: true });
-    const record = publicationDirectoryRecord(entry);
+    if (!samePublicationDirectory(publicationDirectoryRecord(entry), record)) {
+      throw publicationError('release artifact temporary output identity changed during creation');
+    }
     return { entry, record, securityRecord };
   } catch (error) {
     if (created) {
       try {
-        fs.rmSync(entry, { recursive: true, force: true });
+        if (!record) throw new Error('identity unavailable');
+        const quarantine = path.join(
+          outputDir,
+          `${ARTIFACT_CLEANUP_PREFIX}creation-${crypto.randomUUID()}`,
+        );
+        fs.renameSync(entry, quarantine);
+        if (!samePublicationDirectory(publicationDirectoryRecord(quarantine), record)) {
+          throw new Error('identity changed');
+        }
+        fs.rmSync(quarantine, { recursive: true, force: false });
       } catch {
         const primary = error?.message?.startsWith('release artifact')
           ? error : publicationError('release artifact temporary output could not be created');
@@ -614,7 +647,7 @@ export function createArtifactPublication({
       throw publicationError('release artifact temporary output is not on the destination filesystem');
     }
     const outputFence = auditedAncestorIdentityDigest(
-      path.join(output, '.publication-fence'),
+      output,
       boundary,
     );
     const temporaryPaths = Object.fromEntries(names.map((name) => [name, path.join(pending.entry, name)]));
@@ -633,12 +666,31 @@ export function createArtifactPublication({
       pendingSecurityRecord: pending.securityRecord,
       temporaryPaths,
       published: false,
+      recoveryRequired: false,
       cleaned: false,
     };
   } catch (error) {
     let cleanupFailed = false;
-    try { if (pending?.entry) fs.rmSync(pending.entry, { recursive: true, force: true }); } catch { cleanupFailed = true; }
-    try { if (lock?.entry) fs.rmSync(lock.entry, { recursive: true, force: true }); } catch { cleanupFailed = true; }
+    if (pending?.entry) {
+      try {
+        const quarantine = path.join(output, `${ARTIFACT_CLEANUP_PREFIX}pending-${crypto.randomUUID()}`);
+        fs.renameSync(pending.entry, quarantine);
+        if (!samePublicationDirectory(publicationDirectoryRecord(quarantine), pending.record)) {
+          throw new Error('identity changed');
+        }
+        fs.rmSync(quarantine, { recursive: true, force: false });
+      } catch { cleanupFailed = true; }
+    }
+    if (lock?.entry && !cleanupFailed) {
+      try {
+        const quarantine = path.join(output, `${ARTIFACT_CLEANUP_PREFIX}lock-${crypto.randomUUID()}`);
+        fs.renameSync(lock.entry, quarantine);
+        if (!samePublicationDirectory(publicationDirectoryRecord(quarantine), lock.record)) {
+          throw new Error('identity changed');
+        }
+        fs.rmSync(quarantine, { recursive: true, force: false });
+      } catch { cleanupFailed = true; }
+    }
     const primary = error?.message?.startsWith('release artifact')
       ? error : publicationError('release artifact publication setup failed');
     if (cleanupFailed) {
@@ -662,7 +714,7 @@ function assertPublicationContainer(publication, { strictFence = true } = {}) {
     }
     if (strictFence) {
       const currentFence = auditedAncestorIdentityDigest(
-        path.join(publication.outputDir, '.publication-fence'),
+        publication.outputDir,
         publication.authorityRoot,
       );
       if (currentFence !== publication.outputFence) throw new Error('fence mismatch');
@@ -685,6 +737,30 @@ function publicationArtifactState(file, publication) {
     if (!samePathRecord(before, after)) throw new Error('changed');
   } catch {
     throw publicationError('release artifact temporary output is not authorized');
+  }
+  return {
+    dev: String(after.dev),
+    ino: String(after.ino),
+    mode: Number(after.mode & 0o777n),
+    size: String(after.size),
+    mtimeNs: String(after.mtimeNs),
+    ctimeNs: String(after.ctimeNs),
+    digest,
+  };
+}
+
+function artifactStateAt(file, verifiedRoot) {
+  let before;
+  let digest;
+  let after;
+  try {
+    before = fs.lstatSync(file, { bigint: true });
+    if (!before.isFile() || before.isSymbolicLink()) throw new Error('not regular');
+    digest = verifiedReleaseFileDigest(file, { verifiedRoot });
+    after = fs.lstatSync(file, { bigint: true });
+    if (!samePathRecord(before, after)) throw new Error('changed');
+  } catch {
+    throw publicationError('release artifact publication authorization changed');
   }
   return {
     dev: String(after.dev),
@@ -745,23 +821,65 @@ export function writeArtifactChecksums(publication, {
   return publication.temporaryPaths[manifestName];
 }
 
-function safeUnlinkPublished(finalPath, expected) {
+function sameArtifactContent(left, right) {
+  return left.mode === right.mode && left.size === right.size && left.digest === right.digest;
+}
+
+function safeUnlinkPublished(finalPath, expected, publication, unlink = fs.unlinkSync) {
   try {
-    const stat = fs.lstatSync(finalPath, { bigint: true });
-    if (!stat.isFile() || stat.isSymbolicLink()
-      || String(stat.dev) !== expected.dev || String(stat.ino) !== expected.ino) return false;
-    fs.unlinkSync(finalPath);
+    assertPublicationContainer(publication);
+    const current = artifactStateAt(finalPath, publication.outputDir);
+    if (current.dev !== expected.dev || current.ino !== expected.ino
+      || !sameArtifactContent(current, expected)) return false;
+    unlink(finalPath);
+    try {
+      fs.lstatSync(finalPath);
+      return false;
+    } catch (error) {
+      if (error?.code !== 'ENOENT') return false;
+    }
     return true;
   } catch {
     return false;
   }
 }
 
-function removeArtifactPublication(publication) {
+function quarantineOwnedDirectory(publication, kind, randomUUID = crypto.randomUUID, rename = fs.renameSync) {
+  const source = kind === 'pending' ? publication.pendingDir : publication.lockDir;
+  const expected = kind === 'pending' ? publication.pendingRecord : publication.lockRecord;
+  const quarantine = path.join(
+    publication.outputDir,
+    `${ARTIFACT_CLEANUP_PREFIX}${kind}-${randomUUID()}`,
+  );
+  rename(source, quarantine);
+  let current;
+  try {
+    current = publicationDirectoryRecord(quarantine);
+  } catch {
+    throw publicationError('release artifact temporary cleanup could not validate retained state');
+  }
+  if (!samePublicationDirectory(current, expected)) {
+    throw publicationError('release artifact temporary cleanup could not validate retained state');
+  }
+  if (kind === 'pending') publication.pendingDir = quarantine;
+  else publication.lockDir = quarantine;
+  return quarantine;
+}
+
+function removeArtifactPublication(publication, {
+  randomUUID = crypto.randomUUID,
+  rename = fs.renameSync,
+  removeTree = fs.rmSync,
+} = {}) {
   if (publication.cleaned) return { removed: true };
+  if (publication.recoveryRequired) {
+    throw publicationError('release artifact recovery evidence was retained for operator cleanup');
+  }
   assertPublicationContainer(publication, { strictFence: false });
-  fs.rmSync(publication.pendingDir, { recursive: true, force: false });
-  fs.rmSync(publication.lockDir, { recursive: true, force: false });
+  const pending = quarantineOwnedDirectory(publication, 'pending', randomUUID, rename);
+  removeTree(pending, { recursive: true, force: false });
+  const lock = quarantineOwnedDirectory(publication, 'lock', randomUUID, rename);
+  removeTree(lock, { recursive: true, force: false });
   publication.cleaned = true;
   return { removed: true };
 }
@@ -769,10 +887,11 @@ function removeArtifactPublication(publication) {
 export function finishArtifactPublication(publication, {
   primaryError = null,
   remove = removeArtifactPublication,
+  removeOptions = {},
 } = {}) {
   if (!publication || publication.cleaned) return { removed: true };
   try {
-    return remove(publication);
+    return remove(publication, removeOptions);
   } catch {
     const message = 'Release artifact temporary cleanup failed; temporary artifacts were retained for runner cleanup.';
     if (primaryError instanceof Error) {
@@ -785,6 +904,10 @@ export function finishArtifactPublication(publication, {
 
 export function promoteArtifactPublication(publication, authorization, {
   remove = removeArtifactPublication,
+  link = fs.linkSync,
+  unlink = fs.unlinkSync,
+  afterLink = null,
+  randomUUID = crypto.randomUUID,
 } = {}) {
   if (!authorization || authorization.publicationId !== publication.id
     || authorization.outputFence !== publication.outputFence) {
@@ -809,30 +932,93 @@ export function promoteArtifactPublication(publication, authorization, {
     }
   }
 
+  let sealed = null;
+  try {
+    sealed = createPrivatePublicationDirectory(
+      publication.lockDir,
+      `${ARTIFACT_SEALED_PREFIX}${randomUUID()}`,
+    );
+    if (sealed.record.dev !== publication.outputRecord.dev) {
+      throw publicationError('release artifact sealed output is not on the destination filesystem');
+    }
+  } catch (error) {
+    if (/^release artifact/.test(String(error?.message || ''))) throw error;
+    throw publicationError('release artifact sealed output could not be created');
+  }
+
+  const sealedArtifacts = {};
+  try {
+    for (const name of publication.artifactNames) {
+      const source = publication.temporaryPaths[name];
+      const sealedPath = path.join(sealed.entry, name);
+      const before = publicationArtifactState(source, publication);
+      if (!sameArtifactState(before, authorization.artifacts[name])) {
+        throw publicationError('release artifact publication authorization changed');
+      }
+      fs.copyFileSync(source, sealedPath, fs.constants.COPYFILE_EXCL);
+      if (process.platform !== 'win32') fs.chmodSync(sealedPath, before.mode & ~0o222);
+      const sealedState = artifactStateAt(sealedPath, sealed.entry);
+      const after = publicationArtifactState(source, publication);
+      if (!sameArtifactState(after, authorization.artifacts[name])
+        || !sameArtifactContent(sealedState, {
+          ...authorization.artifacts[name],
+          mode: process.platform === 'win32'
+            ? sealedState.mode : authorization.artifacts[name].mode & ~0o222,
+        })) {
+        throw publicationError('release artifact publication authorization changed');
+      }
+      sealedArtifacts[name] = { path: sealedPath, state: sealedState };
+    }
+    const transaction = {
+      version: 1,
+      publicationId: publication.id,
+      state: 'promotion-pending',
+      artifacts: Object.fromEntries(publication.artifactNames.map((name) => [
+        name,
+        { digest: sealedArtifacts[name].state.digest, size: sealedArtifacts[name].state.size },
+      ])),
+    };
+    fs.writeFileSync(
+      path.join(publication.lockDir, ARTIFACT_TRANSACTION_RECORD),
+      `${JSON.stringify(transaction, null, 2)}\n`,
+      { encoding: 'utf8', flag: 'wx', mode: 0o600 },
+    );
+  } catch (error) {
+    if (/^release artifact/.test(String(error?.message || ''))) throw error;
+    throw publicationError('release artifact sealed output could not be authorized');
+  }
+
   const linked = [];
   try {
     for (const name of publication.artifactNames) {
-      const temporary = publication.temporaryPaths[name];
+      const temporary = sealedArtifacts[name].path;
       const finalPath = path.join(publication.outputDir, name);
       try {
-        fs.linkSync(temporary, finalPath);
+        link(temporary, finalPath);
       } catch (error) {
         if (error?.code === 'EEXIST') throw publicationError('release artifact destination already exists');
         throw publicationError('release artifact atomic publication failed');
       }
-      const expected = authorization.artifacts[name];
-      const finalStat = fs.lstatSync(finalPath, { bigint: true });
-      if (!finalStat.isFile() || finalStat.isSymbolicLink()
-        || String(finalStat.dev) !== expected.dev || String(finalStat.ino) !== expected.ino) {
+      linked.push({ finalPath, expected: sealedArtifacts[name].state });
+      if (typeof afterLink === 'function') afterLink({ name, temporary, finalPath, linked: linked.length });
+      assertPublicationContainer(publication);
+      const expected = sealedArtifacts[name].state;
+      const sealedState = artifactStateAt(temporary, sealed.entry);
+      const finalState = artifactStateAt(finalPath, publication.outputDir);
+      if (sealedState.dev !== expected.dev || sealedState.ino !== expected.ino
+        || !sameArtifactContent(sealedState, expected)
+        || !sameArtifactState(finalState, sealedState)) {
         throw publicationError('release artifact publication authorization changed');
       }
-      linked.push({ finalPath, expected });
+      linked[linked.length - 1].expected = sealedState;
+    }
+    assertPublicationContainer(publication);
+    for (const { finalPath, expected } of linked) {
+      if (!sameArtifactState(artifactStateAt(finalPath, publication.outputDir), expected)) {
+        throw publicationError('release artifact publication authorization changed');
+      }
     }
     publication.published = true;
-    publication.outputFence = auditedAncestorIdentityDigest(
-      path.join(publication.outputDir, '.publication-fence'),
-      publication.authorityRoot,
-    );
     try {
       remove(publication);
     } catch {
@@ -846,13 +1032,17 @@ export function promoteArtifactPublication(publication, authorization, {
     };
   } catch (error) {
     if (!publication.published) {
-      for (const { finalPath, expected } of linked.reverse()) safeUnlinkPublished(finalPath, expected);
-      try {
-        publication.outputFence = auditedAncestorIdentityDigest(
-          path.join(publication.outputDir, '.publication-fence'),
-          publication.authorityRoot,
-        );
-      } catch {}
+      let rollbackFailed = false;
+      for (const { finalPath, expected } of linked.reverse()) {
+        if (!safeUnlinkPublished(finalPath, expected, publication, unlink)) rollbackFailed = true;
+      }
+      if (rollbackFailed) {
+        publication.recoveryRequired = true;
+        const primary = /^release artifact/.test(String(error?.message || ''))
+          ? error : publicationError('release artifact publication authorization changed');
+        primary.message = `${primary.message}\nRelease artifact publication failed closed; final-name residue may exist and recovery evidence was retained.`;
+        throw primary;
+      }
     }
     if (/^(?:release artifact|Authorized final artifact)/.test(String(error?.message || ''))) throw error;
     throw publicationError('release artifact publication authorization changed');

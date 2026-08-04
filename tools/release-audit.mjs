@@ -669,6 +669,7 @@ export function auditRelease({
   directorySnapshots = [],
   linkSnapshots = [],
   snapshotRoot = null,
+  preparedSnapshotRoot = false,
 } = {}) {
   const absoluteRoot = path.resolve(root);
   const excluded = markerFile ? path.resolve(markerFile) : null;
@@ -691,10 +692,20 @@ export function auditRelease({
     .sort((a, b) => normaliseRelative(absoluteRoot, a).localeCompare(normaliseRelative(absoluteRoot, b), 'en'));
   const snapshot = snapshotRoot ? path.resolve(snapshotRoot) : null;
   if (snapshot) {
-    if (withinPath(absoluteRoot, snapshot) || fs.existsSync(snapshot)) {
+    if (withinPath(absoluteRoot, snapshot)) {
       throw new Error('release audit snapshot destination is invalid');
     }
-    fs.mkdirSync(snapshot, { recursive: false, mode: 0o700 });
+    if (preparedSnapshotRoot) {
+      const stat = fs.lstatSync(snapshot);
+      if (!stat.isDirectory() || stat.isSymbolicLink()
+        || fs.readdirSync(snapshot).length !== 0
+        || (process.platform !== 'win32' && (stat.mode & 0o777) !== 0o700)) {
+        throw new Error('release audit snapshot destination is invalid');
+      }
+    } else {
+      if (fs.existsSync(snapshot)) throw new Error('release audit snapshot destination is invalid');
+      fs.mkdirSync(snapshot, { recursive: false, mode: 0o700 });
+    }
     for (const directory of traversalSnapshots) {
       const relative = normaliseRelative(absoluteRoot, directory.directory);
       if (relative) fs.mkdirSync(path.join(snapshot, relative), { recursive: true, mode: 0o700 });
@@ -799,7 +810,12 @@ export function auditRelease({
   };
 }
 
-export function auditStagedRelease({ root, markers = [], snapshotRoot = null } = {}) {
+export function auditStagedRelease({
+  root,
+  markers = [],
+  snapshotRoot = null,
+  preparedSnapshotRoot = false,
+} = {}) {
   const absoluteRoot = path.resolve(root);
   const directories = [];
   const links = [];
@@ -817,6 +833,7 @@ export function auditStagedRelease({ root, markers = [], snapshotRoot = null } =
     directorySnapshots: directories,
     linkSnapshots: links,
     snapshotRoot,
+    preparedSnapshotRoot,
   });
 }
 

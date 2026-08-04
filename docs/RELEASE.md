@@ -38,7 +38,13 @@ Release only from this clean-history public application repository. Never copy c
    use mode `0700` on Unix and a protected current-user-only DACL on Windows;
    that privacy state is rechecked with the directory identity. Packaging, payload
    postchecks and temporary-file authorization all finish before Scout creates
-   a final artifact name with an atomic, no-overwrite same-filesystem link.
+   publisher-owned sealed copies in a second unpredictable private directory
+   that is never passed to the packager. Scout rechecks the temporary source
+   while copying, records the authorized digests in a private transaction
+   journal, and creates each final artifact name with an atomic, no-overwrite
+   same-filesystem link to the sealed inode. The original ancestor fence and
+   the complete sealed/final byte identity are rechecked after every link and
+   again before the publication call succeeds.
    Packager or postcheck failure removes the temporary output; a cleanup failure
    retains only bounded runner-cleanup residue and never replaces the primary
    error with a raw filesystem path.
@@ -46,9 +52,15 @@ Release only from this clean-history public application repository. Never copy c
    If a process stops before promotion, no final artifact exists. After
    validating that the lock and pending directory are real children of the
    expected output directory and that no packaging process remains, the runner
-   may delete that clearly temporary residue and rebuild. If a process stops
-   after promotion, the final artifact is already the authorized inode; remove
-   only the temporary hard link/lock after the same identity checks. Never
+   may delete that clearly temporary residue and rebuild. A stop during a
+   multi-file promotion leaves the private lock, sealed copies and transaction
+   journal as recovery evidence; some final names may contain authorized sealed
+   inodes, but the publication call did not complete. Validate the journal,
+   every recorded digest and every final inode as one set before either
+   identity-bound rollback or acceptance. A rollback failure is reported and
+   retains this evidence instead of silently deleting it. If the process stops
+   after the publication call succeeds, every final artifact is an authorized
+   sealed inode; only identity-bound temporary cleanup may remain. Never
    delete or overwrite a colliding final artifact automatically—investigate its
    provenance or use a clean output directory.
 7. Test on clean Windows, macOS and Ubuntu runners: install; first launch; provider detection; supervised/scheduled scans; missed-run/overlap/timeout; upgrade; and uninstall preserving the workspace.

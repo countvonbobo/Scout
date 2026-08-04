@@ -239,11 +239,14 @@ test('stage audit inspects unexpected nested git metadata', () => {
 });
 
 test('packaging consumes the audit-created read-only content snapshot', () => {
-  const stageDir = fs.mkdtempSync(path.join(os.tmpdir(), 'scout-audited-stage-'));
+  const authorizationRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'scout-audited-root-'));
+  const stageDir = path.join(authorizationRoot, 'stage');
+  fs.mkdirSync(stageDir);
   fs.writeFileSync(path.join(stageDir, 'a.txt'), 'audited-a');
   fs.writeFileSync(path.join(stageDir, 'b.txt'), 'audited-b');
   const audit = auditStageBeforePackaging(stageDir, {
     env: { ...process.env, SCOUT_RELEASE_MARKERS: 'SyntheticPackagingMarker' },
+    authorizationRoot,
   });
   assert.doesNotThrow(() => assertAuditedStage(audit));
   fs.writeFileSync(path.join(stageDir, 'a.txt'), 'changed-after-audit');
@@ -257,6 +260,7 @@ test('packaging consumes the audit-created read-only content snapshot', () => {
   fs.writeFileSync(path.join(audit.stageDir, 'a.txt'), 'SyntheticPackagingMarker');
   assert.throws(() => assertAuditedStage(audit), /privacy-authorized snapshot/);
   removeAuditedStage(audit.stageDir);
+  fs.rmSync(authorizationRoot, { recursive: true, force: true });
 });
 
 test('sealed release authorization rejects the complete tamper matrix', () => {
@@ -301,12 +305,15 @@ test('sealed release authorization rejects the complete tamper matrix', () => {
   ];
 
   for (const [name, tamper] of cases) {
-    const stageDir = fs.mkdtempSync(path.join(os.tmpdir(), `scout-audit-${name}-`));
+    const authorizationRoot = fs.mkdtempSync(path.join(os.tmpdir(), `scout-audit-${name}-root-`));
+    const stageDir = path.join(authorizationRoot, 'stage');
+    fs.mkdirSync(stageDir);
     const outside = fs.mkdtempSync(path.join(os.tmpdir(), `scout-audit-${name}-outside-`));
     fs.writeFileSync(path.join(stageDir, 'a.txt'), 'audited-a');
     fs.writeFileSync(path.join(stageDir, 'b.txt'), 'audited-b');
     const audit = auditStageBeforePackaging(stageDir, {
       env: { ...process.env, SCOUT_RELEASE_MARKERS: 'SyntheticPackagingMarker' },
+      authorizationRoot,
     });
     try {
       assert.doesNotThrow(() => assertAuditedStage(audit), `${name}: clean stage`);
@@ -321,7 +328,7 @@ test('sealed release authorization rejects the complete tamper matrix', () => {
       );
     } finally {
       removeAuditedStage(audit.stageDir);
-      fs.rmSync(stageDir, { recursive: true, force: true });
+      fs.rmSync(authorizationRoot, { recursive: true, force: true });
       fs.rmSync(outside, { recursive: true, force: true });
     }
   }
@@ -353,12 +360,15 @@ test('sealed release authorization rejects an active ancestor substitution', () 
 test('a required packager directory mode keeps its files sealed and remains tamper-evident', {
   skip: process.platform === 'win32' ? 'Debian directory modes are exercised on Linux release runners' : false,
 }, () => {
-  const stageDir = fs.mkdtempSync(path.join(os.tmpdir(), 'scout-audit-directory-mode-'));
+  const authorizationRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'scout-audit-directory-mode-root-'));
+  const stageDir = path.join(authorizationRoot, 'stage');
+  fs.mkdirSync(stageDir);
   const controlDir = path.join(stageDir, 'deb', 'DEBIAN');
   fs.mkdirSync(controlDir, { recursive: true });
   fs.writeFileSync(path.join(controlDir, 'control'), 'Package: scout\n');
   const audit = auditStageBeforePackaging(stageDir, {
     env: { ...process.env, SCOUT_RELEASE_MARKERS: 'SyntheticPackagingMarker' },
+    authorizationRoot,
     sealedDirectoryModes: { 'deb/DEBIAN': 0o755 },
   });
   try {
@@ -372,7 +382,7 @@ test('a required packager directory mode keeps its files sealed and remains tamp
     assert.throws(() => assertAuditedStage(audit), /privacy-authorized snapshot/);
   } finally {
     removeAuditedStage(audit.stageDir);
-    fs.rmSync(stageDir, { recursive: true, force: true });
+    fs.rmSync(authorizationRoot, { recursive: true, force: true });
   }
 });
 
@@ -415,6 +425,27 @@ test('audit preparation cleanup preserves its primary error and reports retained
     );
   } finally {
     fs.rmSync(stageDir, { recursive: true, force: true });
+  }
+});
+
+test('audit preparation never removes a pre-existing snapshot collision', () => {
+  const top = fs.mkdtempSync(path.join(os.tmpdir(), 'scout-audit-collision-root-'));
+  const stageDir = path.join(top, 'stage');
+  const collisionId = '11111111-1111-4111-8111-111111111111';
+  const collision = `${stageDir}.audited-${collisionId}`;
+  fs.mkdirSync(stageDir);
+  fs.writeFileSync(path.join(stageDir, 'a.txt'), 'audited-a');
+  fs.mkdirSync(collision);
+  fs.writeFileSync(path.join(collision, 'sentinel'), 'pre-existing');
+  try {
+    assert.throws(() => auditStageBeforePackaging(stageDir, {
+      env: { ...process.env, SCOUT_RELEASE_MARKERS: 'SyntheticPackagingMarker' },
+      authorizationRoot: top,
+      randomUUID: () => collisionId,
+    }));
+    assert.equal(fs.readFileSync(path.join(collision, 'sentinel'), 'utf8'), 'pre-existing');
+  } finally {
+    fs.rmSync(top, { recursive: true, force: true });
   }
 });
 

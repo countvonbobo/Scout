@@ -156,7 +156,7 @@ test('crash boundaries distinguish disposable pre-promotion residue from an auth
       /authorized final artifact exists.*temporary cleanup failed/i,
     );
     assert.equal(fs.readFileSync(finalPath, 'utf8'), 'authorized final');
-    assert.equal(fs.statSync(finalPath).ino, fs.statSync(temporary).ino);
+    assert.notEqual(fs.statSync(finalPath).ino, fs.statSync(temporary).ino);
     release.finishArtifactPublication(publication);
     assert.equal(fs.existsSync(finalPath), true);
     assert.equal(fs.existsSync(publication.pendingDir), false);
@@ -215,6 +215,119 @@ test('authorization rejects unexpected temporary output and publishes a temporar
     const result = release.promoteArtifactPublication(publication, authorization);
     const manifest = fs.readFileSync(result.finalPaths['checksums.txt'], 'utf8');
     assert.match(manifest, /^[a-f0-9]{64}  Scout\.synthetic\n$/);
+  } finally {
+    fix.remove();
+  }
+});
+
+test('promotion rejects bytes changed through the newly linked sealed inode', () => {
+  const fix = fixture();
+  try {
+    const publication = prepare(fix);
+    fs.writeFileSync(publication.temporaryPaths['Scout.synthetic'], 'authorized bytes');
+    const authorization = release.authorizeArtifactPublication(publication);
+    assert.throws(
+      () => release.promoteArtifactPublication(publication, authorization, {
+        afterLink: ({ temporary }) => {
+          if (process.platform !== 'win32') fs.chmodSync(temporary, 0o600);
+          fs.writeFileSync(temporary, 'changed bytes!!!');
+        },
+      }),
+      /authorization changed[\s\S]*final-name residue may exist/,
+    );
+    assert.equal(publication.recoveryRequired, true);
+    assert.equal(fs.existsSync(path.join(publication.lockDir, 'transaction.json')), true);
+  } finally {
+    fix.remove();
+  }
+});
+
+test('promotion rechecks the original output ancestor immediately after linking', () => {
+  const fix = fixture();
+  try {
+    const publication = prepare(fix);
+    fs.writeFileSync(publication.temporaryPaths['Scout.synthetic'], 'authorized bytes');
+    const authorization = release.authorizeArtifactPublication(publication);
+    const installer = path.join(fix.root, 'installer');
+    const held = path.join(fix.root, 'installer-held-during-link');
+    assert.throws(
+      () => release.promoteArtifactPublication(publication, authorization, {
+        afterLink: () => {
+          fs.renameSync(installer, held);
+          fs.mkdirSync(fix.outputDir, { recursive: true });
+        },
+      }),
+      /authorization changed/,
+    );
+    assert.equal(publication.published, false);
+  } finally {
+    fix.remove();
+  }
+});
+
+test('failed multi-output rollback retains durable recovery evidence and reports final-name residue', () => {
+  const fix = fixture(['a.pkg', 'b.pkg']);
+  try {
+    const publication = prepare(fix);
+    fs.writeFileSync(publication.temporaryPaths['a.pkg'], 'artifact a');
+    fs.writeFileSync(publication.temporaryPaths['b.pkg'], 'artifact b');
+    const authorization = release.authorizeArtifactPublication(publication);
+    let links = 0;
+    assert.throws(
+      () => release.promoteArtifactPublication(publication, authorization, {
+        link: (source, target) => {
+          links += 1;
+          if (links === 2) {
+            const error = new Error('injected collision');
+            error.code = 'EEXIST';
+            throw error;
+          }
+          fs.linkSync(source, target);
+        },
+        unlink: () => { throw new Error('injected rollback failure'); },
+      }),
+      /destination already exists[\s\S]*final-name residue may exist/,
+    );
+    assert.equal(fs.existsSync(path.join(fix.outputDir, 'a.pkg')), true);
+    assert.equal(fs.existsSync(path.join(fix.outputDir, 'b.pkg')), false);
+    assert.equal(fs.existsSync(path.join(publication.lockDir, 'transaction.json')), true);
+    const primary = new Error('caller observed publication failure');
+    release.finishArtifactPublication(publication, { primaryError: primary });
+    assert.match(primary.message, /recovery evidence was retained for operator cleanup|temporary artifacts were retained/);
+    assert.equal(fs.existsSync(publication.lockDir), true);
+  } finally {
+    fix.remove();
+  }
+});
+
+test('identity-bound cleanup never deletes a substituted pending directory', () => {
+  const fix = fixture();
+  try {
+    const publication = prepare(fix);
+    fs.writeFileSync(publication.temporaryPaths['Scout.synthetic'], 'partial bytes');
+    const held = `${publication.pendingDir}-held`;
+    const primary = new Error('packager failed');
+    release.finishArtifactPublication(publication, {
+      primaryError: primary,
+      removeOptions: {
+        rename: (source, target) => {
+          if (source === publication.pendingDir) {
+            fs.renameSync(source, held);
+            fs.mkdirSync(source);
+            fs.writeFileSync(path.join(source, 'sentinel'), 'replacement must survive');
+          }
+          fs.renameSync(source, target);
+        },
+      },
+    });
+    assert.match(primary.message, /temporary cleanup failed/);
+    const sentinels = fs.readdirSync(fix.outputDir)
+      .filter((name) => name.startsWith('.scout-release-cleanup-pending-'))
+      .map((name) => path.join(fix.outputDir, name, 'sentinel'));
+    assert.equal(sentinels.length, 1);
+    assert.equal(fs.readFileSync(sentinels[0], 'utf8'), 'replacement must survive');
+    assert.equal(fs.existsSync(publication.lockDir), true);
+    assert.equal(fs.existsSync(held), true);
   } finally {
     fix.remove();
   }
