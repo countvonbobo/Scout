@@ -1139,8 +1139,10 @@ export function promoteArtifactPublication(publication, authorization, {
   }
 
   const sealedArtifacts = {};
+  let sealedAuthorizationStage = 70;
   try {
     for (const name of publication.artifactNames) {
+      sealedAuthorizationStage = 71;
       assertPublicationContainer(publication);
       const source = publication.temporaryPaths[name];
       const sealedPath = path.join(sealed.entry, name);
@@ -1148,10 +1150,14 @@ export function promoteArtifactPublication(publication, authorization, {
       if (!sameArtifactState(before, authorization.artifacts[name])) {
         throw publicationError('release artifact publication authorization changed');
       }
+      sealedAuthorizationStage = 72;
       copy(source, sealedPath, fs.constants.COPYFILE_EXCL);
       if (process.platform !== 'win32') fs.chmodSync(sealedPath, before.mode & ~0o222);
+      sealedAuthorizationStage = 73;
       flushFile(sealedPath);
+      sealedAuthorizationStage = 74;
       assertPublicationContainer(publication);
+      sealedAuthorizationStage = 75;
       const sealedState = artifactStateAt(sealedPath, sealed.entry);
       const after = publicationArtifactState(source, publication);
       if (!sameArtifactState(after, authorization.artifacts[name])
@@ -1164,6 +1170,7 @@ export function promoteArtifactPublication(publication, authorization, {
       }
       sealedArtifacts[name] = { path: sealedPath, state: sealedState };
     }
+    sealedAuthorizationStage = 76;
     flushDirectory(sealed.entry);
     const transaction = {
       version: 1,
@@ -1185,11 +1192,15 @@ export function promoteArtifactPublication(publication, authorization, {
     };
     const transactionPath = path.join(publication.lockDir, ARTIFACT_TRANSACTION_RECORD);
     publication.transactionPath = transactionPath;
+    sealedAuthorizationStage = 77;
     publication.transactionState = writeDurableJson(transactionPath, transaction);
+    sealedAuthorizationStage = 78;
     assertPublicationContainer(publication);
   } catch (error) {
     if (/^release artifact/.test(String(error?.message || ''))) throw error;
-    throw publicationError('release artifact sealed output could not be authorized');
+    throw publicationError(
+      `release artifact sealed output could not be authorized (bounded reason SEAL-${sealedAuthorizationStage})`,
+    );
   }
 
   const linked = [];
