@@ -319,6 +319,18 @@ Test order and acceptance:
   cancellation was rejected with HTTP 403 because the fork account lacks
   upstream administration rights, so no CI state changed. The evidence-only
   ledger commit must trigger a fresh Intel attempt before acceptance.
+- Evidence-head CI run:
+  `https://github.com/oliver-hitchings/Scout/actions/runs/30949153353`.
+  Ubuntu full/audit/native packaging, Apple Silicon macOS full/audit/native
+  packaging and all three browser jobs passed. The fresh Intel full suite
+  completed with 1,480 passed, 6 skipped and one unrelated timing failure because
+  its slow-provider probe did not start within the test window. Windows completed
+  with 1,483 passed, 3 skipped and one different unrelated lock-coordination
+  timing failure; its dedicated publication/DACL protocol had already passed.
+  Neither failed test or source file changed after approved code head `d165e1d`.
+  GitHub rejected the built-in failed-job retry with an upstream-admin 403, so
+  no rerun state changed; this ledger-only evidence update triggers a fresh
+  attempt without altering production code.
 - Independent exact-SHA reviews at `d165e1d`:
   - specification: **APPROVE**, no findings; 67/67 focused checks;
   - code quality: **APPROVE**, no findings; 118/118 focused checks;
