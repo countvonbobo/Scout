@@ -27,7 +27,30 @@ Release only from this clean-history public application repository. Never copy c
    Set `ISCC_PATH` when required. The installer is named
    `Scout-<version>-windows-x64.exe`; it and `checksums.txt` are written to
    `installer/output/`. The current installer creates UI shortcuts but does not
-   add the CLI to `PATH`.
+   add the CLI to `PATH`. Start with no file at either final name: package
+   publication never overwrites an existing artifact or checksum manifest.
+
+   Every platform packager writes into a private
+   `.scout-release-pending-<random-id>` directory under `installer/output/`
+   while holding the local `.scout-release-publication.lock`. The output
+   directory, lock, temporary directory and their real ancestor identities are
+   checked without following symlinks or reparse points. Temporary directories
+   use mode `0700` on Unix and a protected current-user-only DACL on Windows;
+   that privacy state is rechecked with the directory identity. Packaging, payload
+   postchecks and temporary-file authorization all finish before Scout creates
+   a final artifact name with an atomic, no-overwrite same-filesystem link.
+   Packager or postcheck failure removes the temporary output; a cleanup failure
+   retains only bounded runner-cleanup residue and never replaces the primary
+   error with a raw filesystem path.
+
+   If a process stops before promotion, no final artifact exists. After
+   validating that the lock and pending directory are real children of the
+   expected output directory and that no packaging process remains, the runner
+   may delete that clearly temporary residue and rebuild. If a process stops
+   after promotion, the final artifact is already the authorized inode; remove
+   only the temporary hard link/lock after the same identity checks. Never
+   delete or overwrite a colliding final artifact automatically—investigate its
+   provenance or use a clean output directory.
 7. Test on clean Windows, macOS and Ubuntu runners: install; first launch; provider detection; supervised/scheduled scans; missed-run/overlap/timeout; upgrade; and uninstall preserving the workspace.
 8. Tag the reviewed commit with the exact package version prefixed by `v`. The cross-platform workflow builds all packages, runs native smoke tests and required-marker audits, deploys and health-checks the exact tag on the approved private Beta VPS, then publishes one checksum manifest, a keyless GitHub/Sigstore attestation bundle covering every package digest, and the release notes. A failed or unapproved VPS deployment prevents publication. Follow [release package verification and signing](SUPPLY_CHAIN_SECURITY.md) for the ownership, verification, rotation, incident and remaining platform-signing contract.
 

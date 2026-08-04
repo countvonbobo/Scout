@@ -1,0 +1,219 @@
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { test } from 'node:test';
+import * as release from './build-release.mjs';
+
+function fixture(names = ['Scout.synthetic']) {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'scout-publication-'));
+  const outputDir = path.join(root, 'installer', 'output');
+  fs.mkdirSync(path.dirname(outputDir), { recursive: true });
+  return {
+    root,
+    outputDir,
+    names,
+    remove() { fs.rmSync(root, { recursive: true, force: true }); },
+  };
+}
+
+function prepare(fix) {
+  return release.createArtifactPublication({
+    outputDir: fix.outputDir,
+    authorityRoot: fix.root,
+    artifactNames: fix.names,
+  });
+}
+
+test('postcheck failure removes private temporary artifacts without exposing a final name', () => {
+  const fix = fixture();
+  try {
+    const publication = prepare(fix);
+    fs.writeFileSync(publication.temporaryPaths['Scout.synthetic'], 'authorized bytes');
+    const primary = new Error('post-package authorization failed');
+    release.finishArtifactPublication(publication, { primaryError: primary });
+    assert.equal(fs.existsSync(path.join(fix.outputDir, 'Scout.synthetic')), false);
+    assert.equal(fs.existsSync(publication.pendingDir), false);
+    assert.equal(fs.existsSync(publication.lockDir), false);
+    assert.equal(primary.message, 'post-package authorization failed');
+  } finally {
+    fix.remove();
+  }
+});
+
+test('packager failure removes a partial private temporary artifact', () => {
+  const fix = fixture();
+  try {
+    const publication = prepare(fix);
+    fs.writeFileSync(publication.temporaryPaths['Scout.synthetic'], 'partial bytes');
+    release.finishArtifactPublication(publication, { primaryError: new Error('packager failed') });
+    assert.equal(fs.existsSync(publication.pendingDir), false);
+    assert.equal(fs.existsSync(path.join(fix.outputDir, 'Scout.synthetic')), false);
+  } finally {
+    fix.remove();
+  }
+});
+
+test('destination collision fails closed without overwriting the existing artifact', () => {
+  const fix = fixture();
+  try {
+    const publication = prepare(fix);
+    fs.writeFileSync(publication.temporaryPaths['Scout.synthetic'], 'new bytes');
+    const authorization = release.authorizeArtifactPublication(publication);
+    const finalPath = path.join(fix.outputDir, 'Scout.synthetic');
+    fs.writeFileSync(finalPath, 'existing bytes');
+    assert.throws(
+      () => release.promoteArtifactPublication(publication, authorization),
+      /destination already exists/,
+    );
+    assert.equal(fs.readFileSync(finalPath, 'utf8'), 'existing bytes');
+    release.finishArtifactPublication(publication, { primaryError: new Error('collision') });
+    assert.equal(fs.existsSync(publication.pendingDir), false);
+  } finally {
+    fix.remove();
+  }
+});
+
+test('competing publication is excluded and the active publication may finish atomically', () => {
+  const fix = fixture();
+  try {
+    const publication = prepare(fix);
+    assert.throws(() => prepare(fix), /publication is already active/);
+    fs.writeFileSync(publication.temporaryPaths['Scout.synthetic'], 'winner');
+    const authorization = release.authorizeArtifactPublication(publication);
+    release.promoteArtifactPublication(publication, authorization);
+    assert.equal(fs.readFileSync(path.join(fix.outputDir, 'Scout.synthetic'), 'utf8'), 'winner');
+  } finally {
+    fix.remove();
+  }
+});
+
+test('restored output-ancestor substitution invalidates publication authorization', () => {
+  const fix = fixture();
+  try {
+    const publication = prepare(fix);
+    fs.writeFileSync(publication.temporaryPaths['Scout.synthetic'], 'authorized bytes');
+    const authorization = release.authorizeArtifactPublication(publication);
+    const installer = path.join(fix.root, 'installer');
+    const held = path.join(fix.root, 'installer-held');
+    fs.renameSync(installer, held);
+    fs.renameSync(held, installer);
+    assert.throws(
+      () => release.promoteArtifactPublication(publication, authorization),
+      /publication authorization changed/,
+    );
+    release.finishArtifactPublication(publication, { primaryError: new Error('substitution') });
+    assert.equal(fs.existsSync(path.join(fix.outputDir, 'Scout.synthetic')), false);
+  } finally {
+    fix.remove();
+  }
+});
+
+test('temporary cleanup failure preserves the primary error and hides filesystem details', () => {
+  const fix = fixture();
+  try {
+    const publication = prepare(fix);
+    fs.writeFileSync(publication.temporaryPaths['Scout.synthetic'], 'partial bytes');
+    const primary = new Error('packager failed');
+    assert.doesNotThrow(() => release.finishArtifactPublication(publication, {
+      primaryError: primary,
+      remove: () => { throw new Error('/private/path must not escape'); },
+    }));
+    assert.match(primary.message, /^packager failed\nRelease artifact temporary cleanup failed;/);
+    assert.doesNotMatch(primary.message, /private\/path/);
+    release.finishArtifactPublication(publication, { primaryError: primary });
+  } finally {
+    fix.remove();
+  }
+});
+
+test('crash boundaries distinguish disposable pre-promotion residue from an authorized final inode', () => {
+  const before = fixture();
+  try {
+    const publication = prepare(before);
+    fs.writeFileSync(publication.temporaryPaths['Scout.synthetic'], 'pre-promotion');
+    assert.equal(fs.existsSync(publication.pendingDir), true);
+    assert.equal(fs.existsSync(path.join(before.outputDir, 'Scout.synthetic')), false);
+    release.finishArtifactPublication(publication);
+    assert.equal(fs.existsSync(publication.pendingDir), false);
+  } finally {
+    before.remove();
+  }
+
+  const after = fixture();
+  try {
+    const publication = prepare(after);
+    const temporary = publication.temporaryPaths['Scout.synthetic'];
+    const finalPath = path.join(after.outputDir, 'Scout.synthetic');
+    fs.writeFileSync(temporary, 'authorized final');
+    const authorization = release.authorizeArtifactPublication(publication);
+    assert.throws(
+      () => release.promoteArtifactPublication(publication, authorization, {
+        remove: () => { throw new Error('/private/path must not escape'); },
+      }),
+      /authorized final artifact exists.*temporary cleanup failed/i,
+    );
+    assert.equal(fs.readFileSync(finalPath, 'utf8'), 'authorized final');
+    assert.equal(fs.statSync(finalPath).ino, fs.statSync(temporary).ino);
+    release.finishArtifactPublication(publication);
+    assert.equal(fs.existsSync(finalPath), true);
+    assert.equal(fs.existsSync(publication.pendingDir), false);
+  } finally {
+    after.remove();
+  }
+});
+
+test('publication rejects a symlinked or reparse-point output ancestor', () => {
+  const fix = fixture();
+  try {
+    fs.rmSync(path.join(fix.root, 'installer'), { recursive: true, force: true });
+    const redirected = path.join(fix.root, 'redirected');
+    fs.mkdirSync(redirected);
+    try {
+      fs.symlinkSync(redirected, path.join(fix.root, 'installer'), process.platform === 'win32' ? 'junction' : 'dir');
+    } catch (error) {
+      if (process.platform === 'win32' && /EPERM|privilege/i.test(String(error))) return;
+      throw error;
+    }
+    assert.throws(() => prepare(fix), /not a trusted directory/);
+  } finally {
+    fix.remove();
+  }
+});
+
+test('authorization rejects a temporary directory whose privacy state changed', {
+  skip: process.platform === 'win32' ? 'POSIX mode mutation; Windows DACLs are exercised by hosted packaging' : false,
+}, () => {
+  const fix = fixture();
+  try {
+    const publication = prepare(fix);
+    fs.writeFileSync(publication.temporaryPaths['Scout.synthetic'], 'authorized bytes');
+    fs.chmodSync(publication.pendingDir, 0o755);
+    assert.throws(
+      () => release.authorizeArtifactPublication(publication),
+      /publication authorization changed/,
+    );
+    fs.chmodSync(publication.pendingDir, 0o700);
+    release.finishArtifactPublication(publication, { primaryError: new Error('privacy changed') });
+  } finally {
+    fix.remove();
+  }
+});
+
+test('authorization rejects unexpected temporary output and publishes a temporary checksum manifest', () => {
+  const fix = fixture(['Scout.synthetic', 'checksums.txt']);
+  try {
+    const publication = prepare(fix);
+    fs.writeFileSync(publication.temporaryPaths['Scout.synthetic'], 'authorized bytes');
+    release.writeArtifactChecksums(publication);
+    fs.writeFileSync(path.join(publication.pendingDir, 'unexpected'), 'unexpected');
+    assert.throws(() => release.authorizeArtifactPublication(publication), /not authorized/);
+    fs.rmSync(path.join(publication.pendingDir, 'unexpected'));
+    const authorization = release.authorizeArtifactPublication(publication);
+    const result = release.promoteArtifactPublication(publication, authorization);
+    const manifest = fs.readFileSync(result.finalPaths['checksums.txt'], 'utf8');
+    assert.match(manifest, /^[a-f0-9]{64}  Scout\.synthetic\n$/);
+  } finally {
+    fix.remove();
+  }
+});

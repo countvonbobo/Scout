@@ -208,7 +208,17 @@ Access details differ by operator and must be discovered from the private operat
 4. Run the complete test suite, release privacy audit, packaging checks, and relevant manual acceptance. For a workspace-format release, also migrate a production-shaped synthetic workspace, materialise its beta.22 rollback into a separate directory, compare every manifest digest and prove the live synthetic workspace retained its newer data.
    Platform packagers consume only the audit-created content snapshot, recheck
    its privacy-authorized digest immediately before and after packaging, and
-   remove the sealed snapshot in a `finally` path.
+   remove the sealed snapshot in a `finally` path. Each native artifact is first
+   written inside a private, unpredictable directory on the destination
+   filesystem (`0700` on Unix and a protected current-user-only DACL on
+   Windows). Scout binds that privacy state, directory and every real ancestor to the
+   repository root, authorizes the temporary file after the payload postcheck,
+   then creates the final name atomically without overwrite. A destination
+   collision or changed output identity fails closed. Pre-publication crashes
+   can leave only the clearly named temporary directory and publication lock,
+   which are eligible for identity-checked runner cleanup; once the atomic link
+   succeeds, the authorized final inode exists even if temporary cleanup is
+   interrupted.
 5. Commit intentionally, push the branch, and open a pull request against `main`.
 6. For release rehearsal, update the protected `codex/release-candidate` branch to the reviewed commit.
 7. Tag the reviewed package version. The protected release workflow builds every platform, deploys the exact tag to the VPS, verifies health and rollback, and only then publishes.

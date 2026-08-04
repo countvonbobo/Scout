@@ -34,6 +34,16 @@ test('platform packaging consumes verified staged inputs and audits payloads bef
     build.match(/export function buildMac[\s\S]*?return \{ output/)?.[0] || '',
     /fs\.symlinkSync\('\/Applications'[\s\S]*auditStageBeforePackaging\(stage, \{ authorizationRoot: ROOT \}\)/,
   );
+  for (const body of [
+    build.match(/export function buildMac[\s\S]*?^\}/m)?.[0] || '',
+    build.match(/export function buildLinux[\s\S]*?^\}/m)?.[0] || '',
+  ]) {
+    assert.match(body, /createArtifactPublication/);
+    assert.match(body, /authorizeArtifactPublication/);
+    assert.match(body, /promoteArtifactPublication/);
+    assert.match(body, /finishArtifactPublication/);
+    assert.match(body, /publication\.temporaryPaths/);
+  }
 });
 
 test('macOS package-root verification covers the exact app and Applications link', () => {

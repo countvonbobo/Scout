@@ -617,6 +617,16 @@ test('checksums use SHA-256 and do not hash the manifest into itself', () => {
   assert.equal(fs.readFileSync(manifest, 'utf8'), `${sha256(artifact)}  Scout.exe\n`);
 });
 
+test('Windows packaging publishes only authorized private temporary output without overwrite', () => {
+  const source = fs.readFileSync(new URL('./build-release.mjs', import.meta.url), 'utf8');
+  const body = source.match(/export function buildInstaller[\s\S]*?\n\}/)?.[0] || '';
+  assert.match(body, /createArtifactPublication/);
+  assert.match(body, /`\/DOutputDir=\$\{publication\.pendingDir\}`/);
+  assert.match(body, /writeArtifactChecksums[\s\S]*authorizeArtifactPublication[\s\S]*promoteArtifactPublication/);
+  assert.match(body, /finishArtifactPublication/);
+  assert.doesNotMatch(body, /rmSync\(outputDir/);
+});
+
 test('verified payload digests bind file paths, modes and bytes and reject links', () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'scout-payload-digest-'));
   fs.mkdirSync(path.join(root, 'nested'));

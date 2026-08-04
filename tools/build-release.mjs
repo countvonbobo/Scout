@@ -439,6 +439,421 @@ export function assertAuditedStage(audit) {
   }
 }
 
+const ARTIFACT_PUBLICATION_LOCK = '.scout-release-publication.lock';
+const ARTIFACT_PENDING_PREFIX = '.scout-release-pending-';
+
+function publicationError(message) {
+  return new Error(message);
+}
+
+function publicationDirectoryRecord(entry) {
+  const stat = fs.lstatSync(entry, { bigint: true });
+  if (!stat.isDirectory() || stat.isSymbolicLink()) {
+    throw publicationError('release artifact publication output is not a trusted directory');
+  }
+  return {
+    dev: String(stat.dev),
+    ino: String(stat.ino),
+    mode: Number(stat.mode & 0o777n),
+  };
+}
+
+function samePublicationDirectory(left, right) {
+  return left.dev === right.dev && left.ino === right.ino && left.mode === right.mode;
+}
+
+const WINDOWS_PRIVATE_DIRECTORY_SCRIPT = [
+  "$ErrorActionPreference='Stop'",
+  '$entry=$args[0]',
+  '$operation=$args[1]',
+  '$identity=[System.Security.Principal.WindowsIdentity]::GetCurrent()',
+  "if($operation -eq 'create') {",
+  '  $privateAcl=New-Object System.Security.AccessControl.DirectorySecurity',
+  '  $privateAcl.SetAccessRuleProtection($true,$false)',
+  "  $rule=New-Object System.Security.AccessControl.FileSystemAccessRule($identity.User,'FullControl','ContainerInherit,ObjectInherit','None','Allow')",
+  '  [void]$privateAcl.AddAccessRule($rule)',
+  '  Set-Acl -LiteralPath $entry -AclObject $privateAcl',
+  '}',
+  '$acl=Get-Acl -LiteralPath $entry',
+  'if(-not $acl.AreAccessRulesProtected) { exit 41 }',
+  '$rules=@($acl.GetAccessRules($true,$true,[System.Security.Principal.SecurityIdentifier]))',
+  'if($rules.Count -ne 1) { exit 42 }',
+  '$only=$rules[0]',
+  "if($only.IdentityReference.Value -ne $identity.User.Value -or $only.AccessControlType -ne 'Allow' -or (($only.FileSystemRights -band [System.Security.AccessControl.FileSystemRights]::FullControl) -ne [System.Security.AccessControl.FileSystemRights]::FullControl)) { exit 43 }",
+  '$acl.Sddl',
+].join(';');
+
+function privatePublicationSecurityRecord(entry, { create = false } = {}) {
+  if (process.platform !== 'win32') {
+    if (create) fs.chmodSync(entry, 0o700);
+    const stat = fs.lstatSync(entry, { bigint: true });
+    if (!stat.isDirectory() || stat.isSymbolicLink() || Number(stat.mode & 0o777n) !== 0o700) {
+      throw publicationError('release artifact temporary output is not private');
+    }
+    return 'posix:0700';
+  }
+  const result = spawnSync('powershell.exe', [
+    '-NoLogo', '-NoProfile', '-NonInteractive', '-Command',
+    WINDOWS_PRIVATE_DIRECTORY_SCRIPT, entry, create ? 'create' : 'verify',
+  ], { encoding: 'utf8', windowsHide: true });
+  const descriptor = String(result.stdout || '').trim();
+  if (result.status !== 0 || !descriptor) {
+    throw publicationError('release artifact temporary output is not private');
+  }
+  return `windows:${descriptor}`;
+}
+
+function validateArtifactNames(artifactNames) {
+  if (!Array.isArray(artifactNames) || artifactNames.length === 0) {
+    throw publicationError('release artifact publication requires at least one output');
+  }
+  const unique = new Set();
+  for (const name of artifactNames) {
+    if (typeof name !== 'string' || !name || name !== path.basename(name)
+      || name === '.' || name === '..' || name.includes('\0')
+      || name === ARTIFACT_PUBLICATION_LOCK || name.startsWith(ARTIFACT_PENDING_PREFIX)
+      || unique.has(name)) {
+      throw publicationError('release artifact publication contains an invalid output name');
+    }
+    unique.add(name);
+  }
+  return [...unique];
+}
+
+function ensureArtifactOutputDirectory(outputDir, authorityRoot) {
+  const output = path.resolve(outputDir);
+  const boundary = path.resolve(authorityRoot);
+  const relative = path.relative(boundary, output);
+  if (!relative || relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
+    throw publicationError('release artifact publication output is outside its authority root');
+  }
+  const parent = path.dirname(output);
+  try {
+    auditedAncestorIdentityDigest(path.join(parent, '.publication-parent'), boundary);
+    try {
+      fs.mkdirSync(output, { mode: 0o700 });
+    } catch (error) {
+      if (error?.code !== 'EEXIST') throw error;
+    }
+    publicationDirectoryRecord(output);
+    auditedAncestorIdentityDigest(path.join(output, '.publication-output'), boundary);
+  } catch (error) {
+    if (error?.message?.startsWith('release artifact publication')) throw error;
+    throw publicationError('release artifact publication output is not a trusted directory');
+  }
+  return { output, boundary };
+}
+
+function createPrivatePublicationDirectory(outputDir, name) {
+  const entry = path.join(outputDir, name);
+  let created = false;
+  try {
+    fs.mkdirSync(entry, { mode: 0o700 });
+    created = true;
+    const securityRecord = privatePublicationSecurityRecord(entry, { create: true });
+    const record = publicationDirectoryRecord(entry);
+    return { entry, record, securityRecord };
+  } catch (error) {
+    if (created) {
+      try {
+        fs.rmSync(entry, { recursive: true, force: true });
+      } catch {
+        const primary = error?.message?.startsWith('release artifact')
+          ? error : publicationError('release artifact temporary output could not be created');
+        primary.message = `${primary.message}\nRelease artifact temporary cleanup failed; temporary artifacts were retained for runner cleanup.`;
+        throw primary;
+      }
+    }
+    throw error;
+  }
+}
+
+export function createArtifactPublication({
+  outputDir,
+  authorityRoot,
+  artifactNames,
+  randomUUID = crypto.randomUUID,
+} = {}) {
+  const names = validateArtifactNames(artifactNames);
+  const { output, boundary } = ensureArtifactOutputDirectory(outputDir, authorityRoot);
+  for (const name of names) {
+    try {
+      fs.lstatSync(path.join(output, name));
+      throw publicationError('release artifact destination already exists');
+    } catch (error) {
+      if (error?.message === 'release artifact destination already exists') throw error;
+      if (error?.code !== 'ENOENT') {
+        throw publicationError('release artifact destination cannot be validated');
+      }
+    }
+  }
+
+  let lock = null;
+  let pending = null;
+  try {
+    try {
+      lock = createPrivatePublicationDirectory(output, ARTIFACT_PUBLICATION_LOCK);
+    } catch (error) {
+      if (error?.code === 'EEXIST') {
+        throw publicationError('release artifact publication is already active');
+      }
+      throw error;
+    }
+    const id = randomUUID();
+    if (!/^[0-9a-f]{8}-[0-9a-f-]{27,}$/i.test(String(id))) {
+      throw publicationError('release artifact publication could not create a unique output');
+    }
+    pending = createPrivatePublicationDirectory(output, `${ARTIFACT_PENDING_PREFIX}${id}`);
+    const outputRecord = publicationDirectoryRecord(output);
+    if (pending.record.dev !== outputRecord.dev) {
+      throw publicationError('release artifact temporary output is not on the destination filesystem');
+    }
+    const outputFence = auditedAncestorIdentityDigest(
+      path.join(output, '.publication-fence'),
+      boundary,
+    );
+    const temporaryPaths = Object.fromEntries(names.map((name) => [name, path.join(pending.entry, name)]));
+    return {
+      id,
+      artifactNames: names,
+      authorityRoot: boundary,
+      outputDir: output,
+      outputRecord,
+      outputFence,
+      lockDir: lock.entry,
+      lockRecord: lock.record,
+      lockSecurityRecord: lock.securityRecord,
+      pendingDir: pending.entry,
+      pendingRecord: pending.record,
+      pendingSecurityRecord: pending.securityRecord,
+      temporaryPaths,
+      published: false,
+      cleaned: false,
+    };
+  } catch (error) {
+    let cleanupFailed = false;
+    try { if (pending?.entry) fs.rmSync(pending.entry, { recursive: true, force: true }); } catch { cleanupFailed = true; }
+    try { if (lock?.entry) fs.rmSync(lock.entry, { recursive: true, force: true }); } catch { cleanupFailed = true; }
+    const primary = error?.message?.startsWith('release artifact')
+      ? error : publicationError('release artifact publication setup failed');
+    if (cleanupFailed) {
+      primary.message = `${primary.message}\nRelease artifact temporary cleanup failed; temporary artifacts were retained for runner cleanup.`;
+    }
+    throw primary;
+  }
+}
+
+function assertPublicationContainer(publication, { strictFence = true } = {}) {
+  try {
+    const outputRecord = publicationDirectoryRecord(publication.outputDir);
+    const lockRecord = publicationDirectoryRecord(publication.lockDir);
+    const pendingRecord = publicationDirectoryRecord(publication.pendingDir);
+    if (!samePublicationDirectory(outputRecord, publication.outputRecord)
+      || !samePublicationDirectory(lockRecord, publication.lockRecord)
+      || !samePublicationDirectory(pendingRecord, publication.pendingRecord)
+      || privatePublicationSecurityRecord(publication.lockDir) !== publication.lockSecurityRecord
+      || privatePublicationSecurityRecord(publication.pendingDir) !== publication.pendingSecurityRecord) {
+      throw new Error('identity mismatch');
+    }
+    if (strictFence) {
+      const currentFence = auditedAncestorIdentityDigest(
+        path.join(publication.outputDir, '.publication-fence'),
+        publication.authorityRoot,
+      );
+      if (currentFence !== publication.outputFence) throw new Error('fence mismatch');
+    }
+  } catch {
+    throw publicationError('release artifact publication authorization changed');
+  }
+}
+
+function publicationArtifactState(file, publication) {
+  let before;
+  let digest;
+  let after;
+  try {
+    before = fs.lstatSync(file, { bigint: true });
+    if (!before.isFile() || before.isSymbolicLink()) throw new Error('not regular');
+    if (String(before.dev) !== publication.pendingRecord.dev) throw new Error('different filesystem');
+    digest = verifiedReleaseFileDigest(file, { verifiedRoot: publication.pendingDir });
+    after = fs.lstatSync(file, { bigint: true });
+    if (!samePathRecord(before, after)) throw new Error('changed');
+  } catch {
+    throw publicationError('release artifact temporary output is not authorized');
+  }
+  return {
+    dev: String(after.dev),
+    ino: String(after.ino),
+    mode: Number(after.mode & 0o777n),
+    size: String(after.size),
+    mtimeNs: String(after.mtimeNs),
+    ctimeNs: String(after.ctimeNs),
+    digest,
+  };
+}
+
+function sameArtifactState(left, right) {
+  return left.dev === right.dev && left.ino === right.ino
+    && left.mode === right.mode && left.size === right.size
+    && left.mtimeNs === right.mtimeNs && left.ctimeNs === right.ctimeNs
+    && left.digest === right.digest;
+}
+
+export function authorizeArtifactPublication(publication) {
+  assertPublicationContainer(publication);
+  let entries;
+  try {
+    entries = fs.readdirSync(publication.pendingDir).sort();
+  } catch {
+    throw publicationError('release artifact temporary output is not authorized');
+  }
+  if (entries.join('\0') !== [...publication.artifactNames].sort().join('\0')) {
+    throw publicationError('release artifact temporary output is not authorized');
+  }
+  const artifacts = Object.fromEntries(publication.artifactNames.map((name) => [
+    name,
+    publicationArtifactState(publication.temporaryPaths[name], publication),
+  ]));
+  return {
+    publicationId: publication.id,
+    outputFence: publication.outputFence,
+    artifacts,
+  };
+}
+
+export function writeArtifactChecksums(publication, {
+  manifestName = 'checksums.txt',
+} = {}) {
+  if (!publication.artifactNames.includes(manifestName)) {
+    throw publicationError('release artifact publication does not authorize a checksum manifest');
+  }
+  const artifacts = publication.artifactNames.filter((name) => name !== manifestName).sort();
+  if (!artifacts.length) throw publicationError('release artifact checksum manifest has no subjects');
+  const content = artifacts.map((name) => (
+    `${verifiedReleaseFileDigest(publication.temporaryPaths[name], { verifiedRoot: publication.pendingDir })}  ${name}`
+  )).join('\n') + '\n';
+  try {
+    fs.writeFileSync(publication.temporaryPaths[manifestName], content, { encoding: 'utf8', flag: 'wx', mode: 0o600 });
+  } catch {
+    throw publicationError('release artifact checksum manifest could not be created');
+  }
+  return publication.temporaryPaths[manifestName];
+}
+
+function safeUnlinkPublished(finalPath, expected) {
+  try {
+    const stat = fs.lstatSync(finalPath, { bigint: true });
+    if (!stat.isFile() || stat.isSymbolicLink()
+      || String(stat.dev) !== expected.dev || String(stat.ino) !== expected.ino) return false;
+    fs.unlinkSync(finalPath);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function removeArtifactPublication(publication) {
+  if (publication.cleaned) return { removed: true };
+  assertPublicationContainer(publication, { strictFence: false });
+  fs.rmSync(publication.pendingDir, { recursive: true, force: false });
+  fs.rmSync(publication.lockDir, { recursive: true, force: false });
+  publication.cleaned = true;
+  return { removed: true };
+}
+
+export function finishArtifactPublication(publication, {
+  primaryError = null,
+  remove = removeArtifactPublication,
+} = {}) {
+  if (!publication || publication.cleaned) return { removed: true };
+  try {
+    return remove(publication);
+  } catch {
+    const message = 'Release artifact temporary cleanup failed; temporary artifacts were retained for runner cleanup.';
+    if (primaryError instanceof Error) {
+      if (!primaryError.message.includes(message)) primaryError.message = `${primaryError.message}\n${message}`;
+      return { removed: false };
+    }
+    throw publicationError(message);
+  }
+}
+
+export function promoteArtifactPublication(publication, authorization, {
+  remove = removeArtifactPublication,
+} = {}) {
+  if (!authorization || authorization.publicationId !== publication.id
+    || authorization.outputFence !== publication.outputFence) {
+    throw publicationError('release artifact publication authorization changed');
+  }
+  for (const name of publication.artifactNames) {
+    try {
+      fs.lstatSync(path.join(publication.outputDir, name));
+      throw publicationError('release artifact destination already exists');
+    } catch (error) {
+      if (error?.message === 'release artifact destination already exists') throw error;
+      if (error?.code !== 'ENOENT') {
+        throw publicationError('release artifact destination cannot be validated');
+      }
+    }
+  }
+  assertPublicationContainer(publication);
+  for (const name of publication.artifactNames) {
+    const current = publicationArtifactState(publication.temporaryPaths[name], publication);
+    if (!sameArtifactState(current, authorization.artifacts[name])) {
+      throw publicationError('release artifact publication authorization changed');
+    }
+  }
+
+  const linked = [];
+  try {
+    for (const name of publication.artifactNames) {
+      const temporary = publication.temporaryPaths[name];
+      const finalPath = path.join(publication.outputDir, name);
+      try {
+        fs.linkSync(temporary, finalPath);
+      } catch (error) {
+        if (error?.code === 'EEXIST') throw publicationError('release artifact destination already exists');
+        throw publicationError('release artifact atomic publication failed');
+      }
+      const expected = authorization.artifacts[name];
+      const finalStat = fs.lstatSync(finalPath, { bigint: true });
+      if (!finalStat.isFile() || finalStat.isSymbolicLink()
+        || String(finalStat.dev) !== expected.dev || String(finalStat.ino) !== expected.ino) {
+        throw publicationError('release artifact publication authorization changed');
+      }
+      linked.push({ finalPath, expected });
+    }
+    publication.published = true;
+    publication.outputFence = auditedAncestorIdentityDigest(
+      path.join(publication.outputDir, '.publication-fence'),
+      publication.authorityRoot,
+    );
+    try {
+      remove(publication);
+    } catch {
+      throw publicationError('Authorized final artifact exists, but temporary cleanup failed; temporary artifacts were retained for runner cleanup.');
+    }
+    return {
+      finalPaths: Object.fromEntries(publication.artifactNames.map((name) => [
+        name,
+        path.join(publication.outputDir, name),
+      ])),
+    };
+  } catch (error) {
+    if (!publication.published) {
+      for (const { finalPath, expected } of linked.reverse()) safeUnlinkPublished(finalPath, expected);
+      try {
+        publication.outputFence = auditedAncestorIdentityDigest(
+          path.join(publication.outputDir, '.publication-fence'),
+          publication.authorityRoot,
+        );
+      } catch {}
+    }
+    if (/^(?:release artifact|Authorized final artifact)/.test(String(error?.message || ''))) throw error;
+    throw publicationError('release artifact publication authorization changed');
+  }
+}
+
 export function stagePublicSource({
   root = DEFAULT_ROOT,
   stageDir = path.join(root, 'dist', 'release', 'public-source'),
@@ -671,20 +1086,25 @@ export function buildInstaller({ root = DEFAULT_ROOT, stageDir, version, isccPat
   const audit = auditStageBeforePackaging(staged.stageDir, { authorizationRoot: root });
   const auditedStage = audit.stageDir;
   let primaryError = null;
+  let publication = null;
   try {
     assertAuditedStage(audit);
     const auditedPayloadDigest = verifiedReleaseTreeDigest(auditedStage);
     const outputDir = path.join(root, 'installer', 'output');
-    fs.rmSync(outputDir, { recursive: true, force: true });
-    fs.mkdirSync(outputDir, { recursive: true });
     const iscc = isccPath || findIscc();
     if (!iscc) throw new Error('Inno Setup 6 was not found; install it or set ISCC_PATH');
     const selectedVersion = checkedVersion(version || process.env.SCOUT_VERSION || packageVersion(root));
+    const installerName = `Scout-${selectedVersion}-windows-x64.exe`;
+    publication = createArtifactPublication({
+      outputDir,
+      authorityRoot: root,
+      artifactNames: [installerName, 'checksums.txt'],
+    });
     const result = spawnSync(iscc, [
       `/DMyAppVersion=${selectedVersion}`,
       `/DStageDir=${auditedStage}`,
       `/DIconFile=${path.join(auditedStage, path.relative(staged.stageDir, stagedIcon))}`,
-      `/DOutputDir=${outputDir}`,
+      `/DOutputDir=${publication.pendingDir}`,
       path.join(auditedStage, path.relative(staged.stageDir, installerSource)),
     ], { cwd: auditedStage, encoding: 'utf8', windowsHide: true });
     if (result.status !== 0) throw new Error(`Inno Setup failed:\n${String(result.stdout || '')}\n${String(result.stderr || '')}`.trim());
@@ -692,12 +1112,20 @@ export function buildInstaller({ root = DEFAULT_ROOT, stageDir, version, isccPat
       throw new Error('audited Windows release payload changed during packaging');
     }
     assertAuditedStage(audit);
-    const checksums = writeChecksums(outputDir);
-    return { ...staged, outputDir, checksums, version: selectedVersion };
+    writeArtifactChecksums(publication);
+    const authorization = authorizeArtifactPublication(publication);
+    const promoted = promoteArtifactPublication(publication, authorization);
+    return {
+      ...staged,
+      outputDir,
+      checksums: promoted.finalPaths['checksums.txt'],
+      version: selectedVersion,
+    };
   } catch (error) {
     primaryError = error;
     throw error;
   } finally {
+    if (publication) finishArtifactPublication(publication, { primaryError });
     finishAuditedStageCleanup(auditedStage, { primaryError });
   }
 }

@@ -35,6 +35,19 @@ jobs:
         run: npm run release:audit -- --root dist/release/stage --stage --require-markers
         env:
           SCOUT_RELEASE_MARKERS: ${{ secrets.SCOUT_RELEASE_MARKERS }}
+      - name: Install native Windows packager
+        if: runner.os == 'Windows'
+        run: choco install innosetup --yes --no-progress
+      - name: Exercise native Windows packaging
+        if: runner.os == 'Windows'
+        run: node tools/build-release.mjs --installer
+        env:
+          SCOUT_RELEASE_MARKERS: SyntheticCiPackagingMarker
+      - name: Exercise native macOS packaging
+        if: runner.os == 'macOS'
+        run: node tools/build-platform.mjs mac
+        env:
+          SCOUT_RELEASE_MARKERS: SyntheticCiPackagingMarker
       - name: Exercise native Linux packaging
         if: runner.os == 'Linux'
         run: node tools/build-platform.mjs linux
