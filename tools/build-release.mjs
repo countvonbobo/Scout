@@ -934,7 +934,7 @@ function sameArtifactContent(left, right) {
 }
 
 function flushFile(file) {
-  const descriptor = fs.openSync(file, 'r');
+  const descriptor = fs.openSync(file, process.platform === 'win32' ? 'r+' : 'r');
   try { fs.fsyncSync(descriptor); } finally { fs.closeSync(descriptor); }
 }
 
