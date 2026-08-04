@@ -487,15 +487,18 @@ function samePublicationDirectory(left, right) {
 }
 
 const WINDOWS_PRIVATE_DIRECTORY_SCRIPT = [
-  'param([string]$entry,[string]$operation)',
   "$ErrorActionPreference='Stop'",
-  '$identity=[System.Security.Principal.WindowsIdentity]::GetCurrent()',
+  '$entry=$env:SCOUT_PUBLICATION_ENTRY',
+  '$operation=$env:SCOUT_PUBLICATION_OPERATION',
+  'try { $identity=[System.Security.Principal.WindowsIdentity]::GetCurrent() } catch { exit 51 }',
   "if($operation -eq 'create') {",
-  '  $privateAcl=[System.Security.AccessControl.DirectorySecurity]::new()',
-  '  $privateAcl.SetSecurityDescriptorSddlForm(("D:P(A;OICI;FA;;;{0})" -f $identity.User.Value),[System.Security.AccessControl.AccessControlSections]::Access)',
-  '  Set-Acl -LiteralPath $entry -AclObject $privateAcl',
+  '  try {',
+  '    $privateAcl=[System.Security.AccessControl.DirectorySecurity]::new()',
+  '    $privateAcl.SetSecurityDescriptorSddlForm(("D:P(A;OICI;FA;;;{0})" -f $identity.User.Value),[System.Security.AccessControl.AccessControlSections]::Access)',
+  '    Set-Acl -LiteralPath $entry -AclObject $privateAcl',
+  '  } catch { exit 52 }',
   '}',
-  '$acl=Get-Acl -LiteralPath $entry',
+  'try { $acl=Get-Acl -LiteralPath $entry } catch { exit 53 }',
   'if(-not $acl.AreAccessRulesProtected) { exit 41 }',
   '$rules=@($acl.GetAccessRules($true,$true,[System.Security.Principal.SecurityIdentifier]))',
   '$hasFullControl=$false',
@@ -504,7 +507,11 @@ const WINDOWS_PRIVATE_DIRECTORY_SCRIPT = [
   '  if(($candidate.FileSystemRights -band [System.Security.AccessControl.FileSystemRights]::FullControl) -eq [System.Security.AccessControl.FileSystemRights]::FullControl) { $hasFullControl=$true }',
   '}',
   'if(-not $hasFullControl) { exit 43 }',
-  '$acl.GetSecurityDescriptorSddlForm([System.Security.AccessControl.AccessControlSections]::Access)',
+  'try {',
+  '  $descriptor=$acl.GetSecurityDescriptorSddlForm([System.Security.AccessControl.AccessControlSections]::Access)',
+  '  if(-not $descriptor) { exit 54 }',
+  '  $descriptor',
+  '} catch { exit 55 }',
 ].join('\n');
 
 function privatePublicationSecurityRecord(entry, { create = false } = {}) {
@@ -516,10 +523,18 @@ function privatePublicationSecurityRecord(entry, { create = false } = {}) {
     }
     return 'posix:0700';
   }
+  const encodedScript = Buffer.from(WINDOWS_PRIVATE_DIRECTORY_SCRIPT, 'utf16le').toString('base64');
   const result = spawnSync('powershell.exe', [
-    '-NoLogo', '-NoProfile', '-NonInteractive', '-Command',
-    `& { ${WINDOWS_PRIVATE_DIRECTORY_SCRIPT} }`, entry, create ? 'create' : 'verify',
-  ], { encoding: 'utf8', windowsHide: true });
+    '-NoLogo', '-NoProfile', '-NonInteractive', '-EncodedCommand', encodedScript,
+  ], {
+    encoding: 'utf8',
+    windowsHide: true,
+    env: {
+      ...process.env,
+      SCOUT_PUBLICATION_ENTRY: entry,
+      SCOUT_PUBLICATION_OPERATION: create ? 'create' : 'verify',
+    },
+  });
   const descriptor = String(result.stdout || '').trim();
   if (result.status !== 0 || !descriptor) {
     const reason = Number.isInteger(result.status) ? result.status : 90;
