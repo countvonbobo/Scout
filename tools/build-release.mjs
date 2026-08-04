@@ -572,8 +572,16 @@ const WINDOWS_PRIVATE_DIRECTORY_SCRIPT = [
   "$flags=$descriptorMatch.Groups['flags'].Value",
   "if(-not $flags.Contains('P')) { exit 41 }",
   "$aces=$descriptorMatch.Groups['aces'].Value",
-  "$expectedAce='(A;OICI;FA;;;'+$identity.User.Value+')'",
-  'if($aces -ne $expectedAce) { exit 42 }',
+  "$aceMatches=[regex]::Matches($aces,'\\([^)]*\\)')",
+  'if($aceMatches.Count -ne 1) { exit 63 }',
+  "$fields=$aceMatches[0].Value.Substring(1,$aceMatches[0].Value.Length-2).Split(';')",
+  'if($fields.Count -ne 6) { exit 64 }',
+  "if($fields[0] -ne 'A') { exit 65 }",
+  'if($fields[5] -ne $identity.User.Value) { exit 66 }',
+  "$remainingFlags=$fields[1].Replace('OI','').Replace('CI','')",
+  "if(-not $fields[1].Contains('OI') -or -not $fields[1].Contains('CI') -or $remainingFlags -ne '') { exit 67 }",
+  "if($fields[2] -ne 'FA' -and $fields[2] -ne 'GA') { exit 68 }",
+  "if($fields[3] -ne '' -or $fields[4] -ne '') { exit 69 }",
   '$descriptorMatch.Value',
 ].join('\n');
 
