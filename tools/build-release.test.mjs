@@ -259,7 +259,7 @@ test('packaging consumes the audit-created read-only content snapshot', () => {
   fs.chmodSync(path.join(audit.stageDir, 'a.txt'), 0o644);
   fs.writeFileSync(path.join(audit.stageDir, 'a.txt'), 'SyntheticPackagingMarker');
   assert.throws(() => assertAuditedStage(audit), /privacy-authorized snapshot/);
-  removeAuditedStage(audit.stageDir);
+  removeAuditedStage(audit.stageDir, { expectedRecord: audit.stageRecord });
   fs.rmSync(authorizationRoot, { recursive: true, force: true });
 });
 
@@ -327,7 +327,7 @@ test('sealed release authorization rejects the complete tamper matrix', () => {
         `${name}: tampered stage`,
       );
     } finally {
-      removeAuditedStage(audit.stageDir);
+      removeAuditedStage(audit.stageDir, { expectedRecord: audit.stageRecord });
       fs.rmSync(authorizationRoot, { recursive: true, force: true });
       fs.rmSync(outside, { recursive: true, force: true });
     }
@@ -352,7 +352,7 @@ test('sealed release authorization rejects an active ancestor substitution', () 
     fs.rmSync(releaseDir, { recursive: true, force: true });
     fs.renameSync(heldDir, releaseDir);
   } finally {
-    removeAuditedStage(audit.stageDir);
+    removeAuditedStage(audit.stageDir, { expectedRecord: audit.stageRecord });
     fs.rmSync(top, { recursive: true, force: true });
   }
 });
@@ -381,7 +381,7 @@ test('a required packager directory mode keeps its files sealed and remains tamp
     fs.renameSync(path.join(sealedControlDir, 'control-held'), sealedControl);
     assert.throws(() => assertAuditedStage(audit), /privacy-authorized snapshot/);
   } finally {
-    removeAuditedStage(audit.stageDir);
+    removeAuditedStage(audit.stageDir, { expectedRecord: audit.stageRecord });
     fs.rmSync(authorizationRoot, { recursive: true, force: true });
   }
 });
@@ -445,6 +445,86 @@ test('audit preparation never removes a pre-existing snapshot collision', () => 
     }));
     assert.equal(fs.readFileSync(path.join(collision, 'sentinel'), 'utf8'), 'pre-existing');
   } finally {
+    try {
+      const cleanupAudit = fs.readdirSync(top).find((name) => name.includes('.audited-'));
+      if (cleanupAudit) fs.chmodSync(path.join(top, cleanupAudit), 0o700);
+    } catch {}
+    fs.rmSync(top, { recursive: true, force: true });
+  }
+});
+
+test('audited-stage cleanup quarantines before identity validation and preserves a substitute', () => {
+  const top = fs.mkdtempSync(path.join(os.tmpdir(), 'scout-audit-cleanup-identity-root-'));
+  const stageDir = path.join(top, 'stage');
+  fs.mkdirSync(stageDir);
+  fs.writeFileSync(path.join(stageDir, 'a.txt'), 'audited-a');
+  const audit = auditStageBeforePackaging(stageDir, {
+    env: { ...process.env, SCOUT_RELEASE_MARKERS: 'SyntheticPackagingMarker' },
+    authorizationRoot: top,
+  });
+  const held = `${audit.stageDir}-held`;
+  const primary = new Error('packager failed');
+  try {
+    finishAuditedStageCleanup(audit.stageDir, {
+      primaryError: primary,
+      expectedRecord: audit.stageRecord,
+      remove: (entry, options) => removeAuditedStage(entry, {
+        ...options,
+        rename: (source, target) => {
+          fs.renameSync(source, held);
+          fs.mkdirSync(source);
+          fs.writeFileSync(path.join(source, 'sentinel'), 'replacement must survive');
+          fs.renameSync(source, target);
+        },
+      }),
+    });
+    assert.match(primary.message, /Audited release payload cleanup failed/);
+    const replacement = fs.readdirSync(top)
+      .find((name) => name.includes('.audited-') && name.includes('.cleanup-'));
+    assert.ok(replacement);
+    assert.equal(
+      fs.readFileSync(path.join(top, replacement, 'sentinel'), 'utf8'),
+      'replacement must survive',
+    );
+    assert.equal(fs.existsSync(held), true);
+  } finally {
+    if (fs.existsSync(held)) removeAuditedStage(held, { expectedRecord: audit.stageRecord });
+    fs.rmSync(top, { recursive: true, force: true });
+  }
+});
+
+test('audited-stage cleanup rechecks quarantine identity before recursive deletion', () => {
+  const top = fs.mkdtempSync(path.join(os.tmpdir(), 'scout-audit-cleanup-quarantine-root-'));
+  const stageDir = path.join(top, 'stage');
+  fs.mkdirSync(stageDir);
+  fs.writeFileSync(path.join(stageDir, 'a.txt'), 'audited-a');
+  const audit = auditStageBeforePackaging(stageDir, {
+    env: { ...process.env, SCOUT_RELEASE_MARKERS: 'SyntheticPackagingMarker' },
+    authorizationRoot: top,
+  });
+  const primary = new Error('packager failed');
+  let held = null;
+  let replacement = null;
+  try {
+    finishAuditedStageCleanup(audit.stageDir, {
+      primaryError: primary,
+      expectedRecord: audit.stageRecord,
+      remove: (entry, options) => removeAuditedStage(entry, {
+        ...options,
+        empty: (quarantine) => {
+          held = `${quarantine}-held`;
+          fs.renameSync(quarantine, held);
+          fs.mkdirSync(quarantine);
+          fs.writeFileSync(path.join(quarantine, 'sentinel'), 'replacement must survive');
+          replacement = quarantine;
+        },
+      }),
+    });
+    assert.match(primary.message, /Audited release payload cleanup failed/);
+    assert.equal(fs.readFileSync(path.join(replacement, 'sentinel'), 'utf8'), 'replacement must survive');
+    assert.equal(fs.existsSync(held), true);
+  } finally {
+    if (held && fs.existsSync(held)) removeAuditedStage(held, { expectedRecord: audit.stageRecord });
     fs.rmSync(top, { recursive: true, force: true });
   }
 });

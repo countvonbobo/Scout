@@ -83,6 +83,10 @@ test('competing publication is excluded and the active publication may finish at
     const authorization = release.authorizeArtifactPublication(publication);
     release.promoteArtifactPublication(publication, authorization);
     assert.equal(fs.readFileSync(path.join(fix.outputDir, 'Scout.synthetic'), 'utf8'), 'winner');
+    const receipt = fs.readdirSync(fix.outputDir)
+      .find((name) => name.startsWith('.scout-release-completed-'));
+    assert.ok(receipt);
+    assert.equal(JSON.parse(fs.readFileSync(path.join(fix.outputDir, receipt), 'utf8')).state, 'complete');
   } finally {
     fix.remove();
   }
@@ -328,6 +332,129 @@ test('identity-bound cleanup never deletes a substituted pending directory', () 
     assert.equal(fs.readFileSync(sentinels[0], 'utf8'), 'replacement must survive');
     assert.equal(fs.existsSync(publication.lockDir), true);
     assert.equal(fs.existsSync(held), true);
+  } finally {
+    fix.remove();
+  }
+});
+
+test('promotion authorizes its flushed transaction journal and rolls back if it disappears', () => {
+  const fix = fixture();
+  try {
+    const publication = prepare(fix);
+    fs.writeFileSync(publication.temporaryPaths['Scout.synthetic'], 'authorized bytes');
+    const authorization = release.authorizeArtifactPublication(publication);
+    assert.throws(
+      () => release.promoteArtifactPublication(publication, authorization, {
+        afterLink: () => fs.unlinkSync(path.join(publication.lockDir, 'transaction.json')),
+      }),
+      /publication authorization changed/,
+    );
+    assert.equal(fs.existsSync(path.join(fix.outputDir, 'Scout.synthetic')), false);
+    release.finishArtifactPublication(publication, { primaryError: new Error('journal changed') });
+    assert.equal(fs.existsSync(publication.pendingDir), false);
+    assert.equal(fs.existsSync(publication.lockDir), false);
+  } finally {
+    fix.remove();
+  }
+});
+
+test('rollback reports incomplete evidence when an authorized journal was removed', () => {
+  const fix = fixture(['a.pkg', 'b.pkg']);
+  try {
+    const publication = prepare(fix);
+    fs.writeFileSync(publication.temporaryPaths['a.pkg'], 'artifact a');
+    fs.writeFileSync(publication.temporaryPaths['b.pkg'], 'artifact b');
+    const authorization = release.authorizeArtifactPublication(publication);
+    let links = 0;
+    assert.throws(
+      () => release.promoteArtifactPublication(publication, authorization, {
+        link: (source, target) => {
+          links += 1;
+          if (links === 2) throw new Error('injected second-link failure');
+          fs.linkSync(source, target);
+        },
+        afterLink: () => fs.unlinkSync(path.join(publication.lockDir, 'transaction.json')),
+        unlink: () => { throw new Error('injected rollback failure'); },
+      }),
+      /recovery evidence is incomplete/,
+    );
+    assert.equal(publication.recoveryRequired, true);
+    assert.equal(fs.existsSync(path.join(publication.lockDir, 'transaction.json')), false);
+    assert.equal(fs.existsSync(publication.lockDir), true);
+  } finally {
+    fix.remove();
+  }
+});
+
+test('publisher-owned sealed directory identity is rechecked during copying', () => {
+  const fix = fixture();
+  try {
+    const publication = prepare(fix);
+    fs.writeFileSync(publication.temporaryPaths['Scout.synthetic'], 'authorized bytes');
+    const authorization = release.authorizeArtifactPublication(publication);
+    assert.throws(
+      () => release.promoteArtifactPublication(publication, authorization, {
+        copy: (source, target, flags) => {
+          const sealed = path.dirname(target);
+          fs.renameSync(sealed, `${sealed}-held`);
+          fs.mkdirSync(sealed, { mode: 0o755 });
+          fs.copyFileSync(source, target, flags);
+        },
+      }),
+      /publication authorization changed/,
+    );
+    assert.equal(fs.existsSync(path.join(fix.outputDir, 'Scout.synthetic')), false);
+  } finally {
+    fix.remove();
+  }
+});
+
+test('cleanup rechecks quarantined identity before deleting any replacement content', () => {
+  const fix = fixture();
+  try {
+    const publication = prepare(fix);
+    fs.writeFileSync(publication.temporaryPaths['Scout.synthetic'], 'partial bytes');
+    const primary = new Error('packager failed');
+    let replacement = null;
+    release.finishArtifactPublication(publication, {
+      primaryError: primary,
+      removeOptions: {
+        empty: (entry) => {
+          const held = `${entry}-held`;
+          fs.renameSync(entry, held);
+          fs.mkdirSync(entry);
+          fs.writeFileSync(path.join(entry, 'sentinel'), 'replacement must survive');
+          replacement = entry;
+        },
+      },
+    });
+    assert.match(primary.message, /temporary cleanup failed/);
+    assert.ok(replacement);
+    assert.equal(fs.readFileSync(path.join(replacement, 'sentinel'), 'utf8'), 'replacement must survive');
+    assert.equal(fs.existsSync(publication.lockDir), true);
+  } finally {
+    fix.remove();
+  }
+});
+
+test('promotion rechecks destination authority after successful temporary cleanup', () => {
+  const fix = fixture();
+  try {
+    const publication = prepare(fix);
+    fs.writeFileSync(publication.temporaryPaths['Scout.synthetic'], 'authorized bytes');
+    const authorization = release.authorizeArtifactPublication(publication);
+    const installer = path.join(fix.root, 'installer');
+    const held = path.join(fix.root, 'installer-held-after-cleanup');
+    assert.throws(
+      () => release.promoteArtifactPublication(publication, authorization, {
+        afterCleanup: () => {
+          fs.renameSync(installer, held);
+          fs.mkdirSync(fix.outputDir, { recursive: true });
+        },
+      }),
+      /publication authorization changed/,
+    );
+    assert.equal(publication.published, true);
   } finally {
     fix.remove();
   }

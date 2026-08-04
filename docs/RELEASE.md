@@ -44,7 +44,12 @@ Release only from this clean-history public application repository. Never copy c
    journal, and creates each final artifact name with an atomic, no-overwrite
    same-filesystem link to the sealed inode. The original ancestor fence and
    the complete sealed/final byte identity are rechecked after every link and
-   again before the publication call succeeds.
+   again before the publication call succeeds. Scout flushes each sealed file,
+   the full-identity transaction journal and its directory before the first
+   link. After every final link is authorized, it publishes and flushes one
+   unpredictable `.scout-release-completed-<id>.json` receipt containing the
+   complete artifact authority; that small receipt remains after private
+   temporary cleanup as the durable commit boundary.
    Packager or postcheck failure removes the temporary output; a cleanup failure
    retains only bounded runner-cleanup residue and never replaces the primary
    error with a raw filesystem path.
@@ -57,10 +62,14 @@ Release only from this clean-history public application repository. Never copy c
    journal as recovery evidence; some final names may contain authorized sealed
    inodes, but the publication call did not complete. Validate the journal,
    every recorded digest and every final inode as one set before either
-   identity-bound rollback or acceptance. A rollback failure is reported and
+   identity-bound rollback or acceptance. Cleanup first moves owned directories
+   to unpredictable quarantine names, then empties the already-bound directory
+   rather than recursively trusting the pathname; any substituted quarantine is
+   retained and reported. A rollback failure is reported and
    retains this evidence instead of silently deleting it. If the process stops
    after the publication call succeeds, every final artifact is an authorized
-   sealed inode; only identity-bound temporary cleanup may remain. Never
+   sealed inode and the matching durable completion receipt exists; only
+   identity-bound temporary cleanup may remain. Never
    delete or overwrite a colliding final artifact automatically—investigate its
    provenance or use a clean output directory.
 7. Test on clean Windows, macOS and Ubuntu runners: install; first launch; provider detection; supervised/scheduled scans; missed-run/overlap/timeout; upgrade; and uninstall preserving the workspace.

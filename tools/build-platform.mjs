@@ -72,7 +72,7 @@ export function buildMac({ arch = process.arch, nodeExecutable = process.execPat
     throw error;
   } finally {
     if (publication) finishArtifactPublication(publication, { primaryError });
-    finishAuditedStageCleanup(auditedStage, { primaryError });
+    finishAuditedStageCleanup(auditedStage, { primaryError, expectedRecord: audit.stageRecord });
   }
 }
 
@@ -150,7 +150,7 @@ export function buildLinux({ nodeExecutable = process.execPath } = {}) {
     throw error;
   } finally {
     if (publication) finishArtifactPublication(publication, { primaryError });
-    finishAuditedStageCleanup(auditedStage, { primaryError });
+    finishAuditedStageCleanup(auditedStage, { primaryError, expectedRecord: audit.stageRecord });
   }
 }
 
