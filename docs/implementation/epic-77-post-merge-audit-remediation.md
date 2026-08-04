@@ -43,7 +43,7 @@ Verification status in this initial ledger is deliberately `unverified`: the aud
 
 | ID | Severity | Provenance | Verification | Beta gate | Workstream | Required disposition and evidence | Branch / commit / PR / tests / CI / review |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| F-1 | Critical | Epic-introduced | reproduced; repair under review | **BLOCK: exact-head CI/review not green** | 1 | Reproduce clean seal→assert failure; preserve pre-seal audit and read-only seal; authorise sealed digest; clean pass plus content/mode/path/link/add/delete/replace tamper failures; pre/post packager checks; primary error not masked by cleanup; execute a real packager round trip. | Draft PR #84; pushed head `6556502060f5bc5ee31bc3963e23532858ddeacb`; local tested code successor `db4df350ce958e44505dccedd277e8979254a021`; initial CI failed Linux packaging; exact-head rereview/reverification pending; see F-1 evidence below. |
+| F-1 | Critical | Epic-introduced | reproduced; locally repaired | **BLOCK: exact-head CI/review pending** | 1 | Reproduce clean seal→assert failure; preserve pre-seal audit and read-only seal; authorise sealed digest; clean pass plus content/mode/path/link/add/delete/replace tamper failures; pre/post packager checks; primary error not masked by cleanup; execute real packager round trips; publish only authorized private temporary artifacts with atomic no-overwrite promotion. | Draft PR #84; pushed head still `6556502060f5bc5ee31bc3963e23532858ddeacb` before the pending normal push; locally tested publication code `d33258f96d4c82db7cc434839b2c1edbf1fee6ec`; exact-head hosted packagers and rereviews pending; see F-1 evidence below. |
 | D-1 | Critical | Pre-existing but amplified by Epic authority model | unverified | **BLOCK** | 2 | Put adoption under shared mutation/OS exclusion; heartbeat and recheck fence through renames/receipt/publication; advance generation lineage; prove stale owners cannot write; crash-safe rollback; require service stop/restart ordering in workflow and operations docs. Synthetic roots only. | pending |
 | E-1 | Important | Epic-introduced | unverified | **BLOCK** | 3/7 | Upgraded users must be gated on publication or shown an explicit legacy-discovery disclosure; ranked-stage/UI claims must match the actual engine; update troubleshooting and composition/browser coverage. | pending |
 | E-2 | Important | Epic-introduced | unverified | **BLOCK** | 3 | Derive provider card, sign-in panel and verification offer from one health-gated presentation authority; contradictory signed-in/blocked states and suppressed remedies must be impossible. | pending |
@@ -210,9 +210,8 @@ Test order and acceptance:
   `1f8310c0af50935c68978e95a916682bbb9cecec`.
 - Pushed PR head: `6556502060f5bc5ee31bc3963e23532858ddeacb`.
 - Latest locally tested code commit:
-  `db4df350ce958e44505dccedd277e8979254a021`. It is intentionally unpushed
-  while the remaining security/output-promotion decision is unresolved, so the
-  repair is not an exact-pushed-head acceptance candidate.
+  `d33258f96d4c82db7cc434839b2c1edbf1fee6ec`. It is not yet
+  pushed, so the repair is not an exact-pushed-head acceptance candidate.
 - Commit map:
   - `e7294263331ec7abcc2453f3fd462d2d5153190d` — initial remediation ledger.
   - `143ffb7edb0b88411919fe3d8007398626a53d06` — focused sealed-snapshot design.
@@ -229,6 +228,13 @@ Test order and acceptance:
     preparation-cleanup reporting and transient ancestor substitution; authorize
     Debian's required `DEBIAN` directory mode while files remain read-only and
     the mode/identity/ancestor authorization remains tamper-evident.
+  - `f265b367f40bf1b74ea9b531f48dd2a529a5d01c` — record the first exact-head
+    reviewer verdicts and the unresolved temporary-publication security blocker.
+  - `d33258f96d4c82db7cc434839b2c1edbf1fee6ec` — package every platform into a private, unique same-filesystem
+    directory; validate Unix modes or a protected Windows DACL, real ancestors,
+    directory/output identity and artifact identity; run all postchecks before
+    atomic no-overwrite hard-link promotion; add bounded failure cleanup and
+    crash-recovery semantics; and exercise Linux, Windows and both macOS CI paths.
 - Independent reproduction: a synthetic one-file stage changed from mode `0644`
   to `0444`; pre-seal digest
   `df3328...` and sealed digest `9da773...` differed, and the untouched clean
@@ -237,25 +243,32 @@ Test order and acceptance:
 - RED evidence: the first production-code change ran one clean seal→assert test:
   1 total, 0 passed, 1 failed as expected. The same test passed after the repair.
 - Focused release/build/workflow/privacy verification at the pushed head: 76
-  passed, 0 failed. The expanded focused set after review repairs at `db4df350`
-  is 92 passed, 0 failed.
+  passed, 0 failed. The final local focused set is 103 passed, 0 failed.
   This includes content, mode, rename/path, symlink, addition, deletion and
-  same-byte replacement cases. The replacement case proves the reproducible
-  tree digest remains equal and the local identity authorization rejects it.
-- Full Node suite at pushed head `6556502`: 1,458 total; 1,452 passed; 0 failed;
-  6 genuine platform skips; 224.2109 seconds. Exact-local-head rerun is pending.
-- Full Playwright suite at pushed head `6556502`: 186 total; 175 passed; 0 failed; 11
-  intentional skips; Chromium and Firefox; 3.6 minutes.
+  same-byte replacement cases. Publication TDD first ran 7 tests with 0 passed
+  and 7 expected failures before the helper existed, then reached 10 passed and
+  0 failed. It covers postcheck and packager failure, final collision, competing
+  publication, ancestor substitution, cleanup failure, pre/post-promotion crash
+  boundaries, symlink/reparse ancestors, private-mode mutation, unexpected
+  outputs and checksum authorization.
+- Full Node suite at local publication head `d33258f96d4c82db7cc434839b2c1edbf1fee6ec`: 1,472 total; 1,466 passed;
+  0 failed; 6 genuine platform skips; 231.803645 seconds.
+- Full Playwright suite after the publication implementation: 186 total; 175
+  passed; 0 failed; 11 intentional skips; Chromium and Firefox; 2.9 minutes.
+  The subsequent production change was confined to Windows temporary-directory
+  DACL enforcement; exact-head hosted browser jobs remain required.
 - Documentation policy focus: 13 passed, 0 failed.
 - Production dependency audit: `npm audit --omit=dev` found 0 vulnerabilities.
 - Stage-only build passed. Required-marker release audit scanned 1,596 files
   with one synthetic marker, produced tree digest
-  `eb8f75b1e87a0964fe60377584d6a7e43e25ea4c8d346995d98e99e246e836cd`,
+  `5e9f9ec30c86c3c5c1f207911665544e82d0bf2070e9e8fb082b90d177154232`,
   and passed.
 - Native macOS packaging passed through the real `build-platform.mjs mac` path
   after installing the pinned Typst 0.14.2 runtime. At local review-repair head
-  `db4df350`, artifact `Scout-0.1.0-beta.23-macos-arm64.dmg` had SHA-256
-  `bdacdfba1c7bc7eee75f23dab9dcccb9c0491f0cce5cc9ca5f524fd11b9fdb8e`.
+  `d33258f96d4c82db7cc434839b2c1edbf1fee6ec`, artifact `Scout-0.1.0-beta.23-macos-arm64.dmg` had SHA-256
+  `243a334c9c8dd561676d369f7341776af23180da19ea3084ca8dfa238875d099`.
+  It was created through private temporary publication; the final output was a
+  regular one-link file in a `0700` output directory with no pending/lock residue.
   The artifact remains ignored in the disposable worktree and is not published.
 - Interrupted/environment-limited attempts: the first unprivileged native macOS
   build could not use the host Clang cache/SDK, then passed under the approved
@@ -282,9 +295,9 @@ Test order and acceptance:
   gap. `db4df350` adds RED/GREEN regressions and repairs both code findings.
   Security also requires unique temporary package outputs promoted only after
   successful postchecks, or an explicit narrower trusted-packager boundary.
-- Still required before F-1 acceptance: resolve that output-promotion security
-  decision; finish this evidence-only ledger update; rerun proportionate full
-  verification; publish after a fresh remote-state check; inspect the new
+- The output-promotion security decision is now implemented locally. Still
+  required before F-1 acceptance: publish the three existing local commits plus
+  this evidence update after a fresh remote-state check; inspect the new
   exact-head CI, including Linux DEB/tar and Windows; obtain exact-new-head
   specification, code-quality and security/privacy rereviews; resolve every
   finding; and record the final privacy/metadata audit. Native Windows
