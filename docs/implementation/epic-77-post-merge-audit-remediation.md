@@ -5,7 +5,7 @@
 - Programme status: **ACTIVE — next beta paused**.
 - Repository: `https://github.com/oliver-hitchings/Scout`.
 - Exact starting and current `main`: `1f8310c0af50935c68978e95a916682bbb9cecec`.
-- Remote verification: GitHub `main` was re-queried on 2026-08-03 and still matched the audited commit.
+- Remote verification: GitHub `main` was re-queried on 2026-08-04 and still matched the audited commit.
 - Epic #77: open; current body last updated `2026-08-02T09:56:43Z` and byte-equivalent to the frozen body apart from a trailing newline.
 - Issue #76: open; current body/comments last updated `2026-08-02T09:46:33Z`; four live provider-authentication checks remain operator-only.
 - Existing open PR review: PR #15 is unrelated. No active PR duplicates this remediation programme.
@@ -43,7 +43,7 @@ Verification status in this initial ledger is deliberately `unverified`: the aud
 
 | ID | Severity | Provenance | Verification | Beta gate | Workstream | Required disposition and evidence | Branch / commit / PR / tests / CI / review |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| F-1 | Critical | Epic-introduced | reproduced; locally repaired | **BLOCK: exact-head CI/review pending** | 1 | Reproduce clean seal→assert failure; preserve pre-seal audit and read-only seal; authorise sealed digest; clean pass plus content/mode/path/link/add/delete/replace tamper failures; pre/post packager checks; primary error not masked by cleanup; execute real packager round trips; publish only authorized private temporary artifacts with atomic no-overwrite promotion. | Draft PR #84; pushed head still `6556502060f5bc5ee31bc3963e23532858ddeacb` before the pending normal push; locally tested publication code `d33258f96d4c82db7cc434839b2c1edbf1fee6ec`; exact-head hosted packagers and rereviews pending; see F-1 evidence below. |
+| F-1 | Critical | Epic-introduced | reproduced; repaired and independently approved at exact code head | **BLOCK: final evidence-only head CI** | 1 | Reproduce clean seal→assert failure; preserve pre-seal audit and read-only seal; authorise sealed digest; clean pass plus content/mode/path/link/add/delete/replace tamper failures; pre/post packager checks; primary error not masked by cleanup; execute real packager round trips; publish only authorized private temporary artifacts with atomic no-overwrite promotion. | Draft PR #84; exact code head `d165e1d9099b93b705e56aea0a170f2d9ab0b979`; focused 118/118; exact-SHA specification/code/security reviews APPROVE; CI run 30946243076 has six green jobs and one stalled Intel macOS attempt; see F-1 evidence below. |
 | D-1 | Critical | Pre-existing but amplified by Epic authority model | unverified | **BLOCK** | 2 | Put adoption under shared mutation/OS exclusion; heartbeat and recheck fence through renames/receipt/publication; advance generation lineage; prove stale owners cannot write; crash-safe rollback; require service stop/restart ordering in workflow and operations docs. Synthetic roots only. | pending |
 | E-1 | Important | Epic-introduced | unverified | **BLOCK** | 3/7 | Upgraded users must be gated on publication or shown an explicit legacy-discovery disclosure; ranked-stage/UI claims must match the actual engine; update troubleshooting and composition/browser coverage. | pending |
 | E-2 | Important | Epic-introduced | unverified | **BLOCK** | 3 | Derive provider card, sign-in panel and verification offer from one health-gated presentation authority; contradictory signed-in/blocked states and suppressed remedies must be impossible. | pending |
@@ -208,10 +208,10 @@ Test order and acceptance:
 - Draft PR: `https://github.com/oliver-hitchings/Scout/pull/84`.
 - Branch: `codex/epic-77-f1-release-packaging`, based directly on
   `1f8310c0af50935c68978e95a916682bbb9cecec`.
-- Pushed PR head: `6556502060f5bc5ee31bc3963e23532858ddeacb`.
-- Latest locally tested code commit:
-  `d33258f96d4c82db7cc434839b2c1edbf1fee6ec`. It is not yet
-  pushed, so the repair is not an exact-pushed-head acceptance candidate.
+- Exact pushed and independently reviewed code head:
+  `d165e1d9099b93b705e56aea0a170f2d9ab0b979`.
+- Fixed base and current upstream `main`:
+  `1f8310c0af50935c68978e95a916682bbb9cecec`.
 - Commit map:
   - `e7294263331ec7abcc2453f3fd462d2d5153190d` — initial remediation ledger.
   - `143ffb7edb0b88411919fe3d8007398626a53d06` — focused sealed-snapshot design.
@@ -223,7 +223,7 @@ Test order and acceptance:
   - `7e075813f091d78e510d3c295024f4e38bd9437c` — retain this active ledger while
     preserving the stale-plan documentation guard.
   - `6556502060f5bc5ee31bc3963e23532858ddeacb` — record pre-review local
-    verification; this is the current pushed PR head.
+    verification; this was the first reviewed PR head.
   - `db4df350ce958e44505dccedd277e8979254a021` — resolve review findings for
     preparation-cleanup reporting and transient ancestor substitution; authorize
     Debian's required `DEBIAN` directory mode while files remain read-only and
@@ -235,6 +235,29 @@ Test order and acceptance:
     directory/output identity and artifact identity; run all postchecks before
     atomic no-overwrite hard-link promotion; add bounded failure cleanup and
     crash-recovery semantics; and exercise Linux, Windows and both macOS CI paths.
+  - `ab530f494e1f15c3bf8bb90803976747b61fd48b` — record artifact-publication evidence.
+  - `5e374f1c69c9eb6c9a1bdda3d831cc1d42e828cf` — make the ancestor-substitution regression portable.
+  - `ef76f70b15ff46af06bd098bc8179e3e01e9fe13` — enforce Windows publication privacy.
+  - `0bfc6c83617830b6ddd7ae2eef4e60a679251a95` — validate normalized Windows ACLs.
+  - `f9faefae63d526a5f9514a7c4bdb8365400e8bd6` — add bounded Windows privacy diagnostics.
+  - `a29a13f3cc44b22146de094a660ed506eaecd905` — seal the publication transaction.
+  - `8c3abf64583da8fb51747609cb610b54ceaa222e` — invoke Windows ACL validation safely.
+  - `32bf8433753598aca68d537acdd65ef4c870b28f` — preserve the current owner while restricting Windows ACLs.
+  - `5592058cb59fa8831d6056c686b2f007eadd8c9b` — make publication recovery durable.
+  - `fdf1bde766994cbd359fdbda48e8192215f19637` — restrict the Windows publication ACL natively.
+  - `915afd4eedf116316cd6b5470909e1a622799dd4` — bind the Windows ACL grant to the current SID.
+  - `e1126838afe247af84d2119bcaadb18e0bf7d099` — classify the hosted Windows ACL-read failure.
+  - `f6a4bfb7f3b73d6e91f668fb17c34f9e05a407f8` — try filesystem-API Windows ACL verification; superseded after hosted evidence.
+  - `1b0a079f8da54e1c8472ee6be0f7f399759385cb` — verify the Windows publication DACL from SDDL.
+  - `2eb511e5436cbf10e65e27a4f5cc9105743a1229` — classify the hosted SDDL representation.
+  - `d9d08476ac3e192b580d04f054ab77626207552e` — isolate the DACL from the saved Windows descriptor.
+  - `184947245bfad97ed8f8bce0954d064d701b13af` — verify the Windows DACL semantically.
+  - `e855b6d9028466bbc7c824ad88555a14741ecae7` — rebuild the Windows publication DACL deterministically.
+  - `0fff5b8d8b3dcd9ecdcc27f78e4027e210ab6091` — resolve the canonical Windows ACL principal.
+  - `a2b2117eca9a0895823a13831285ede3485f8b2d` — classify a hosted Windows sealing failure.
+  - `c6ef4bd186e99243cd5a8263dac6541e2a14a11e` — flush sealed files through a Windows write-capable handle.
+  - `d165e1d9099b93b705e56aea0a170f2d9ab0b979` — close completion-receipt rollback,
+    bound-directory cleanup and atomic rollback-quarantine races, with regressions.
 - Independent reproduction: a synthetic one-file stage changed from mode `0644`
   to `0444`; pre-seal digest
   `df3328...` and sealed digest `9da773...` differed, and the untouched clean
@@ -242,28 +265,37 @@ Test order and acceptance:
   mismatch. No private workspace, provider, release or package was involved.
 - RED evidence: the first production-code change ran one clean seal→assert test:
   1 total, 0 passed, 1 failed as expected. The same test passed after the repair.
-- Focused release/build/workflow/privacy verification at the pushed head: 76
-  passed, 0 failed. The final local focused set is 103 passed, 0 failed.
+- Focused release/build/platform/workflow/privacy/documentation verification at
+  exact code head `d165e1d`: **118 passed, 0 failed, 0 skipped**.
   This includes content, mode, rename/path, symlink, addition, deletion and
-  same-byte replacement cases. Publication TDD first ran 7 tests with 0 passed
-  and 7 expected failures before the helper existed, then reached 10 passed and
-  0 failed. It covers postcheck and packager failure, final collision, competing
-  publication, active ancestor substitution, cleanup failure, pre/post-promotion crash
-  boundaries, symlink/reparse ancestors, private-mode mutation, unexpected
-  outputs and checksum authorization.
-- Full Node suite at local publication head `d33258f96d4c82db7cc434839b2c1edbf1fee6ec`: 1,472 total; 1,466 passed;
-  0 failed; 6 genuine platform skips; 231.803645 seconds.
+  same-byte replacement cases. Publication coverage includes postcheck and packager
+  failure, destination collision, competing publication, active ancestor
+  substitution, cleanup failure, cleanup substitution before the child binds its
+  cwd, pre/post-promotion crash boundaries, symlink/reparse ancestors, private-mode
+  mutation, unexpected outputs, checksum authorization, transaction loss,
+  completion-receipt validation failure and substitution during rollback.
+- Full hosted Node suite at `d165e1d`:
+  - Ubuntu: 1,487 total; 1,481 passed; 0 failed; 6 skipped.
+  - Apple Silicon macOS: 1,487 total; 1,481 passed; 0 failed; 6 skipped.
+  - Windows: 1,487 total; 1,484 passed; 0 failed; 3 skipped.
+  - Dedicated Windows publication/DACL protocol: 22 total; 21 passed; 0 failed;
+    1 platform-appropriate skip.
 - Full Playwright suite after the publication implementation: 186 total; 175
   passed; 0 failed; 11 intentional skips; Chromium and Firefox; 2.9 minutes.
-  The subsequent production change was confined to Windows temporary-directory
-  DACL enforcement; exact-head hosted browser jobs remain required.
+  Exact `d165e1d` hosted browser counts are Ubuntu Chromium 93/93, Ubuntu Firefox
+  82 passed plus 11 intentional skips, and Windows Chromium 93/93.
 - Documentation policy focus: 13 passed, 0 failed.
 - Production dependency audit: `npm audit --omit=dev` found 0 vulnerabilities.
 - Stage-only build passed. Required-marker release audit scanned 1,596 files
   with one synthetic marker, produced tree digest
   `5e9f9ec30c86c3c5c1f207911665544e82d0bf2070e9e8fb082b90d177154232`,
   and passed.
-- Native macOS packaging passed through the real `build-platform.mjs mac` path
+- Native packaging at exact code head `d165e1d` passed through the real packagers:
+  Ubuntu produced the Debian package and Linux tar archive without
+  `dpkg-deb --nocheck`; Apple Silicon macOS produced the DMG; Windows applied and
+  verified the private DACL and produced the installer. All used audited private
+  temporary publication. The Intel macOS attempt is discussed under hosted CI.
+- Earlier local native macOS packaging passed through the real `build-platform.mjs mac` path
   after installing the pinned Typst 0.14.2 runtime. At local review-repair head
   `d33258f96d4c82db7cc434839b2c1edbf1fee6ec`, artifact `Scout-0.1.0-beta.23-macos-arm64.dmg` had SHA-256
   `243a334c9c8dd561676d369f7341776af23180da19ea3084ca8dfa238875d099`.
@@ -277,32 +309,32 @@ Test order and acceptance:
   same full suite then passed under approved host execution. The first sandboxed
   npm audit lacked registry DNS access; the approved network retry passed. These
   were environment limitations, not product-test failures.
-- Exact-head CI run `https://github.com/oliver-hitchings/Scout/actions/runs/30839526761`
-  passed the Ubuntu full Node suite (1,458 total; 1,452 passed; 0 failed; 6
-  skips), staging and fork-safe audit, but failed the real Linux packaging step:
-  `dpkg-deb` rejected sealed `DEBIAN` mode `0555` because it requires
-  `0755–0775`. Local commit `db4df350` addresses this without `--nocheck`: only
-  that control directory is authorized as `0755`; its files remain `0444`, and
-  mode, identity and ancestor-chain changes remain fail-closed. A hosted Linux
-  rerun is still required. All six other jobs passed: Windows, Apple Silicon
-  macOS and Intel macOS Node/audit; Windows Chromium; and Ubuntu Chromium and
-  Firefox.
-- Exact-SHA reviews of pushed head `6556502`: code quality found no production
-  defect but found this ledger stale; specification requested changes for
-  internal audit-preparation cleanup plus the stale ledger; security requested
-  changes after reproducing a transient ancestor swap that packaged unaudited
-  bytes while pre/post checks passed, and independently noted the same cleanup
-  gap. `db4df350` adds RED/GREEN regressions and repairs both code findings.
-  Security also requires unique temporary package outputs promoted only after
-  successful postchecks, or an explicit narrower trusted-packager boundary.
-- The output-promotion security decision is now implemented locally. Still
-  required before F-1 acceptance: publish the three existing local commits plus
-  this evidence update after a fresh remote-state check; inspect the new
-  exact-head CI, including Linux DEB/tar and Windows; obtain exact-new-head
-  specification, code-quality and security/privacy rereviews; resolve every
-  finding; and record the final privacy/metadata audit. Native Windows
-  packaging/installation and installer smoke remain operator release gates.
-  No merge is authorised.
+- Exact-code-head CI run:
+  `https://github.com/oliver-hitchings/Scout/actions/runs/30946243076`.
+  Six jobs completed successfully: Ubuntu full/audit/native DEB+tar, Apple
+  Silicon macOS full/audit/native DMG, Windows full/audit/DACL/native installer,
+  and all three browser jobs. The Intel macOS runner remained in `npm test` for
+  more than 30 minutes, versus about 5 minutes in the immediately preceding
+  successful all-platform run 30945126304 at `c6ef4bd`; GitHub exposed no partial log. An attempted
+  cancellation was rejected with HTTP 403 because the fork account lacks
+  upstream administration rights, so no CI state changed. The evidence-only
+  ledger commit must trigger a fresh Intel attempt before acceptance.
+- Independent exact-SHA reviews at `d165e1d`:
+  - specification: **APPROVE**, no findings; 67/67 focused checks;
+  - code quality: **APPROVE**, no findings; 118/118 focused checks;
+  - security/privacy: **APPROVE**, no findings; 118/118 focused checks and no
+    private path, credential or personal-data disclosure in the changed range.
+- All original and fresh F-1 findings are repaired: clean seal authorization,
+  audit-preparation cleanup reporting, stable ancestor fencing, Debian control
+  mode, private same-filesystem output, Windows DACL application/verification,
+  sealed-copy durability, transaction/recovery evidence, post-link mutation,
+  completion-receipt rollback, substituted-directory cleanup and atomic
+  quarantine-based rollback.
+- Remaining gates are evidence/operator gates, not known code findings: a fresh
+  exact-head Intel macOS hosted run; native installation/first-launch smoke on
+  release hosts; and the later signing/attestation/publication/deployment gates.
+  No merge, tag, release, package publication, deployment, retarget, approval,
+  review resolution or issue closure occurred or is authorised here.
 
 ## Evidence update protocol
 
