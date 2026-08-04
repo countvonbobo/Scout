@@ -248,7 +248,7 @@ Test order and acceptance:
   same-byte replacement cases. Publication TDD first ran 7 tests with 0 passed
   and 7 expected failures before the helper existed, then reached 10 passed and
   0 failed. It covers postcheck and packager failure, final collision, competing
-  publication, ancestor substitution, cleanup failure, pre/post-promotion crash
+  publication, active ancestor substitution, cleanup failure, pre/post-promotion crash
   boundaries, symlink/reparse ancestors, private-mode mutation, unexpected
   outputs and checksum authorization.
 - Full Node suite at local publication head `d33258f96d4c82db7cc434839b2c1edbf1fee6ec`: 1,472 total; 1,466 passed;

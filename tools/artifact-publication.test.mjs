@@ -88,7 +88,7 @@ test('competing publication is excluded and the active publication may finish at
   }
 });
 
-test('restored output-ancestor substitution invalidates publication authorization', () => {
+test('output-ancestor substitution invalidates publication authorization', () => {
   const fix = fixture();
   try {
     const publication = prepare(fix);
@@ -97,11 +97,13 @@ test('restored output-ancestor substitution invalidates publication authorizatio
     const installer = path.join(fix.root, 'installer');
     const held = path.join(fix.root, 'installer-held');
     fs.renameSync(installer, held);
-    fs.renameSync(held, installer);
+    fs.mkdirSync(fix.outputDir, { recursive: true });
     assert.throws(
       () => release.promoteArtifactPublication(publication, authorization),
       /publication authorization changed/,
     );
+    fs.rmSync(installer, { recursive: true, force: true });
+    fs.renameSync(held, installer);
     release.finishArtifactPublication(publication, { primaryError: new Error('substitution') });
     assert.equal(fs.existsSync(path.join(fix.outputDir, 'Scout.synthetic')), false);
   } finally {
