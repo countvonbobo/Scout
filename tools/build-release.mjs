@@ -502,7 +502,8 @@ function privatePublicationSecurityRecord(entry, { create = false } = {}) {
   ], { encoding: 'utf8', windowsHide: true });
   const descriptor = String(result.stdout || '').trim();
   if (result.status !== 0 || !descriptor) {
-    throw publicationError('release artifact temporary output is not private');
+    const reason = Number.isInteger(result.status) ? result.status : 90;
+    throw publicationError(`release artifact temporary output is not private (bounded reason ACL-${reason})`);
   }
   return `windows:${descriptor}`;
 }

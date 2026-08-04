@@ -24,6 +24,9 @@ jobs:
       - run: npm ci
       - run: node tools/typst-runtime.mjs install
       - run: node tools/typst-runtime.mjs verify --compile
+      - name: Verify Windows artifact publication protocol
+        if: runner.os == 'Windows'
+        run: node --test tools/artifact-publication.test.mjs
       - run: npm test
       - name: Verify release staging
         run: node tools/build-release.mjs --stage-only
