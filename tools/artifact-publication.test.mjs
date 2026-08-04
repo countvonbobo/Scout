@@ -292,13 +292,99 @@ test('failed multi-output rollback retains durable recovery evidence and reports
       }),
       /destination already exists[\s\S]*final-name residue may exist/,
     );
-    assert.equal(fs.existsSync(path.join(fix.outputDir, 'a.pkg')), true);
+    assert.equal(fs.existsSync(path.join(fix.outputDir, 'a.pkg')), false);
     assert.equal(fs.existsSync(path.join(fix.outputDir, 'b.pkg')), false);
+    const retainedRollback = fs.readdirSync(publication.lockDir)
+      .find((name) => name.startsWith('.rollback-'));
+    assert.ok(retainedRollback);
+    assert.equal(
+      fs.readFileSync(path.join(publication.lockDir, retainedRollback), 'utf8'),
+      'artifact a',
+    );
     assert.equal(fs.existsSync(path.join(publication.lockDir, 'transaction.json')), true);
     const primary = new Error('caller observed publication failure');
     release.finishArtifactPublication(publication, { primaryError: primary });
     assert.match(primary.message, /recovery evidence was retained for operator cleanup|temporary artifacts were retained/);
     assert.equal(fs.existsSync(publication.lockDir), true);
+  } finally {
+    fix.remove();
+  }
+});
+
+test('completion-receipt validation failure rolls back the linked receipt and every artifact', () => {
+  const fix = fixture();
+  try {
+    const publication = prepare(fix);
+    fs.writeFileSync(publication.temporaryPaths['Scout.synthetic'], 'authorized bytes');
+    const authorization = release.authorizeArtifactPublication(publication);
+    let heldReceiptSource = null;
+    assert.throws(
+      () => release.promoteArtifactPublication(publication, authorization, {
+        link: (source, target) => {
+          fs.linkSync(source, target);
+          if (path.basename(source) === 'transaction.complete.json') {
+            heldReceiptSource = `${source}.held`;
+            fs.renameSync(source, heldReceiptSource);
+            fs.copyFileSync(heldReceiptSource, source);
+          }
+        },
+      }),
+      /completion receipt authorization changed/,
+    );
+    assert.ok(heldReceiptSource);
+    assert.equal(fs.existsSync(path.join(fix.outputDir, 'Scout.synthetic')), false);
+    assert.deepEqual(
+      fs.readdirSync(fix.outputDir).filter((name) => name.startsWith('.scout-release-completed-')),
+      [],
+    );
+    assert.equal(publication.recoveryRequired, false);
+    release.finishArtifactPublication(publication, { primaryError: new Error('receipt changed') });
+    assert.equal(fs.existsSync(publication.lockDir), false);
+  } finally {
+    fix.remove();
+  }
+});
+
+test('rollback quarantines a substituted final name without deleting the replacement', () => {
+  const fix = fixture(['a.pkg', 'b.pkg']);
+  try {
+    const publication = prepare(fix);
+    fs.writeFileSync(publication.temporaryPaths['a.pkg'], 'artifact a');
+    fs.writeFileSync(publication.temporaryPaths['b.pkg'], 'artifact b');
+    const authorization = release.authorizeArtifactPublication(publication);
+    const held = path.join(fix.outputDir, '.held-authorized-a');
+    let links = 0;
+    let substituted = false;
+    assert.throws(
+      () => release.promoteArtifactPublication(publication, authorization, {
+        link: (source, target) => {
+          links += 1;
+          if (links === 2) {
+            const error = new Error('injected collision');
+            error.code = 'EEXIST';
+            throw error;
+          }
+          fs.linkSync(source, target);
+        },
+        rollbackRename: (source, target) => {
+          fs.renameSync(source, held);
+          fs.writeFileSync(source, 'replacement must survive');
+          fs.renameSync(source, target);
+          substituted = true;
+        },
+      }),
+      /destination already exists[\s\S]*recovery evidence was retained/,
+    );
+    assert.equal(substituted, true);
+    assert.equal(fs.readFileSync(held, 'utf8'), 'artifact a');
+    const retainedReplacement = fs.readdirSync(publication.lockDir)
+      .find((name) => name.startsWith('.rollback-'));
+    assert.ok(retainedReplacement);
+    assert.equal(
+      fs.readFileSync(path.join(publication.lockDir, retainedReplacement), 'utf8'),
+      'replacement must survive',
+    );
+    assert.equal(publication.recoveryRequired, true);
   } finally {
     fix.remove();
   }
@@ -432,6 +518,29 @@ test('cleanup rechecks quarantined identity before deleting any replacement cont
     assert.ok(replacement);
     assert.equal(fs.readFileSync(path.join(replacement, 'sentinel'), 'utf8'), 'replacement must survive');
     assert.equal(fs.existsSync(publication.lockDir), true);
+  } finally {
+    fix.remove();
+  }
+});
+
+test('bound cleanup child rejects a substituted directory before deleting its contents', () => {
+  const fix = fixture();
+  const owned = path.join(fix.root, 'owned-cleanup');
+  const held = `${owned}-held`;
+  try {
+    fs.mkdirSync(owned);
+    fs.writeFileSync(path.join(owned, 'owned'), 'owned bytes');
+    const stat = fs.lstatSync(owned, { bigint: true });
+    const expectedRecord = { dev: String(stat.dev), ino: String(stat.ino) };
+    fs.renameSync(owned, held);
+    fs.mkdirSync(owned);
+    fs.writeFileSync(path.join(owned, 'sentinel'), 'replacement must survive');
+    assert.throws(
+      () => release.emptyOwnedDirectory(owned, { expectedRecord }),
+      /identity-bound directory emptying failed/,
+    );
+    assert.equal(fs.readFileSync(path.join(owned, 'sentinel'), 'utf8'), 'replacement must survive');
+    assert.equal(fs.readFileSync(path.join(held, 'owned'), 'utf8'), 'owned bytes');
   } finally {
     fix.remove();
   }

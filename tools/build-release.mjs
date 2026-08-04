@@ -485,6 +485,10 @@ const ARTIFACT_COMPLETION_PREFIX = '.scout-release-completed-';
 const EMPTY_BOUND_DIRECTORY_SCRIPT = [
   "const fs = require('node:fs');",
   "const path = require('node:path');",
+  'const bound = fs.lstatSync(".", { bigint: true });',
+  'if (!bound.isDirectory() || bound.isSymbolicLink()',
+  '  || String(bound.dev) !== process.argv[2]',
+  '  || String(bound.ino) !== process.argv[3]) process.exit(91);',
   'function writable(entry) {',
   '  const stat = fs.lstatSync(entry);',
   '  if (stat.isSymbolicLink()) return;',
@@ -499,9 +503,13 @@ const EMPTY_BOUND_DIRECTORY_SCRIPT = [
   '}',
 ].join('\n');
 
-function emptyOwnedDirectory(entry, { restoreWritable = false } = {}) {
+export function emptyOwnedDirectory(entry, { restoreWritable = false, expectedRecord } = {}) {
+  if (!expectedRecord?.dev || !expectedRecord?.ino) {
+    throw new Error('identity-bound directory emptying failed');
+  }
   const result = spawnSync(process.execPath, [
     '-e', EMPTY_BOUND_DIRECTORY_SCRIPT, restoreWritable ? 'writable' : 'sealed',
+    expectedRecord.dev, expectedRecord.ino,
   ], {
     cwd: entry,
     stdio: 'ignore',
@@ -515,7 +523,7 @@ function finishOwnedDirectoryRemoval(entry, expectedRecord, {
   removeEmpty = fs.rmdirSync,
   restoreWritable = false,
 } = {}) {
-  empty(entry, { restoreWritable });
+  empty(entry, { restoreWritable, expectedRecord });
   const current = publicationDirectoryRecord(entry);
   if (!samePublicationDirectoryIdentity(current, expectedRecord)
     || fs.readdirSync(entry).length !== 0) {
@@ -990,15 +998,33 @@ function assertPublishedArtifactSet(publication, linked, completion = null, {
   }
 }
 
-function safeUnlinkPublished(finalPath, expected, publication, unlink = fs.unlinkSync) {
+function safeUnlinkPublished(finalPath, expected, publication, {
+  rename = fs.renameSync,
+  unlink = fs.unlinkSync,
+  randomUUID = crypto.randomUUID,
+} = {}) {
   try {
     assertPublicationContainer(publication, { strictTransaction: false });
-    const current = artifactStateAt(finalPath, publication.outputDir);
-    if (current.dev !== expected.dev || current.ino !== expected.ino
-      || !sameArtifactContent(current, expected)) return false;
-    unlink(finalPath);
+    const quarantine = path.join(publication.lockDir, `.rollback-${randomUUID()}`);
+    try {
+      fs.lstatSync(quarantine);
+      return false;
+    } catch (error) {
+      if (error?.code !== 'ENOENT') return false;
+    }
+    rename(finalPath, quarantine);
     try {
       fs.lstatSync(finalPath);
+      return false;
+    } catch (error) {
+      if (error?.code !== 'ENOENT') return false;
+    }
+    const current = artifactStateAt(quarantine, publication.lockDir);
+    if (current.dev !== expected.dev || current.ino !== expected.ino
+      || !sameArtifactContent(current, expected)) return false;
+    unlink(quarantine);
+    try {
+      fs.lstatSync(quarantine);
       return false;
     } catch (error) {
       if (error?.code !== 'ENOENT') return false;
@@ -1093,6 +1119,7 @@ export function promoteArtifactPublication(publication, authorization, {
   remove = removeArtifactPublication,
   link = fs.linkSync,
   unlink = fs.unlinkSync,
+  rollbackRename = fs.renameSync,
   copy = fs.copyFileSync,
   afterLink = null,
   afterCleanup = null,
@@ -1259,6 +1286,7 @@ export function promoteArtifactPublication(publication, authorization, {
       if (error?.code === 'EEXIST') throw publicationError('release artifact destination already exists');
       throw publicationError('release artifact completion receipt could not be published');
     }
+    completionLink = { finalPath: completionFinalPath, expected: beforeCompletionLink };
     const completionSourceState = artifactStateAt(completionSource, publication.lockDir);
     const completionFinalState = artifactStateAt(completionFinalPath, publication.outputDir);
     if (completionSourceState.dev !== beforeCompletionLink.dev
@@ -1267,7 +1295,7 @@ export function promoteArtifactPublication(publication, authorization, {
       || !sameArtifactState(completionFinalState, completionSourceState)) {
       throw publicationError('release artifact completion receipt authorization changed');
     }
-    completionLink = { finalPath: completionFinalPath, expected: completionFinalState };
+    completionLink.expected = completionFinalState;
     flushDirectory(publication.outputDir);
     assertPublicationContainer(publication);
     assertPublishedArtifactSet(publication, linked, completionLink);
@@ -1292,10 +1320,14 @@ export function promoteArtifactPublication(publication, authorization, {
         completionLink.finalPath,
         completionLink.expected,
         publication,
-        unlink,
+        { rename: rollbackRename, unlink, randomUUID },
       )) rollbackFailed = true;
       for (const { finalPath, expected } of linked.reverse()) {
-        if (!safeUnlinkPublished(finalPath, expected, publication, unlink)) rollbackFailed = true;
+        if (!safeUnlinkPublished(finalPath, expected, publication, {
+          rename: rollbackRename,
+          unlink,
+          randomUUID,
+        })) rollbackFailed = true;
       }
       if (rollbackFailed) {
         publication.recoveryRequired = true;
