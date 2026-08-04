@@ -348,7 +348,9 @@ test('sealed release authorization rejects a restored ancestor substitution', ()
   }
 });
 
-test('a required packager directory mode keeps its files sealed and remains tamper-evident', () => {
+test('a required packager directory mode keeps its files sealed and remains tamper-evident', {
+  skip: process.platform === 'win32' ? 'Debian directory modes are exercised on Linux release runners' : false,
+}, () => {
   const stageDir = fs.mkdtempSync(path.join(os.tmpdir(), 'scout-audit-directory-mode-'));
   const controlDir = path.join(stageDir, 'deb', 'DEBIAN');
   fs.mkdirSync(controlDir, { recursive: true });

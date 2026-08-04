@@ -481,7 +481,7 @@ const WINDOWS_PRIVATE_DIRECTORY_SCRIPT = [
   '$only=$rules[0]',
   "if($only.IdentityReference.Value -ne $identity.User.Value -or $only.AccessControlType -ne 'Allow' -or (($only.FileSystemRights -band [System.Security.AccessControl.FileSystemRights]::FullControl) -ne [System.Security.AccessControl.FileSystemRights]::FullControl)) { exit 43 }",
   '$acl.Sddl',
-].join(';');
+].join('\n');
 
 function privatePublicationSecurityRecord(entry, { create = false } = {}) {
   if (process.platform !== 'win32') {
