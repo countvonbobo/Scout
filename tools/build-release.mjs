@@ -554,7 +554,7 @@ const WINDOWS_PRIVATE_DIRECTORY_SCRIPT = [
   '$operation=$env:SCOUT_PUBLICATION_OPERATION',
   'try { $identity=[System.Security.Principal.WindowsIdentity]::GetCurrent() } catch { exit 51 }',
   "if($operation -eq 'create') {",
-  "  try { & icacls.exe $entry '/inheritance:r' '/grant:r' ($identity.Name + ':(OI)(CI)F') | Out-Null } catch { exit 56 }",
+  "  try { & icacls.exe $entry '/inheritance:r' '/grant:r' ('*' + $identity.User.Value + ':(OI)(CI)F') | Out-Null } catch { exit 56 }",
   '  if($LASTEXITCODE -ne 0) { exit 57 }',
   '}',
   'try { $acl=Get-Acl -LiteralPath $entry } catch { exit 53 }',
